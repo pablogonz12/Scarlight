@@ -470,10 +470,136 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// `VICTORY_SHOW_TARGET=<n>`: every frame shows the `n`th texture it
+/// rendered to or wrote (first-use order, the `<i>` of a target dump's file
+/// names) instead of what the title presents; frames with fewer targets show
+/// the title's own picture. `VICTORY_SHOW_TARGET=busiest`: the displayable
+/// target (8-bit, 10-bit or 16-bit float colour, 16:9, at least 1280 wide) the
+/// most draws wrote, which in a world frame is a G-buffer layer. A debugging
+/// view: it shows a buffer as it is (a G-buffer layer unlit, say), not a
+/// finished picture.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum Show {
+    Index(usize),
+    Busiest,
+    LastColor(u32, u32),
+}
+
+fn parse_show(value: &str) -> Option<Show> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("busiest") {
+        return Some(Show::Busiest);
+    }
+    if let Some(size) = value.strip_prefix("last:") {
+        let (width, height) = size.split_once('x')?;
+        let (width, height) = (width.parse().ok()?, height.parse().ok()?);
+        return (width > 0 && height > 0).then_some(Show::LastColor(width, height));
+    }
+    value.parse().ok().map(Show::Index)
+}
+
+pub(crate) fn show_index() -> Option<Show> {
+    static N: std::sync::OnceLock<Option<Show>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let v = std::env::var("VICTORY_SHOW_TARGET").ok()?;
+        let v = v.trim();
+        let show = parse_show(v)?;
+        tracing::warn!(target = v, "VICTORY_SHOW_TARGET: showing a render target instead of the title's picture");
+        Some(show)
+    })
+}
+
+/// Draws that wrote each noted target this frame (show mode `busiest`).
+static HITS: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// The most recently noted matching color texture. First-use order in TARGETS
+/// cannot distinguish A, B, A from A, B.
+static LAST_COLOR: std::sync::Mutex<Option<std::sync::Arc<crate::resource::HostTexture>>> =
+    std::sync::Mutex::new(None);
+
+fn preview_color(desc: &D3D12_RESOURCE_DESC, width: u32, height: u32) -> bool {
+    desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && desc.Width == u64::from(width)
+        && desc.Height == height
+        && desc.MipLevels == 1
+        && desc.DepthOrArraySize == 1
+        && desc.SampleDesc.Count == 1
+        && matches!(
+            desc.Format,
+            DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+                | DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+        )
+}
+
+/// At the present of `frame` in show mode: the noted target to show, if the
+/// frame has one. Clears the frame's list unless a dump still needs it.
+pub(crate) fn shown(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+    let show = show_index()?;
+    let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut hits = HITS.lock().unwrap_or_else(|e| e.into_inner());
+    if !matches!(show, Show::LastColor(..)) && frame.is_power_of_two() && frame >= 256 {
+        let list: Vec<String> = targets
+            .iter()
+            .enumerate()
+            .map(|(i, (r, c))| {
+                // SAFETY: a live resource.
+                let d = unsafe { c.texture.GetDesc() };
+                let n = hits.iter().find(|h| h.0 == *r).map_or(0, |h| h.1);
+                format!("{i}: {}x{} f{} ({n} draws)", d.Width, d.Height, d.Format.0)
+            })
+            .collect();
+        tracing::info!(frame, ?list, "VICTORY_SHOW_TARGET: this frame's targets");
+    }
+    let pick = match show {
+        Show::LastColor(..) => LAST_COLOR.lock().unwrap_or_else(|e| e.into_inner()).take(),
+        Show::Index(n) => targets.get(n).map(|(_, c)| c.clone()),
+        Show::Busiest => targets
+            .iter()
+            .filter(|(_, c)| {
+                // SAFETY: a live resource.
+                let d = unsafe { c.texture.GetDesc() };
+                d.Width >= 1280
+                    // Screen-shaped (16:9): not a shadow map, which more draws write.
+                    && d.Width * 9 == u64::from(d.Height) * 16
+                    && matches!(d.Format.0, 9..=14 | 23..=25 | 27..=32 | 87 | 90 | 91)
+            })
+            .max_by_key(|(r, _)| hits.iter().find(|h| h.0 == *r).map_or(0, |h| h.1))
+            .map(|(_, c)| c.clone()),
+    };
+    if !(dump_on() && listed(frame)) {
+        targets.clear();
+    }
+    hits.clear();
+    pick
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if resource.is_null() {
         return;
+    }
+    let dumping = dump_on() && listed(crate::queue::presented() + 1);
+    match show_index() {
+        Some(Show::LastColor(width, height)) => {
+            if let Some(copy) = crate::resource::host_copy(resource) {
+                // SAFETY: the retained host texture is live.
+                if preview_color(&unsafe { copy.texture.GetDesc() }, width, height) {
+                    *LAST_COLOR.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
+                }
+            }
+            if !dumping {
+                return;
+            }
+        }
+        Some(_) => {
+            let mut hits = HITS.lock().unwrap_or_else(|e| e.into_inner());
+            match hits.iter_mut().find(|h| h.0 == resource as usize) {
+                Some(h) => h.1 += 1,
+                None => hits.push((resource as usize, 1)),
+            }
+        }
+        None if !dumping => return,
+        None => {}
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
     if !targets.iter().any(|&(r, _)| r == resource as usize)
@@ -976,6 +1102,39 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preview_selectors_preserve_indices_and_reject_incomplete_sizes() {
+        use super::{Show, parse_show};
+        assert_eq!(parse_show(" 3 "), Some(Show::Index(3)));
+        assert_eq!(parse_show("BUSIEST"), Some(Show::Busiest));
+        assert_eq!(parse_show("last:2560x1440"), Some(Show::LastColor(2560, 1440)));
+        for invalid in ["last:", "last:0x720", "last:1920x0", "last:12x34x56"] {
+            assert_eq!(parse_show(invalid), None);
+        }
+    }
+
+    #[test]
+    fn preview_accepts_only_compatible_single_surface_color_textures() {
+        use super::*;
+        let mut desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1280,
+            Height: 720,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        assert!(preview_color(&desc, 1280, 720));
+        assert!(!preview_color(&desc, 1920, 1080));
+        desc.SampleDesc.Count = 4;
+        assert!(!preview_color(&desc, 1280, 720));
+        desc.SampleDesc.Count = 1;
+        desc.Format = DXGI_FORMAT_D32_FLOAT;
+        assert!(!preview_color(&desc, 1280, 720));
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
