@@ -1750,9 +1750,9 @@ impl<'a> Lower<'a> {
         for b in 0..p.blocks.len() {
             let found = super::wave::sections(p, b);
             for (&start, sec) in &found {
-                for i in start + 1..sec.end {
+                for i in (start + 1..sec.end).chain(sec.end + 1..sec.after) {
                     for &(_, w) in &p.blocks[b].insts[i].writes {
-                        inside.insert(w, (b, start, sec.end));
+                        inside.insert(w, (b, start, sec.after));
                     }
                 }
             }
@@ -2250,11 +2250,20 @@ impl<'a> Lower<'a> {
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
                 self.inst(b, i)?;
-                if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
+                if let Some((end, after)) = self
+                    .sections
+                    .get(&b)
+                    .and_then(|s| s.get(&i))
+                    .map(|s| (s.end, s.after))
+                {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
                     }
-                    i = end;
+                    self.inst(b, end)?;
+                    for j in end + 1..after {
+                        self.section_inst(b, j, i);
+                    }
+                    i = after;
                     continue;
                 }
                 i += 1;
