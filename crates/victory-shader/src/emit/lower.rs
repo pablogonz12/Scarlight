@@ -9770,8 +9770,13 @@ impl<'a> Lower<'a> {
             }
             // shortcut: stores are taken to write all four channels of a
             // float format (the console converts by the view's format).
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
+            // DXIL's typed stores write all four: a store of some channels
+            // (their data packed in channel order) keeps the others as the
+            // texel holds them, read first. Unlike the console's masked
+            // write, that races with other lanes' stores to those channels
+            // of the same texel.
+            if *dmask == 0 {
+                return Err("an image store of no channels");
             }
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
@@ -9781,12 +9786,13 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
             };
-            let mut vals = Vec::new();
-            for k in 0..4u8 {
+            let mut vals = [None; 4];
+            for (k, ch) in (0..4u8).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
+                let k = k as u8;
                 // d16: two f16 channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
-                vals.push(if *d16 {
+                vals[usize::from(ch)] = Some(if *d16 {
                     let mut x = self.i32_of(v)?;
                     if k % 2 == 1 {
                         let k16 = self.s.m.i32(16);
@@ -9801,6 +9807,30 @@ impl<'a> Lower<'a> {
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
+            let vals: Vec<V> = if let Some(vals) = vals.iter().copied().collect::<Option<Vec<_>>>()
+            {
+                vals
+            } else {
+                // Our declarations have four channels.
+                self.s.flags |= flags::TYPED_UAV_LOADS;
+                let mut args = vec![h, iu];
+                args.extend(&cs);
+                args.extend([iu, iu, iu]);
+                let old = self.s.op(
+                    self.cur,
+                    "textureLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    66,
+                    &args,
+                );
+                (0..4u32)
+                    .map(|ch| match vals[ch as usize] {
+                        Some(x) => x,
+                        None => self.s.m.extract(self.cur, old, ch),
+                    })
+                    .collect()
+            };
             let mut args = vec![h];
             args.extend(cs);
             args.extend(vals);
@@ -11976,6 +12006,54 @@ mod tests {
             slot: 0,
         });
         (layout, used)
+    }
+
+    #[test]
+    fn an_image_store_of_some_channels_keeps_the_others() {
+        // An image descriptor loaded from the table at s0, then
+        // image_store of channels `dmask` (data from v1, or v[4:7] for all
+        // four) at (0, 0).
+        let store = |dmask: u32| {
+            let vdata = if dmask == 0xF { 4 } else { 1 };
+            let words = [
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF40C_0202,
+                0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0
+                0x7E02_02F2, // v_mov_b32 v1, 1.0
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0x7E08_02F2, // v_mov_b32 v4, 1.0
+                0x7E0A_02F2, // v_mov_b32 v5, 1.0
+                0x7E0C_02F2, // v_mov_b32 v6, 1.0
+                0x7E0E_02F2, // v_mov_b32 v7, 1.0
+                0xF020_0008 | dmask << 8,
+                0x0002_0002 | vdata << 8, // image_store v1, v[2:3], s[8:15] dim:2D
+                S_ENDPGM,
+            ];
+            let layout = vec![root(RootType::Table, 0, 0)];
+            let used = vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            }];
+            let l = lower_with(&words, layout, used).unwrap();
+            let c = crate::Container::parse(&l.dxil).unwrap();
+            let sfi0 = c.part(crate::FourCC::SFI0).unwrap().data;
+            u64::from_le_bytes(sfi0.try_into().unwrap())
+        };
+        // DXIL's typed stores write all four channels: the ones the store
+        // leaves are read from the texel first (a typed UAV load).
+        for dmask in [0x1, 0x3, 0x4, 0x7] {
+            let features = store(dmask);
+            assert_ne!(features & 0x800, 0, "dmask {dmask:#x}: SFI0 {features:#x}");
+        }
+        assert_eq!(store(0xF) & 0x800, 0);
     }
 
     #[test]
