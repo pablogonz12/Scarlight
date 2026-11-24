@@ -2376,6 +2376,12 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
+    if inst.name() == "s_bfm_b32" && k == 0 {
+        // A bit field of constant width and offset (a sampler word, say).
+        let (width, at) = (lane_of(*src.first()?)?, lane_of(*src.get(1)?)?);
+        let ones = (1u32 << (width & 31)).wrapping_sub(1);
+        return Some(Moved::Const(ones << (at & 31)));
+    }
     let src = src.first()?;
     match (inst.name(), *src) {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
@@ -2389,6 +2395,10 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         ("s_brev_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(x.reverse_bits())),
         ("s_not_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(!x)),
         // 64-bit inline integers are sign-extended.
+        // Literals below 2^31: zero and sign extension agree.
+        ("s_mov_b64", Operand::Literal(x)) if (x as i32) >= 0 => {
+            Some(Moved::Const(if k == 0 { x } else { 0 }))
+        }
         ("s_mov_b64", Operand::Const(c @ 128..=208)) => {
             let low = inline(c)?;
             Some(Moved::Const(if k == 0 {
