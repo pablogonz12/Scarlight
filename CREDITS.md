@@ -1,5 +1,8 @@
 # Credits
 
+- **Duff [c430b1de](https://github.com/Marvisak/VIctory/commit/c430b1de)**, GPL-3.0:
+  pack typed buffer d16 loads two channels per register, retaining integer bits.
+
 Scarlight is a port of **VIctory** ([Marvisak/VIctory](https://github.com/Marvisak/VIctory)),
 GPL-3.0. Its history, authorship and commit dates are kept.
 
