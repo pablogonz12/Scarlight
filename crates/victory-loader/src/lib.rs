@@ -21,7 +21,6 @@
 //!    point on a thread with the stack size the image asks for; from then
 //!    on, pass every thread start and end on to the attached images.
 
-#[cfg(windows)]
 mod crash;
 #[cfg(windows)]
 mod hooks;

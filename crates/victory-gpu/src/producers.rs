@@ -8,6 +8,10 @@
 //! would have written (its unordered-access views and render targets), forgets
 //! a range again when work that runs writes it, and logs once per pair
 //! a reader that runs reading one of them, with the shader that was dropped.
+//!
+//! On this base nothing calls it yet: the base's draw path does not tell it
+//! which work was dropped, so the port of those call sites is still to come.
+#![allow(dead_code)]
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;

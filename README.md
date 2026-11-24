@@ -64,20 +64,22 @@ host's own Direct3D 12 driver takes the place of vkd3d-proton. Crates and import
 > as the base (Scarlight's move onto it is in progress) and Microsoft's `d3dcompiler_47.dll` next to the exe as a
 > stop-gap (Wine's built-in compiler rejects its runtime helper shaders), the opening scenes render lit on an
 > RX 9070 XT under GE-Proton: 4,900-7,000 draws per frame, about 1-4 fps, menus, pad and sound working. Many
-> surfaces are still untextured and shadowed areas are dark. `main` itself does not render the world yet; the
-> table below describes `main`.
+> surfaces are still untextured and shadowed areas are dark. `main` itself does not render the world yet; this
+> branch does, and the table below describes this branch.
 
 <p align="center"><img src="docs/brand/status.svg" alt="Pipeline status on main: Boot, Menus and World loads are done; Lit picture is in progress (PR: Scarlight on the fxceless base); Playable is not yet reached." width="100%"></p>
 
 | Works | Does not |
 |---|---|
-| Boots to the menus | The world picture: mostly black |
-| Menus at 30 fps | World frame rate: about 0.5 fps |
-| Loads the world, with audio | Any real gameplay |
+| Boots to the menus | World frame rate: about 1-4 fps |
+| Menus at 30 fps | Shadowed areas: no ray-traced light yet, they stay black |
+| The world renders lit and textured | Any real gameplay |
 
-The black picture comes from shaders that Scarlight cannot translate yet, so their draws are
-skipped. The frame rate is limited by copying the title's memory. Both are being worked on
-upstream. Tested setup and measurements: [AMD-LINUX.md](AMD-LINUX.md).
+On this branch the world picture works; that is what the note above is about. On Linux under Wine it
+needs Microsoft's `d3dcompiler_47.dll` next to the exe until our own shader-based fallback lands: Wine's
+built-in compiler refuses the helper shaders with `E5005`, and every indirect draw and dispatch is
+dropped, which leaves the world black. On Windows the built-in compiler works. The frame rate is
+limited by copying the title's memory. Tested setup and measurements: [AMD-LINUX.md](AMD-LINUX.md).
 
 <!-- state:begin -->
 ## Project state
@@ -88,13 +90,11 @@ upstream. Tested setup and measurements: [AMD-LINUX.md](AMD-LINUX.md).
 
 | World shaders | Full archive | Best world fps | Furthest |
 |:---:|:---:|:---:|:---:|
-| **720 / 768** offline on RADV | **24,073 / 25,529** translated | **0.45** on Scarlight builds | World loads and plays audio; picture mostly black |
-
-*0.6 fps with HUD and minimap reached is VIctory #994 as-is with its debug pixel shader, not a Scarlight build.*
+| **766 / 768** offline on RADV | **25,526 / 25,694** translated | **1-4** on this branch | World renders lit and textured; shadowed areas dark |
 
 </div>
 
-Last updated: 24 Nov 2026, Scarlight `main after #11`.
+Last updated: 24 Nov 2026, `pr/scarlight-next` (the fxceless base).
 
 ### Milestones
 
@@ -103,42 +103,40 @@ Last updated: 24 Nov 2026, Scarlight `main after #11`.
 | ✅ | Boots | Boots into the title's own menus |
 | ✅ | Menus | 30 fps, drawn and interactive |
 | ✅ | Loads world | World streams in and the title's audio plays |
-| 🟡 | World picture | Mostly black: 48 of 768 world programs still skip their draws |
-| ❌ | Playable | 0.45 fps and a black picture: no real gameplay |
+| 🟡 | World picture | Lit and textured on RX 9070 XT / Linux with a native `d3dcompiler_47`, about 1-4 fps; shadowed areas stay black (no ray-traced light); 2 of 768 world programs still skip their draws |
+| ❌ | Playable | 1-4 fps: no real gameplay yet |
 
 ### Shader translation
 
 | Programs | Translated | Total | Progress |
 |---|---|---|---|
-| **All programs** | **24,073** | **25,529** | `█████████░ 94%` |
-| World set, translate → SPIR-V → RADV pipeline | 720 | 768 | `█████████░ 94%` |
+| **All programs** | **25,526** | **25,694** | `██████████ 99%` |
+| World set, translate → SPIR-V → RADV pipeline | 766 | 768 | `██████████ 100%` |
 
-*Full archive: 25,529 programs, measured at main after #11. World set: 768 programs, each through translation, SPIR-V validation and a real RADV pipeline.*
+*Full archive: `victory translate` under Wine on the title's shader archive (log `translate-fx.txt`), with this base's own default host wave widths, so not byte-identical to the earlier VIctory `main` table. World set: 768 programs, each through translation, SPIR-V validation and a real RADV pipeline; the two that fail are a wave sum of 16-bit floats, and one program whose DXIL times out into a core dump.*
 
 <details>
-<summary>Breakdown at 4e7e6a3 (before #11): per stage and top failure reasons</summary>
+<summary>Breakdown: per stage and top failure reasons</summary>
 
 | Programs | Translated | Total | Progress |
 |---|---|---|---|
-| Vertex + pixel | 13,146 | 14,234 | `█████████░ 92%` |
-| Compute | 2,404 | 2,582 | `█████████░ 93%` |
-| Mesh | 8,396 | 8,713 | `██████████ 96%` |
-| **All programs** | **23,946** | **26,084** | `█████████░ 92%` |
-
-Measured on `translate-main.txt` at 4e7e6a3 (PR #704), 24 Nov 2026; the totals above are newer and are not the sum of these rows. The 555 programs that are neither vertex/pixel, compute nor mesh were not emitted then and counted as untranslated.
+| Vertex + pixel | 14,140 | 14,247 | `██████████ 99%` |
+| Compute | 2,624 | 2,682 | `██████████ 98%` |
+| Mesh | 8,762 | 8,765 | `██████████ 100%` |
+| **All programs** | **25,526** | **25,694** | `██████████ 99%` |
 
 **Top remaining shader failures (same measurement)**
 
-| Failures | Reason |
+| Refusals | Reason |
 |---|---|
-| 716 | a descriptor's address or format read as data |
-| 298 | a lane mask read as data |
 | 195 | an address in an SGPR that is no root parameter |
-| 166 | a packed input half no element holds |
-| 88 | an SCC the emitter did not compute |
-| 73 | an address not from a root parameter |
-| 61 | an opaque lane mask |
-| 48 | a cross-lane operation outside compute |
+| 40 | a descriptor chosen by control flow |
+| 40 | a descriptor read only as data |
+| 33 | a lane mask holding lanes elsewhere, read as data |
+| 13 | an opaque lane mask |
+| 11 | a lane mask read as data |
+| 10 | a hardware SGPR input |
+| 8 | the first half of an interpolation |
 
 </details>
 
@@ -147,15 +145,14 @@ Measured on `translate-main.txt` at 4e7e6a3 (PR #704), 24 Nov 2026; the totals a
 | Measurement | RX 9070 XT, Linux / Wine (24 Nov 2026) |
 |---|---|
 | Menus | 30 fps |
-| World | 0.45 fps |
-| Title-memory copies | 628–864 ms/frame |
-| Write-watch checks | 459–573 ms/frame |
+| World | 1-4 fps (2.02 over 20 minutes with the native compiler; 4.72 in the longest run) |
+| Title-memory copies | 114-158 ms/frame |
 
 ### Tested hardware
 
 | GPU | OS / driver | Furthest stage |
 |---|---|---|
-| RX 9070 XT (RDNA4) | CachyOS, Mesa 26.3.1 RADV; GE-Proton11-14 with vkd3d-proton master | World loads and plays audio, picture mostly black; 720 of 768 world programs build a RADV pipeline |
+| RX 9070 XT (RDNA4) | CachyOS, Mesa 26.3.1 RADV; GE-Proton11-14 with vkd3d-proton master, native `d3dcompiler_47` | World renders lit and textured at 1-4 fps (shadowed areas black); 766 of 768 world programs build a RADV pipeline |
 
 <!-- state:end -->
 
@@ -288,7 +285,12 @@ GPL-3.0-or-later; see [LICENSE](LICENSE). Architecture overview: [docs/architect
 
 ## 💖 Thanks
 
-Scarlight is derived from [VIctory](https://github.com/Marvisak/VIctory) by Marvis and its contributors, and keeps their commit history. Thanks to the authors listed in [INTEGRATION.md](INTEGRATION.md), [JMAN730/victory](https://github.com/JMAN730/victory), and everyone whose fixes made the world load.
+Scarlight is derived from [VIctory](https://github.com/Marvisak/VIctory) by Marvis and its contributors, and
+from [@fxceless](https://github.com/fxceless)'s fork (`578d459`, `7b0f736d`), which is the base of the branch
+that first renders the world lit; all keep their commit history. Thanks to @fxceless and @ZazaJr24 for that
+base, to @deadkid14 and @ItsYusei99 for finding what Wine's `d3dcompiler_47` refuses, to the authors listed in
+[INTEGRATION.md](INTEGRATION.md), [JMAN730/victory](https://github.com/JMAN730/victory), and everyone whose
+fixes made the world load.
 
 <p align="center">
 <a href="https://github.com/pablogonz12/Scarlight/graphs/contributors"><img src="https://contrib.rocks/image?repo=pablogonz12/Scarlight" alt="Scarlight contributors"></a>

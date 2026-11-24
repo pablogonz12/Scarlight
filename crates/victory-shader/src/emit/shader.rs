@@ -9,82 +9,66 @@ use super::container::{self, Binding, Psv, SigElement};
 pub const USER_DATA_SPACE: u32 = 0;
 /// Where immediate samplers are bound: `s<n>` in this space.
 pub const SAMPLER_SPACE: u32 = 0;
-/// Where root CBVs, SRVs and UAVs are bound: `b<root parameter index>`,
-/// `t<root parameter index>` and `u<root parameter index>` in this space.
+/// Where root CBVs and SRVs are bound: `b<root parameter index>` and
+/// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
-/// Where the host's runtime stride table is bound: `t0` in this space
-/// (one [`StrideEntry`] per view-heap slot).
-pub const STRIDE_SPACE: u32 = 2;
 
-/// What the host writes per view-heap slot in the runtime stride table, for
-/// buffers a shader reads without a stride known when it was translated.
+/// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
+/// reads buffers through descriptors it picks from the view heap at an
+/// index it computes (SM 6.6 dynamic resources): a raw buffer of
+/// [`SLOT_STRIDES_COUNT`] dwords the host keeps, dword `i` the bytes per
+/// element of the buffer view at heap slot `i` (0: none or not a buffer).
+/// The console's descriptor holds that stride and its hardware multiplies
+/// the element index by it; the program's code does not say it, and the
+/// used-resource list only names what tables hold. A shader that has this
+/// root SRV also tells the host that the buffer views of the whole heap
+/// must be ready when it runs, not only those its tables name.
+pub const SLOT_STRIDES: u8 = 255;
+/// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
+pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+
+/// Title memory by address (`resource::MEMORY`): console code reads and
+/// writes through raw 40-bit addresses it takes from root constants,
+/// descriptors and other memory (the ray-tracing structure builder and the
+/// programs that walk its structures). The host keeps copies of the title
+/// memory shaders use; a shader with such an access finds the copy by the
+/// address:
 ///
-/// The shader reads such a buffer through a raw handle, and a raw handle
-/// reads a raw view only: over a structured or typed view D3D12 leaves the
-/// result undefined (an RTX 5070 reads other dwords than a Radeon or WARP
-/// do). So the host makes a raw view of the same bytes in another slot for
-/// every buffer view that is not raw, and says here where it is.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct StrideEntry {
-    /// Bytes per element of the view in the slot (0: no buffer view).
-    pub stride: u32,
-    /// The heap slot holding a raw view of the bytes the slot's view reads;
-    /// none when the slot's own view is raw (or reads nothing).
-    pub raw_slot: Option<u32>,
-    /// Bytes from the start of that raw view to the slot's view's first
-    /// byte: a multiple of 4 below 16 ([`RawWindow`]).
-    pub bias: u32,
-}
-
-impl StrideEntry {
-    /// Bytes per entry in the table: slot `i`'s entry is at `i * BYTES`.
-    pub const BYTES: u32 = 8;
-    /// The raw slots an entry can name.
-    pub const RAW_SLOTS: u32 = (1 << 28) - 1;
-
-    /// The entry as the shader reads it: the stride, then the raw slot plus
-    /// one in the low 28 bits (0: the slot itself) under the bias. A table
-    /// of zeros sends every slot to itself.
-    pub fn words(self) -> [u32; 2] {
-        debug_assert!(self.bias < 16);
-        let raw = self.raw_slot.map_or(0, |s| {
-            debug_assert!(s < Self::RAW_SLOTS);
-            s + 1
-        });
-        [self.stride, raw | self.bias << 28]
-    }
-}
-
-/// A raw view covering bytes `[start, start + len)` of a buffer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RawWindow {
-    /// The view's first element (4 bytes each).
-    pub first: u64,
-    /// Its element count.
-    pub dwords: u32,
-    /// Bytes from the view's start to `start` ([`StrideEntry::bias`]).
-    pub bias: u32,
-}
-
-impl RawWindow {
-    /// The window for bytes `[start, start + len)`. The host wants raw
-    /// views to start on 16 bytes (`D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT`), the
-    /// console on 4, so the view starts up to 12 bytes early and the shader
-    /// adds the difference. None for a start off a dword (raw loads drop
-    /// the low address bits) or a view too long to count.
-    pub fn covering(start: u64, len: u64) -> Option<RawWindow> {
-        if !start.is_multiple_of(4) {
-            return None;
-        }
-        let bias = start % 16;
-        let dwords = u32::try_from((bias + len).div_ceil(4).max(1)).ok()?;
-        Some(RawWindow {
-            first: (start - bias) / 4,
-            dwords,
-            bias: bias as u32,
-        })
-    }
-}
+/// - the root SRV `t<SLOT_MEMORY>` in [`ROOT_CBV_SPACE`] is a directory of
+///   [`MEMORY_PAGES`] entries of two dwords, one per 64 KiB of title
+///   address space: the number of the host copy holding that page (0: none
+///   yet) and the page's byte offset in that copy;
+/// - copy `n` is the raw buffer view at view-heap slot `base + n`, `base`
+///   the user-data dword of kind [`USER_MEMORY_BASE`]; slot `base` itself
+///   reads zeros and drops writes;
+/// - the root UAV `u<SLOT_FAULTS>` takes the page numbers of accesses that
+///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 a sink), which the
+///   host reads afterwards to make those copies for the frames to come.
+pub const SLOT_MEMORY: u8 = 254;
+/// See [`SLOT_MEMORY`].
+pub const SLOT_FAULTS: u8 = 253;
+/// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
+pub const MEMORY_PAGES: u32 = 1 << 21;
+/// Dwords of the [`SLOT_FAULTS`] buffer.
+pub const MEMORY_FAULTS: u32 = 4096;
+/// `RootType::Other` code of a user-data dword the host computes: the view
+/// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
+pub const USER_MEMORY_BASE: u32 = 0x100;
+/// `RootType::Other` code of a user-data dword the host computes: the low
+/// 32 bits of the title address of the buffer view at dword `dword` of the
+/// descriptor table of root parameter `slot`; [`USER_VIEW_ADDRESS`] + 1:
+/// its bits from 32 up. (Console code reads the address out of a buffer
+/// descriptor and uses it as a pointer.)
+pub const USER_VIEW_ADDRESS: u32 = 0x101;
+/// `RootType::Other` code of a user-data dword the host computes: the
+/// bytes (0 to 15) by which the raw view the host binds for the root view
+/// of root parameter `slot` begins before the title's address. A raw view
+/// begins on 16 bytes of its host buffer; the console's root views begin
+/// anywhere (the structure builder's counters sit at addresses ending in
+/// 4 and c). The shader adds the dword to every byte offset through that
+/// view. Asked for every root UAV, and for the root SRVs of programs with
+/// a spilled user-data table.
+pub const USER_VIEW_BIAS: u32 = 0x103;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -94,10 +78,10 @@ pub(crate) mod flags {
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
-    pub const ATOMIC_INT64_TYPED: u64 = 1 << 27;
+    pub const ATOMIC_TYPED64: u64 = 1 << 27;
+    pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
-    pub const ATOMIC_INT64_HEAP: u64 = 1 << 32;
 }
 
 pub(crate) struct Types {
@@ -121,14 +105,27 @@ pub(crate) struct Mesh {
     pub topology: u8,
 }
 
+/// What a geometry shader declares: triangles in, triangle strips out on
+/// stream 0, one instance.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Geometry {
+    pub max_vertices: u32,
+}
+
+/// The null slot a host view heap keeps at its end when the title's heap did not fit in it
+/// (0: no limit). Shaders translated while it is set read that slot for any view index at or
+/// past it: a host that caps its heap (NVIDIA at 1 000 000 views; a retail game's heap is
+/// larger) hung its GPU on reads past the end (GPU-based validation: "descriptor heap index
+/// out of bounds"), which AMD's driver forgives.
+static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// See [`VIEW_LIMIT`]: `null_slot` is the last slot of the host's view heap, kept null.
+pub fn set_view_heap_limit(null_slot: u32) {
+    VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub(crate) struct Shader {
     pub m: Module,
-    /// Test builds: the property words of each handle annotation, in order.
-    #[cfg(test)]
-    pub annotations: Vec<(u32, u32)>,
-    /// Test builds: typed loads assembled from a dword-aligned pair.
-    #[cfg(test)]
-    pub unaligned_typed_loads: u32,
     pub t: Types,
     pub pixel: bool,
     pub inputs: Vec<SigElement>,
@@ -137,6 +134,8 @@ pub(crate) struct Shader {
     pub prims: Vec<SigElement>,
     /// A mesh shader (`threads` is its thread-group size).
     pub mesh: Option<Mesh>,
+    /// A geometry shader (the rectangle stage, `rect.rs`); `pixel` is false.
+    pub geometry: Option<Geometry>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
@@ -147,10 +146,8 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
-    /// Root UAVs (raw buffers) read and written, likewise.
+    /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
-    /// Handle of the runtime stride table (`t0`, [`STRIDE_SPACE`]), if read.
-    pub stride_table: Option<V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -163,22 +160,6 @@ pub(crate) struct Shader {
     lds: Option<V>,
     main: V,
     pub entry: usize,
-    /// The `dx.op` operations called (names without overload).
-    ops: std::collections::BTreeSet<String>,
-}
-
-thread_local! {
-    /// See [`last_summary`].
-    static LAST: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
-}
-
-/// What the module this thread finished last declares and calls: its
-/// thread-group size and wave size, and its `dx.op` operations. A
-/// diagnostic for tools that report a module the validator refuses, since
-/// the validator's message for an operation the stage or the entry's
-/// properties do not allow names neither.
-pub(crate) fn last_summary() -> String {
-    LAST.with(|l| l.borrow().clone())
 }
 
 impl Shader {
@@ -201,10 +182,6 @@ impl Shader {
         let entry = m.new_block();
         Shader {
             m,
-            #[cfg(test)]
-            annotations: Vec::new(),
-            #[cfg(test)]
-            unaligned_typed_loads: 0,
             t: Types {
                 void,
                 i1,
@@ -221,13 +198,13 @@ impl Shader {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh: None,
+            geometry: None,
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
-            stride_table: None,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -236,7 +213,6 @@ impl Shader {
             lds: None,
             main,
             entry,
-            ops: std::collections::BTreeSet::new(),
         }
     }
 
@@ -266,8 +242,6 @@ impl Shader {
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
         self.m.ptr(fty);
-        self.ops
-            .insert(name.split('.').next().unwrap_or(name).to_owned());
         let f = self
             .m
             .function(&format!("dx.op.{name}"), fty, Some(attr), false);
@@ -347,8 +321,8 @@ impl Shader {
         h
     }
 
-    /// The handle of the root UAV (a raw buffer the shader may write) of
-    /// root parameter `slot`: `u<slot>` in [`ROOT_CBV_SPACE`].
+    /// The handle of the root UAV (a raw buffer) of root parameter `slot`:
+    /// `u<slot>` in [`ROOT_CBV_SPACE`].
     pub fn root_uav_handle(&mut self, slot: u8) -> V {
         if let Some(&(_, h)) = self.root_uavs.iter().find(|r| r.0 == slot) {
             return h;
@@ -366,36 +340,9 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        // A raw buffer with unordered access.
         let h = self.annotate(block, h, 11 | 0x1000, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_uavs.push((slot, h));
-        h
-    }
-
-    /// The handle of the host's runtime stride table (`t0` in
-    /// [`STRIDE_SPACE`], a raw buffer of [`StrideEntry`] words indexed by
-    /// view-heap slot).
-    pub fn stride_table_handle(&mut self) -> V {
-        if let Some(h) = self.stride_table {
-            return h;
-        }
-        let z = self.m.i32(0);
-        let bind = [z, z, self.m.i32(STRIDE_SPACE), self.m.i8(0)];
-        let bind = self.m.aggregate(self.t.bind, &bind);
-        let f = self.m.bool(false);
-        let block = self.entry;
-        let h = self.op(
-            block,
-            "createHandleFromBinding",
-            Attr::ReadNone,
-            self.t.handle,
-            217,
-            &[bind, z, f],
-        );
-        let h = self.annotate(block, h, 11, 0);
-        self.flags |= flags::RAW_BUFFERS;
-        self.stride_table = Some(h);
         h
     }
 
@@ -427,8 +374,6 @@ impl Shader {
     }
 
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
-        #[cfg(test)]
-        self.annotations.push((props0, props1));
         let p = [self.m.i32(props0), self.m.i32(props1)];
         let p = self.m.aggregate(self.t.props, &p);
         self.op(
@@ -451,6 +396,25 @@ impl Shader {
         nonuniform: bool,
         props: (u32, u32),
     ) -> V {
+        // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
+        let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+        // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
+        let index = if !sampler && limit != 0 {
+            let null = self.m.i32(limit);
+            let i32t = self.t.i32;
+            self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, null])
+        } else if sampler {
+            // A sampler heap has at most 2,048 samplers on any host: an
+            // index past that (a number read from memory the host has not
+            // got yet) stays inside the largest heap there is.
+            // shortcut: not the bound heap's own count, which a title
+            // heap smaller than 2,048 would need.
+            let last = self.m.i32(2047);
+            let i32t = self.t.i32;
+            self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last])
+        } else {
+            index
+        };
         self.flags |= if sampler {
             flags::SAMPLER_HEAP
         } else {
@@ -471,16 +435,6 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
-        let threads = self
-            .threads
-            .map_or(String::new(), |[x, y, z]| format!("threads {x}x{y}x{z}, "));
-        let wave = self.wave_size.map_or("any".to_owned(), |n| n.to_string());
-        let ops: Vec<&str> = self.ops.iter().map(String::as_str).collect();
-        let summary = format!("{threads}wave size {wave}; ops: {}", ops.join(", "));
-        // Tests of the emitted shape read the instruction count off the end.
-        #[cfg(test)]
-        let summary = format!("{summary}; {} instructions", self.m.instructions());
-        LAST.with(|l| *l.borrow_mut() = summary);
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         let mut resources = None;
@@ -494,7 +448,6 @@ impl Shader {
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
             || !self.root_uavs.is_empty()
-            || self.stride_table.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -549,28 +502,20 @@ impl Shader {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() || self.stride_table.is_some() {
-                let mut specs: Vec<(u32, u32)> = self
-                    .root_srvs
-                    .iter()
-                    .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
-                    .collect();
-                if self.stride_table.is_some() {
-                    specs.push((STRIDE_SPACE, 0));
-                }
+            if !self.root_srvs.is_empty() {
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
                 let p = self.m.ptr(ty);
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
-                for (n, (space, reg)) in specs.into_iter().enumerate() {
+                for (n, (slot, _)) in self.root_srvs.clone().into_iter().enumerate() {
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
-                        Some(i32c(&mut self, space)),
-                        Some(i32c(&mut self, reg)),
+                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
+                        Some(i32c(&mut self, u32::from(slot))),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
                         Some(i32c(&mut self, 0)),
@@ -579,8 +524,8 @@ impl Shader {
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
                         kind: 4,
-                        space,
-                        register: reg,
+                        space: ROOT_CBV_SPACE,
+                        register: u32::from(slot),
                         dxil_kind: 11,
                     });
                 }
@@ -597,8 +542,9 @@ impl Shader {
                 let no = self.m.md_value(no);
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
-                    // Shape, then: globally coherent, a counter, a
-                    // rasterizer-ordered view.
+                    // Id, variable, name, space, lower bound, range size,
+                    // shape (11: raw buffer), globally coherent, counter,
+                    // rasterizer ordered, no extra properties.
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
@@ -656,7 +602,6 @@ impl Shader {
             bindings.sort_by_key(|b| match b.kind {
                 2 => 0,
                 1 => 1,
-                4 => 2,
                 7 => 3,
                 _ => 2,
             });
@@ -691,6 +636,11 @@ impl Shader {
                     });
                 }
             }
+            // A geometry shader lists four streams: the other three have
+            // no outputs.
+            if self.geometry.is_some() {
+                view.extend([0, 0, 0]);
+            }
             let arr = self.m.array(view.len() as u32, self.t.i32);
             let elems: Vec<V> = view.iter().map(|&v| self.m.i32(v)).collect();
             let arr = self.m.aggregate(arr, &elems);
@@ -711,14 +661,21 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
-        // Entry properties: shader flags (tag 0), thread-group size (4),
-        // wave size (11).
+        // Entry properties: shader flags (tag 0), geometry state (1),
+        // thread-group size (4), wave size (11).
         let mut props = Vec::new();
         if self.flags != 0 {
             props.push(i32c(&mut self, 0));
             let i64t = self.m.int(64);
             let f = self.m.int_const(i64t, self.flags as i64);
             props.push(self.m.md_value(f));
+        }
+        if let Some(g) = self.geometry {
+            // Input primitive (3: triangles), maximum vertices, stream
+            // mask, output topology (5: triangle strips), instances.
+            props.push(i32c(&mut self, 1));
+            let state = [3, g.max_vertices, 1, 5, 1].map(|n| Some(i32c(&mut self, n)));
+            props.push(self.m.md_node(state.to_vec()));
         }
         if let Some(threads) = self.threads {
             let t = threads.map(|n| Some(i32c(&mut self, n)));
@@ -766,9 +723,10 @@ impl Shader {
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
         self.m.named_md("dx.valver", vec![version]);
-        // Program kinds: 0 pixel, 1 vertex, 5 compute, 13 mesh.
+        // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
+            _ if self.geometry.is_some() => ("gs", 2),
             (Some(_), _) => ("cs", 5u32),
             (None, true) => ("ps", 0),
             (None, false) => ("vs", 1),
@@ -804,17 +762,17 @@ impl Shader {
         if self.flags & flags::BARYCENTRICS != 0 {
             features |= 0x2_0000;
         }
-        if self.flags & flags::ATOMIC_INT64_TYPED != 0 {
-            features |= 0x40_0000;
-        }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;
         }
-        if self.flags & flags::ATOMIC_INT64_HEAP != 0 {
-            features |= 0x1000_0000;
-        }
         if self.flags & flags::SAMPLER_HEAP != 0 {
             features |= 0x400_0000;
+        }
+        if self.flags & flags::ATOMIC_TYPED64 != 0 {
+            features |= 0x40_0000;
+        }
+        if self.flags & flags::ATOMIC_HEAP64 != 0 {
+            features |= 0x1000_0000;
         }
         let sfi0 = features.to_le_bytes();
         let isg1 = container::signature(&self.inputs, true);
@@ -831,6 +789,7 @@ impl Shader {
             outputs: &self.outputs,
             prims: &self.prims,
             mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
+            geometry: self.geometry.map(|g| g.max_vertices),
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,

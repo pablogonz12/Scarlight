@@ -44,7 +44,6 @@ impl Display for Operand {
             }
             Operand::Const(code) => f.write_str(&const_name(code)),
             Operand::Literal(value) => write!(f, "lit(0x{value:08x})"),
-            Operand::Spill(reg) => write!(f, "spill[{reg}]"),
             Operand::Attr { index, chan, .. } => write!(
                 f,
                 "attr{index}.{}",

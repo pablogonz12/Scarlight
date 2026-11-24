@@ -4,6 +4,35 @@ This branch is VIctory `main` plus open pull requests and fixes from other branc
 
 Maintained by @pablogonz12. Tested on Linux (RX 9070 XT, RADV, GE-Proton / vkd3d-proton master).
 
+## The base: the fxceless fork
+
+This branch is not built on VIctory `main` any more. Its starting point is
+[@fxceless](https://github.com/fxceless)'s fork (GPL-3.0, based on VIctory `main`
+`ffe310e`), whose two commits are what first make the world render lit on a PC. Scarlight's own
+history is merged on top of that base and its fixes are re-added one at a time.
+
+| Commit | Author | What it brought |
+|---|---|---|
+| `578d459` | @fxceless | One squashed commit on VIctory `main` (+32,334/−1,349): meshlet culling read scene buffers as the wrong view kind, lights packed by compute were read back through empty copies, implicit-level samples outside pixel shaders (730 compute programs), gathers at a named mip read level 0, depth/stencil twins, descriptor-table exhaustion, card-memory big-buffer copies, relay/late-wait submission, the ray-tracing structure builder |
+| `7b0f736d` | @fxceless (+ @ZazaJr24 `d279e69`, `e9765a7`) | shadow/trace translate, pipeline waits, and the wave64 barrier gate that fixes the device loss the previous wave64 update introduced |
+
+Measured with this base (24 Nov 2026): offline world set **766 of 768** programs translate, validate
+as SPIR-V and build a RADV pipeline; the full archive reaches **25,526 of 25,694** programs (99.3%)
+against VIctory `main`'s 24,114 of 25,562; the world picture is lit on RX 9070 XT / RADV / Wine at
+about 1–4 fps (test run `fx-d3dc-1`).
+
+## Wine's `d3dcompiler_47`
+
+@deadkid14 and @ItsYusei99 found that Wine's built-in `d3dcompiler_47` rejects helper HLSL with
+`E5005` (no `InterlockedMax` on `RWByteAddressBuffer`, `RootSignature` attribute ignored), which
+silently drops every indirect draw and dispatch and leaves the picture black (VIctory issues
+[#909](https://github.com/Marvisak/VIctory/issues/909), [#170](https://github.com/Marvisak/VIctory/issues/170);
+fixes: PR [#994](https://github.com/Marvisak/VIctory/pull/994), the `VICTORY_DXC` fallback). Our own
+measurement agrees: the same tree stays black with Wine's built-in compiler and renders lit with a
+native `d3dcompiler_47` installed. Building the indirect-argument clamp with our own emitter
+(Scarlight `ffa13108`, VIctory [#1470](https://github.com/Marvisak/VIctory/pull/1470)) is the way out
+without a native compiler.
+
 ## Merged pull requests
 
 | PR | Author | Title | Why |
@@ -37,8 +66,11 @@ Maintained by @pablogonz12. Tested on Linux (RX 9070 XT, RADV, GE-Proton / vkd3d
 
 ## Known test failure
 
-`emit::tests::indexed_move_initializes_an_input_before_its_first_use` (from #457) fails on this branch (`WrongStart` case); it fails with or without #383.
+None on this base: `cargo test -p victory-shader --lib` is 158 passed, 0 failed, 2 ignored. Tests
+that need a real GPU (`vkd3d-proton`, a D3D12 device) stay out of CI's Windows runner the same way
+they always have.
 
 ## Measured
 
-751 shaders dumped from a run into the world, re-translated offline: `main` 666 translate; this branch 677, all valid SPIR-V under vkd3d-proton master.
+With the fxceless base: offline world set 766 of 768; full archive 25,526 of 25,694; world lit on
+RX 9070 XT / RADV / Wine with a native `d3dcompiler_47`, 1–4 fps.
