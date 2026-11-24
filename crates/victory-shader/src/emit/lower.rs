@@ -2503,6 +2503,11 @@ impl<'a> Lower<'a> {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
             }
+            Some(&Val::Missing(LANE_MASK)) => {
+                let val = self.mask_scc(v).map(Val::Bit)?;
+                self.vals.insert(v, val);
+                return Ok(val);
+            }
             Some(&Val::Missing(w)) => return Err(w),
             Some(&val) => return Ok(val),
             None => {}
@@ -3181,6 +3186,49 @@ impl<'a> Lower<'a> {
         Ok(if high { y } else { x })
     }
 
+    /// SCC of a lane-mask operation read as data (`s_cselect` on it, say):
+    /// whether the mask has a lane set, from its ballot where it is written.
+    fn mask_scc(&mut self, scc: Value) -> Result<V, Why> {
+        let p = self.x.p;
+        let &b = self.def_block.get(&scc).ok_or(LANE_MASK)?;
+        let inst: &Inst = p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| i.write(Reg::Scc) == Some(scc))
+            .ok_or(LANE_MASK)?;
+        let Fields::Sop {
+            dst: Some(Operand::Scalar { code, .. }),
+            ..
+        } = inst.fields
+        else {
+            return Err(LANE_MASK);
+        };
+        if inst.write(Reg::S(EXEC)).is_some() {
+            return Err(LANE_MASK);
+        }
+        let lo = inst.write(Reg::S(code)).ok_or(LANE_MASK)?;
+        let x = self.mask_dword(lo)?;
+        let any = match inst.write(Reg::S(code + 1)) {
+            Some(hi) if self.wave() == 64 => {
+                let y = self.mask_dword(hi)?;
+                let at = if b == self.cur_ir {
+                    self.cur
+                } else {
+                    self.tail[b].ok_or("a lane mask written after its use")?
+                };
+                self.s.m.bin(at, Bin::Or, x, y)
+            }
+            _ => x,
+        };
+        let at = if b == self.cur_ir {
+            self.cur
+        } else {
+            self.tail[b].ok_or("a lane mask written after its use")?
+        };
+        let zero = self.s.m.i32(0);
+        Ok(self.s.m.cmp(at, pred::NE, any, zero))
+    }
+
     // ---- operands ----
 
     fn operand(&mut self, inst: &Inst, op: &Operand) -> Result<V, Why> {
@@ -3194,9 +3242,14 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            // src_scc: the scalar condition, 0 or 1.
+            Operand::Const(253) => {
+                let v = inst.read(Reg::Scc).ok_or("an unread operand")?;
+                self.i32_of(v)
+            }
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
-                .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
+                .ok_or("a special operand (vccz, execz, lds_direct)"),
             Operand::Literal(x) => Ok(self.s.m.i32(x)),
             Operand::Attr { .. } => Err("an attribute operand"),
         }
