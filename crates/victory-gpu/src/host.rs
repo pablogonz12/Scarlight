@@ -5704,7 +5704,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
             unsafe { to.write_bytes(0, n) };
-        } else if !read(at, to, n) {
+        } else if !read_piece(at, to, n) {
             // A mapping may change between query and read.
             read_pieces(at, to, n);
         }
@@ -5717,10 +5717,10 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
     // that fails), zeros for what cannot be read.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
+        if !read_piece(at as *const u8, to, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
                 let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
+                if !read_piece(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
                     // SAFETY: inside the destination, which is mapped.
@@ -5740,12 +5740,23 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    read_mark(src, dst, len, true)
+}
+
+/// [`read`] for a piece of a range: a piece that reads marks nothing, so a
+/// block the title only has pages of is never taken for one it has whole
+/// (see [`crate::watch::copied`]).
+fn read_piece(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    read_mark(src, dst, len, false)
+}
+
+fn read_mark(src: *const u8, dst: *mut u8, len: usize, mark: bool) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    if plain(src as usize, len) {
+    if plain(src as usize, len) && !overlaps(src as usize, dst as usize, len) {
         // SAFETY: the layer has copied this whole range before and its first
         // and last pages read just now; the destination is mapped writable
-        // memory of `len` bytes.
+        // memory of `len` bytes and does not overlap the source.
         unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
         #[cfg(feature = "diagnostics")]
         {
@@ -5763,7 +5774,7 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
     let whole = unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 };
-    if whole && reading.is_some() {
+    if whole && mark && reading.is_some() {
         // The kernel read all of it: it is there.
         crate::watch::copied(src as usize, len);
     }
@@ -5792,6 +5803,13 @@ fn plain(at: usize, len: usize) -> bool {
     }
     let last = at + len - 1;
     probe(at) && (last == at || probe(last))
+}
+
+/// Whether `[a, a + len)` and `[b, b + len)` share a byte: the plain copy
+/// needs them apart, and a title may hand us copies that overlap (D3D12
+/// leaves intersecting copies undefined; the layer contains them).
+fn overlaps(a: usize, b: usize, len: usize) -> bool {
+    a.abs_diff(b) < len
 }
 
 /// Whether the page of `at` can be read: one byte through the kernel, which
@@ -5839,7 +5857,7 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();
-    let write = |at: usize, n: usize| {
+    let write = |at: usize, n: usize, mark: bool| {
         let from = src.wrapping_add(at - dst as usize);
         if plain(at, n) {
             // SAFETY: the layer knows the whole range is mapped (its first and
@@ -5867,19 +5885,19 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
             // the destination.
             unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
         };
-        if written {
+        if written && mark {
             // The kernel wrote all of it: it is there.
             crate::watch::copied(at, n);
         }
         written
     };
-    if len == 0 || write(dst as usize, len) {
+    if len == 0 || write(dst as usize, len, true) {
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
+        if !write(at, n, false) {
             for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
+                write(at, n, false);
             });
         }
     });
