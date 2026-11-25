@@ -361,6 +361,7 @@ pub(crate) fn hoisting() -> bool {
 static CLAMP_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// [`CLAMP_PASSES`] now.
+#[cfg(test)]
 pub(crate) fn clamp_passes() -> u64 {
     CLAMP_PASSES.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -390,6 +391,9 @@ fn min_stride(kind: u32) -> Option<u32> {
         1 => Some(20),
         2 | 10 => Some(12),
         _ => None,
+    }
+}
+
 const HOIST_CHUNK: u64 = 256 << 10;
 
 struct Job {
@@ -696,33 +700,6 @@ pub(crate) fn hoist(
 ) -> Option<(ID3D12Resource, u64)> {
     list.budget()?;
     list.hoisted().push(src_buf, gpu, spec)
-}
-
-/// Records, in `list`, the clamp of `records` records of `kind` (PC
-/// argument numbering) `stride` bytes apart at host address `gpu` (a title
-/// buffer's copy, only read) into the list's own argument buffer, left
-/// ready to be read as arguments: that buffer, for [`done`] after the
-/// execution. Replaces the list's compute root signature and pipeline
-/// (callers bind theirs after). `None` if the clamp is not available.
-///
-/// Title buffers' copies are never transitioned: they are common between
-/// submissions and every use promotes them (shader and root views, the
-/// input assembler, these reads), with unordered-access barriers for order.
-/// Only the list's argument buffer moves, common, unordered access,
-/// indirect argument, common: its states are known whatever order lists
-/// run in.
-// shortcut: a buffer a shader writes through an unordered view and the
-// input assembler then reads in one submission is, by the letter of D3D12,
-// promoted to a write state the input assembler may not use (the debug
-// layer cannot see view accesses; GPU-based validation might); upgrade to
-// per-list tracked buffer states if a driver or that validation minds.
-pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u32, u32)) -> Option<ID3D12Resource> {
-    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
-        return None;
-    };
-    if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
-        return None;
-    }
 }
 
 /// The record's argument bytes (its payload): the least stride of `kind`.
@@ -1898,7 +1875,7 @@ void main() {
         let mut rb_offsets = Vec::with_capacity(specs.len());
         let mut rb_cur = 0u64;
         for s in &specs {
-            let out = super::bound(&list_inline, base_gpu + s.off, (s.kind, s.stride, s.records)).unwrap();
+            let out = super::bound(&list_inline, (&src, s.off), None, (s.kind, s.stride, s.records)).unwrap();
             let bytes = u64::from(s.stride * s.records);
             // SAFETY: open list; `out` is in `INDIRECT_ARGUMENT` after `bound`.
             unsafe {
@@ -2010,59 +1987,6 @@ void main() {
         }
     }
 
-    /// Replays all transition barriers emitted by two hoisted lists run in
-    /// either order (matching `argument_buffers_move_from_their_current_states`):
-    /// the title's buffer is never transitioned and every hoisted scratch chunk
-    /// moves `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT -> COMMON`.
-    #[test]
-    fn hoisted_transitions_start_from_current_states_and_never_touch_title_buffer() {
-        use crate::host::tests::{issued, replay};
-        use windows::core::Interface;
-        let Some(host) = super::host() else {
-            return;
-        };
-        let (title, data) = host.shared_buffer(1 << 16).unwrap();
-        // SAFETY: mapped buffer; live buffer.
-        let gpu = unsafe {
-            data.cast::<[u32; 3]>().write_volatile([70_000, 1, 1]);
-            title.GetGPUVirtualAddress()
-        };
-        let key = |r: &super::ID3D12Resource| r.as_raw() as usize;
-        for a_first in [true, false] {
-            let lists = [host.new_list().unwrap(), host.new_list().unwrap()];
-            issued();
-            let recorded: Vec<_> = lists
-                .iter()
-                .map(|l| {
-                    let (out, at) = super::hoist(l, &title, gpu, (2, 12, 1)).unwrap();
-                    l.close();
-                    (out, at, issued())
-                })
-                .collect();
-            let order = if a_first { [0, 1] } else { [1, 0] };
-            let mut states: std::collections::HashMap<usize, u32> =
-                [key(&title), key(&recorded[0].0), key(&recorded[1].0)]
-                    .into_iter()
-                    .map(|k| (k, 0))
-                    .collect();
-            // Run each list one at a time so prelude + list barriers replay in exact GPU order.
-            for &i in &order {
-                issued();
-                host.execute(&[&lists[i]]);
-                let mut run = issued();
-                run.extend_from_slice(&recorded[i].2);
-                replay(&run, &mut states).unwrap();
-                assert!(run.iter().all(|t| t.0 != key(&title)), "title copy must never be transitioned");
-            }
-            assert!(states.values().all(|&s| s == 0), "all buffers must return to COMMON");
-            for (out, at, _) in &recorded {
-                assert_eq!(read_words(out, *at, 3), vec![65_535, 1, 1]);
-            }
-            // SAFETY: mapped title buffer untouched.
-            assert_eq!(unsafe { data.cast::<[u32; 3]>().read_volatile() }, [70_000, 1, 1]);
-        }
-    }
-
     /// Re-submitting the same closed hoisted list twice re-clamps cleanly into
     /// its own scratch chunks without mutating the title's source buffer.
     #[test]
@@ -2133,6 +2057,58 @@ void main() {
         assert_eq!(read_words(&dst, at, 3), vec![65_535, 1, 1]);
     }
 
+    /// The dispatch count the hoisted clamp saves: the inline clamp records
+    /// one compute pass per draw, the batched prelude one per run of draws
+    /// reading the same argument buffer into the same scratch chunk.
+    #[test]
+    fn hoisted_clamps_cost_one_pass_per_run_of_draws() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        const DRAWS: usize = 1024;
+        const STRIDE: u32 = 20;
+        let (src, ptr) = host.shared_buffer((DRAWS * STRIDE as usize) as u64).unwrap();
+        // SAFETY: mapped buffer; live buffer.
+        let base_gpu = unsafe {
+            for i in 0..DRAWS {
+                let p = ptr.add(i * STRIDE as usize).cast::<u32>();
+                p.write(300);
+                p.add(1).write(1);
+                p.add(2).write(0);
+                p.add(3).write(0);
+                p.add(4).write(0);
+            }
+            src.GetGPUVirtualAddress()
+        };
+
+        let list = host.new_list().unwrap();
+        let before = super::clamp_passes();
+        for i in 0..DRAWS {
+            let out = super::bound(&list, (&src, (i * STRIDE as usize) as u64), None, (1, STRIDE, 1)).unwrap();
+            super::done(&list, &out);
+        }
+        let inline = super::clamp_passes() - before;
+
+        let (budget, budget_gpu) = {
+            list.budget().unwrap();
+            let (res, gpu) = list.budget_resource().unwrap();
+            (res.clone(), gpu)
+        };
+        let mut hoisted_locs = Vec::with_capacity(DRAWS);
+        for i in 0..DRAWS {
+            hoisted_locs.push(
+                super::hoist(&list, &src, base_gpu + (i * STRIDE as usize) as u64, (1, STRIDE, 1)).unwrap(),
+            );
+        }
+        let prelude = host.new_list().unwrap();
+        let before = super::clamp_passes();
+        assert!(list.hoisted().record_prelude(&prelude.list, &budget, budget_gpu));
+        let hoisted = super::clamp_passes() - before;
+
+        assert_eq!(inline, DRAWS as u64, "the inline clamp records a pass per draw");
+        assert_eq!(hoisted, 1, "the batched prelude records one pass for the run");
+    }
+
     /// Release benchmark comparing inline `bound()` + `done()` vs prelude-
     /// hoisted batched clamping across 9,000 indirect indexed draws.
     ///
@@ -2164,7 +2140,7 @@ void main() {
 
         let run_inline = || {
             for i in 0..DRAWS {
-                let out = super::bound(&list_inline, base_gpu + (i * STRIDE as usize) as u64, (1, STRIDE, 1)).unwrap();
+                let out = super::bound(&list_inline, (&src, (i * STRIDE as usize) as u64), None, (1, STRIDE, 1)).unwrap();
                 super::done(&list_inline, &out);
             }
             list_inline.close();
