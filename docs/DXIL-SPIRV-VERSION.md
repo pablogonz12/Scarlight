@@ -31,3 +31,9 @@ vkd3d-proton master's pin, so a release may not label it as upstream binaries or
 offer at the upstream tag's tree. Before a release ships this pair, record the exact vkd3d-proton
 commit and the dxil-spirv submodule revision that built it, and name that same tree in the release
 instructions, the generated `VERSIONS.txt` and the attached source archive.
+
+A release does this itself now: the `Release` workflow
+(`.github/workflows/release.yml`) builds that pair at the two pinned commits
+(`VKD3D_COMMIT`, `DXIL_SPIRV_COMMIT`), records both in the tarball's `VERSION` and
+`files/licenses/VERSIONS.txt`, and attaches the source of that exact tree — vkd3d-proton with the
+overridden dxil-spirv — as `vkd3d-proton-source.tar.gz`. Bumping either commit is a release note.

@@ -74,12 +74,16 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   `crates/victory-gpu/src/descriptor/host.rs`, with `widen_due` kept on the hit path). Its section-heap windows
   did not come over: measured under Wine + vkd3d-proton + RADV, a committed section opens and the import under it
   is refused, silently substituting the driver's own memory (`xcl-bin/notes/zero-copy.md` 6).
-- **JMAN730/project-flamingo [PR #648](https://github.com/JMAN730/project-flamingo/pull/648)** (Cursor Agent),
-  GPL-3.0: the idea of answering a host texture the driver refuses with one that has fewer top mip levels
-  instead of none at all, and of keeping placed views at their full chains. Reimplemented on this tree's
-  lazy `Hosted`/`Made` textures (`crates/victory-gpu/src/resource.rs`, `VICTORY_MIP_RETRY=0`): every refusal
-  halves the chain down to one level rather than only `E_OUTOFMEMORY` dropping three, there is no
-  process-wide pressure, and views, copies and resolves read the recorded count.
+- **Marvisak/VIctory [#2721](https://github.com/Marvisak/VIctory/pull/2721)** (0xkn0wh3r3), GPL-3.0: the idea
+  that a frame past a budget says what bound it and why, split into our work around submissions, the GPU,
+  the copy-back and the rest, the largest named (`crates/victory-gpu/src/frame_budget.rs`,
+  `VICTORY_FRAME_BUDGET=0`). Reimplemented on this tree's counters and its own 50 ms budget: its
+  per-command timestamps, memory-trait breakdown and slow-pipeline guard are not taken.
+
+- **fxceless/victory-fork [PR #979](https://github.com/fxceless/victory-fork/pull/979)** (gmanka), GPL-3.0: the
+  guarded views' clean blocks kept as contiguous runs (`CleanBlocks`, `crates/victory-gpu/src/watch.rs`), so a
+  refresh of a mostly clean view heap walks only its dirty gaps instead of collecting one entry per 64 KiB
+  block under the guard mutex; the per-block set it replaces is the test's reference.
 
 ## Tools
 
