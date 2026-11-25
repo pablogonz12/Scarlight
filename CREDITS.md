@@ -80,6 +80,13 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   `VICTORY_FRAME_BUDGET=0`). Reimplemented on this tree's counters and its own 50 ms budget: its
   per-command timestamps, memory-trait breakdown and slow-pipeline guard are not taken.
 
+- **fxceless/victory-fork [PR #976](https://github.com/fxceless/victory-fork/pull/976)** (MoscaLosca), GPL-3.0: a
+  compute or mesh dispatch asking for more than the host's 65,535 groups in `x` runs as pieces, each told where
+  its groups start in a host-computed user-data dword the translated program adds to its group id
+  (`USER_GROUP_BASE`, `crates/victory-shader/src/emit/shader.rs`, `Lower::compute_id`;
+  `State::dispatch`/`dispatch_mesh`, `crates/victory-gpu/src/draw.rs`, `VICTORY_GROUP_SPLIT=0`), and the clamp's
+  budget words now count the largest group count a compute record asked for as well as the mesh one.
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
