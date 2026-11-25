@@ -26,8 +26,8 @@ wrothgaril, Yaekai.
 
 ## Co-authors
 
-BlueKaiman, kais7654, pushkarreddyy, Cursor Agent (project-flamingo #686, `22066e545`: a pixel helper
-lane's `v_readfirstlane` reads its own value).
+BlueKaiman, kais7654, pushkarreddyy, shh, Cursor Agent (project-flamingo #686, `22066e545`: a pixel
+helper lane's `v_readfirstlane` reads its own value).
 
 ## Design notes
 
