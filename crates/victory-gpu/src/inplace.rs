@@ -236,8 +236,14 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
                 Canary::Unfinished => {
                     // The canary's copy was handed to the GPU and its end is
                     // not known: the heap and the buffer stay with it (as
-                    // `ask_page` keeps his), rather than being released under
-                    // a submission that may still read them.
+                    // `ask_page` keeps its own), rather than being released
+                    // under a submission that may still read them. Their pages
+                    // are locked all the same, so they are charged to the cap
+                    // like a region in place - and never given back, since
+                    // `gone` is never called for them.
+                    let at = if window { 0 } else { 2 };
+                    STATS[at].fetch_add(1, Ordering::Relaxed);
+                    STATS[at + 1].fetch_add(pages, Ordering::Relaxed);
                     STATS[8].fetch_add(1, Ordering::Relaxed);
                     std::mem::forget(placed);
                     return None;
@@ -401,9 +407,10 @@ fn title_pages_arrived(device: &ID3D12Device, placed: &Placed, at: u64, len: u64
         return if in_place(known) { Canary::Arrived } else { Canary::Unmade };
     }
     let found = canary(device, placed, at, len);
-    // A submission whose end is not known is not an answer: it must not be
-    // remembered as one (the next region asks again).
-    if found != Canary::Unfinished {
+    // Only a real answer stands for the run: a submission whose end is not
+    // known is none, and a span too short for a canary says nothing about the
+    // host (`Unmade`) - a later region with a 64-byte span asks again.
+    if matches!(found, Canary::Arrived | Canary::Elsewhere) {
         STATE.store(found.found() as u8, Ordering::Relaxed);
     }
     match found {
@@ -1791,6 +1798,13 @@ mod tests {
             );
             assert_eq!(found, if reads { Canary::Arrived } else { Canary::Elsewhere }, "the canary is what the GPU really reads of the title's address");
             assert_eq!(kept, reads, "a region is kept in place only where the GPU reads the title's own bytes");
+            if crate::test_device::is_software(&device) {
+                // The runtime's and the kernel's answer (module docs): on the
+                // software adapter a committed section through a view *is* the
+                // GPU's pages, and §144's assertion holds there unchanged.
+                assert!(reads, "the software adapter reads the section's bytes through the view");
+                assert_eq!(found, Canary::Arrived, "and the canary finds them");
+            }
             assert!(same(memory, &ours[..CANARY]), "the canary put the title's bytes back");
             std::mem::forget(placed);
             drop((buffer, heap));
