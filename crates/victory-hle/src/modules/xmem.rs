@@ -772,7 +772,16 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
             own: false,
         });
     }
-    let view = View::map(slice, *n)?;
+    let view = match View::map(slice, *n) {
+        Some(view) => view,
+        None => {
+            // The handoff must not outlive a failed acquisition: a block left
+            // marked as taken makes a pending copy-back skip the GPU's results
+            // for it while the physical pages keep their stale bytes.
+            PhysicalWrite::end(slice, within, len);
+            return None;
+        }
+    };
     // A window longer than the budget (a big tile) is this request's alone:
     // keeping it would hold that much of the title's memory.
     if budget == 0 || len > budget {
