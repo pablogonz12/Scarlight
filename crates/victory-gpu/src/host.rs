@@ -815,8 +815,14 @@ mod tests {
             super::copy_mapped(sparse.as_mut_ptr(), part, 128 << 10, false);
             assert!(sparse[..4096].iter().all(|&b| b == 0x5a));
             assert!(sparse[4096..].iter().all(|&b| b == 0));
+            // The layer hears of memory that goes, as it does from the runtime
+            // (`title_memory_remapped`): a freed range's blocks are not
+            // "there" for a later copy at an address the kernel hands out again.
+            crate::watch::title_memory_remapped(part as usize, 128 << 10);
             assert_ne!(VirtualFree(part.cast(), 0, MEM_RELEASE), 0);
+            crate::watch::title_memory_remapped(dst as usize, N);
             assert_ne!(VirtualFree(dst.cast(), 0, MEM_RELEASE), 0);
+            crate::watch::title_memory_remapped(base as usize, N);
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
     }
