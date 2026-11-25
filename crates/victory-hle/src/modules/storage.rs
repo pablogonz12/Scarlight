@@ -172,7 +172,9 @@ static VTABLE: Methods<8> = Methods([
     prompt_result as *const (),    // 0x38
 ]);
 
-#[cfg(test)]
+// The test serves a drive over Windows paths (`X:\`) and reaches the title's
+// file calls, which are Windows only.
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;

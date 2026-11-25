@@ -411,6 +411,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // reads its own executable as a PE image
     fn parses_own_test_binary() {
         let info = ImageInfo::parse(&own_image()).unwrap();
         assert_eq!(info.machine, MACHINE_AMD64);
@@ -430,6 +431,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // reads its own executable as a PE image
     fn rva_to_file_offset_maps_entry_point() {
         let data = own_image();
         let info = ImageInfo::parse(&data).unwrap();
@@ -438,6 +440,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // reads its own executable as a PE image
     fn rva_to_file_offset_rejects_offsets_past_4_gib() {
         let mut info = ImageInfo::parse(&own_image()).unwrap();
         let rva = info.sections[0].rva + 0x20;
@@ -458,6 +461,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // reads its own executable as a PE image
     fn rejects_iat_outside_image() {
         let mut data = own_image();
         let dd = layout::data_directory_offset(&data, dir::IMPORT).unwrap();
