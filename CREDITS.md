@@ -26,7 +26,7 @@ wrothgaril, Yaekai.
 
 ## Co-authors
 
-BlueKaiman, kais7654, pushkarreddyy, shh.
+BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shader metadata cache, VIctory #2614).
 
 ## Design notes
 

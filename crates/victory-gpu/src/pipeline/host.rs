@@ -1189,6 +1189,7 @@ mod tests {
         let shader = Shader {
             stage: "mesh",
             hash: "mesh grid".to_owned(),
+            full_hash: *blake3::hash(&ms).as_bytes(),
             container: ms.clone(),
             translated: std::sync::OnceLock::new(),
         };
