@@ -11527,6 +11527,7 @@ mod tests {
     mod code_table;
     mod desc_data;
     mod mad_u16_lerp;
+    mod mul24_hi;
 
     /// Tables of 2D textures at s0 and samplers at s1.
     fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
