@@ -5786,7 +5786,7 @@ fn read_piece(src: *const u8, dst: *mut u8, len: usize) -> bool {
 fn read_mark(src: *const u8, dst: *mut u8, len: usize, mark: bool) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    if plain(src as usize, len) && !overlaps(src as usize, dst as usize, len) {
+    if plain(src as usize, len) && !copies_overlap(src as usize, dst as usize, len) {
         // SAFETY: the layer has copied this whole range before and its first
         // and last pages read just now; the destination is mapped writable
         // memory of `len` bytes and does not overlap the source.
@@ -5841,7 +5841,7 @@ fn plain(at: usize, len: usize) -> bool {
 /// Whether `[a, a + len)` and `[b, b + len)` share a byte: the plain copy
 /// needs them apart, and a title may hand us copies that overlap (D3D12
 /// leaves intersecting copies undefined; the layer contains them).
-fn overlaps(a: usize, b: usize, len: usize) -> bool {
+fn copies_overlap(a: usize, b: usize, len: usize) -> bool {
     a.abs_diff(b) < len
 }
 
