@@ -79,22 +79,14 @@ index the program computes from `LocalInvocationId`, so it is a separate change.
   (and all 32) lanes. Ask for 32 lanes on a 64-thread group instead and the same
   test fails on 32 of 64 lanes, which is exactly the bug this pinning prevents.
 
-## DPP row ops, the next step
+## DPP row ops
 
-`v_mov_b32_dpp` (and the rest of the DPP family) with `row_shl`, `row_shr`,
-`row_ror`, `row_bcast15/31` and `quad_perm` addresses lanes *within one 16-lane
-row* of the console wave. With the subgroup pinned to the program's wave size,
-`SubgroupLocalInvocationId` is the console lane, so each of those becomes one
-`OpGroupNonUniformShuffle` with an index computed as
-
-    lane = (SubgroupLocalInvocationId & ~15) | ((SubgroupLocalInvocationId + delta) & 15)
-
-per row operation, and `quad_perm` becomes the same shuffle with
-`lane = (SubgroupLocalInvocationId & ~3) | perm[SubgroupLocalInvocationId & 3]`.
-`row_bcast15` / `row_bcast31` are `OpGroupNonUniformShuffle` with the index fixed
-to the row's own lane 15 (or 31), which also needs no wave-crossing exchange. The
-emitter's test name for that work is
-`dpp_row_ops_become_shuffles_within_16_lane_rows`, ignored until it lands.
+`v_mov_b32_dpp` and the rest of the DPP family lower to
+`OpGroupNonUniformShuffle` / `ShuffleXor` / `QuadSwap` inside one 16-lane row of
+the console wave, with the lane read from `SubgroupLocalInvocationId` — which is
+the console lane exactly because the subgroup is pinned here. The controls, the
+out-of-row and `bound_ctrl` rules, the row/bank write masks and the lane table
+are in `docs/spirv-dpp-rows.md`.
 
 ## Credits
 

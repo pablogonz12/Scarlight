@@ -20,13 +20,15 @@
 //! What this does not model yet: EXEC is a scalar all-ones/all-zeros mask
 //! rather than a per-lane one (as `lower`'s per-lane form is), so programs
 //! whose lanes diverge inside a wave compute the wrong values while still
-//! emitting valid modules; images, DPP/SDWA source modifiers, typed buffer
-//! formats and wave/ballot operations are reported as gaps.
+//! emitting valid modules; images, typed buffer formats and wave/ballot
+//! operations are reported as gaps. DPP reads of another lane of the wave are
+//! lowered to subgroup shuffles (`docs/spirv-dpp-rows.md`), which is why the
+//! module carries the console's wave size.
 
 use std::collections::HashMap;
 
 use crate::ShaderError;
-use crate::gfx10::{Fields, Operand};
+use crate::gfx10::{Dpp, Fields, Operand};
 use crate::io::{Input, Io};
 use crate::ir::{Exit, Inst, Program, Reg};
 use crate::native::{HwStage, NativeProgram, StageIo};
@@ -57,6 +59,8 @@ mod op {
     pub const TYPE_POINTER: u16 = 32;
     pub const TYPE_FUNCTION: u16 = 33;
     pub const CONSTANT: u16 = 43;
+    pub const CONSTANT_COMPOSITE: u16 = 44;
+    pub const VECTOR_EXTRACT_DYNAMIC: u16 = 77;
     pub const FUNCTION: u16 = 54;
     pub const FUNCTION_END: u16 = 56;
     pub const VARIABLE: u16 = 59;
@@ -127,6 +131,10 @@ mod op {
     pub const BIT_FIELD_U_EXTRACT: u16 = 203;
     pub const BIT_REVERSE: u16 = 204;
     pub const BIT_COUNT: u16 = 205;
+    /// `OpGroupNonUniformShuffle*`: a DPP read of another lane of the wave.
+    pub const GROUP_NON_UNIFORM_SHUFFLE: u16 = 345;
+    pub const GROUP_NON_UNIFORM_SHUFFLE_XOR: u16 = 346;
+    pub const GROUP_NON_UNIFORM_QUAD_SWAP: u16 = 366;
     pub const CONTROL_BARRIER: u16 = 224;
     pub const IMAGE_SAMPLE_EXPLICIT_LOD: u16 = 88;
     pub const IMAGE_SAMPLE_DREF_EXPLICIT_LOD: u16 = 90;
@@ -182,6 +190,8 @@ mod cap {
     pub const GROUP_NON_UNIFORM: u32 = 61;
     /// `OpGroupNonUniformShuffle`: another lane's value, DPP and lane reads.
     pub const GROUP_NON_UNIFORM_SHUFFLE: u32 = 65;
+    /// `OpGroupNonUniformQuadSwap`: a quad_perm that swaps all four lanes.
+    pub const GROUP_NON_UNIFORM_QUAD: u32 = 68;
 }
 
 mod storage {
@@ -196,6 +206,8 @@ mod storage {
 mod builtin {
     pub const WORKGROUP_ID: u32 = 26;
     pub const LOCAL_INVOCATION_ID: u32 = 27;
+    /// The console's lane number inside its wave: DPP reads address this.
+    pub const SUBGROUP_LOCAL_INVOCATION_ID: u32 = 41;
 }
 
 /// GLSL.std.450 instruction numbers used here.
@@ -482,12 +494,22 @@ pub struct Emitter<'a> {
     /// The vec3 thread-group id and local invocation id inputs, if read.
     tid_var: Option<u32>,
     gid_var: Option<u32>,
+    /// The `SubgroupLocalInvocationId` input: the console's lane in its wave,
+    /// which is what a DPP read addresses. Only a program that reads another
+    /// lane declares it (the builtin needs `GroupNonUniform`).
+    lane_var: Option<u32>,
+    /// Pointer type to one unsigned 32-bit input: the lane id a shuffle
+    /// addresses must be an unsigned integer (SPIR-V `Id` operand).
+    p_in_u32: u32,
     regs: Vec<u32>,
     scc: u32,
     zero: u32,
     one: u32,
     minus_one: u32,
     ci: HashMap<u32, u32>,
+    /// The same constants as unsigned integers (a shuffle's id and mask and
+    /// its arithmetic, which SPIR-V types as unsigned).
+    cu: HashMap<u32, u32>,
     ci64: HashMap<u64, u32>,
     /// Constant instructions, spliced in before the functions (a constant
     /// may be created while the body is emitted, and the module's layout
@@ -506,6 +528,8 @@ pub struct Emitter<'a> {
     local_size: [u32; 3],
     scope_device: u32,
     scope_workgroup: u32,
+    /// `ScopeSubgroup`: a DPP read is inside the console's own wave.
+    scope_subgroup: u32,
     sem_acq_rel_workgroup: u32,
     /// The image and sampler bindings this program names, in program order.
     images: Vec<ImgBind>,
@@ -516,6 +540,12 @@ pub struct Emitter<'a> {
     src_patch: Vec<(Operand, u32)>,
     /// The SDWA destination mapping of the instruction being emitted.
     sdwa_dst: Option<crate::gfx10::Sdwa>,
+    /// The first source's value, replaced by the instruction being emitted
+    /// (a DPP read of another lane). Consumed by the first `src32`.
+    dpp_src: Option<u32>,
+    /// The lane mask a DPP write is enabled by: lanes the row/bank masks
+    /// leave out keep the destination's value (`VALU` row/bank masking).
+    dpp_mask: Option<u32>,
     t_smp: u32,
     p_smp: u32,
     v2i: u32,
@@ -644,6 +674,20 @@ fn crosses_lanes(p: &Program) -> bool {
     })
 }
 
+/// Whether a DPP quad permutation swaps all four lanes of its quad, the three
+/// cases `OpGroupNonUniformQuadSwap` covers (and names its own capability).
+fn quad_swaps(p: &Program) -> bool {
+    p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+        matches!(
+            &i.fields,
+            Fields::Valu(crate::gfx10::Valu {
+                dpp: Some(Dpp::Row { ctrl, .. }),
+                ..
+            }) if matches!(*ctrl, 0x1B | 0x4E | 0xB1)
+        )
+    })
+}
+
 impl<'a> Emitter<'a> {
     fn new(
         p: &'a Program,
@@ -685,6 +729,7 @@ impl<'a> Emitter<'a> {
             unreachable!()
         };
         let p_in_v3 = m.id();
+        let p_in_u32 = m.id();
         let pc = m.id();
         let lds = m.id();
         let ext = m.id();
@@ -693,6 +738,7 @@ impl<'a> Emitter<'a> {
         let minus_one = m.id();
         let scope_device = m.id();
         let scope_workgroup = m.id();
+        let scope_subgroup = m.id();
         let sem = m.id();
         let pc_var = m.id();
         let loop_head = m.id();
@@ -703,6 +749,15 @@ impl<'a> Emitter<'a> {
         let _arr_len = m.id();
         let tid_var = m.id();
         let gid_var = m.id();
+        // A program that reads another lane of its wave needs the lane input;
+        // declaring it in every module would ask for `GroupNonUniform` there
+        // too.
+        let dpp = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some()));
+        let lane_var = dpp.then(|| m.id());
         let main = m.id();
         let p_pc_i32 = m.id();
         let p_arr = m.id();
@@ -803,18 +858,21 @@ impl<'a> Emitter<'a> {
             pf_bool,
             pfn,
             p_in_v3,
+            p_in_u32,
             pc,
             lds,
             ext,
             main,
             tid_var: Some(tid_var),
             gid_var: Some(gid_var),
+            lane_var,
             regs: Vec::new(),
             scc: 0,
             zero,
             one,
             minus_one,
             ci: HashMap::new(),
+            cu: HashMap::new(),
             ci64: HashMap::new(),
             consts: Vec::new(),
             pc_var,
@@ -828,11 +886,14 @@ impl<'a> Emitter<'a> {
             local_size,
             scope_device,
             scope_workgroup,
+            scope_subgroup,
             sem_acq_rel_workgroup: sem,
             images,
             samplers,
             src_patch: Vec::new(),
             sdwa_dst: None,
+            dpp_src: None,
+            dpp_mask: None,
             t_smp,
             p_smp,
             v2i,
@@ -869,6 +930,22 @@ impl<'a> Emitter<'a> {
         let new = self.m.words.split_off(at);
         self.consts.extend_from_slice(&new);
         self.ci.insert(v, id);
+        id
+    }
+
+    /// An unsigned 32-bit constant: the lane arithmetic of a DPP read is in
+    /// the unsigned domain, which is the type `OpGroupNonUniformShuffle`
+    /// wants for the lane it addresses.
+    fn cu32(&mut self, v: u32) -> u32 {
+        if let Some(&id) = self.cu.get(&v) {
+            return id;
+        }
+        let id = self.m.id();
+        let at = self.m.words.len();
+        self.m.ins(op::CONSTANT, self.t_u32, id, &[v]);
+        let new = self.m.words.split_off(at);
+        self.consts.extend_from_slice(&new);
+        self.cu.insert(v, id);
         id
     }
 
@@ -1062,6 +1139,12 @@ impl<'a> Emitter<'a> {
 
     /// A 32-bit source as an i32 value.
     fn src32(&mut self, o: &Operand) -> R<u32> {
+        // A DPP read replaces the first source of the instruction with another
+        // lane's value (`dpp_patch`), for exactly one read: a second source
+        // that happens to name the same register is its own lane's.
+        if let Some(v) = self.dpp_src.take() {
+            return Ok(v);
+        }
         if let Some((_, v)) = self.src_patch.iter().find(|(p, _)| p == o) {
             return Ok(*v);
         }
@@ -1158,6 +1241,15 @@ impl<'a> Emitter<'a> {
             Some(sdwa) => self.sdwa_dst_value(start, v, sdwa),
             None => v,
         };
+        // DPP writes only the lanes its row and bank masks enable; the others
+        // keep the destination's value.
+        let v = match self.dpp_mask.take() {
+            Some(mask) => {
+                let old = self.load(start);
+                self.select(mask, v, old)
+            }
+            None => v,
+        };
         self.store(start, v);
         Ok(())
     }
@@ -1191,14 +1283,6 @@ impl<'a> Emitter<'a> {
             Operand::Literal(v) => Ok(self.c64(u64::from(v))),
             _ => gap("a 64-bit source that is not a register"),
         }
-    }
-
-    fn valu_mods(v: &crate::gfx10::Valu) -> R<()> {
-        // SDWA and `opsel` are translated (`valu_patch`). DPP reads other
-        // lanes of the wave, which this emitter does not model one by one
-        // yet: it is taken as the identity, like the lane shortcuts below.
-        let _ = v;
-        Ok(())
     }
 
     // ---- the module --------------------------------------------------------
@@ -1235,6 +1319,9 @@ impl<'a> Emitter<'a> {
             caps.push(cap::GROUP_NON_UNIFORM);
             caps.push(cap::GROUP_NON_UNIFORM_SHUFFLE);
         }
+        if quad_swaps(self.p) {
+            caps.push(cap::GROUP_NON_UNIFORM_QUAD);
+        }
         caps.sort_unstable();
         caps.dedup();
         for c in caps {
@@ -1257,6 +1344,7 @@ impl<'a> Emitter<'a> {
                     self.tid_var.unwrap(),
                     self.gid_var.unwrap(),
                 ];
+                iface.extend(self.lane_var);
                 iface.extend(self.images.iter().map(|b| b.var));
                 iface.extend(self.samplers.iter().map(|s| s.1));
                 iface
@@ -1289,6 +1377,18 @@ impl<'a> Emitter<'a> {
                 builtin::LOCAL_INVOCATION_ID,
             ],
         );
+        if let Some(lane_var) = self.lane_var {
+            self.m.ins(
+                op::DECORATE,
+                0,
+                0,
+                &[
+                    lane_var,
+                    decoration::BUILT_IN,
+                    builtin::SUBGROUP_LOCAL_INVOCATION_ID,
+                ],
+            );
+        }
         self.m.ins(
             op::DECORATE,
             0,
@@ -1380,6 +1480,12 @@ impl<'a> Emitter<'a> {
             self.p_in_v3,
             &[storage::INPUT, self.t_v3u32],
         );
+        self.m.ins(
+            op::TYPE_POINTER,
+            0,
+            self.p_in_u32,
+            &[storage::INPUT, self.t_u32],
+        );
         let alen = self.arr_len();
         self.m
             .ins(op::TYPE_ARRAY, 0, self.t_arr, &[self.t_i32, alen]);
@@ -1469,6 +1575,8 @@ impl<'a> Emitter<'a> {
             .ins(op::CONSTANT, self.t_i32, self.scope_device, &[1]);
         self.m
             .ins(op::CONSTANT, self.t_i32, self.scope_workgroup, &[2]);
+        self.m
+            .ins(op::CONSTANT, self.t_i32, self.scope_subgroup, &[3]);
         self.m.ins(
             op::CONSTANT,
             self.t_i32,
@@ -1492,6 +1600,10 @@ impl<'a> Emitter<'a> {
             self.gid_var.unwrap(),
             &[storage::INPUT],
         );
+        if let Some(lane_var) = self.lane_var {
+            self.m
+                .ins(op::VARIABLE, self.p_in_u32, lane_var, &[storage::INPUT]);
+        }
         for b in &self.images {
             self.m
                 .ins(op::VARIABLE, b.pty, b.var, &[storage::UNIFORM_CONSTANT]);
@@ -1894,6 +2006,271 @@ impl<'a> Emitter<'a> {
         }
         self.src_patch = patch;
         self.sdwa_dst = v.sdwa.filter(|s| s.dst_sel != 6 || s.dst_unused != 0);
+        Ok(())
+    }
+
+    // ---- DPP: another lane of the console wave ------------------------------
+
+    /// The console's lane number in its wave. The pipeline pins the subgroup
+    /// to the wave size (`SpirvProgram::{wave_size, subgroup_plan}`), so a
+    /// subgroup's invocation id is the console lane DPP addresses.
+    fn lane(&mut self) -> u32 {
+        let v = self.lane_var.expect("a DPP read has the lane input");
+        let id = self.m.id();
+        self.ins(op::LOAD, self.t_u32, id, &[v]);
+        id
+    }
+
+    /// The value lane `id` of this wave holds: `DPP` reads one of the 16 lanes
+    /// of a row, and nothing crosses a row.
+    fn shuffle(&mut self, a: u32, id: u32) -> u32 {
+        let scope = self.scope_subgroup;
+        let r = self.m.id();
+        self.ins(op::GROUP_NON_UNIFORM_SHUFFLE, self.t_i32, r, &[scope, a, id]);
+        r
+    }
+
+    /// The value the lane `mask` lanes away in every quad holds: `row_mirror`,
+    /// `row_half_mirror` and `row_xmask` are all one xor inside the row, and
+    /// an xor below 16 never leaves it.
+    fn shuffle_xor(&mut self, a: u32, mask: u32) -> u32 {
+        if mask == 0 {
+            return a;
+        }
+        let scope = self.scope_subgroup;
+        let m = self.cu32(mask);
+        let r = self.m.id();
+        self.ins(
+            op::GROUP_NON_UNIFORM_SHUFFLE_XOR,
+            self.t_i32,
+            r,
+            &[scope, a, m],
+        );
+        r
+    }
+
+    /// The value that lane holds whose number is this lane's xor `dir + 1`
+    /// inside its quad: `quad_perm` [1,0,3,2], [2,3,0,1] and [3,2,1,0].
+    fn quad_swap(&mut self, a: u32, dir: u32) -> u32 {
+        let scope = self.scope_subgroup;
+        let d = self.cu32(dir);
+        let r = self.m.id();
+        self.ins(
+            op::GROUP_NON_UNIFORM_QUAD_SWAP,
+            self.t_i32,
+            r,
+            &[scope, a, d],
+        );
+        r
+    }
+
+    /// A constant vector: DPP's quad permutation is a table of four lanes,
+    /// indexed by the lane's place in its quad.
+    fn c_vec4(&mut self, v: [u32; 4]) -> u32 {
+        let mut parts = Vec::new();
+        for x in v {
+            parts.push(self.c32(x));
+        }
+        let ty = self.v4i;
+        let id = self.m.id();
+        let at = self.m.words.len();
+        self.ins(op::CONSTANT_COMPOSITE, ty, id, &parts);
+        let new = self.m.words.split_off(at);
+        self.consts.extend_from_slice(&new);
+        id
+    }
+
+    /// The lanes a DPP write is enabled in, as the flag `OpSelect` takes:
+    /// `row_mask` bit `lane / 16` and `bank_mask` bit `(lane / 4) % 4`. A lane
+    /// outside both masks keeps the destination's value, as the machine leaves
+    /// it, so a mask of all ones writes the whole wave and needs no flag.
+    fn dpp_write_mask(&mut self, lane: u32, row_mask: u8, bank_mask: u8) -> Option<u32> {
+        if row_mask == 0xF && bank_mask == 0xF {
+            return None;
+        }
+        let t = self.t_u32;
+        let sh4 = self.cu32(4);
+        let sh2 = self.cu32(2);
+        let one = self.cu32(1);
+        let three = self.cu32(3);
+        let row = self.bin(op::SHIFT_RIGHT_LOGICAL, t, lane, sh4);
+        let rm = self.cu32(u32::from(row_mask));
+        let rbit = self.bin(op::SHIFT_RIGHT_LOGICAL, t, rm, row);
+        let rbit = self.bin(op::BITWISE_AND, t, rbit, one);
+        let bank = self.bin(op::SHIFT_RIGHT_LOGICAL, t, lane, sh2);
+        let bank = self.bin(op::BITWISE_AND, t, bank, three);
+        let bm = self.cu32(u32::from(bank_mask));
+        let bbit = self.bin(op::SHIFT_RIGHT_LOGICAL, t, bm, bank);
+        let bbit = self.bin(op::BITWISE_AND, t, bbit, one);
+        let both = self.bin(op::BITWISE_AND, t, rbit, bbit);
+        let zero = self.cu32(0);
+        Some(self.cmp(op::I_NOT_EQUAL, both, zero))
+    }
+
+    /// The value a DPP control reads for lane `lane`, from the source value
+    /// `a` (`AMD RDNA2 ISA`, "DPP operations"): a quad permutation inside four
+    /// lanes, or one of a 16-lane row's lanes. `bound_ctrl` turns a read past
+    /// the row's end into the lane's own value; without it such a lane reads
+    /// zero.
+    fn dpp_value(&mut self, a: u32, lane: u32, ctrl: u16, bound: bool) -> R<u32> {
+        // The row and the lane's place in it: no DPP read leaves its row.
+        let t = self.t_u32;
+        let mask15 = self.cu32(15);
+        let mask_row = self.cu32(0xFFFF_FFF0);
+        let row = self.bin(op::BITWISE_AND, t, lane, mask_row);
+        let lir = self.bin(op::BITWISE_AND, t, lane, mask15);
+        // The control's top nibble names the operation, its low nibble the
+        // amount; below 0x100 it is a quad permutation.
+        let hi = ctrl >> 4;
+        let n = u32::from(ctrl & 0xF);
+        match hi {
+            0x00..=0x0F => {
+                // quad_perm: lane (i % 4) reads lane perm[i % 4] of its quad.
+                let p = [
+                    u32::from(ctrl & 3),
+                    u32::from(ctrl >> 2 & 3),
+                    u32::from(ctrl >> 4 & 3),
+                    u32::from(ctrl >> 6 & 3),
+                ];
+                if p == [0, 1, 2, 3] {
+                    return Ok(a);
+                }
+                for k in 1..=3u32 {
+                    if p == [k, 1 ^ k, 2 ^ k, 3 ^ k] {
+                        return Ok(self.quad_swap(a, k - 1));
+                    }
+                }
+                let mask_quad = self.cu32(12);
+                let mask_lane = self.cu32(3);
+                let quad = self.bin(op::BITWISE_AND, t, lane, mask_quad);
+                let at = self.bin(op::BITWISE_AND, t, lane, mask_lane);
+                let table = self.c_vec4(p);
+                let pick = self.bin(op::VECTOR_EXTRACT_DYNAMIC, self.t_i32, table, at);
+                let from = self.bin(op::BITWISE_OR, t, row, quad);
+                let id = self.bin(op::BITWISE_OR, t, from, pick);
+                Ok(self.shuffle(a, id))
+            }
+            0x10 => {
+                // row_shl: lane i reads lane i + n of the row.
+                if n == 0 {
+                    return Ok(a);
+                }
+                let k = self.cu32(n);
+                let end = self.cu32(16 - n);
+                let inside = self.cmp(op::U_LESS_THAN, lir, end);
+                let moved = self.bin(op::I_ADD, t, lir, k);
+                let moved = self.bin(op::BITWISE_AND, t, moved, mask15);
+                let id = self.bin(op::BITWISE_OR, t, row, moved);
+                let v = self.shuffle(a, id);
+                // Past the row's end, bound_ctrl reads the lane itself.
+                let past = if bound { a } else { self.zero };
+                Ok(self.select(inside, v, past))
+            }
+            0x11 => {
+                // row_shr: lane i reads lane i - n of the row.
+                if n == 0 {
+                    return Ok(a);
+                }
+                let k = self.cu32(n);
+                let back = self.cu32(16 - n);
+                let inside = self.cmp(op::U_GREATER_THAN_EQUAL, lir, k);
+                let moved = self.bin(op::I_ADD, t, lir, back);
+                let moved = self.bin(op::BITWISE_AND, t, moved, mask15);
+                let id = self.bin(op::BITWISE_OR, t, row, moved);
+                let v = self.shuffle(a, id);
+                let past = if bound { a } else { self.zero };
+                Ok(self.select(inside, v, past))
+            }
+            0x12 => {
+                // row_ror: the row rotates, so no lane reads past its end.
+                if n == 0 {
+                    return Ok(a);
+                }
+                let back = self.cu32(16 - n);
+                let moved = self.bin(op::I_ADD, t, lir, back);
+                let moved = self.bin(op::BITWISE_AND, t, moved, mask15);
+                let id = self.bin(op::BITWISE_OR, t, row, moved);
+                Ok(self.shuffle(a, id))
+            }
+            0x14 => match n {
+                0 => Ok(self.shuffle_xor(a, 15)),
+                1 => Ok(self.shuffle_xor(a, 8)),
+                2 => {
+                    // row_bcast15: lane 15 of every row, to the whole row.
+                    let id = self.bin(op::BITWISE_OR, t, row, mask15);
+                    Ok(self.shuffle(a, id))
+                }
+                3 => {
+                    // row_bcast31: lane 31 of a 64-lane wave, to all of it (a
+                    // 32-lane wave has no such lane).
+                    if !self.p.wave64 {
+                        return gap("row_bcast31 in a 32-lane wave");
+                    }
+                    let id = self.cu32(31);
+                    Ok(self.shuffle(a, id))
+                }
+                _ => gap("a DPP row broadcast this emitter does not know"),
+            },
+            0x15 => {
+                // row_share: lane i + n of the row, held at its last lane.
+                if n == 0 {
+                    return Ok(a);
+                }
+                let k = self.cu32(n);
+                let moved = self.bin(op::I_ADD, t, lir, k);
+                let moved = self.ext2(glsl::UMIN, t, moved, mask15);
+                let id = self.bin(op::BITWISE_OR, t, row, moved);
+                Ok(self.shuffle(a, id))
+            }
+            0x16 => Ok(self.shuffle_xor(a, n)),
+            _ => gap("a DPP control this emitter does not model"),
+        }
+    }
+
+    /// The DPP source of the instruction being emitted: its first source
+    /// becomes another lane's value, and its write only lands in the lanes the
+    /// row and bank masks enable.
+    fn dpp_patch(&mut self, v: &crate::gfx10::Valu) -> R<()> {
+        let Some(dpp) = v.dpp else {
+            return Ok(());
+        };
+        let src = *v
+            .src
+            .first()
+            .ok_or(Gap("a DPP read without a source"))?;
+        let a = self.src32(&src)?;
+        let (value, mask) = match dpp {
+            // DPP8: each bank of eight lanes picks one of its own lanes, three
+            // bits per lane. There is no row or bank write mask.
+            Dpp::Lanes { sel, .. } => {
+                let t = self.t_u32;
+                let lane = self.lane();
+                let mask7 = self.cu32(7);
+                let mask8 = self.cu32(0xFFFF_FFF8);
+                let three = self.cu32(3);
+                let at = self.bin(op::BITWISE_AND, t, lane, mask7);
+                let shift = self.bin(op::I_MUL, t, at, three);
+                let table = self.cu32(sel);
+                let pick = self.bin(op::SHIFT_RIGHT_LOGICAL, t, table, shift);
+                let pick = self.bin(op::BITWISE_AND, t, pick, mask7);
+                let base = self.bin(op::BITWISE_AND, t, lane, mask8);
+                let id = self.bin(op::BITWISE_OR, t, base, pick);
+                (self.shuffle(a, id), None)
+            }
+            Dpp::Row {
+                ctrl,
+                row_mask,
+                bank_mask,
+                bound_ctrl,
+                ..
+            } => {
+                let lane = self.lane();
+                let value = self.dpp_value(a, lane, ctrl, bound_ctrl)?;
+                (value, self.dpp_write_mask(lane, row_mask, bank_mask))
+            }
+        };
+        self.dpp_src = Some(value);
+        self.dpp_mask = mask;
         Ok(())
     }
 
@@ -2583,6 +2960,8 @@ impl<'a> Emitter<'a> {
         let name = i.name();
         self.src_patch.clear();
         self.sdwa_dst = None;
+        self.dpp_src = None;
+        self.dpp_mask = None;
         match &i.fields {
             Fields::Smem { .. } => return self.smem(i),
             Fields::Buffer { .. } => return self.mubuf(i),
@@ -3112,10 +3491,10 @@ impl<'a> Emitter<'a> {
             Fields::Valu(v) => v.clone(),
             _ => return gap("an instruction this emitter does not implement"),
         };
-        Self::valu_mods(&v)?;
         if v.sdwa.is_some() || v.opsel & 3 != 0 {
             self.valu_patch(&v, name)?;
         }
+        self.dpp_patch(&v)?;
         if let Some(rest) = name.strip_prefix("v_cmpx_") {
             return self.valu_compare(&v, rest, true);
         }
