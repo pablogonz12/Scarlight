@@ -753,6 +753,20 @@ fn create_with_fewer_mips<T, E>(
     }
 }
 
+/// A resident mip window `(first level, levels)` of a title texture, as the
+/// same levels of a host copy that lacks the title's top `dropped` ones: only
+/// its start moves, and it ends where the copy does. `(0, 0)` (nothing
+/// resident) stays.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn resident_in_host(resident: (u32, u32), dropped: u32, mips: u32) -> (u32, u32) {
+    let (first, count) = resident;
+    if count == 0 {
+        return (0, 0);
+    }
+    let first = first.saturating_sub(dropped);
+    (first, count.min(mips.saturating_sub(first)).max(1))
+}
+
 /// A view's `(most detailed level, levels)` of a title texture, as the same
 /// levels of a host copy that lacks the title's top `dropped` ones (see
 /// [`dropped_mips`]): its level `i` is the title's `i + dropped`. A view of
@@ -2616,6 +2630,20 @@ mod tests {
         assert_eq!(droppable_mips(&texture(64, 64, 28, 4), 9), 3);
         // A 1-level texture has nothing to give.
         assert_eq!(droppable_mips(&texture(64, 64, 28, 1), 1), 0);
+    }
+
+    #[test]
+    fn a_resident_window_moves_with_the_dropped_levels() {
+        // Seven levels gone from thirteen: the window the title holds at
+        // (10, 3) is (3, 3) of the copy's six.
+        assert_eq!(resident_in_host((10, 3), 7, 6), (3, 3));
+        // A window that starts inside the dropped levels shows the copy's
+        // largest.
+        assert_eq!(resident_in_host((1, 3), 7, 6), (0, 3));
+        // Nothing resident stays nothing; a window reaching past the copy's
+        // last level ends there.
+        assert_eq!(resident_in_host((0, 0), 7, 6), (0, 0));
+        assert_eq!(resident_in_host((4, 8), 2, 6), (2, 4));
     }
 
     #[test]
