@@ -61,6 +61,11 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   child that is not there is a miss whatever its box holds, and that an empty or inverted box and any NaN
   coordinate miss in both node widths, with the reference's own tests
   (`crates/victory-shader/src/bvh.rs`, `crates/victory-shader/src/emit/intersect.rs`).
+- **fxceless/victory-fork [PR #1097](https://github.com/fxceless/victory-fork/pull/1097)** (Azemed), GPL-3.0: the
+  userspace table of the runtime's placeholder reservations, and the guards' block sets as bits (64 blocks to a
+  word), so placeholder memory is no longer asked about the kernel block by block
+  (`crates/victory-gpu/src/inplace.rs`, `crates/victory-gpu/src/watch.rs`); the Wine check that the calls
+  placeholders need are all there is ours (`crates/victory-hle/src/modules/xmem.rs`).
 
 ## Tools
 
