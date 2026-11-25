@@ -79,6 +79,11 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   the copy-back and the rest, the largest named (`crates/victory-gpu/src/frame_budget.rs`,
   `VICTORY_FRAME_BUDGET=0`). Reimplemented on this tree's counters and its own 50 ms budget: its
   per-command timestamps, memory-trait breakdown and slow-pipeline guard are not taken.
+- **Marvisak/VIctory [#2513](https://github.com/Marvisak/VIctory/pull/2513)** (Calvix2k), GPL-3.0: the idea
+  that a copy-back brings a declared range's snapshot in step with the bytes it takes from title memory, so that a
+  later overlapping range does not put the copy's older bytes back over a title write (`merge_back` in
+  `crates/victory-gpu/src/shadow.rs`). Reimplemented: theirs changes `copy_back_marked`, which this tree has no
+  equivalent of (its `copy_back` merges into the copy and keeps one snapshot per submission).
 
 ## Tools
 
