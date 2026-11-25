@@ -432,6 +432,61 @@ mod tests {
         assert!(cached(&cache, &build, b"other", fail).is_err());
     }
 
+    /// What this fix was for. The key before it named four switches
+    /// (`VICTORY_WAVE_WIDE`, `VICTORY_WAVE_DEEP_SKIPS`, `VICTORY_WAVE_OWN_BITS`,
+    /// `VICTORY_F16_NEAREST`) and nothing else, so a run with any other one
+    /// changed was served the translation the earlier run had cached: 106 of
+    /// the 751 dumped programs translate to different DXIL with
+    /// `VICTORY_FIRST_HALF=0`, `VICTORY_F16_SUM_WIDE=0` and
+    /// `VICTORY_STRICT_JOINS=1` change or refuse one each. A key that ignores
+    /// the switch is shown here serving that stale entry; the key built from
+    /// `settings_bytes` misses it.
+    #[test]
+    fn a_switch_outside_the_old_key_served_a_stale_translation() {
+        use std::ffi::OsString;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let container = b"a console container";
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        // The old key's settings: the four switches it named, all unset, so
+        // the same bytes whatever any other switch says.
+        let old_settings = victory_shader::emit::settings_bytes_of(|name| {
+            let four = [
+                "VICTORY_WAVE_WIDE",
+                "VICTORY_WAVE_DEEP_SKIPS",
+                "VICTORY_WAVE_OWN_BITS",
+                "VICTORY_F16_NEAREST",
+            ];
+            four.contains(&name).then(|| OsString::from("0"))
+        });
+        let old = build_key(b"our executable", &old_settings);
+        assert_eq!(cached(&cache, &old, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+
+        let half = victory_shader::emit::settings_bytes_of(|name| match name {
+            "VICTORY_FIRST_HALF" => Some(OsString::from("0")),
+            _ => None,
+        });
+        assert_ne!(
+            victory_shader::emit::settings_bytes_of(|_| None),
+            half,
+            "VICTORY_FIRST_HALF=0 does not change the settings"
+        );
+        // The old key cannot tell the two runs apart: the stale entry is served.
+        assert_eq!(cached(&cache, &old, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 1, "the old key served it");
+        // The new one does: it translates again.
+        let new = build_key(b"our executable", &half);
+        assert_ne!(old, new);
+        assert_eq!(cached(&cache, &new, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 2, "the new key translated");
+    }
+
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
         let mut files = Vec::new();
         for e in std::fs::read_dir(dir).unwrap().flatten() {
