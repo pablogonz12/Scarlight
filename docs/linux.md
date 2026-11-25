@@ -46,6 +46,9 @@ GAME_EXE="<the title's exe>"
 export WINEPREFIX="$HOME/.local/share/scarlight-prefix"
 export WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,d3d11,d3d10core,d3dcompiler_47=n,b"
 export VKD3D_CONFIG=ignore_shared_fence
+export MESA_SHADER_CACHE_DIR="$WINEPREFIX/mesa-cache"   # see "Mesa shader cache" below
+export MESA_SHADER_CACHE_DISABLE=false
+export MESA_SHADER_CACHE_MAX_SIZE=8G
 export VICTORY_HOOKS=1   # place the patches your build's profile lists; see title-profiles.md
 export VICTORY_GAME_DIR="$GAME_DIR"
 export VICTORY_LOG="${VICTORY_LOG:-info}"
@@ -56,6 +59,31 @@ exec "$PROTON/files/bin/wine" "$EXE" run "$GAME_DIR/$GAME_EXE" --execute
 Make it executable once with `chmod +x play.sh`. Pass switches in front: `VICTORY_GPU_TIMING=1 ./play.sh`;
 they are listed under [switches](#switches). If you use GE-Proton's own D3D12 DLLs, make sure your
 prefix has them installed or copy them next to the exe.
+
+### Mesa shader cache
+
+Mesa (RADV/ANV) keeps its own on-disk cache of compiled shaders, and it is worth a great deal here:
+building all **751** programs of the fixed scene from cold costs **37,672 ms** of pipeline creation
+in total, and the same run against a warm cache costs **148 ms**. The whole set is **8.7 MB in 253
+files**, so the disk cost is trivial next to the time it buys.
+
+Mesa's default cache limit is 1 GiB and it **evicts** when full — a shader evicted is a full
+recompile on the next boot — so the play script sets the cache explicitly:
+
+| Variable | Value | Why |
+|---|---|---|
+| `MESA_SHADER_CACHE_DIR` | inside the prefix | one place per install; see the per-prefix note below |
+| `MESA_SHADER_CACHE_DISABLE` | `false` | some drivers and wrappers default the cache off |
+| `MESA_SHADER_CACHE_MAX_SIZE` | `8G` | measured to hold the scene with room to spare; 16 GiB is planned and untested |
+
+The directory is **per prefix**: a run started under another `WINEPREFIX` finds an empty cache and
+pays the whole cold cost again, which looks exactly like a code regression and is not one. Keep one
+prefix per install, and point `MESA_SHADER_CACHE_DIR` at the same directory if you want the cache to
+outlive the prefix.
+
+`MESA_SHADER_CACHE_READ_ONLY=1` makes Mesa never write the cache; it is the only way to ship a
+prebuilt cache to other machines, and it is **not** what this script does — a read-only cache never
+fills in, so anything missing from it recompiles on every boot.
 
 ## 5. Title profiles (optional)
 
