@@ -25,3 +25,9 @@ installed tool to hand, copy the two files straight into
 `compatibilitytools.d/Scarlight/files/` and press Play again. No DXIL byte changes, so
 nothing else in the shader pipeline moves. Details and the gdb trace: local
 `xcl-bin/notes/dxil-spirv-crash.md` (game-derived, not in this repo).
+
+That pair is **not** an unmodified upstream release: it carries a dxil-spirv submodule newer than
+vkd3d-proton master's pin, so a release may not label it as upstream binaries or point its source
+offer at the upstream tag's tree. Before a release ships this pair, record the exact vkd3d-proton
+commit and the dxil-spirv submodule revision that built it, and name that same tree in the release
+instructions, the generated `VERSIONS.txt` and the attached source archive.
