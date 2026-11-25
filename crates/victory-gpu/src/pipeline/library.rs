@@ -75,7 +75,13 @@ static DIR: OnceLock<PathBuf> = OnceLock::new();
 /// others, in `dir/<build>`, and a run only ever writes its own; [`KEPT`]
 /// of the newest are kept (`VICTORY_LIBRARY_PRUNE=0`: every one of them).
 pub fn use_pipeline_cache(dir: PathBuf) {
-    let _ = DIR.set(keyed(&dir, &crate::shader_cache::build_name()));
+    let path = match crate::shader_cache::build_name() {
+        Some(build) => keyed(&dir, &build, prune()),
+        // No name for this build: a directory nothing else writes, and
+        // nothing pruned (the ones there are other builds').
+        None => dir.join(unnamed()),
+    };
+    let _ = DIR.set(path);
 }
 
 /// Whether libraries of other builds are removed; `VICTORY_LIBRARY_PRUNE=0`
@@ -83,6 +89,15 @@ pub fn use_pipeline_cache(dir: PathBuf) {
 fn prune() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_PRUNE").is_none_or(|v| v != "0"))
+}
+
+/// A library directory's name for a run that cannot name its build: the
+/// time, so that no other run shares it.
+fn unnamed() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    blake3::hash(&now.as_nanos().to_le_bytes()).to_hex()[..16].to_owned()
 }
 
 /// Whether `dir` is a library directory this wrote: a name that is 16
@@ -105,14 +120,31 @@ fn is_translation(dir: &Path) -> bool {
 /// which is what a bisection between two builds needs.
 const KEPT: usize = 2;
 
+/// The file a run leaves in its own library directory: pruning keeps the
+/// library *used* most recently, and a warm run that adds no pipelines
+/// writes nothing else (its directory's modification time is then as old as
+/// the library it loaded, and it would be pruned in place of a stale one).
+const USED_FILE: &str = "used.txt";
+
+/// Marks `path` as the library in use now, so pruning keeps it.
+fn mark_used(path: &Path) {
+    let _ = std::fs::create_dir_all(path);
+    // Removed and written again: writing over a file leaves the directory's
+    // own modification time alone.
+    let used = path.join(USED_FILE);
+    let _ = std::fs::remove_file(&used);
+    let _ = std::fs::write(&used, b"");
+}
+
 /// `dir`'s library for `build`, with older libraries pruned to [`KEPT`] (by
-/// modification time).
-fn keyed(dir: &Path, build: &str) -> PathBuf {
+/// modification time) when `prune` is set.
+fn keyed(dir: &Path, build: &str, prune: bool) -> PathBuf {
     let path = dir.join(build);
+    mark_used(&path);
     let Ok(entries) = std::fs::read_dir(dir) else {
         return path;
     };
-    if !prune() {
+    if !prune {
         return path;
     }
     let mut others: Vec<(std::time::SystemTime, PathBuf)> = entries
@@ -986,8 +1018,8 @@ mod keyed_tests {
     #[test]
     fn builds_do_not_share_a_library() {
         let dir = temp("separate");
-        let one = keyed(&dir, "00112233aabbccdd");
-        let two = keyed(&dir, "00112233aabbccde");
+        let one = keyed(&dir, "00112233aabbccdd", true);
+        let two = keyed(&dir, "00112233aabbccde", true);
         assert_ne!(one, two, "two builds share a directory");
         std::fs::create_dir_all(&one).unwrap();
         std::fs::write(one.join(LIBRARY_FILE), b"one").unwrap();
@@ -1008,13 +1040,35 @@ mod keyed_tests {
     #[test]
     fn the_same_build_reuses_its_library() {
         let dir = temp("reuse");
-        let first = keyed(&dir, "00112233aabbccdd");
+        let first = keyed(&dir, "00112233aabbccdd", true);
         saved(&first);
         std::fs::write(first.join(EARLY_FILE), b"early").unwrap();
-        let again = keyed(&dir, "00112233aabbccdd");
+        let again = keyed(&dir, "00112233aabbccdd", true);
         assert_eq!(first, again);
         assert_eq!(std::fs::read(first.join(LIBRARY_FILE)).unwrap(), b"library");
         assert_eq!(std::fs::read(first.join(EARLY_FILE)).unwrap(), b"early");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A warm run of the previous build keeps its library: pruning keeps
+    /// the one used most recently, not the one written most recently.
+    #[test]
+    fn the_library_used_last_is_kept() {
+        let dir = temp("used");
+        let stale = saved(&keyed(&dir, "00112233aabbccdd", false));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let previous = keyed(&dir, "1111222233334444", false);
+        saved(&previous);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // The previous build runs again and adds nothing to its library.
+        assert_eq!(keyed(&dir, "1111222233334444", false), previous);
+
+        // A new build prunes: the stale library goes, the one just used
+        // stays.
+        let current = keyed(&dir, "ffffffffffffffff", true);
+        assert!(current.join(USED_FILE).is_file(), "this run did not mark its own library");
+        assert!(previous.join(LIBRARY_FILE).is_file(), "the library used last was pruned");
+        assert!(!stale.exists(), "the stale library was kept");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1040,7 +1094,7 @@ mod keyed_tests {
         }
         let current = saved(&dir.join("ffffffffffffffff"));
 
-        assert_eq!(keyed(&dir, "ffffffffffffffff").join(LIBRARY_FILE), current);
+        assert_eq!(keyed(&dir, "ffffffffffffffff", true).join(LIBRARY_FILE), current);
         assert!(dir.join("backup").join("sentinel").is_file(), "a foreign directory was deleted");
         // [KEPT] libraries of ours are left: this build's and the newest
         // other one.
