@@ -12038,4 +12038,5 @@ mod tests {
 
     // Buffer formats and their widenings: kept in their own file (lower.rs is at the size limit).
     mod formats;
+    mod widened_exec;
 }
