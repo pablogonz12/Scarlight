@@ -686,9 +686,8 @@ impl Lanes {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
-                Command::Read(request) => {
-                    lane.reads
-                        .push_back((seq, request, std::time::Instant::now()));
+                Command::Read(request, enqueued) => {
+                    lane.reads.push_back((seq, request, enqueued));
                 }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
@@ -810,7 +809,9 @@ const MEMORY_SOURCE: u64 = 1 << 22;
 const PAGE: usize = 64 * 1024;
 
 enum Command {
-    Read(Request),
+    /// A read, and when the title enqueued it: the queue stage runs from
+    /// there, not from the submission that moved it to the workers.
+    Read(Request, std::time::Instant),
     Status(Status),
 }
 
@@ -839,7 +840,7 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
-    queue(this, Command::Read(request));
+    queue(this, Command::Read(request, std::time::Instant::now()));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -943,9 +944,9 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let mark = Mark::begin();
+    // The file read charges `Stage::Read` itself (`read_into`); a memory
+    // source reads nothing, so there is nothing to charge here.
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
-    mark.end(Stage::Read);
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
         let mut packed = vec![0; request.intermediate_size as usize];
@@ -1625,7 +1626,7 @@ mod tests {
         let mut r = request(options, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
-        lane.unsubmitted.push(Command::Read(r));
+        lane.unsubmitted.push(Command::Read(r, std::time::Instant::now()));
     }
 
     #[test]
