@@ -1,5 +1,8 @@
 # Credits
 
+- **Marvis [da82e444](https://github.com/Marvisak/VIctory/commit/da82e444)**, GPL-3.0:
+  correctly rounded normalized buffer format conversion.
+
 - **Marvisak/VIctory [13091f6e](https://github.com/Marvisak/VIctory/commit/13091f6e)**, GPL-3.0:
   array level queries use spatial coordinates only.
 
