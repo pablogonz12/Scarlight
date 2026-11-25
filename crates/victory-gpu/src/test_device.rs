@@ -19,7 +19,7 @@ use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device};
 use windows::core::Interface;
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS,
-    IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIFactory4,
+    IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1, IDXGIFactory4,
 };
 
 /// Which adapter `VICTORY_TEST_ADAPTER` names; anything else is `auto`.
@@ -77,13 +77,24 @@ fn hardware() -> Option<IDXGIAdapter> {
     }
 }
 
+/// The adapter a device runs on, by its LUID: D3D12 has no `IDXGIDevice` in
+/// its object, so a cast to one would fail and every device would look like a
+/// card's (`ID3D12Device::GetAdapterLuid`, `IDXGIFactory4::EnumAdapterByLuid`).
+fn adapter_of(device: &ID3D12Device) -> Option<IDXGIAdapter> {
+    // SAFETY: plain DXGI queries on the device's own LUID.
+    unsafe {
+        let luid = device.GetAdapterLuid();
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        factory.EnumAdapterByLuid(luid).ok()
+    }
+}
+
 /// The vendor and device of the adapter a device runs on, for the one line a
 /// run prints (`None` when the device cannot name its adapter).
 fn named(device: &ID3D12Device) -> Option<(u32, u32)> {
     // SAFETY: plain DXGI queries on the device's own adapter.
     unsafe {
-        let dxgi = device.cast::<IDXGIDevice>().ok()?;
-        let desc = dxgi.GetAdapter().ok()?.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
+        let desc = adapter_of(device)?.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
         Some((desc.VendorId, desc.DeviceId))
     }
 }
@@ -92,12 +103,7 @@ fn named(device: &ID3D12Device) -> Option<(u32, u32)> {
 /// and the kernel's rules are all there is, and a test that pins what a card's
 /// driver adds says so.
 pub(crate) fn is_software(device: &ID3D12Device) -> bool {
-    // SAFETY: plain DXGI queries on the device's own adapter.
-    unsafe {
-        let Ok(dxgi) = device.cast::<IDXGIDevice>() else { return false };
-        let Ok(adapter) = dxgi.GetAdapter() else { return false };
-        software(&adapter) == Some(true)
-    }
+    adapter_of(device).as_ref().and_then(software) == Some(true)
 }
 
 /// A D3D12 device of `level` on the adapter the run asks for, if any.
