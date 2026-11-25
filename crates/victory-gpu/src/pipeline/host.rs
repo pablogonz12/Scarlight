@@ -1376,14 +1376,24 @@ mod tests {
             out.unwrap()
         };
 
-        let run_draw = |min: f32, max: f32| -> u8 {
-            let mut state = crate::draw::State::default();
-            let first_list = host.new_list().unwrap();
-            state.set_depth_bounds(&first_list, min, max);
-            first_list.close();
-            // Replay onto a second host list, exercising `State::replay`.
-            let list = host.new_list().unwrap();
-            state.replay(&list);
+        // `replay`: the bounds go through `State::set_depth_bounds` and
+        // `State::replay`; otherwise they are set on the list alone, so the
+        // host's own support is told apart from replay restoring them.
+        let run_draw = |min: f32, max: f32, replay: bool| -> u8 {
+            let list = if replay {
+                let mut state = crate::draw::State::default();
+                let first_list = host.new_list().unwrap();
+                state.set_depth_bounds(&first_list, min, max);
+                first_list.close();
+                // Replay onto a second host list, exercising `State::replay`.
+                let list = host.new_list().unwrap();
+                state.replay(&list);
+                list
+            } else {
+                let list = host.new_list().unwrap();
+                crate::draw::depth_bounds(&list, min, max);
+                list
+            };
             let rtv = host.rtv(Some(&color), None);
             let dsv = host.dsv(&depth, None);
             let vp = D3D12_VIEWPORT {
@@ -1458,16 +1468,22 @@ mod tests {
         };
 
         // WARP reports depth bounds support through `D3D12_FEATURE_D3D12_OPTIONS2`
-        // and then draws through the bounds: check that the host applies what it
-        // reports before holding it to the assertions below (the probe is the
-        // rejection case itself, so nothing is weakened where the feature works).
-        if run_draw(0.9, 1.0) != 0 {
-            eprintln!(
-                "host reports depth bounds support but draws through the bounds; skipped"
-            );
+        // and then draws through the bounds: probe the host with the bounds set
+        // on the list itself (not through `State::replay`, whose failure the
+        // assertions below must still catch) before holding it to them.
+        if run_draw(0.9, 1.0, false) != 0 {
+            eprintln!("host reports depth bounds support but draws through the bounds; skipped");
             return;
         }
-        assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
-        assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
+        assert_eq!(
+            run_draw(0.6, 1.0, true),
+            0,
+            "depth 0.5 outside [0.6, 1.0] must be rejected"
+        );
+        assert_eq!(
+            run_draw(0.4, 0.6, true),
+            255,
+            "depth 0.5 inside [0.4, 0.6] must pass"
+        );
     }
 }

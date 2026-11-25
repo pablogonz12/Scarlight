@@ -10,6 +10,13 @@ behaviour without a major version bump.
 
 ### Added
 
+- A Steam compatibility tool (`tools/steam-compat/`): install it into Steam's
+  `compatibilitytools.d`, pick **Scarlight (Xbox Series)** under a title's Properties >
+  Compatibility, and Play. It runs on the Wine of an installed Proton, in Steam's own prefix.
+  `scarlight.conf` holds the options, the log is `$STEAM_COMPAT_DATA_PATH/scarlight.log`, and
+  `SCARLIGHT_DRY_RUN=1` binds imports without running. Microsoft's `d3dcompiler_47.dll` is optional
+  and is never shipped; `tools/steam-compat/package.sh` builds the release tarball, which a GitHub
+  Actions job attaches on a tag. See [docs/steam.md](docs/steam.md).
 - Linux build of the Xbox Series compatibility layer, running through Proton (Wine + vkd3d-proton)
   on Mesa's open Vulkan drivers, RADV first.
 - Boot, menus, audio and gamepad input work; menus run at 30 fps.
