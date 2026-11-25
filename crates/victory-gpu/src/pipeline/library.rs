@@ -718,12 +718,14 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
         let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
-        // A list at the cap was truncated when it was written: say so.
-        let truncated = set.len() >= EARLY_MAX;
+        // A list at the cap may have been truncated when it was written;
+        // the file holds only the keys, so say that it is full rather than
+        // that keys were dropped (the save that wrote it logged the count).
+        let at_cap = set.len() >= EARLY_MAX;
         tracing::info!(
             pipelines = set.len(),
             cap = EARLY_MAX,
-            truncated,
+            at_cap,
             "title pipelines to start early"
         );
         *used = Some(set);
@@ -758,6 +760,9 @@ pub(crate) fn note_used(key: &str) {
     } else if set.len() >= EARLY_MAX && !set.contains(key) {
         // Logged once, when the cap is first reached, and counted for every
         // key after it: a run never loses the tail without a word.
+        // The next save must write and log the count even when the list
+        // itself did not change: a refusal alone is not a reason to save.
+        USED_CHANGED.store(true, Ordering::Relaxed);
         let dropped = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
         if dropped == 1 {
             tracing::warn!(
