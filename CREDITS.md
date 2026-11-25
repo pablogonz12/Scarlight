@@ -135,6 +135,8 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   `crates/victory-shader/src/dxbc.rs`; `Source::bytes()` for both the raw and the `SGD5` paths,
   `apps/victory/src/shader.rs`). Reimplemented on this tree's `victory translate`, which has no `warm` command.
 
+- **avatarmanz/VIctory-7900XTX [350c68648](https://github.com/avatarmanz/VIctory-7900XTX/commit/350c68648)** (avatarmanz), GPL-3.0: a texture's first upload started ahead on a copy queue of its own (`texture/ahead.rs`) and a slot shown only once that upload ran (`descriptor/host.rs::show_after`, 3bab23c06), which there ended a device loss every ~16 minutes. Reimplemented on this tree's texture path: `crates/victory-gpu/src/texture/ahead.rs`, the copy queue made at device creation and a submission's wait on its fence in `crates/victory-gpu/src/host.rs`, `VICTORY_UPLOAD_AHEAD=1` and `VICTORY_SHOW_AFTER`.
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
