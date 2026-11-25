@@ -138,6 +138,9 @@ def dxil_sources():
         path
         for path in sorted(glob.glob(os.path.join(ROOT, "crates/victory-shader/src/emit/*.rs")))
         if not path.endswith("_tests.rs")
+        # The direct emitter's files are not the DXIL path: a literal only
+        # they use is not a case for a translated instruction.
+        and not os.path.basename(path).startswith("spirv")
     ]
     ir = os.path.join(ROOT, "crates/victory-shader/src/ir.rs")
     if os.path.exists(ir):
@@ -178,11 +181,22 @@ def coverage(forms, names, tokens, prefix):
     tokens = tokens | {
         token[: -len("_e64")] for token in tokens if token.endswith("_e64")
     }
+    def short_of(name):
+        return name[: -len("_e64")] if name.endswith("_e64") else name
+
+    # One opcode, several names (VOP2 0x006 is both `v_fmac_legacy_f32` and
+    # `v_mac_legacy_f32`, which the decoder names): the opcode is decoded,
+    # so every name of it is.
+    decoded_keys = set()
+    for form in forms:
+        if short_of(form["name"]) not in names:
+            continue
+        decoded_keys.add((form["enc"], form["opcode"]))
     rows = []
     for form in forms:
         name = form["name"]
-        short = name[: -len("_e64")] if name.endswith("_e64") else name
-        decoded = short in names
+        short = short_of(name)
+        decoded = (form["enc"], form["opcode"]) in decoded_keys
         exact = decoded and short in tokens
         via = ""
         if decoded and not exact:
@@ -369,9 +383,7 @@ def scan(args):
         "family": sum(1 for row in rows if row["family"]),
     }
     totals["dxil"] = totals["case"] + totals["family"]
-    totals["spirv"] = totals["spirv"] if spirv_files else None
-    if spirv_files:
-        totals["spirv"] = sum(1 for row in rows if row["spirv"])
+    totals["spirv"] = sum(1 for row in rows if row["spirv"]) if spirv_files else None
 
     decoded_names = {row["name"] for row in rows if row["decoded"]}
     needed = [
@@ -509,7 +521,7 @@ def md_section(data, svg_name="shaders.svg"):
                 row["enc"],
                 row["forms"],
                 row["decoded"],
-                row["case"],
+                row["case"] + row["family"],
                 row["family"],
                 spirv_cell(row),
                 bar(row["decoded"], row["forms"]),
@@ -520,7 +532,7 @@ def md_section(data, svg_name="shaders.svg"):
         % (
             t["forms"],
             t["decoded"],
-            t["case"],
+            t["case"] + t["family"],
             t["family"],
             ("%d" % t["spirv"]) if data["spirv_branch"] else "—",
             bar(t["decoded"], t["forms"]),
@@ -735,7 +747,9 @@ def progress_svg(data):
     rows = data["per_encoding"]
     label_w = 96
     bar_w = 360
-    width = label_w + bar_w + 78
+    # The aggregate labels sit after their track (`label_w + total_w + 8`):
+    # the document has to be wide enough for them.
+    width = label_w + bar_w + 128
     top = 116
     step = 19
     height = top + step * len(rows) + 46
@@ -951,7 +965,7 @@ text{fill:var(--fg)}text.muted{fill:var(--muted)}
                 esc(row["enc"]),
                 row["forms"],
                 row["decoded"],
-                row["case"],
+                row["case"] + row["family"],
                 row["family"],
                 ("%d" % row["spirv"]) if data["spirv_branch"] else "—",
             )

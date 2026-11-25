@@ -1,6 +1,6 @@
 {
  "date": "2026-11-25",
- "decoded_names": 1200,
+ "decoded_names": 1203,
  "decoder_forms": 1232,
  "formats": {
   "texture": 98,
@@ -111,8 +111,8 @@
     "VOP2",
     "VOPC"
    ],
-   "case": 266,
-   "decoded": 295,
+   "case": 267,
+   "decoded": 296,
    "decoder": true,
    "forms": 322,
    "modifier": "DPP16"
@@ -124,8 +124,8 @@
     "VOP2",
     "VOPC"
    ],
-   "case": 266,
-   "decoded": 295,
+   "case": 267,
+   "decoded": 296,
    "decoder": true,
    "forms": 322,
    "modifier": "DPP8"
@@ -137,8 +137,8 @@
     "VOP2",
     "VOPC"
    ],
-   "case": 266,
-   "decoded": 295,
+   "case": 267,
+   "decoded": 296,
    "decoder": true,
    "forms": 322,
    "modifier": "SDWA"
@@ -156,26 +156,6 @@
   {
    "enc": "SOP1",
    "name": "s_brev_b64"
-  },
-  {
-   "enc": "SOP1",
-   "name": "s_bcnt0_i32_b32"
-  },
-  {
-   "enc": "SOP1",
-   "name": "s_bcnt0_i32_b64"
-  },
-  {
-   "enc": "SOP1",
-   "name": "s_ff0_i32_b32"
-  },
-  {
-   "enc": "SOP1",
-   "name": "s_ff0_i32_b64"
-  },
-  {
-   "enc": "SOP1",
-   "name": "s_flbit_i32_b64"
   },
   {
    "enc": "SOP1",
@@ -378,18 +358,38 @@
    "name": "s_trap"
   },
   {
-   "enc": "SOPP",
-   "name": "s_cbranch_cdbgsys"
+   "enc": "SMEM",
+   "name": "s_load_dwordx2"
   },
   {
-   "enc": "SOPP",
-   "name": "s_cbranch_cdbguser"
+   "enc": "SMEM",
+   "name": "s_load_dwordx4"
+  },
+  {
+   "enc": "SMEM",
+   "name": "s_load_dwordx8"
+  },
+  {
+   "enc": "SMEM",
+   "name": "s_load_dwordx16"
+  },
+  {
+   "enc": "SMEM",
+   "name": "s_scratch_load_dword"
+  },
+  {
+   "enc": "SMEM",
+   "name": "s_scratch_load_dwordx2"
+  },
+  {
+   "enc": "SMEM",
+   "name": "s_scratch_load_dwordx4"
   }
  ],
- "needed_total": 520,
+ "needed_total": 492,
  "per_encoding": [
   {
-   "case": 23,
+   "case": 28,
    "decoded": 66,
    "enc": "SOP1",
    "family": 2,
@@ -413,10 +413,10 @@
    "spirv": 0
   },
   {
-   "case": 4,
+   "case": 6,
    "decoded": 18,
    "enc": "SOPC",
-   "family": 10,
+   "family": 8,
    "forms": 18,
    "spirv": 0
   },
@@ -424,12 +424,12 @@
    "case": 30,
    "decoded": 37,
    "enc": "SOPP",
-   "family": 0,
+   "family": 4,
    "forms": 37,
    "spirv": 0
   },
   {
-   "case": 9,
+   "case": 8,
    "decoded": 84,
    "enc": "SMEM",
    "family": 0,
@@ -437,7 +437,7 @@
    "spirv": 0
   },
   {
-   "case": 59,
+   "case": 60,
    "decoded": 81,
    "enc": "VOP1",
    "family": 0,
@@ -446,17 +446,17 @@
   },
   {
    "case": 36,
-   "decoded": 44,
+   "decoded": 45,
    "enc": "VOP2",
    "family": 1,
    "forms": 51,
    "spirv": 0
   },
   {
-   "case": 63,
-   "decoded": 110,
+   "case": 70,
+   "decoded": 112,
    "enc": "VOP3",
-   "family": 2,
+   "family": 3,
    "forms": 118,
    "spirv": 0
   },
@@ -469,15 +469,15 @@
    "spirv": 0
   },
   {
-   "case": 0,
+   "case": 4,
    "decoded": 170,
    "enc": "VOPC",
-   "family": 170,
+   "family": 166,
    "forms": 190,
    "spirv": 0
   },
   {
-   "case": 11,
+   "case": 12,
    "decoded": 154,
    "enc": "DS",
    "family": 0,
@@ -485,23 +485,23 @@
    "spirv": 0
   },
   {
-   "case": 0,
+   "case": 16,
    "decoded": 75,
    "enc": "MUBUF",
-   "family": 75,
+   "family": 59,
    "forms": 75,
    "spirv": 0
   },
   {
-   "case": 1,
+   "case": 0,
    "decoded": 16,
    "enc": "MTBUF",
-   "family": 7,
+   "family": 8,
    "forms": 16,
    "spirv": 0
   },
   {
-   "case": 11,
+   "case": 24,
    "decoded": 103,
    "enc": "MIMG",
    "family": 16,
@@ -555,18 +555,14 @@
  },
  "spirv_branch": false,
  "totals": {
-  "case": 306,
-  "decoded": 1200,
-  "dxil": 680,
-  "family": 374,
+  "case": 353,
+  "decoded": 1203,
+  "dxil": 711,
+  "family": 358,
   "forms": 1236,
   "spirv": null
  },
  "undecoded": [
-  {
-   "enc": "VOP2",
-   "name": "v_fmac_legacy_f32"
-  },
   {
    "enc": "VOP2",
    "name": "v_add_u32"
@@ -593,10 +589,6 @@
   },
   {
    "enc": "VOP3",
-   "name": "v_fma_legacy_f32"
-  },
-  {
-   "enc": "VOP3",
    "name": "v_add_u16_e64"
   },
   {
@@ -610,10 +602,6 @@
   {
    "enc": "VOP3",
    "name": "v_sub_i16"
-  },
-  {
-   "enc": "VOP3",
-   "name": "v_interp_p2_hi_f16"
   },
   {
    "enc": "VOP3",
