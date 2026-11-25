@@ -33,13 +33,21 @@ pub struct StaticSampler {
 // The floats come from fixed-point fields: never NaN.
 impl Eq for StaticSampler {}
 
+/// Whether the sampler's own mip filter is asked of the host
+/// (`VICTORY_ANISO_POINT_MIP=0` keeps the old linear-mip approximation for
+/// anisotropic samplers).
+fn aniso_point_mip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_ANISO_POINT_MIP").map_or(true, |v| v != "0"))
+}
+
 impl StaticSampler {
     /// The filter supported by the host device. Anisotropic point-mip
     /// filtering is optional (`D3D12_OPTIONS19`); older devices retain the
     /// previous linear-mip approximation. Comparison/min/max reduction
     /// bits and the sampler's LOD bounds are unchanged.
     pub fn filter_for_host(&self, aniso_point_mip_supported: bool) -> u32 {
-        if !aniso_point_mip_supported && self.filter & !0x180 == 0x54 {
+        if !(aniso_point_mip_supported && aniso_point_mip()) && self.filter & !0x180 == 0x54 {
             self.filter | 1
         } else {
             self.filter

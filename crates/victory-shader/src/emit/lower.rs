@@ -108,6 +108,15 @@ const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
 
+/// Whether a 16-bit interpolation applies its output modifier (omod) and
+/// clamp (`VICTORY_INTERP_F16_OMOD_CLAMP=0` leaves both out).
+fn interp_f16_omod_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_INTERP_F16_OMOD_CLAMP").map_or(true, |v| v != "0")
+    })
+}
+
 /// The f16 bits of inline float constant `c` (240..=248: 0.5, -0.5, 1.0,
 /// -1.0, 2.0, -2.0, 4.0, -4.0, 1/(2 pi)).
 fn inline_f16(c: u8) -> u32 {
@@ -8992,7 +9001,9 @@ impl<'a> Lower<'a> {
                 } else if f16 {
                     let z = self.s.m.f32(0);
                     let mut f = half(self, h)?.unwrap_or(z);
-                    if let Fields::Valu(v) = &inst.fields {
+                    if interp_f16_omod_clamp()
+                        && let Fields::Valu(v) = &inst.fields
+                    {
                         if v.omod != 0 {
                             let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
                             let k = self.s.m.f32(factor.to_bits());
