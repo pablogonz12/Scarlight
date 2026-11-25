@@ -1987,6 +1987,12 @@ impl Shadow {
     /// shortcut: what shaders wrote is found by keeping the range's bytes
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
+    /// Whether this host copy's bytes are the title memory itself (in place):
+    /// the shaders write there, so there is no snapshot and no copy-back.
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.

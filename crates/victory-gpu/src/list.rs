@@ -2400,7 +2400,16 @@ mod tests {
         // The source's refresh first (the bytes the copy reads), then the
         // destination's GPU write (nothing may copy title memory over it
         // before the copy-back).
-        assert_eq!(list.step_kinds(), [StepKind::Refresh, StepKind::GpuWrite]);
+        // In place the destination's host copy *is* title memory
+        // ([`crate::shadow::Shadow::gpu_writes`] returns early): the GPU's
+        // copy lands there, so there is no snapshot to take and nothing to
+        // copy back for it.
+        let expected: &[StepKind] = if to.in_place() {
+            &[StepKind::Refresh]
+        } else {
+            &[StepKind::Refresh, StepKind::GpuWrite]
+        };
+        assert_eq!(list.step_kinds(), expected);
         list.close();
         host.execute(&[&list]);
         // SAFETY: inside the destination's host copy, which is mapped.
