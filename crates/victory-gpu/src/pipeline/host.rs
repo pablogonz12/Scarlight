@@ -1163,6 +1163,208 @@ mod tests {
         }
     }
 
+    /// A direct mesh dispatch forwards the caller's whole group grid: the
+    /// host counts a group of every `x`, `y` and `z` (the `x`-only indirect
+    /// entry keeps its call at one group across `y` and `z`). `MS` is one
+    /// thread per group, so `MSInvocations` is the number of groups.
+    #[test]
+    fn a_mesh_dispatch_forwards_all_group_counts() {
+        use crate::object::{S_OK, This, guid, slot};
+
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        if !host.mesh_shaders() {
+            eprintln!("no host mesh shader support; skipped");
+            return;
+        }
+        let Some(dxc) = dxc() else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let ms = compile(&dxc, dir.path(), MS, "ms_6_6");
+        // The translation is the container's own host code: it is already
+        // DXIL, so nothing is emitted and the test needs no console container.
+        let shader = Shader {
+            stage: "mesh",
+            hash: "mesh grid".to_owned(),
+            full_hash: *blake3::hash(&ms).as_bytes(),
+            container: ms.clone(),
+            translated: std::sync::OnceLock::new(),
+        };
+        assert!(
+            shader
+                .translated
+                .set(Some(Translated {
+                    host: victory_shader::emit::HostShader {
+                        stage: victory_shader::HwStage::Ms,
+                        dxil: ms,
+                        user_data: vec![],
+                        samplers: vec![],
+                        static_samplers: vec![],
+                        root_cbvs: vec![],
+                        root_srvs: vec![],
+                        root_uavs: vec![],
+                        root_indexed_views: vec![],
+                    },
+                    used: vec![],
+                    stores: false,
+                }))
+                .is_ok()
+        );
+        let mut g = GraphicsState {
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ..Default::default()
+        };
+        // This pipeline has one color target, with no depth buffer.
+        g.depth.DepthEnable = false.into();
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let null = std::ptr::null();
+        let mut pipeline = null;
+        assert_eq!(
+            super::super::hand_out(
+                vec![Arc::new(shader)],
+                Some(Box::new(g)),
+                &super::super::PIPELINE_IIDS[0],
+                &mut pipeline
+            ),
+            S_OK
+        );
+        assert!(
+            crate::pipeline::host_pipeline(pipeline).is_some(),
+            "native mesh pipeline did not build"
+        );
+
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut alloc, mut list) = (null, null);
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut alloc),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, alloc, null, &list_iid, &mut list),
+            S_OK
+        );
+        let native = crate::list::host_list(list).expect("a host list");
+        slot::<extern "system" fn(This, This)>(list, 0xc8)(list, pipeline);
+        let groups = [(2, 1, 1), (2, 3, 1), (2, 1, 4), (2, 3, 4), (2, 0, 4)];
+        let count = groups.len() as u32 + 1;
+        let mut queries: Option<ID3D12QueryHeap> = None;
+        // SAFETY: a live device and storage for the returned query heap.
+        let made = unsafe {
+            host.device.CreateQueryHeap(
+                &D3D12_QUERY_HEAP_DESC {
+                    Type: D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1,
+                    Count: count,
+                    NodeMask: 0,
+                },
+                &mut queries,
+            )
+        };
+        let Some(queries) = made.ok().and(queries) else {
+            eprintln!("mesh pipeline statistics unavailable; skipped");
+            return;
+        };
+        let size = usize::try_from(count).unwrap() * size_of::<D3D12_QUERY_DATA_PIPELINE_STATISTICS1>();
+        let readback = {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_READBACK,
+                ..Default::default()
+            };
+            let rd = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size as u64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut out: Option<ID3D12Resource> = None;
+            // SAFETY: a valid readback buffer description.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &rd,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut out,
+                    )
+                    .unwrap();
+            }
+            out.unwrap()
+        };
+        let kind = D3D12_QUERY_TYPE_PIPELINE_STATISTICS1;
+        let dispatch = slot::<extern "system" fn(This, u32, u32, u32)>(
+            list,
+            crate::list::slot_offset_for_test(list, 0x3f8),
+        );
+        let x_only = slot::<extern "system" fn(This, u32, u64, u64, u64)>(
+            list,
+            crate::list::slot_offset_for_test(list, 0x310),
+        );
+        for (index, (x, y, z)) in groups.into_iter().enumerate() {
+            // SAFETY: the open list and the indexed query belong to this test.
+            unsafe { native.list.BeginQuery(&queries, kind, index as u32) };
+            dispatch(list, x, y, z);
+            // SAFETY: ends the query begun above, of the same type and index.
+            unsafe { native.list.EndQuery(&queries, kind, index as u32) };
+        }
+        let last = groups.len() as u32;
+        // SAFETY: a live query heap with one more query and a live list.
+        unsafe { native.list.BeginQuery(&queries, kind, last) };
+        // The direct call's `x` only, as the console's indirect entry has it.
+        x_only(list, 2, 0, 0, 0);
+        // SAFETY: every query was begun and ended by this list, and the
+        // readback buffer holds one statistics record per query.
+        unsafe {
+            native.list.EndQuery(&queries, kind, last);
+            native
+                .list
+                .ResolveQueryData(&queries, kind, 0, count, &readback, 0);
+        }
+        assert_eq!(
+            slot::<extern "system" fn(This) -> i32>(list, 0x48)(list),
+            S_OK
+        );
+        host.execute(&[native]);
+        let mut ptr = std::ptr::null_mut();
+        // SAFETY: `execute` waited for the GPU, which wrote `count` records.
+        let actual: Vec<u64> = unsafe {
+            readback.Map(0, None, Some(&mut ptr)).unwrap();
+            let records = std::slice::from_raw_parts(
+                ptr.cast::<D3D12_QUERY_DATA_PIPELINE_STATISTICS1>(),
+                usize::try_from(count).unwrap(),
+            );
+            let actual = records.iter().map(|s| s.MSInvocations).collect();
+            readback.Unmap(0, None);
+            actual
+        };
+        for object in [list, alloc, pipeline] {
+            slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        }
+        assert_eq!(actual, [2, 6, 8, 24, 0, 2]);
+    }
+
     /// A mesh pipeline made once is loaded from the library the next time,
     /// not compiled again (a stream without a topology never loads).
     #[test]
