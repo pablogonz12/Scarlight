@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
+use crate::compare::{changed_runs, first_difference, last_difference};
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
@@ -1051,63 +1052,6 @@ fn give_back(v: Vec<u8>) {
 
 const NOT_WATCHED: u8 = 2;
 
-/// Where `a` and `b` (of one length) first differ, compared eight bytes at
-/// a time.
-fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
-    let whole = a.len().min(b.len()) / 8 * 8;
-    let from = a[..whole]
-        .as_chunks::<8>().0.iter()
-        .zip(b[..whole].chunks_exact(8))
-        .position(|(x, y)| x != y)
-        .map_or(whole, |word| word * 8);
-    a[from..].iter().zip(&b[from..]).position(|(x, y)| x != y).map(|i| from + i)
-}
-
-/// Where `a` and `b` (of one length) last differ.
-fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
-    let whole = a.len().min(b.len()) / 8 * 8;
-    if let Some(i) = a[whole..].iter().zip(&b[whole..]).rposition(|(x, y)| x != y) {
-        return Some(whole + i);
-    }
-    let word = a[..whole]
-        .as_chunks::<8>().0.iter()
-        .zip(b[..whole].chunks_exact(8))
-        .rposition(|(x, y)| x != y)?
-        * 8;
-    a[word..word + 8]
-        .iter()
-        .zip(&b[word..word + 8])
-        .rposition(|(x, y)| x != y)
-        .map(|i| word + i)
-}
-
-#[cfg(test)]
-mod difference_tests {
-    use super::{first_difference, last_difference};
-
-    /// The word-wise searches agree with the byte-wise ones they replace.
-    #[test]
-    fn differences_are_found_as_byte_by_byte() {
-        let base: Vec<u8> = (0..61u32).map(|i| (i * 7 + 3) as u8).collect();
-        let same = base.clone();
-        assert_eq!(first_difference(&base, &same), None);
-        assert_eq!(last_difference(&base, &same), None);
-        for len in [0usize, 1, 7, 8, 9, 16, 23, 61] {
-            for at in 0..len {
-                for other in at..len {
-                    let (a, mut b) = (&base[..len], base[..len].to_vec());
-                    b[at] ^= 0x80;
-                    b[other] ^= 0x01;
-                    let first = a.iter().zip(&b).position(|(x, y)| x != y);
-                    let last = a.iter().zip(&b).rposition(|(x, y)| x != y);
-                    assert_eq!(first_difference(a, &b), first, "{len} {at} {other}");
-                    assert_eq!(last_difference(a, &b), last, "{len} {at} {other}");
-                }
-            }
-        }
-    }
-}
-
 /// The unit shader writes are looked for and put back in.
 const PIECE: usize = 64 << 10;
 
@@ -1468,7 +1412,7 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                             std::slice::from_raw_parts((before + at) as *const u8, n),
                         )
                     };
-                    if now != old {
+                    if !crate::compare::equal(now, old) {
                         pieces.push((at, n));
                     }
                     at += n;
@@ -1635,79 +1579,6 @@ static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// [`MERGED`], taken.
 pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
-}
-
-/// The runs of bytes where `now` differs from `was` (of one length), as
-/// (offset, bytes) in order: every differing byte is in a run and no equal
-/// byte is.
-fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
-    #[inline]
-    fn all_differ_8(a: u64, b: u64) -> bool {
-        let d = a ^ b;
-        d.wrapping_sub(0x0101_0101_0101_0101) & !d & 0x8080_8080_8080_8080 == 0
-    }
-    #[inline]
-    unsafe fn load_u64(ptr: *const u8, off: usize) -> u64 {
-        unsafe { ptr.add(off).cast::<u64>().read_unaligned() }
-    }
-    let n = now.len().min(was.len());
-    let (np, wp) = (now.as_ptr(), was.as_ptr());
-    let mut runs = Vec::new();
-    let mut i = 0;
-    while i < n {
-        // Equal bytes: 64 bytes at a time, then 8 bytes at a time.
-        while i + 64 <= n {
-            let eq = unsafe {
-                load_u64(np, i) == load_u64(wp, i)
-                    && load_u64(np, i + 8) == load_u64(wp, i + 8)
-                    && load_u64(np, i + 16) == load_u64(wp, i + 16)
-                    && load_u64(np, i + 24) == load_u64(wp, i + 24)
-                    && load_u64(np, i + 32) == load_u64(wp, i + 32)
-                    && load_u64(np, i + 40) == load_u64(wp, i + 40)
-                    && load_u64(np, i + 48) == load_u64(wp, i + 48)
-                    && load_u64(np, i + 56) == load_u64(wp, i + 56)
-            };
-            if !eq {
-                break;
-            }
-            i += 64;
-        }
-        while i + 8 <= n && unsafe { load_u64(np, i) == load_u64(wp, i) } {
-            i += 8;
-        }
-        while i < n && unsafe { *np.add(i) == *wp.add(i) } {
-            i += 1;
-        }
-        if i >= n {
-            break;
-        }
-        let first = i;
-        // Differing bytes: 64 bytes at a time, then 8 bytes at a time.
-        while i + 64 <= n {
-            let diff = unsafe {
-                all_differ_8(load_u64(np, i), load_u64(wp, i))
-                    && all_differ_8(load_u64(np, i + 8), load_u64(wp, i + 8))
-                    && all_differ_8(load_u64(np, i + 16), load_u64(wp, i + 16))
-                    && all_differ_8(load_u64(np, i + 24), load_u64(wp, i + 24))
-                    && all_differ_8(load_u64(np, i + 32), load_u64(wp, i + 32))
-                    && all_differ_8(load_u64(np, i + 40), load_u64(wp, i + 40))
-                    && all_differ_8(load_u64(np, i + 48), load_u64(wp, i + 48))
-                    && all_differ_8(load_u64(np, i + 56), load_u64(wp, i + 56))
-            };
-            if !diff {
-                break;
-            }
-            i += 64;
-        }
-        while i + 8 <= n && unsafe { all_differ_8(load_u64(np, i), load_u64(wp, i)) } {
-            i += 8;
-        }
-        while i < n && unsafe { *np.add(i) != *wp.add(i) } {
-            i += 1;
-        }
-        runs.push((first, i - first));
-    }
-    runs
 }
 
 #[cfg(test)]

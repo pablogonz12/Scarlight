@@ -148,6 +148,13 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   `crates/victory-shader/src/dxbc.rs`; `Source::bytes()` for both the raw and the `SGD5` paths,
   `apps/victory/src/shader.rs`). Reimplemented on this tree's `victory translate`, which has no `warm` command.
 
+- **avatarmanz/VIctory-7900XTX** (GPL-3.0), commit [b6202840a](https://github.com/avatarmanz/VIctory-7900XTX/commit/b6202840a):
+  the idea of comparing title bytes under shader writes with AVX2 rather than eight bytes at a time: the copy-back's
+  piece walk, its first and last difference and the differing runs take thirty-two bytes a compare where the CPU has
+  AVX2, checked at run time, with the eight-byte walk kept as the fallback (`crates/victory-gpu/src/compare.rs`,
+  `VICTORY_AVX2_COMPARE=1`; on his machine 14 -> 4-7 ms of compares a frame). His compares run on threads of their
+  own; ours already do (`wide` in `shadow.rs`).
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
