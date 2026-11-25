@@ -153,6 +153,9 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if placeholder && base.is_null() && !at.is_null() {
+        victory_gpu::title_memory_placeholder(at as usize, size);
+    }
     if base.is_null() {
         tracing::debug!(
             size,

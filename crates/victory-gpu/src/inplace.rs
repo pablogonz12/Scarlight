@@ -54,7 +54,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
@@ -581,6 +581,109 @@ static VIEWS: Mutex<Views> = Mutex::new(Views { views: BTreeMap::new(), sections
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The runtime's placeholder reservations (`MEM_RESERVE_PLACEHOLDER`, made by
+/// `xmem::XMemVirtualAlloc`) for its 64 KiB pages, as `base -> bytes`.
+///
+/// Inside one, pages can only become mapped or unmapped through `xmem::map`,
+/// which tells the GPU side ([`title_memory_view`] and
+/// [`crate::title_memory_remapped`]), and can never be write-watched. So the
+/// guards and the copies answer "is this a view", "how much of it is there"
+/// and "which of its blocks are unmapped holes" from this table and [`VIEWS`],
+/// instead of thousands of `GetWriteWatch`/`VirtualQuery`/`VirtualProtect`
+/// calls a frame ([`PLACEHOLDER_HITS`] counts them).
+static PLACEHOLDERS: RwLock<BTreeMap<usize, usize>> = RwLock::new(BTreeMap::new());
+
+/// Placeholder fast-path skips since the last reading: [0] write-watch
+/// questions never asked, [1] absent-block `VirtualQuery` walks cut short,
+/// [2] `texture::committed`/`mapped_bytes` `VirtualQuery` walks skipped.
+pub(crate) static PLACEHOLDER_HITS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// `VICTORY_PLACEHOLDER_FAST`: on; `=0` answers every placeholder question the
+/// old way, with the kernel calls.
+pub(crate) fn placeholder_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACEHOLDER_FAST").is_none_or(|v| v != "0"))
+}
+
+/// The runtime reserved a placeholder region `[at, at + len)` for its 64 KiB
+/// pages (`XMemVirtualAlloc` with `MEM_RESERVE_PLACEHOLDER`).
+pub fn title_memory_placeholder(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    PLACEHOLDERS.write().unwrap_or_else(|e| e.into_inner()).insert(at, len);
+}
+
+/// Whether all of `[start, end)` lies inside one placeholder reservation.
+pub(crate) fn placeholder_range(start: usize, end: usize) -> bool {
+    if !placeholder_fast() || start >= end {
+        return false;
+    }
+    let map = PLACEHOLDERS.read().unwrap_or_else(|e| e.into_inner());
+    map.range(..=start).next_back().is_some_and(|(&base, &len)| end <= base.saturating_add(len))
+}
+
+/// The bytes of `[start, start + len)` that are there, from [`VIEWS`] alone
+/// (no kernel call), for a range inside a placeholder; `None` outside one.
+pub(crate) fn placeholder_mapped_bytes(start: usize, len: usize) -> Option<u64> {
+    if len == 0 || !placeholder_range(start, start.saturating_add(len)) {
+        return None;
+    }
+    PLACEHOLDER_HITS[2].fetch_add(1, Ordering::Relaxed);
+    Some(mapped_bytes_in(&views(), start, start.saturating_add(len)))
+}
+
+/// The merged runs `(from, to)` of 64 KiB blocks of `[from_block, to_block)`
+/// that are mapped, for a block range inside a placeholder; `None` outside
+/// one. The blocks between the runs are unmapped holes, without asking.
+pub(crate) fn placeholder_mapped_blocks(from_block: usize, to_block: usize) -> Option<Vec<(usize, usize)>> {
+    if from_block >= to_block {
+        return None;
+    }
+    let (start, end) = (from_block.checked_mul(K64)?, to_block.checked_mul(K64)?);
+    if !placeholder_range(start, end) {
+        return None;
+    }
+    let v = views();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut push = |lo: usize, hi: usize| {
+        let (lo, hi) = ((lo / K64).max(from_block), hi.div_ceil(K64).min(to_block));
+        if lo >= hi {
+            return;
+        }
+        match runs.last_mut() {
+            Some((_, last)) if lo <= *last => *last = (*last).max(hi),
+            _ => runs.push((lo, hi)),
+        }
+    };
+    if let Some((&base, &(bytes, _, _))) = v.views.range(..=start).next_back()
+        && base.saturating_add(bytes) > start
+    {
+        push(start, base.saturating_add(bytes).min(end));
+    }
+    for (&base, &(bytes, _, _)) in v.views.range(start.saturating_add(1)..end) {
+        push(base, base.saturating_add(bytes).min(end));
+    }
+    Some(runs)
+}
+
+/// The bytes the views of `v` show of `[start, end)`.
+fn mapped_bytes_in(v: &Views, start: usize, end: usize) -> u64 {
+    let mut there = 0u64;
+    if let Some((&base, &(bytes, _, _))) = v.views.range(..=start).next_back()
+        && base.saturating_add(bytes) > start
+    {
+        there += (base.saturating_add(bytes).min(end) - start) as u64;
+    }
+    for (&base, &(bytes, _, _)) in v.views.range(start.saturating_add(1)..end) {
+        let hi = base.saturating_add(bytes).min(end);
+        if hi > base {
+            there += (hi - base) as u64;
+        }
+    }
+    there
 }
 
 /// The runtime made a section of `bytes` for physical pages; `committed`
@@ -1472,6 +1575,41 @@ mod tests {
             assert!(whole_allocation(base as usize, 4 * K64));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }
+    }
+
+    /// The placeholder table answers the guards' and the copies' questions
+    /// from the view census: mapped bytes and the mapped runs of a block
+    /// range inside a runtime placeholder, and `None` outside one.
+    #[test]
+    fn placeholder_tables_say_what_is_mapped_without_asking() {
+        let base = 0x7_6ca0_0000usize;
+        title_memory_placeholder(base, 8 * K64);
+        assert!(placeholder_range(base, base + 8 * K64));
+        assert!(placeholder_range(base + 16, base + K64));
+        assert!(!placeholder_range(base, base + 9 * K64));
+        assert!(!placeholder_range(base + 8 * K64, base + 9 * K64));
+        assert_eq!(placeholder_mapped_bytes(base, 8 * K64), Some(0));
+        assert_eq!(placeholder_mapped_blocks(base / K64, base / K64 + 8), Some(Vec::new()));
+
+        // Blocks [1, 3) and [5, 6) mapped, holes at 0, 3, 4, 6, 7.
+        title_memory_view(base + K64, 2 * K64, 88, 0);
+        title_memory_view(base + 5 * K64, K64, 88, 2 * K64 as u64);
+        assert_eq!(placeholder_mapped_bytes(base, 8 * K64), Some(3 * K64 as u64));
+        // A range that starts inside a view.
+        assert_eq!(
+            placeholder_mapped_bytes(base + K64 + 16, 2 * K64 - 32),
+            Some((2 * K64 - 32) as u64)
+        );
+        assert_eq!(
+            placeholder_mapped_blocks(base / K64, base / K64 + 8),
+            Some(vec![(base / K64 + 1, base / K64 + 3), (base / K64 + 5, base / K64 + 6)])
+        );
+        // Outside a placeholder: nothing is claimed.
+        assert_eq!(placeholder_mapped_bytes(base + 8 * K64, K64), None);
+
+        // What the runtime unmaps is no longer shown.
+        views_gone(base, 8 * K64);
+        assert_eq!(placeholder_mapped_bytes(base, 8 * K64), Some(0));
     }
 
     /// Only private memory committed whole, read-write, is taken for a part.

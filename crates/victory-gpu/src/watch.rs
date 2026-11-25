@@ -594,11 +594,20 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     if first >= last {
         return Some(Vec::new());
     }
+    // A range inside a runtime placeholder reservation is view memory, and
+    // asking Windows whether it is (`is_view`: a `VirtualQuery` a hole) or
+    // asking the kernel's write watch about it (it cannot be write-watched)
+    // can only say what the table says: those questions are not put.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
-        let g = guards();
-        g.protected.contains(first) || g.absent.contains(first)
-    };
+    let in_placeholder = crate::inplace::placeholder_range(first * BLOCK, last * BLOCK);
+    if in_placeholder {
+        crate::inplace::PLACEHOLDER_HITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let known = in_placeholder
+        || (!*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
+            let g = guards();
+            g.protected.contains(first) || g.absent.contains(first)
+        });
     if !known && !is_view(start, end) {
         return None;
     }
@@ -616,7 +625,19 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         let lo = if w == first_w { first & 63 } else { 0 };
         let hi = if w == last_w { ((last - 1) & 63) + 1 } else { 64 };
         let mask = BlockSet::word_mask(lo, hi);
-        let mut open = mask & !g.clean.word(w);
+        // In a placeholder, a block noted absent is a hole the runtime has
+        // not mapped since (a mapping clears the note): no `VirtualQuery` to
+        // find that out again (`PLACEHOLDER_HITS[1]`).
+        let mut open = if in_placeholder {
+            let holes = mask & g.absent.word(w) & !g.clean.word(w);
+            if holes != 0 {
+                crate::inplace::PLACEHOLDER_HITS[1]
+                    .fetch_add(holes.count_ones() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            mask & !(g.clean.word(w) | holes)
+        } else {
+            mask & !g.clean.word(w)
+        };
         if open == 0 {
             if let Some((r0, r1)) = run.take() {
                 protect(&mut g, r0, r1);
@@ -738,6 +759,39 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     };
     if set(from, to) {
         note(g, from, to);
+        return;
+    }
+    // Inside a runtime placeholder the unmapped parts are known — they are
+    // the blocks between the mapped runs — so they are noted absent here
+    // instead of a failing `VirtualProtect` and a `VirtualQuery` a block: the
+    // title's 64 KiB reservations are mostly holes (`PLACEHOLDER_HITS[1]`).
+    if let Some(runs) = crate::inplace::placeholder_mapped_blocks(from, to) {
+        let mut cursor = from;
+        let note_holes = |g: &mut Guards, from: usize, to: usize| {
+            if from < to {
+                g.absent.insert_range(from, to);
+                g.mapped.remove_range(from, to);
+                crate::inplace::PLACEHOLDER_HITS[1]
+                    .fetch_add((to - from) as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        for (r0, r1) in runs {
+            note_holes(g, cursor, r0);
+            if set(r0, r1) {
+                note(g, r0, r1);
+            } else {
+                for block in r0..r1 {
+                    if set(block, block + 1) {
+                        note(g, block, block + 1);
+                    } else if block < uncommitted_end(block) {
+                        g.absent.insert(block);
+                        g.mapped.remove(block);
+                    }
+                }
+            }
+            cursor = r1;
+        }
+        note_holes(g, cursor, to);
         return;
     }
     for block in from..to {
@@ -1188,6 +1242,113 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// The placeholder fast path, measured: a 64 MiB runtime placeholder
+    /// reservation with 4 MiB of its blocks mapped and 960 blocks of holes,
+    /// guarded whole (`guard`, the frame's question) with the guards reset
+    /// each round. Prints ms a round and the skips counted; run the same exe
+    /// with `VICTORY_PLACEHOLDER_FAST=0` for the kernel arm (the switch is
+    /// read once, so it takes a run each).
+    #[test]
+    fn placeholder_guard_microbench() {
+        use std::ffi::c_void;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEMORY_BASIC_INFORMATION, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2, VirtualAlloc2,
+            VirtualQuery,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        use std::sync::atomic::Ordering;
+        const ROUNDS: usize = 20;
+        let (base, blocks, mapped) = (0x7_6cc0_0000 as *mut c_void, 1024usize, 64usize);
+        let len = blocks * BLOCK;
+        // SAFETY: a range of our own at an address of our choice, as the
+        // runtime's placeholder for 64 KiB pages; then a section mapped into
+        // its first 4 MiB, as `xmem::map` does.
+        let view = unsafe {
+            assert_eq!(
+                VirtualAlloc2(
+                    GetCurrentProcess(),
+                    base,
+                    len,
+                    MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                    PAGE_NOACCESS,
+                    std::ptr::null_mut(),
+                    0,
+                ),
+                base
+            );
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (mapped * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let split = VirtualFree(base, mapped * BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            let split_err = std::io::Error::last_os_error();
+            let view = MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                base,
+                0,
+                mapped * BLOCK,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert_eq!(
+                view.Value,
+                base,
+                "the placeholder could not take a view: split {split} ({split_err}), map {:?}",
+                std::io::Error::last_os_error()
+            );
+            view
+        };
+        // The same numbers a 64 KiB block's `VirtualQuery` gives, for the
+        // kernel arm's syscall count: one question, whatever the answer.
+        let queries = std::time::Instant::now();
+        for _ in 0..1000 {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            unsafe { VirtualQuery(base.cast(), &mut info, size_of_val(&info)) };
+        }
+        let per_query = queries.elapsed().as_secs_f64() * 1e6 / 1000.0;
+        crate::inplace::title_memory_placeholder(base as usize, len);
+        crate::inplace::title_memory_view(base as usize, mapped * BLOCK, 77, 0);
+        let started = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            {
+                let mut g = guards();
+                (g.protected, g.clean, g.absent, g.mapped) =
+                    (BlockSet::new(), BlockSet::new(), BlockSet::new(), BlockSet::new());
+            }
+            let written = guard(base as usize, base as usize + len).expect("a placeholder is view memory");
+            assert_eq!(written.len(), blocks * BLOCK / PAGE, "every block of it is asked about");
+        }
+        let round = started.elapsed().as_secs_f64() * 1e3 / ROUNDS as f64;
+        let [watch, absent, bytes] = [0, 1, 2].map(|i| crate::inplace::PLACEHOLDER_HITS[i].swap(0, Ordering::Relaxed));
+        eprintln!(
+            "placeholder guard microbench: fast path {} - {round:.2} ms a round over {blocks} blocks ({mapped} mapped), \
+             skips a round: watch {:.0}, holes {:.0}, bytes {:.0}; one VirtualQuery {per_query:.2} us",
+            u8::from(crate::inplace::placeholder_fast()),
+            watch as f64 / ROUNDS as f64,
+            absent as f64 / ROUNDS as f64,
+            bytes as f64 / ROUNDS as f64,
+        );
+        // SAFETY: the view we made, back to a placeholder, then the
+        // placeholder released.
+        unsafe {
+            UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
+            VirtualFree(base, 0, MEM_RELEASE);
+        }
+        title_memory_remapped(base as usize, len);
+    }
 
     /// A copy's whole range is known mapped, and only that: not one byte
     /// past its end, and nothing before it was copied.

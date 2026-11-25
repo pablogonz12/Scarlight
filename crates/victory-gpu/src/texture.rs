@@ -1441,11 +1441,14 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
-    if by_query() {
-        return committed_by_query(at, len);
-    }
     if len == 0 {
         return true;
+    }
+    if let Some(mapped) = crate::inplace::placeholder_mapped_bytes(at as usize, len) {
+        return mapped == len as u64;
+    }
+    if by_query() {
+        return committed_by_query(at, len);
     }
     let (there, of) = readable(at as usize, len, true);
     there == of
@@ -1541,6 +1544,9 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         return 0;
     }
     let start = at as usize;
+    if let Some(mapped) = crate::inplace::placeholder_mapped_bytes(start, len) {
+        return mapped;
+    }
     let end = start.saturating_add(len);
     if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
         return 0;
