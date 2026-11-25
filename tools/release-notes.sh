@@ -37,9 +37,15 @@ fi
 BASE="$(sed -n '1{s/[[:space:]]*$//;p;}' "$HERE/steam-compat/BASE")"
 SERIES="${BASE#GE-Proton}"
 SERIES="${SERIES/-/.}"
-REV=$((1 + $(git -C "$ROOT" tag --list "v$SERIES.*" | wc -l)))
+SERIES_RE="$(printf '%s' "$SERIES" | sed 's/\./\\./g')"
+LAST="$(git -C "$ROOT" tag --list "v$SERIES.*" |
+  sed -n "s/^v$SERIES_RE\.\([0-9][0-9]*\)$/\1/p" | sort -n | tail -1)"
+REV=1
+if [ -n "$LAST" ]; then REV=$((LAST + 1)); fi
 NEXT="$SERIES.$REV"
-SINCE="$(git -C "$ROOT" log -1 --format=%cs "$FROM" 2>/dev/null || true)"
+# The tag's own commit time, not its date: a PR merged the same morning, before
+# the tag was cut, belongs to the release that already shipped it.
+SINCE="$(git -C "$ROOT" log -1 --format=%ct "$FROM" 2>/dev/null || true)"
 if [ -z "$SINCE" ]; then
   echo "no commit for $FROM: run git fetch --tags, or pass a tag that exists" >&2
   exit 1
@@ -50,9 +56,14 @@ trap 'rm -rf -- "$WORK"' EXIT
 gh pr list --repo "$REPO" --state merged --limit 400 \
   --json number,title,mergedAt \
   --jq '.[] | "\(.mergedAt)\t\(.number)\t\(.title)"' | sort > "$WORK/prs.tsv"
-awk -F'\t' -v since="$SINCE" 'substr($1, 1, 10) >= since' "$WORK/prs.tsv" | sort -t$'\t' -k1,1 \
-  > "$WORK/since.tsv"
-COUNT="$(wc -l < "$WORK/since.tsv")"
+while IFS=$'\t' read -r merged num title; do
+  [ -n "${num:-}" ] || continue
+  when="$(date -u -d "$merged" +%s 2>/dev/null || echo 0)"
+  if [ "$when" -ge "$((SINCE - 0))" ]; then
+    printf '%s\t%s\t%s\n' "$merged" "$num" "$title"
+  fi
+done < "$WORK/prs.tsv" | sort -t$'\t' -k1,1 > "$WORK/since.tsv"
+COUNT="$(grep -c . "$WORK/since.tsv" || true)"
 
 # One bucket per PR, first match wins. Picture is the default because most work
 # here is what the card draws; anything the keywords miss is listed last.

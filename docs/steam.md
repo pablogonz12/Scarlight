@@ -40,12 +40,14 @@ the host instead; nothing else changes.
 
    ```bash
    cd ~/.local/share/Steam/compatibilitytools.d/Scarlight-<version>
+   cp ../Scarlight-<older version>/scarlight.conf .   # keep your settings, if you had a release
    [ -f scarlight.conf ] || cp scarlight.conf.example scarlight.conf
    ```
-4. **If Scarlight is already installed**, your `scarlight.conf` is safe: a release ships
-   `scarlight.conf.example` and never a `scarlight.conf`, and the tool copies the example into place
-   only when there is no conf yet. An upgrade therefore keeps your `PROTON=`, `D3DCOMPILER=` and other
-   settings, and only `scarlight.conf.example` is refreshed — diff it to see new options.
+4. **If Scarlight is already installed**, each version has its own directory, so a new release starts
+   from the example: copy your `scarlight.conf` across as in step 3. Inside one directory nothing is
+   ever replaced: a release ships `scarlight.conf.example` and never a `scarlight.conf`, and the tool
+   copies the example into place only when there is no conf yet, so your `PROTON=`, `D3DCOMPILER=`
+   and other settings survive a re-extract of the same version.
    `tools/steam-compat/install.sh` behaves the same way.
 5. Restart Steam.
 
@@ -156,7 +158,8 @@ SCARLIGHT_DRY_RUN=1 %command%        # in the game's Launch Options, after clear
 ## 5. Uninstall
 
 ```bash
-tools/steam-compat/install.sh --uninstall      # or: rm -rf ~/.local/share/Steam/compatibilitytools.d/Scarlight-<version>
+tools/steam-compat/install.sh --uninstall      # a source install (Scarlight/)
+rm -rf ~/.local/share/Steam/compatibilitytools.d/Scarlight-<version>   # a release
 ```
 
 Nothing else is needed: Scarlight keeps no service, no system package and no file outside the tool

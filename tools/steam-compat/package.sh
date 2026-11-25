@@ -118,11 +118,16 @@ BASE_SERIES="${BASE#GE-Proton}"
 BASE_SERIES="${BASE_SERIES/-/.}" # 11-14 -> 11.14
 
 if [ -z "$VERSION" ]; then
-  # No tag of this GE release yet means revision 1; each tag adds one, so a
-  # rebase on a newer GE-Proton starts at .1 again by itself.
+  # The highest revision this GE release has tagged, plus one - not how many
+  # tags there are: with v11.14.1 and v11.14.3 the next is 11.14.4, never an
+  # existing number again. No tag yet means .1, and a rebase on a newer
+  # GE-Proton starts at .1 by itself.
   REV=1
   if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-    REV=$((1 + $(git -C "$ROOT" tag --list "v$BASE_SERIES.*" | wc -l)))
+    SERIES_RE="$(printf '%s' "$BASE_SERIES" | sed 's/\./\\./g')"
+    LAST="$(git -C "$ROOT" tag --list "v$BASE_SERIES.*" |
+      sed -n "s/^v$SERIES_RE\.\([0-9][0-9]*\)$/\1/p" | sort -n | tail -1)"
+    if [ -n "$LAST" ]; then REV=$((LAST + 1)); fi
   fi
   VERSION="$BASE_SERIES.$REV"
 fi
@@ -140,6 +145,10 @@ case "$VERSION" in
     exit 2
     ;;
 esac
+if [ "$(printf '%s' "$VERSION" | awk -F. '{print NF}')" != 3 ]; then
+  echo "--version must be three numbers, <major>.<release>.<revision>; got '$VERSION'" >&2
+  exit 2
+fi
 COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 WORK="$(mktemp -d)"

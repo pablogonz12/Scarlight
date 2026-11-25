@@ -86,8 +86,14 @@ else
   if [ -z "$PDIR" ]; then
     # A newer GE-Proton of the same series usually runs this build; say so once
     # and name the one this release expects.
-    FOUND="$(for base in "${CT_DIRS[@]}"; do ls -d "$base"/GE-Proton11-* 2>/dev/null; done |
-      sort -V | tail -1)"
+    # Only an install that has a Wine counts (a leftover folder or a half
+    # extracted tarball must not win), and they are compared by name: the newest
+    # GE-Proton11-20 beats GE-Proton11-9, whatever directory each sits in.
+    FOUND="$(for base in "${CT_DIRS[@]}"; do
+      for d in "$base"/GE-Proton11-*; do
+        if [ -x "$d/files/bin/wine" ]; then printf '%s\t%s\n' "$(basename "$d")" "$d"; fi
+      done
+    done | sort -V | tail -1 | cut -f2)"
     if [ -z "$FOUND" ]; then
       log "no GE-Proton in compatibilitytools.d; $BASE is required ($GE_URL)"
       echo "scarlight: no GE-Proton found in compatibilitytools.d; $BASE is required." >&2

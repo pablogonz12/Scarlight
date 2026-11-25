@@ -91,8 +91,9 @@ To cut one:
 
 ```bash
 git -C <clone> fetch hub --tags
-git -C <clone> worktree add -b release/v<version> ../rel hub/main   # or work on main
-tools/steam-compat/package.sh --vkd3d <dlls> --exe <victory.exe>     # version comes from BASE + tags
+git -C <clone> worktree add -b release/v<version> ../rel hub/main
+cd <clone>/../rel                    # worktree add does not enter it: the rest runs inside
+tools/steam-compat/package.sh --vkd3d <dlls> --exe <victory.exe>   # version from BASE + tags
 git tag v<version> && git push hub v<version>
 ```
 

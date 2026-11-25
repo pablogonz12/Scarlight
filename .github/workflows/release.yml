@@ -93,8 +93,10 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
+          # glslang: vkd3d-proton's meson.build wants glslangValidator even with
+          # -Denable_tests=false (it validates the builtin shaders it compiles).
           sudo apt-get install -y --no-install-recommends \
-            build-essential meson ninja-build mingw-w64 python3
+            build-essential meson ninja-build mingw-w64 python3 glslang-tools
           # A short id is enough to check out once the history is here, and it is
           # readable in the release notes; the full id is in VERSION and here.
           git clone --quiet "$VKD3D_REPO" vkd3d-src

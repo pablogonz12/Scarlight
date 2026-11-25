@@ -77,7 +77,7 @@ Three steps. Full detail — every option, logs, uninstall, troubleshooting — 
 
 Two things a release leaves to you, both one step: if Steam cannot find the Proton Scarlight should run
 on, name yours in `compatibilitytools.d/Scarlight-<version>/scarlight.conf` (`PROTON=`); and put your own copy of
-DXC's `dxil.dll` and `dxcompiler.dll` in `Scarlight/files/` (Microsoft's binaries are not redistributed
+DXC's `dxil.dll` and `dxcompiler.dll` in `Scarlight-<version>/files/` (Microsoft's binaries are not redistributed
 by a Linux release). [docs/steam.md](docs/steam.md) has both.
 
 ## Releases
