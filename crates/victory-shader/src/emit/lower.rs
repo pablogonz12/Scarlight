@@ -65,6 +65,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Whether its UAVs are rasterizer ordered views (a POPS pixel shader).
+    #[cfg(test)]
+    pub rovs: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1254,6 +1257,12 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if let StageIo::Ps {
+            db_shader_control, ..
+        } = &x.native.io
+        {
+            s.pops(*db_shader_control);
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -2284,6 +2293,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            rovs: self.s.rovs,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -11800,6 +11811,8 @@ mod tests {
 
     // Descriptor words read as numbers: kept in their own file (lower.rs is at the size limit).
     mod desc_data;
+    // A POPS pixel shader's rasterizer ordered views: likewise.
+    mod pops_rov;
 
     /// Tables of 2D textures at s0 and samplers at s1.
     fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
