@@ -1180,13 +1180,20 @@ fn skip_clean_enabled(setting: Option<&str>) -> bool {
 /// title's memory has nothing to copy, memory last found not write-watched
 /// is copied whole, a copy with no whole copy of its pages yet has them to
 /// fill, and a range the journal cannot answer for is copied.
+/// `[from, to)` cut to a copy of `len` bytes at `start`: what of the ask
+/// lies in the copy, as title addresses.
+fn cut_to_copy(start: usize, len: usize, from: usize, to: usize) -> (usize, usize) {
+    let end = start.saturating_add(len);
+    (from.clamp(start, end), to.clamp(start, end))
+}
+
 fn clean_decided(placed: bool, watched: u8, all_copied: u64, in_range: bool, written: Option<bool>) -> bool {
     !placed && watched == 1 && all_copied != 0 && in_range && written == Some(false)
 }
 
 #[cfg(test)]
 mod clean_tests {
-    use super::{clean_decided, skip_clean_enabled};
+    use super::{clean_decided, cut_to_copy, skip_clean_enabled};
 
     /// A copy nothing wrote since it was last brought up to date is clean;
     /// one with pages never copied whole, not known to be write-watched,
@@ -1206,6 +1213,20 @@ mod clean_tests {
         assert!(!clean_decided(false, 1, 7, true, None));
         // A range outside the copy.
         assert!(!clean_decided(false, 1, 7, false, Some(false)));
+    }
+
+    /// An ask is cut to the copy: one reaching past its end answers for the
+    /// bytes inside it only (a nested copy's tail is no part of it), and one
+    /// wholly outside asks nothing.
+    #[test]
+    fn a_clean_check_is_cut_to_the_copy() {
+        // A 0x4000-byte copy at 0x1000, and asks around it.
+        assert_eq!(cut_to_copy(0x1000, 0x4000, 0x2000, 0x3000), (0x2000, 0x3000), "inside");
+        assert_eq!(cut_to_copy(0x1000, 0x4000, 0x1000, 0x5000), (0x1000, 0x5000), "whole");
+        assert_eq!(cut_to_copy(0x1000, 0x4000, 0xf00, 0x6000), (0x1000, 0x5000), "past both ends");
+        assert_eq!(cut_to_copy(0x1000, 0x4000, 0x4000, 0x6000), (0x4000, 0x5000), "the tail only");
+        assert_eq!(cut_to_copy(0x1000, 0x4000, 0x6000, 0x7000), (0x5000, 0x5000), "outside: empty");
+        assert_eq!(cut_to_copy(0x1000, 0x4000, 0x9000, 0x9100), (0x5000, 0x5000), "past it: empty");
     }
 
     /// Skipping clean copies is on unless the switch is set to 0.
@@ -2695,7 +2716,8 @@ impl Shadow {
         self.update_free(from, to)
     }
 
-    /// Whether a refresh of `[address, address + len)` would copy nothing:
+    /// Whether a refresh of `[from, to)` (title addresses, cut to the copy)
+    /// would copy nothing:
     /// every page of the copy was copied whole at some asking, and the
     /// journal holds no page of the range written after it. The copy keeps
     /// one number, so the check walks no pages and takes no lock of the
@@ -2705,12 +2727,12 @@ impl Shadow {
     /// write-watched, a copy placed in the title's memory (nothing to copy
     /// either way), and a range no asking of this submission covers
     /// ([`crate::watch::written_since`]).
-    pub(crate) fn clean(&self, address: usize, len: usize) -> bool {
-        let (from, to) = self.inside(address, len);
-        let start = self.start as usize;
+    pub(crate) fn clean(&self, from: usize, to: usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = cut_to_copy(start, end - start, from, to);
         let since = self.all_copied.load(Ordering::Relaxed);
         let written = if since != 0 && from < to {
-            crate::watch::written_since(start + from, start + to, since)
+            crate::watch::written_since(from, to, since)
         } else {
             None
         };

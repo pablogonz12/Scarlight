@@ -108,6 +108,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         ask_run(j, &pieces[i..k]);
         i = k;
     }
+    normalize_ahead(&mut j.ahead);
 }
 
 /// Since the last frame line: the kernel askings that took a millisecond
@@ -197,9 +198,10 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             j.ahead.push((first, last));
         }
     }
-    // In order, for the searches [`covers`] makes: the ranges above come in
-    // no order.
-    j.ahead.sort_unstable();
+    // In order and apart, for the searches [`covers`] makes: the ranges
+    // above come in no order, and one may overlap what an asking already
+    // holds (`[0, 12000)` and `[8000, 20000)` are each asked alone).
+    normalize_ahead(&mut j.ahead);
     j.kept = !j.ahead.is_empty();
 }
 
@@ -294,9 +296,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+    covers(&j.ahead, first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -332,7 +332,29 @@ pub(crate) fn written_since(start: usize, end: usize, since: u64) -> Option<bool
     covered.then(|| j.written.range(first..last).any(|(_, &w)| w > since))
 }
 
-/// Whether `pieces` (page ranges, in order) hold `[first, last)` whole.
+/// The ahead pieces as one range per run of pieces that meet or overlap,
+/// sorted: every page range an asking of the submission covered lies in one
+/// of them, so [`covers`]'s search finds it. `ask_once` asks a range an
+/// asking already holds in part alone, which leaves pieces that overlap
+/// (`[0, 12000)` and `[8000, 20000)`); a range in the second would not be
+/// found, and `writes` would ask the kernel again for what the journal has.
+fn normalize_ahead(pieces: &mut Vec<(usize, usize)>) {
+    if pieces.len() < 2 {
+        return;
+    }
+    pieces.sort_unstable();
+    let mut runs: Vec<(usize, usize)> = Vec::with_capacity(pieces.len());
+    for &(first, last) in pieces.iter() {
+        match runs.last_mut() {
+            Some(run) if first <= run.1 => run.1 = run.1.max(last),
+            _ => runs.push((first, last)),
+        }
+    }
+    *pieces = runs;
+}
+
+/// Whether `pieces` (page ranges, in order, apart) hold `[first, last)`
+/// whole.
 fn covers(pieces: &[(usize, usize)], first: usize, last: usize) -> bool {
     // The first piece ending after `first` is the only one that can hold it.
     let i = pieces.partition_point(|&(_, b)| b <= first);
@@ -1182,6 +1204,32 @@ mod tests {
         forget_askings();
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Askings of one submission that meet or overlap are one range each
+    /// run, so a page range lying in any of them is covered: the journal
+    /// answers for it instead of the kernel being asked again.
+    #[test]
+    fn overlapping_askings_are_merged_so_a_range_inside_any_is_covered() {
+        let mut ahead = vec![(0usize, 12_000usize), (8_000, 20_000)];
+        normalize_ahead(&mut ahead);
+        assert_eq!(ahead, [(0, 20_000)], "the second overlapping the first");
+        assert!(covers(&ahead, 0, 12_000));
+        assert!(covers(&ahead, 8_000, 20_000), "the one the scan missed");
+        assert!(covers(&ahead, 5_000, 15_000), "across both");
+        assert!(!covers(&ahead, 12_000, 21_000), "past both");
+        assert!(!covers(&ahead, 0, 20_001), "one page more");
+        // Ends that meet are one range too, and the order they come in does
+        // not matter.
+        let mut ahead = vec![(40, 50), (0, 5), (5, 40)];
+        normalize_ahead(&mut ahead);
+        assert_eq!(ahead, [(0, 50)]);
+        // Ranges apart stay apart.
+        let mut ahead = vec![(0, 5), (40, 50), (10, 20)];
+        normalize_ahead(&mut ahead);
+        assert_eq!(ahead, [(0, 5), (10, 20), (40, 50)]);
+        assert!(!covers(&ahead, 5, 10), "the gap between them");
+        assert!(covers(&ahead, 10, 20));
     }
 
     /// What a copy's "nothing wrote it" check costs, per copy, over the
