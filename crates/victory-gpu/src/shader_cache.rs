@@ -100,6 +100,7 @@ pub(crate) fn build() -> &'static [u8; 32] {
                 // served the translations an earlier run of the same
                 // executable had cached with the switch unset.
                 for name in [
+                    "VICTORY_CODE_READS",
                     "VICTORY_WAVE_WIDE",
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
