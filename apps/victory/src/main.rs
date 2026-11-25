@@ -7,11 +7,12 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
+#[cfg(windows)]
 mod translate;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
@@ -111,8 +112,49 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Print the identity the layer uses to pick a title profile (BLAKE3),
+    /// and whether a profile matches it. Prints only numbers of this build.
+    TitleId {
+        /// The title's executable.
+        exe: PathBuf,
+    },
+    /// Make the title pipelines of earlier runs that the pipeline library
+    /// lacks, without starting the title (`run` does it at its start;
+    /// `VICTORY_WARMUP=0` turns that off).
+    Warmup,
     /// Show the resolved configuration and check it.
     Config,
+    /// Bench the DirectStorage path over the title's own archive files
+    /// (read-only, never written): MB/s, the stage split per request
+    /// (queue, lock, read, inflate, dest) and worker utilisation, through
+    /// the same `execute` a load's requests take. No title, no display, no
+    /// Vulkan (loading.md).
+    #[cfg(feature = "diagnostics")]
+    DstorageBench {
+        /// The archive files to read (the title's `.rpf`s). Never written.
+        files: Vec<PathBuf>,
+        /// `raw` (reads into an address), `page` (reads into 64 KiB
+        /// physical pages, the title's destination form), `zlib` or
+        /// `zpage` (the load's inflate into either).
+        #[arg(long, default_value = "page")]
+        mode: String,
+        /// Workers, as the load's dstorage pool has them.
+        #[arg(long, default_value_t = 16)]
+        workers: usize,
+        /// Seconds of work.
+        #[arg(long, default_value_t = 10.0)]
+        seconds: f64,
+        /// Bytes per request.
+        #[arg(long, default_value_t = 1 << 20)]
+        block: usize,
+        /// MiB of the files to deflate for `--mode zlib` and `zpage`.
+        #[arg(long, default_value_t = 32)]
+        corpus_mb: usize,
+        /// Page destinations a worker rotates through: the load's requests
+        /// land in many pages, not always the same ones.
+        #[arg(long, default_value_t = 4)]
+        tiles: usize,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -125,6 +167,34 @@ enum Unimplemented {
 enum Console {
     SeriesX,
     SeriesS,
+}
+
+/// `victory title-id <exe>`: the BLAKE3 a profile matches, and the profile
+/// that matches it, if any. Run locally; do not paste the hash into a report.
+fn title_id(exe: &std::path::Path) -> Result<()> {
+    let data = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
+    let hash = blake3::hash(&data);
+    let cfg = victory_core::Config::load()?;
+    println!("image          {}", exe.display());
+    println!("blake3         {hash}");
+    match cfg.title_profile(&hash.to_hex()) {
+        Some(profile) => println!(
+            "profile        {} ({} hooks)",
+            profile
+                .file()
+                .map_or_else(|| "<inline>".to_owned(), |p| p.display().to_string()),
+            profile.hooks.len()
+        ),
+        None => {
+            let dirs: Vec<String> = cfg
+                .profile_dirs
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect();
+            println!("profile        none (searched {})", dirs.join(", "));
+        }
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -152,6 +222,12 @@ fn main() -> Result<()> {
             verbose,
             disasm,
         } => shader::run(paths, verbose || disasm, disasm),
+        // `translate` checks the output with the host's D3D12: Windows only.
+        #[cfg(not(windows))]
+        Command::Translate { .. } => {
+            anyhow::bail!("translate checks shaders against the host's D3D12 and needs Windows")
+        }
+        #[cfg(windows)]
         Command::Translate {
             paths,
             validate,
@@ -159,7 +235,17 @@ fn main() -> Result<()> {
             list,
             jobs,
             host_lanes,
-        } => translate::run(paths, validate, pipelines, list, jobs, host_lanes),
+        } => {
+            // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
+            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+                victory_shader::emit::set_view_heap_limit(n);
+            }
+            // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
+            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+                victory_shader::emit::set_host_max_wave(n);
+            }
+            translate::run(paths, validate, pipelines, list, jobs, host_lanes)
+        }
         Command::Run {
             exe,
             unimplemented,
@@ -168,7 +254,42 @@ fn main() -> Result<()> {
             console,
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
+        Command::TitleId { exe } => title_id(&exe),
+        Command::Warmup => run::warmup(),
         Command::Config => show_config(),
+        #[cfg(feature = "diagnostics")]
+        Command::DstorageBench {
+            files,
+            mode,
+            workers,
+            seconds,
+            block,
+            corpus_mb,
+            tiles,
+        } => {
+            use victory_hle::dstorage_bench::{Mode, Opts};
+            let mode = match mode.as_str() {
+                "raw" => Mode::Raw,
+                "page" => Mode::Page,
+                "zlib" => Mode::Zlib,
+                "zpage" => Mode::Zpage,
+                other => anyhow::bail!("--mode is raw, page, zlib or zpage, not {other:?}"),
+            };
+            let opts = Opts {
+                files,
+                workers: workers.clamp(1, 256),
+                seconds,
+                block: block.clamp(4096, 16 << 20),
+                mode,
+                corpus_mb,
+                tiles: tiles.clamp(1, 256),
+            };
+            let report = victory_hle::dstorage_bench::run(&opts)
+                .map_err(|e| anyhow::anyhow!(e))
+                .context("the dstorage bench")?;
+            report.print();
+            Ok(())
+        }
     }
 }
 

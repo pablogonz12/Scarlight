@@ -26,7 +26,7 @@ pub const IID: Guid = Guid::new(
     [0x8b, 0x27, 0x95, 0xfc, 0x02, 0xd0, 0xf7, 0x5d],
 );
 
-/// As the title asks for it; it calls 0x20 (path) and 0x28
+/// As the title (2026) asks for it; it calls 0x20 (path) and 0x28
 /// (space) with the same arguments.
 pub const IID_2026: Guid = Guid::new(
     0x41a4_e10c,
@@ -172,7 +172,9 @@ static VTABLE: Methods<8> = Methods([
     prompt_result as *const (),    // 0x38
 ]);
 
-#[cfg(test)]
+// The test serves a drive over Windows paths (`X:\`) and reaches the title's
+// file calls, which are Windows only.
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;

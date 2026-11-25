@@ -537,6 +537,14 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
+    // Where every other thread was when the fault happened: an intermittent
+    // fault (the title's own fail-fast at +0x2215c35, say) is usually one
+    // thread deciding another has made no progress, and only the other
+    // threads' stacks say what that one was waiting for.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if to_file {
+        crate::stacks::dump_stacks();
+    }
     if to_file {
         let said = title_output();
         eprint!("{said}");

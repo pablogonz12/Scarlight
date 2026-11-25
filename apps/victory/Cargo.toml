@@ -16,6 +16,7 @@ victory-shader = { workspace = true, features = ["host"] }
 victory-game.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
+tracing.workspace = true
 memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true

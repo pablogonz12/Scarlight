@@ -89,10 +89,12 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
             }
         }
     }
-    let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
-    for i in order {
-        let (e, offset) = (&elements[i], offsets[i]);
+    // The rows stay in the console's element order: the module's signature
+    // metadata lists them that way, and the validator compares the part to it
+    // element by element (a row's columns may be interleaved between
+    // semantics).
+    for (i, e) in elements.iter().enumerate() {
+        let offset = offsets[i];
         let used = e.usage << e.col;
         let rw = if input { used } else { !used & 0xf };
         for v in [
@@ -115,6 +117,23 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     out
 }
 
+/// The most a mesh shader's outputs may take, in bytes (D3D12).
+pub(crate) const MESH_OUTPUT_LIMIT: u64 = 32 * 1024;
+
+/// A mesh shader's output size as the DXIL validator measures it against
+/// [`MESH_OUTPUT_LIMIT`]: 4 bytes per component of every vertex element
+/// and primitive element, times the maxima rounded up to multiples of 32.
+pub(crate) fn mesh_output_bytes(
+    vertex: &[SigElement],
+    primitive: &[SigElement],
+    max_vertices: u32,
+    max_primitives: u32,
+) -> u64 {
+    let scalars = |els: &[SigElement]| els.iter().map(|e| u64::from(e.cols)).sum::<u64>();
+    let align = |n: u32| u64::from(n).next_multiple_of(32);
+    4 * (scalars(vertex) * align(max_vertices) + scalars(primitive) * align(max_primitives))
+}
+
 /// A resource bound by register, as `PSV0` lists it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Binding {
@@ -122,12 +141,12 @@ pub(crate) struct Binding {
     pub kind: u32,
     pub space: u32,
     pub register: u32,
-    /// DXIL resource kind (11 raw buffer, 13 cbuffer, 14 sampler).
+    /// DXIL resource kind (13 cbuffer, 14 sampler).
     pub dxil_kind: u32,
 }
 
 pub(crate) struct Psv<'a> {
-    /// PSV shader kind: 0 pixel, 1 vertex, 5 compute.
+    /// PSV shader kind: 0 pixel, 1 vertex, 2 geometry, 5 compute.
     pub stage: u8,
     /// Vertex: writes `SV_Position`. Pixel: writes depth.
     pub flag: bool,
@@ -137,6 +156,9 @@ pub(crate) struct Psv<'a> {
     pub prims: &'a [SigElement],
     /// Mesh: its state and the group-shared bytes it declares.
     pub mesh: Option<(super::shader::Mesh, u32)>,
+    /// Geometry (triangles in, triangle strips out on stream 0): its
+    /// maximum vertex count. `flag`: writes `SV_Position`.
+    pub geometry: Option<u32>,
     pub bindings: &'a [Binding],
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
@@ -189,6 +211,15 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[26] = vectors(p.prims) as u8;
         info[27] = mesh.topology;
         info[30] = p.prims.len() as u8;
+    }
+    if let Some(max_vertices) = p.geometry {
+        // Input primitive (3: triangles), output topology (5: triangle
+        // strips), stream mask, position written; the vertex maximum.
+        info[0..4].copy_from_slice(&3u32.to_le_bytes());
+        info[4..8].copy_from_slice(&5u32.to_le_bytes());
+        info[8..12].copy_from_slice(&1u32.to_le_bytes());
+        info[12] = u8::from(p.flag);
+        info[26..28].copy_from_slice(&(max_vertices as u16).to_le_bytes());
     }
     out.extend(info);
     u32s(&mut out, &[p.bindings.len() as u32]);
@@ -386,5 +417,40 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn signature_keeps_the_console_element_order_within_a_row() {
+        // Two semantics share row 2 (columns 0 and 3). The module's signature
+        // metadata lists TEXCOORD first and the validator compares the part
+        // to it element by element, so the part must keep that order rather
+        // than sort by column.
+        let el = |name: &str, kind, comp, row, col, usage| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp,
+            interp: 1,
+            row: Some(row),
+            col,
+            cols: 1,
+            usage,
+            half: false,
+        };
+        let part = signature(
+            &[
+                el("TEXCOORD", 0, 9, 2, 0, 7),
+                el("COLOR", 0, 9, 2, 3, 8),
+            ],
+            true,
+        );
+        let name_at = |i: usize| {
+            let at = 8 + 32 * i;
+            let offset = u32::from_le_bytes(part[at + 4..at + 8].try_into().unwrap()) as usize;
+            let end = part[offset..].iter().position(|&b| b == 0).unwrap();
+            std::str::from_utf8(&part[offset..offset + end]).unwrap()
+        };
+        assert_eq!(name_at(0), "TEXCOORD");
+        assert_eq!(name_at(1), "COLOR");
     }
 }
