@@ -3161,13 +3161,15 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
+        // The dynamic slots start at `base`, not right after the title's 4.
+        let base = heap.base;
         let a = heap.dynamic(heap.dynamic - 100).unwrap();
         let b = heap.dynamic(60).unwrap();
-        assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
+        assert_eq!((a, b), (base, base + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
         heap.release(a, 50);
-        assert_eq!(heap.dynamic(50), Some(4));
-        assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+        assert_eq!(heap.dynamic(50), Some(base));
+        assert_eq!(heap.dynamic(40), Some(base + heap.dynamic - 40));
     }
 }
