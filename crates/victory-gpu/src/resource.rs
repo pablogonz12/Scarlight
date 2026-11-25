@@ -2557,6 +2557,65 @@ mod tests {
         assert!(unordered_view_stored(27, Some(28), nvidia));
     }
 
+    /// The uses left out are exactly the ones the device does not take: it
+    /// answers for each format itself, and nothing beyond its answer is
+    /// dropped. A host that takes both uses of every format -- RADV does --
+    /// keeps every use and every unordered view it made before, so the new
+    /// paths never trigger there.
+    #[cfg(windows)]
+    #[test]
+    fn the_uses_left_out_are_the_ones_the_device_does_not_take() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        for format in [10, 28, 86, 87, 115] {
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: DXGI_FORMAT(format as i32),
+                ..Default::default()
+            };
+            // SAFETY: a plain query into a structure of its size.
+            let asked = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of_val(&support) as u32,
+                )
+            };
+            if asked.is_err() {
+                continue;
+            }
+            let report = host_uses(format).expect("an answered query");
+            assert_eq!(
+                report.0,
+                support.Support1.0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0,
+                "format {format}: the render target use is the device's answer"
+            );
+            assert_eq!(
+                report.1,
+                support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0,
+                "format {format}: the typed unordered access use is the device's answer"
+            );
+            let flags = taken_flags(format, 1 | 4, Some(report));
+            assert_eq!(
+                flags & 1 != 0,
+                report.0,
+                "format {format}: the render target use stays exactly where the device takes it"
+            );
+            assert_eq!(
+                flags & 4 != 0,
+                report.1,
+                "format {format}: the unordered access use stays exactly where the device takes it"
+            );
+            assert_eq!(
+                unordered_view_stored(format, Some(format), host_uses),
+                report.1,
+                "format {format}: its unordered views are made exactly where the device takes that use"
+            );
+        }
+    }
+
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;
     type Address = extern "system" fn(This) -> u64;
