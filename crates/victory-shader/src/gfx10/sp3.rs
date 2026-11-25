@@ -778,6 +778,15 @@ mod tests {
     }
 
     #[test]
+    fn ds_wrap_reads_both_data_operands() {
+        // llvm-mc -mcpu=gfx1030: DATA0 is subtracted, DATA1 added.
+        assert_eq!(
+            one(&[0xD8D0_0010, 0x0806_0402], true),
+            "ds_wrap_rtn_b32 v8, v2, v4, v6 offset:16"
+        );
+    }
+
+    #[test]
     fn image_d16_data_is_packed() {
         // Three f16 channels occupy two VGPRs; NSA lists the addresses.
         let words = [0xF09C_070A, 0x8024_0801, 0x0000_0005];
