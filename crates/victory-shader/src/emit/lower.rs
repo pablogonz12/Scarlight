@@ -12092,6 +12092,52 @@ mod tests {
         lower_with(&words, layout(), used()).unwrap();
     }
 
+    /// project-flamingo #695: a scalar `s_buffer_load_dword` from a table
+    /// SRV reads raw bytes, whatever structure stride the resource entry
+    /// declares. On a host that binds the slot as a raw view, a structured
+    /// read returned nothing (a black menu).
+    #[test]
+    fn a_scalar_table_srv_load_reads_raw_bytes() {
+        // The table's descriptor into s[8:11], then s_buffer_load_dword s6,
+        // s[8:11], null; v_mov_b32 v0, s6; ds_write_b32 v0, v0 (keeps the
+        // load); s_endpgm
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF420_0184,
+            0xFA00_0000, // s_buffer_load_dword s6, s[8:11], null
+            0x7E00_0206, // v_mov_b32 v0, s6
+            0xD834_0000,
+            0x0000_0000, // ds_write_b32 v0, v0
+            S_ENDPGM,
+        ];
+        let layout = || vec![root(RootType::Table, 0, 0)];
+        let used = |stride| {
+            vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }]
+        };
+        let wide = lower_with(&words, layout(), used(8)).expect("a structured table SRV load");
+        let narrow = lower_with(&words, layout(), used(4)).expect("a structured table SRV load");
+        // Both lower (the raw path; a structured read would need the stride), and
+        // the stride leaves the bindings and the program's size alone. One byte of
+        // the container's part header may differ, so the bytes are not compared.
+        assert_eq!(
+            (wide.dxil.len(), &wide.root_srvs, &wide.user_data, &wide.samplers),
+            (narrow.dxil.len(), &narrow.root_srvs, &narrow.user_data, &narrow.samplers),
+            "the declared stride must not shape a scalar table SRV load"
+        );
+    }
+
     /// project-flamingo #720 (`7e956a90a`): a typeless RAW view bound with a
     /// zero structure stride is a flat byte buffer, not "a structured buffer
     /// of unknown stride": the index contributes `index * 0`, so an indexed
