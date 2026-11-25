@@ -1042,43 +1042,55 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // the copy queue, ahead of the lists (`ahead`), so a frame's preparation
     // does not stop for the read of a whole texture; the submission waits for
     // it before its lists run (`VICTORY_SHOW_AFTER`).
-    if ahead::on() && !staging.uploaded.load(Relaxed) {
+    if ahead::on()
+        && !staging.uploaded.load(Relaxed)
+        && !list.writes_title(staging.memory as usize, staging.layout.size as usize)
+    {
         let key = ahead::key(&staging);
-        match staging.ahead.load(Relaxed) {
-            // On its way: this list records no copy, and the submission
-            // waits for it before the lists run (`ahead::synchronise`).
-            ahead::PENDING => return false,
-            ahead::NONE => {
-                let upload = ahead::Upload {
-                    buffer: staging.buffer.clone(),
-                    footprints: staging.footprints.clone(),
-                    texture: texture.clone(),
-                    bytes: staging.bytes,
-                };
-                let detiling = staging.clone();
-                let taken = ahead::take(key, upload, Box::new(move || {
-                    detiling.refresh_now();
-                }));
-                if let Some(job) = taken {
-                    staging.ahead.store(ahead::PENDING, Relaxed);
-                    // Once the copies have run the host texture holds what
-                    // the staging buffer was detiled to, as a list's own
-                    // uploads leave it.
-                    let ran = staging.clone();
-                    job.then(move || {
-                        use std::sync::atomic::Ordering::Relaxed;
-                        ran.uploaded.store(true, Relaxed);
-                        ran.dirty.store(false, Relaxed);
-                        ran.ahead.store(ahead::DONE, Relaxed);
-                        #[cfg(feature = "diagnostics")]
-                        ran.present.queued();
-                    });
+        let upload = ahead::Upload {
+            buffer: staging.buffer.clone(),
+            footprints: staging.footprints.clone(),
+            texture: texture.clone(),
+            bytes: staging.bytes,
+        };
+        let detiling = staging.clone();
+        // The claim is taken with the job (and the registry's lock), so
+        // exactly one list starts a texture's first upload: two batches
+        // copying one texture is not something D3D12 allows, and the second
+        // would be waited on by nothing.
+        if let Some(job) = ahead::take(
+            key,
+            &staging.ahead,
+            upload,
+            Box::new(move || {
+                detiling.refresh_now();
+            }),
+        ) {
+            // The host texture holds what the staging buffer was detiled to
+            // once the copies have run, as a list's own uploads leave it; a
+            // batch that did not run gives the claim back, and the next list
+            // uploads it itself.
+            let ran = staging.clone();
+            job.then(move |copied: bool| {
+                use std::sync::atomic::Ordering::Relaxed;
+                ran.ahead
+                    .store(if copied { ahead::DONE } else { ahead::NONE }, Relaxed);
+                if copied {
+                    ran.uploaded.store(true, Relaxed);
+                    ran.dirty.store(false, Relaxed);
                     #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::TexUploads, 1);
-                    return false;
+                    ran.present.queued();
                 }
-            }
-            _ => {}
+            });
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexUploads, 1);
+            return false;
+        }
+        // On its way with another list: this list records no copy, and the
+        // submission waits for it before the lists run
+        // (`ahead::synchronise`).
+        if staging.ahead.load(Relaxed) == ahead::PENDING {
+            return false;
         }
     }
     // The host texture has the staging buffer's contents: only the check

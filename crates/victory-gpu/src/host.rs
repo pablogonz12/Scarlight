@@ -5670,6 +5670,24 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// Whether a step this list has recorded writes part of
+    /// `[start, start + len)` of title memory when the list is submitted: an
+    /// upload of that memory started ahead of the submission would copy the
+    /// bytes such a step replaces (the list's own upload runs after it).
+    pub(crate) fn writes_title(&self, start: usize, len: usize) -> bool {
+        let end = start.saturating_add(len);
+        let overlaps = |dst: usize, n: usize| dst < end && start < dst.saturating_add(n);
+        let deferred = self.deferred();
+        deferred
+            .copies
+            .iter()
+            .any(|step| matches!(step, Step::Copy(dst, _, n) if overlaps(*dst, *n)))
+            || deferred
+                .writes
+                .iter()
+                .any(|&(dst, _, n)| overlaps(dst, n))
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {

@@ -93,25 +93,26 @@ pub(crate) struct Job {
     prepare: Box<dyn Fn() + Send + Sync>,
     /// The fence value its submission signals (0: not submitted yet).
     value: AtomicU64,
-    /// What to do once the copies have run; called on the worker.
-    then: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
-    /// It has run.
+    /// What to do once the copies have run (`true`) or could not be recorded
+    /// (`false`); called on the worker.
+    then: Mutex<Vec<Box<dyn FnOnce(bool) + Send>>>,
+    /// It has run, or could not be recorded.
     ran: Mutex<bool>,
     ran_now: Condvar,
+    /// Whether they ran (meaningful once `ran`).
+    ran_with: Mutex<bool>,
     asked: std::time::Instant,
 }
 
 impl Job {
-    /// Calls `f` once the copies have run: now, if they have.
-    pub(crate) fn then(&self, f: impl FnOnce() + Send + 'static) {
-        if self.done() {
-            f();
-            return;
-        }
+    /// Calls `f` once the copies have run (or could not be), with whether
+    /// they ran: now, if that is known already.
+    pub(crate) fn then(&self, f: impl FnOnce(bool) + Send + 'static) {
         let mut then = self.then.lock().unwrap_or_else(|e| e.into_inner());
         if self.done() {
+            let ran = *self.ran_with.lock().unwrap_or_else(|e| e.into_inner());
             drop(then);
-            f();
+            f(ran);
             return;
         }
         then.push(Box::new(f));
@@ -201,10 +202,12 @@ pub(crate) fn full(bytes: u64) -> bool {
 }
 
 /// Starts `upload` on its way, `prepare` having detiled the staging buffer
-/// first; `None` when there is no copy queue (the list copies, as before) or
-/// the jobs on their way are full. The switch is the caller's ([`on`]).
+/// first; `None` when there is no copy queue (the list copies, as before),
+/// the jobs on their way are full, or another list has the claim. The switch
+/// is the caller's ([`on`]).
 pub(crate) fn take(
     key: usize,
+    claim: &std::sync::atomic::AtomicU8,
     upload: Upload,
     prepare: Box<dyn Fn() + Send + Sync>,
 ) -> Option<Arc<Job>> {
@@ -213,6 +216,16 @@ pub(crate) fn take(
         return None;
     }
     let bytes = upload.bytes;
+    // The claim and the registration are one step with [`synchronise`], which
+    // takes this lock: a submission either finds the job or claimed before it
+    // was registered, and no two lists claim one texture.
+    let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
+    if claim
+        .compare_exchange(NONE, PENDING, Relaxed, Relaxed)
+        .is_err()
+    {
+        return None;
+    }
     let job = Arc::new(Job {
         upload,
         key,
@@ -221,14 +234,13 @@ pub(crate) fn take(
         then: Mutex::new(Vec::new()),
         ran: Mutex::new(false),
         ran_now: Condvar::new(),
+        ran_with: Mutex::new(false),
         asked: std::time::Instant::now(),
     });
     BYTES.fetch_add(bytes, Relaxed);
     STATS[AHEAD].fetch_add(1, Relaxed);
-    ON_THEIR_WAY
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(job.clone());
+    way.push(job.clone());
+    drop(way);
     QUEUE.0
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -247,8 +259,8 @@ fn on_the_way(key: usize) -> Option<Arc<Job>> {
         .cloned()
 }
 
-/// Waits, briefly, for the upload ahead of the staging buffer at `key` to
-/// have run: a refresh of it must not write the bytes a copy is reading.
+/// Waits for the upload ahead of the staging buffer at `key` to have run: a
+/// refresh of it must not write the bytes a copy is reading.
 pub(crate) fn settle(key: usize) {
     let Some(job) = on_the_way(key) else {
         return;
@@ -257,9 +269,22 @@ pub(crate) fn settle(key: usize) {
         return;
     }
     STATS[THREAD_WAIT].fetch_add(1, Relaxed);
-    if !job.wait(SUBMIT_WAIT) {
-        STATS[FAILED].fetch_add(1, Relaxed);
-        tracing::warn!(key, "a texture's upload ahead did not run: its contents are a frame late");
+    wait_out(key, &job);
+}
+
+/// Waits for `job` past [`SUBMIT_WAIT`] rather than giving up on it: a
+/// refresh of its staging buffer, or a submission that samples its texture,
+/// must not run beside the copies, and returning while they are still to come
+/// would be exactly that. (A worker stuck this long is a finding of its own;
+/// the line says so.)
+fn wait_out(key: usize, job: &Job) {
+    if job.wait(SUBMIT_WAIT) {
+        return;
+    }
+    STATS[FAILED].fetch_add(1, Relaxed);
+    tracing::warn!(key, "a texture's upload ahead is slow; waiting for it");
+    if !job.wait(std::time::Duration::from_secs(600)) {
+        tracing::warn!(key, "a texture's upload ahead never ran");
     }
 }
 
@@ -286,10 +311,7 @@ pub(crate) fn shown(key: usize) {
     // Its worker has not submitted it yet (or the queue would not take the
     // wait): the thread waits for the copies.
     STATS[THREAD_WAIT].fetch_add(1, Relaxed);
-    if !job.wait(SUBMIT_WAIT) {
-        STATS[FAILED].fetch_add(1, Relaxed);
-        tracing::warn!(key, "a texture's upload ahead did not run: it is sampled as it was");
-    }
+    wait_out(key, &job);
 }
 
 /// Before a submission's lists run: every upload ahead still on its way is
@@ -336,13 +358,15 @@ impl Copy {
     }
 }
 
-/// The copy queue and its threads, made on first use.
+/// The copy queue and its worker, made on first use: `None` when the device
+/// has no copy queue or its worker thread could not be started, and then no
+/// upload is taken (a job nothing would run must not be admitted).
 fn workers() -> Option<&'static Copy> {
     static STARTED: OnceLock<Option<()>> = OnceLock::new();
     // One worker: a fence moves forward once for the queue, so a second
     // worker's batches would have to be ordered with this one's anyway
     // (shortcut: the detilings of two textures are not done at once).
-    STARTED.get_or_init(|| {
+    let started = STARTED.get_or_init(|| {
         Copy::get()?;
         std::thread::Builder::new()
             .name("uploads ahead".to_owned())
@@ -354,6 +378,7 @@ fn workers() -> Option<&'static Copy> {
             .ok()?;
         Some(())
     });
+    started.as_ref()?;
     Copy::get()
 }
 
@@ -398,9 +423,6 @@ fn work() -> windows::core::Result<()> {
             (job.prepare)();
         }
         let value = copy.next.fetch_add(1, Relaxed) + 1;
-        for job in &jobs {
-            job.value.store(value, Relaxed);
-        }
         let ran = match submit(copy, &worker, &jobs, value) {
             Err(e) => {
                 STATS[FAILED].fetch_add(jobs.len() as u64, Relaxed);
@@ -408,6 +430,11 @@ fn work() -> windows::core::Result<()> {
                 false
             }
             Ok(()) => {
+                // Only once its signal is queued: a wait for a value no
+                // submission signals would hold the drawing queue for good.
+                for job in &jobs {
+                    job.value.store(value, Relaxed);
+                }
                 // SAFETY: the fence and the event are ours, and the jobs
                 // hold what the submission names until it has run.
                 unsafe {
@@ -528,11 +555,18 @@ fn finish(jobs: &[Arc<Job>], ran: bool) {
     }
     for job in jobs {
         BYTES.fetch_sub(job.upload.bytes, Relaxed);
+        *job.ran_with.lock().unwrap_or_else(|e| e.into_inner()) = ran;
         *job.ran.lock().unwrap_or_else(|e| e.into_inner()) = true;
         job.ran_now.notify_all();
+        if !ran {
+            // Its copies never ran: the texture keeps what it holds, and the
+            // list that asked is told so (it claims it again next time).
+            STATS[FAILED].fetch_add(1, Relaxed);
+            tracing::warn!("an upload ahead did not run: its texture stays as it was");
+        }
         let then = std::mem::take(&mut *job.then.lock().unwrap_or_else(|e| e.into_inner()));
         for f in then {
-            f();
+            f(ran);
         }
     }
 }
@@ -698,8 +732,9 @@ mod tests {
             );
         }
         let (queue, fence) = host.copy_queue()?;
-        // SAFETY: a plain query.
-        let value = unsafe { fence.GetCompletedValue() } + 1;
+        // A value from the worker's own counter: one it will not use for a
+        // batch of its own (a test-only value could be one it signals later).
+        let value = Copy::get()?.next.fetch_add(1, Relaxed) + 1;
         let (allocator, list) = copy_list(host)?;
         let back = host.read_back_buffer(total)?;
         let event =
@@ -778,7 +813,7 @@ mod tests {
         // fences, which is what a submission waits on (`wait_copy`).
         // SAFETY: a plain query, a signal of ours and an event of ours.
         let made = unsafe {
-            let value = fence.GetCompletedValue() + 1;
+            let value = Copy::get().expect("the copy queue").next.fetch_add(1, Relaxed) + 1;
             let event =
                 windows::Win32::System::Threading::CreateEventW(None, false, false, None)
                     .expect("an event");
@@ -820,17 +855,22 @@ mod tests {
         let bytes = upload.bytes;
         let led = counters();
         let key = 0x000a_2ead;
-        let Some(job) = take(key, upload, Box::new(|| {})) else {
+        let claim = std::sync::atomic::AtomicU8::new(NONE);
+        let Some(job) = take(key, &claim, upload, Box::new(|| {})) else {
             panic!("no upload ahead taken: the host has no copy queue");
         };
-        // What a submission does before its lists: wait for the upload.
+        assert_eq!(claim.load(Relaxed), PENDING, "the claim is the upload's");
+        // What a submission does before its lists: wait for the upload (a
+        // queue wait, which the card keeps, not this thread), then the job
+        // itself before its completion is read.
         synchronise();
+        assert!(job.wait(std::time::Duration::from_secs(20)), "its copies have run");
         let after = counters();
         assert_eq!(after[AHEAD], led[AHEAD] + 1, "one upload started ahead");
         if show_after() {
             assert!(
-                after[QUEUED_WAIT] + after[THREAD_WAIT] > led[QUEUED_WAIT] + led[THREAD_WAIT],
-                "the submission waited for it: {after:?}"
+                after[QUEUED_WAIT] + after[THREAD_WAIT] >= led[QUEUED_WAIT] + led[THREAD_WAIT],
+                "the submission waited for it, or found it done: {after:?}"
             );
             assert_eq!(after[EARLY], led[EARLY], "nothing was sampled before it ran");
         } else {
@@ -864,14 +904,20 @@ mod tests {
         };
         let led = counters();
         let key = 0xc0_0c;
-        let job = take(key, upload, Box::new(|| {})).expect("taken ahead");
+        let claim = std::sync::atomic::AtomicU8::new(NONE);
+        let job = take(key, &claim, upload, Box::new(|| {})).expect("taken ahead");
         let (told, heard) = std::sync::mpsc::channel();
-        job.then(move || told.send(1).unwrap());
+        job.then(move |ran| told.send(ran).unwrap());
         // Twice: whichever of the queue wait and the thread wait comes first,
-        // both are counted, and the second asking finds it done.
+        // both are counted, and the second asking finds it done or not.
         synchronise();
         synchronise();
-        assert!(heard.recv_timeout(std::time::Duration::from_secs(20)).is_ok());
+        assert!(job.wait(std::time::Duration::from_secs(20)));
+        assert_eq!(
+            heard.recv_timeout(std::time::Duration::from_secs(20)).ok(),
+            Some(true),
+            "its callback ran, and the copies ran"
+        );
         let after = counters();
         assert_eq!(after[AHEAD], led[AHEAD] + 1);
         assert_eq!(after[RAN], led[RAN] + 1);
@@ -880,7 +926,9 @@ mod tests {
             assert!(after[QUEUED_WAIT] + after[THREAD_WAIT] >= 1, "{after:?}");
             assert_eq!(after[EARLY], led[EARLY], "and none was shown early");
         } else {
-            assert_eq!(after[EARLY], led[EARLY] + 2, "both waitings skipped (switch off)");
+            // One for this asking at least; the copy may have run between
+            // the two, and then the second asking finds no job to skip.
+            assert!(after[EARLY] > led[EARLY], "the waitings were skipped (switch off)");
         }
     }
 
@@ -900,7 +948,8 @@ mod tests {
         if let Some(texture) = texture(host, 64, 64, 1)
             && let Some(upload) = staging(host, &texture, |n| n as u8)
         {
-            let _ = take(0x00_abcd, upload, Box::new(|| {}));
+            let claim = std::sync::atomic::AtomicU8::new(NONE);
+            let _ = take(0x00_abcd, &claim, upload, Box::new(|| {}));
             synchronise();
         }
         for _ in 0..3 {
@@ -912,7 +961,8 @@ mod tests {
             };
             bytes = upload.bytes;
             let started = std::time::Instant::now();
-            let job = take(0x4_7004, upload, Box::new(|| {})).expect("taken ahead");
+            let claim = std::sync::atomic::AtomicU8::new(NONE);
+            let job = take(0x4_7004, &claim, upload, Box::new(|| {})).expect("taken ahead");
             synchronise();
             assert!(job.wait(std::time::Duration::from_secs(20)));
             ahead_us.push(started.elapsed().as_micros() as u64);
