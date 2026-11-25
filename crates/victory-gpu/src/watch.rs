@@ -108,6 +108,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         ask_run(j, &pieces[i..k]);
         i = k;
     }
+    normalize_ahead(&mut j.ahead);
 }
 
 /// Since the last frame line: the kernel askings that took a millisecond
@@ -197,6 +198,10 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             j.ahead.push((first, last));
         }
     }
+    // In order and apart, for the searches [`covers`] makes: the ranges
+    // above come in no order, and one may overlap what an asking already
+    // holds (`[0, 12000)` and `[8000, 20000)` are each asked alone).
+    normalize_ahead(&mut j.ahead);
     j.kept = !j.ahead.is_empty();
 }
 
@@ -291,10 +296,69 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+    covers(&j.ahead, first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+}
+
+/// Forgets every asking and every page found written: for a test that
+/// starts from a journal of its own and leaves none behind (it must run
+/// with `--test-threads=1`).
+#[cfg(test)]
+pub(crate) fn forget_askings() {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.asked = 0;
+    j.ahead_asked = 0;
+    j.written.clear();
+    j.ahead.clear();
+    j.kept = false;
+    j.found.clear();
+}
+
+/// Whether a page of `[start, end)` was written after asking `since`, from
+/// the journal: `None` where the journal holds no asking as new as `since`
+/// covering the range (the kernel must be asked, [`writes`]).
+///
+/// Where it does, every write up to that asking was reported to it, so no
+/// page written since leaves no entry: a copy whose pages were all copied
+/// at `since` and gets `Some(false)` here has nothing to copy, without the
+/// page walk and the copy's own lock that [`writes`] and the copy lead to.
+pub(crate) fn written_since(start: usize, end: usize, since: u64) -> Option<bool> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    if first >= last {
+        return Some(false);
+    }
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let covered = j.ahead_asked >= since && covers(&j.ahead, first, last);
+    covered.then(|| j.written.range(first..last).any(|(_, &w)| w > since))
+}
+
+/// The ahead pieces as one range per run of pieces that meet or overlap,
+/// sorted: every page range an asking of the submission covered lies in one
+/// of them, so [`covers`]'s search finds it. `ask_once` asks a range an
+/// asking already holds in part alone, which leaves pieces that overlap
+/// (`[0, 12000)` and `[8000, 20000)`); a range in the second would not be
+/// found, and `writes` would ask the kernel again for what the journal has.
+fn normalize_ahead(pieces: &mut Vec<(usize, usize)>) {
+    if pieces.len() < 2 {
+        return;
+    }
+    pieces.sort_unstable();
+    let mut runs: Vec<(usize, usize)> = Vec::with_capacity(pieces.len());
+    for &(first, last) in pieces.iter() {
+        match runs.last_mut() {
+            Some(run) if first <= run.1 => run.1 = run.1.max(last),
+            _ => runs.push((first, last)),
+        }
+    }
+    *pieces = runs;
+}
+
+/// Whether `pieces` (page ranges, in order, apart) hold `[first, last)`
+/// whole.
+fn covers(pieces: &[(usize, usize)], first: usize, last: usize) -> bool {
+    // The first piece ending after `first` is the only one that can hold it.
+    let i = pieces.partition_point(|&(_, b)| b <= first);
+    pieces.get(i).is_some_and(|&(a, b)| a <= first && last <= b)
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -309,7 +373,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
-    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if covers(&j.ahead, first, last) {
         return Some((
             j.ahead_asked,
             j.written
@@ -1150,6 +1214,130 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A range no asking of the submission since reported written is known
+    /// clean from the journal, and the write it did report is not taken for
+    /// a write in another range of the same asking: a copy is clean while
+    /// nothing in *its* range was written.
+    #[test]
+    fn a_range_is_known_clean_until_an_asking_finds_it_written() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        // A journal of its own: the askings and pages of the tests that ran
+        // before stay out of it, and its own out of theirs.
+        forget_askings();
+        let (a, b) = (p, p + 2 * PAGE);
+        let (c, d) = (p + 2 * PAGE, p + 4 * PAGE);
+        ask_once(&[(a, b), (c, d)]);
+        let (since, pages) = asked(a, b).expect("asked ahead");
+        assert!(pages.is_empty(), "nothing written yet");
+        assert_eq!(written_since(a, b, since), Some(false));
+        assert_eq!(written_since(c, d, since), Some(false));
+        // SAFETY: our pages.
+        unsafe { ((c + 8) as *mut u8).write_volatile(7) };
+        // The submission asks again: the write is the new asking's, and it
+        // is the other range's.
+        ask_once(&[(a, b), (c, d)]);
+        let (now, _) = asked(a, b).expect("asked again");
+        assert!(now > since);
+        assert_eq!(written_since(a, b, since), Some(false), "another range's write");
+        assert_eq!(written_since(c, d, since), Some(true), "its own write");
+        // Asked from the asking that found it: nothing since.
+        assert_eq!(written_since(c, d, now), Some(false));
+        // A range no asking holds is not answered for: the kernel must be.
+        let mut plain = vec![0u8; PAGE];
+        assert_eq!(
+            written_since(plain.as_mut_ptr() as usize, plain.as_ptr() as usize + PAGE, since),
+            None
+        );
+        ask_once_end();
+        forget_askings();
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Askings of one submission that meet or overlap are one range each
+    /// run, so a page range lying in any of them is covered: the journal
+    /// answers for it instead of the kernel being asked again.
+    #[test]
+    fn overlapping_askings_are_merged_so_a_range_inside_any_is_covered() {
+        let mut ahead = vec![(0usize, 12_000usize), (8_000, 20_000)];
+        normalize_ahead(&mut ahead);
+        assert_eq!(ahead, [(0, 20_000)], "the second overlapping the first");
+        assert!(covers(&ahead, 0, 12_000));
+        assert!(covers(&ahead, 8_000, 20_000), "the one the scan missed");
+        assert!(covers(&ahead, 5_000, 15_000), "across both");
+        assert!(!covers(&ahead, 12_000, 21_000), "past both");
+        assert!(!covers(&ahead, 0, 20_001), "one page more");
+        // Ends that meet are one range too, and the order they come in does
+        // not matter.
+        let mut ahead = vec![(40, 50), (0, 5), (5, 40)];
+        normalize_ahead(&mut ahead);
+        assert_eq!(ahead, [(0, 50)]);
+        // Ranges apart stay apart.
+        let mut ahead = vec![(0, 5), (40, 50), (10, 20)];
+        normalize_ahead(&mut ahead);
+        assert_eq!(ahead, [(0, 5), (10, 20), (40, 50)]);
+        assert!(!covers(&ahead, 5, 10), "the gap between them");
+        assert!(covers(&ahead, 10, 20));
+    }
+
+    /// What a copy's "nothing wrote it" check costs, per copy, over the
+    /// copies one submission asks about together: the refresh's [`writes`]
+    /// (the journal's answer, after which the copy's pages are walked)
+    /// against [`written_since`], which the flush's skip asks instead. Run
+    /// under Wine:
+    /// `cargo xwin test --no-run --target x86_64-pc-windows-msvc -p victory-gpu`,
+    /// then the exe with `--ignored --nocapture clean_copies_bench`.
+    #[test]
+    #[ignore]
+    fn clean_copies_bench() {
+        use std::time::Instant;
+        for pages in [1024usize, 4096] {
+            // SAFETY: a fresh write-watched allocation, freed at the end.
+            let p = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    pages * PAGE,
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            } as usize;
+            assert_ne!(p, 0);
+            forget_askings();
+            let ranges: Vec<(usize, usize)> = (0..pages).map(|i| (p + i * PAGE, p + (i + 1) * PAGE)).collect();
+            ask_once(&ranges);
+            let (since, _) = asked(ranges[0].0, ranges[0].1).expect("asked ahead");
+            // The refresh's ask, as `copy_stale` makes it.
+            let started = Instant::now();
+            let mut reported = 0;
+            for &(a, b) in &ranges {
+                reported += writes(a, b, true).map_or(0, |(_, written)| written.len());
+            }
+            let before = started.elapsed();
+            // The flush's skip.
+            let started = Instant::now();
+            let clean = ranges.iter().filter(|&&(a, b)| written_since(a, b, since) == Some(false)).count();
+            let after = started.elapsed();
+            println!(
+                "{pages} copies: writes() {} ns each, written_since() {} ns each; {clean} clean, {reported} pages reported",
+                before.as_nanos() / pages as u128,
+                after.as_nanos() / pages as u128,
+            );
+            ask_once_end();
+            forget_askings();
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        }
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
