@@ -62,7 +62,7 @@ Three steps. Full detail — every option, logs, uninstall, troubleshooting — 
    ```bash
    cd ~/Downloads
    mkdir -p ~/.local/share/Steam/compatibilitytools.d/
-   tar -xzf Scarlight-*.tar.gz -C ~/.local/share/Steam/compatibilitytools.d/
+   tar -xzf Scarlight-<version>.tar.gz -C ~/.local/share/Steam/compatibilitytools.d/
    ```
 
    Flatpak Steam uses `~/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d/`.

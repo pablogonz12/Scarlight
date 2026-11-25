@@ -30,12 +30,18 @@ the host instead; nothing else changes.
 
    ```bash
    mkdir -p ~/.local/share/Steam/compatibilitytools.d/
-   tar -xzf Scarlight-*.tar.gz -C ~/.local/share/Steam/compatibilitytools.d/
+   tar -xzf Scarlight-<version>.tar.gz -C ~/.local/share/Steam/compatibilitytools.d/
    ```
 
    Flatpak Steam: `~/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d/`.
-3. Open `Scarlight/scarlight.conf` and set `PROTON` to a Proton you have installed (the folder name
-   under `compatibilitytools.d/`, or a full path). That is the only setting you must touch.
+3. Create your settings file from the example if you have none yet, then set `PROTON` to a Proton you
+   have installed (the folder name under `compatibilitytools.d/`, or a full path). That is the only
+   setting you must touch:
+
+   ```bash
+   cd ~/.local/share/Steam/compatibilitytools.d/Scarlight
+   [ -f scarlight.conf ] || cp scarlight.conf.example scarlight.conf
+   ```
 4. **If Scarlight is already installed**, your `scarlight.conf` is safe: a release ships
    `scarlight.conf.example` and never a `scarlight.conf`, and the tool copies the example into place
    only when there is no conf yet. An upgrade therefore keeps your `PROTON=`, `D3DCOMPILER=` and other

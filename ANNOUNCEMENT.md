@@ -20,8 +20,10 @@ command-stream decoder and the shader translator are the same code, and the same
   tarball, and a GitHub Actions job attaches it on a tag.
 - **Only what may be redistributed is shipped.** The tarball carries Scarlight and vkd3d-proton, with
   their licence texts. Microsoft's `d3dcompiler_47.dll` is never shipped and is optional: the tool
-  runs on Wine's built-in compiler, and a copy you are licensed to use is picked up from
-  `scarlight.conf` or from your prefix. DXC's `dxil.dll` and `dxcompiler.dll` are opt-in for a
+  runs on Wine's built-in compiler. A copy you are licensed to use is picked up at launch from, in
+  order: the `D3DCOMPILER=` path in `scarlight.conf`, `files/d3dcompiler_47.dll` in the tool folder, or
+  one already staged in the game's prefix (`drive_c/scarlight/`); `install.sh --d3dcompiler PATH`
+  puts a copy in `files/` for you. DXC's `dxil.dll` and `dxcompiler.dll` are opt-in for a
   packager (`package.sh --include-dxc`), because Microsoft's terms for those binaries limit them to
   use on Windows; a release leaves them to you, in one documented step (`docs/steam.md`).
 - **The same runtime as Proton.** The tool's `toolmanifest.vdf` asks Steam for the Steam Linux Runtime
