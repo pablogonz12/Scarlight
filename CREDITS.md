@@ -80,6 +80,13 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   `VICTORY_FRAME_BUDGET=0`). Reimplemented on this tree's counters and its own 50 ms budget: its
   per-command timestamps, memory-trait breakdown and slow-pipeline guard are not taken.
 
+- **fxceless/victory-fork [PR #1130](https://github.com/fxceless/victory-fork/pull/1130)** (Lkxex), GPL-3.0:
+  detiling only the 64 KiB pages a texture's write watch says the title wrote, instead of the whole texture at
+  every refresh (`crates/victory-formats/src/texture.rs`'s `Layout::detile_window`,
+  `crates/victory-gpu/src/texture.rs`'s `Staging::refresh_pages`, `VICTORY_DETILE_DIRTY=0`). Its own page table
+  and its per-page reads are not taken: our subresource ranges come from the layout (`Layout::mip_extents`) and
+  the written pages are read in runs, with the rows outside the window skipped whole.
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
