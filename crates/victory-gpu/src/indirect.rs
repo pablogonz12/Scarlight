@@ -1211,7 +1211,10 @@ void main() {
         let total = (STRIDE * RECORDS) as usize;
         // One run of the clamp: what the budget holds after it, which
         // records were kept, and the two words of notes.
-        let rest1 = harness.clamp.clone();
+        // Compiled explicitly, as REST 0 is below: `Harness::new`'s own clamp
+        // takes whatever `VICTORY_INDIRECT_REST` the runner has (CodeRabbit,
+        // PR #233).
+        let rest1 = compile_cs(&harness.device, &format!("#define REST 1\n{SOURCE}")).expect("the clamp must compile");
         let rest0 = compile_cs(&harness.device, &format!("#define REST 0\n{SOURCE}")).expect("the clamp must compile");
         let run = |harness: &mut Harness, clamp: &Clamp| -> (u32, Vec<u32>, u32, u32) {
             let (src_buf, src_ptr, _) = harness.shared_buffer(total as u64);
