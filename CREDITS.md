@@ -79,6 +79,12 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   the copy-back and the rest, the largest named (`crates/victory-gpu/src/frame_budget.rs`,
   `VICTORY_FRAME_BUDGET=0`). Reimplemented on this tree's counters and its own 50 ms budget: its
   per-command timestamps, memory-trait breakdown and slow-pipeline guard are not taken.
+- **miatson/VIctory [#2801](https://github.com/miatson/VIctory/pull/2801)** (miatson), GPL-3.0: the idea that
+  the console blends MIN/MAX into integer render targets, which the host refuses, so such a target is made to
+  write unblended when the pipeline is built (`crates/victory-gpu/src/pipeline/host.rs`). Its twin pipeline
+  states did not come over; the format list came across as it stands, now checked against the `DXGI_FORMAT`
+  constants by a test.
+
 - **JMAN730/project-flamingo [#747](https://github.com/JMAN730/project-flamingo/pull/747)** (Rareuncommon),
   GPL-3.0: lower `v_mul_hi_u32_u24`/`v_mul_hi_i32_i24` as the high dword of the 48-bit product of the low 24
   bits of each operand (`crates/victory-shader/src/emit/lower/valu_int.rs`). Reimplemented on this tree's
@@ -93,10 +99,25 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   refresh of a mostly clean view heap walks only its dirty gaps instead of collecting one entry per 64 KiB
   block under the guard mutex; the per-block set it replaces is the test's reference.
 
+- **DexNom/VIctory [4775e8aaf](https://github.com/DexNom/VIctory/commit/4775e8aaf0f45c316807d26202efb369f40ceea0)**,
+  GPL-3.0: one lock serializing the tests that set the global frame clock or read it across a wait
+  (`TEST_FRAME_LOCK`, `crates/victory-gpu/src/frame.rs`), so a test that retimes the clock cannot move
+  another's ticks under it when `cargo test` runs the crate's tests in parallel.
 - **AnyPS5** ([boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5)): the format of the
   source-counted progress page (reference instruction forms, history chart). No code taken.
+- **HUMAN** ([HumanlyDev/HUMAN](https://github.com/HumanlyDev/HUMAN)) by HumanlyDev and bdycounter-sudo,
+  GPL-3.0-or-later: the pass that draws a depth plane's twin into the plane runs inline, in the list that
+  wrote the twin (and that list replays the title's state after it), so a depth test in the same list sees
+  what the shaders wrote (`crates/victory-gpu/src/host.rs` `twin_use`/`pass_plane`, `draw.rs` `replay`);
+  `VICTORY_PLANE_INLINE=0` waits for the list's close, as before.
+
 - **Mesa** ([aco_opcodes.py](https://gitlab.freedesktop.org/mesa/mesa)), MIT: the reference list of
   RDNA2 instruction forms in `tools/progress/rdna2_isa_forms.txt` is generated from it.
+- **Marvisak/VIctory [#2513](https://github.com/Marvisak/VIctory/pull/2513)** (Calvix2k), GPL-3.0: the idea
+  that a copy-back brings a declared range's snapshot in step with the bytes it takes from title memory, so that a
+  later overlapping range does not put the copy's older bytes back over a title write (`merge_back` in
+  `crates/victory-gpu/src/shadow.rs`). Reimplemented: theirs changes `copy_back_marked`, which this tree has no
+  equivalent of (its `copy_back` merges into the copy and keeps one snapshot per submission).
 
 - **Marvisak/VIctory [#2163](https://github.com/Marvisak/VIctory/pull/2163)** (0xkn0wh3r3), GPL-3.0: the
   built-in BCPack table's first BC7 dictionary entry has its 32 indices right after its width bytes, where
@@ -123,6 +144,11 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   (`DeferredViews`, `must_defer`, `VICTORY_DEFER_NEW_VIEWS=0` off), counted on the frame line. Reimplemented on
   this tree's counters: its born-after stamps on both twins and on placed buffers are kept, its `sync_line`
   place is ours.
+- **fxceless/victory-fork [PR #981](https://github.com/fxceless/victory-fork/pull/981)** (avt0m4t), GPL-3.0: an
+  embedded shader keys and translates on its declared DXBC bytes, so a packed record whose payload runs on past
+  the container gets the same BLAKE3 as its standalone copy (`Container::as_bytes()`,
+  `crates/victory-shader/src/dxbc.rs`; `Source::bytes()` for both the raw and the `SGD5` paths,
+  `apps/victory/src/shader.rs`). Reimplemented on this tree's `victory translate`, which has no `warm` command.
 
 ## Tools
 

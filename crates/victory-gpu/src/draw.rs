@@ -965,6 +965,12 @@ impl State {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
         }
+        if self.depth != 0 {
+            // A depth texture shaders also write: sync what they wrote
+            // before binding, marking depth as written only when depth writes
+            // are enabled.
+            list.twin_use(self.depth as This, false, self.depth_state != DEPTH_READ);
+        }
         if !self.bind(list, p, false) {
             return false;
         }
@@ -1015,8 +1021,6 @@ impl State {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
         if self.depth != 0 {
-            // A depth texture shaders also write: what they wrote, first.
-            list.twin_use(self.depth as This, false, true);
             // A view that writes neither plane keeps the texture readable:
             // the depth read state, together with the shader read states
             // if this draw's shaders read the same texture (the write state
@@ -1048,6 +1052,9 @@ impl State {
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
+        if list.take_plane_clobbered() {
+            self.replay(list);
+        }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
@@ -1286,6 +1293,12 @@ impl State {
                     return false;
                 }
             }
+        }
+        // If a table/resource SRV triggered an inline depth-plane pass,
+        // restore title graphics/compute bindings and re-bind cleanly once.
+        if list.take_plane_clobbered() {
+            self.replay(list);
+            return self.bind(list, p, compute);
         }
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.

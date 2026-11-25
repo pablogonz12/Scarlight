@@ -174,34 +174,6 @@ impl GraphicsState {
         }
     }
 
-    /// The blend state the host pipeline is made with. The console blends
-    /// into integer targets (MIN, MAX); D3D12 refuses a pipeline that
-    /// enables blending on one, so those targets write unblended and the
-    /// others keep the title's blending.
-    fn host_blend(&self) -> D3D12_BLEND_DESC {
-        let mut blend = self.blend;
-        if !host_blend_on() {
-            return blend;
-        }
-        let count = (self.targets.NumRenderTargets as usize).min(8);
-        let integer = |i: usize| integer(self.targets.RTFormats[i]);
-        let independent = blend.IndependentBlendEnable.as_bool();
-        // Without independent blending, target 0's description is every target's.
-        let blended =
-            |i: usize| blend.RenderTarget[if independent { i } else { 0 }].BlendEnable.as_bool();
-        if !(0..count).any(|i| integer(i) && blended(i)) {
-            return blend;
-        }
-        if !independent {
-            blend.RenderTarget = [blend.RenderTarget[0]; 8];
-            blend.IndependentBlendEnable = true.into();
-        }
-        for i in (0..count).filter(|&i| integer(i)) {
-            blend.RenderTarget[i].BlendEnable = false.into();
-        }
-        blend
-    }
-
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
@@ -385,6 +357,33 @@ impl GraphicsState {
             BackFace: d.BackFace,
             DepthBoundsTestEnable: self.depth_bounds.into(),
         }
+    }
+
+    /// The blend state the host pipeline is made with. D3D12 refuses a
+    /// pipeline that enables blending on an integer render target, though the
+    /// console blends into one (MIN, MAX), so those targets write unblended.
+    fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let mut blend = self.blend;
+        if !host_blend_on() {
+            return blend;
+        }
+        let count = (self.targets.NumRenderTargets as usize).min(8);
+        let independent = blend.IndependentBlendEnable.as_bool();
+        // Without independent blending, target 0's description is every target's.
+        let blended =
+            |i: usize| blend.RenderTarget[if independent { i } else { 0 }].BlendEnable.as_bool();
+        let integer = |i: usize| integer_format(self.targets.RTFormats[i].0 as u32);
+        if !(0..count).any(|i| integer(i) && blended(i)) {
+            return blend;
+        }
+        if !independent {
+            blend.RenderTarget = [blend.RenderTarget[0]; 8];
+            blend.IndependentBlendEnable = true.into();
+        }
+        for i in (0..count).filter(|&i| integer(i)) {
+            blend.RenderTarget[i].BlendEnable = false.into();
+        }
+        blend
     }
 
     /// The vertex buffer slots the input layout reads.
@@ -923,6 +922,25 @@ impl HostPipeline {
 #[repr(C, align(8))]
 struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
 
+/// Whether a `DXGI_FORMAT` value is an integer one (`*_UINT`, `*_SINT`, and the
+/// packed 10-bit `R10G10B10A2_UINT`), which the host cannot blend into.
+fn integer_format(format: u32) -> bool {
+    matches!(
+        format,
+        3 | 4 // R32G32B32A32
+            | 7 | 8 // R32G32B32
+            | 12 | 14 // R16G16B16A16
+            | 17 | 18 // R32G32
+            | 25 // R10G10B10A2_UINT
+            | 30 | 32 // R8G8B8A8
+            | 36 | 38 // R16G16
+            | 42 | 43 // R32
+            | 50 | 52 // R8G8
+            | 57 | 59 // R16
+            | 62 | 64 // R8
+    )
+}
+
 fn stream_pipeline<S>(
     device: &ID3D12Device,
     stream: &mut S,
@@ -1013,34 +1031,6 @@ fn host_blend_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HOST_BLEND").is_none_or(|v| v != "0"))
 }
 
-/// Whether a format holds integers (`_UINT`, `_SINT`): the host cannot blend
-/// into one, whatever the title's state says.
-fn integer(format: DXGI_FORMAT) -> bool {
-    matches!(
-        format,
-        DXGI_FORMAT_R32G32B32A32_UINT
-            | DXGI_FORMAT_R32G32B32A32_SINT
-            | DXGI_FORMAT_R32G32B32_UINT
-            | DXGI_FORMAT_R32G32B32_SINT
-            | DXGI_FORMAT_R16G16B16A16_UINT
-            | DXGI_FORMAT_R16G16B16A16_SINT
-            | DXGI_FORMAT_R32G32_UINT
-            | DXGI_FORMAT_R32G32_SINT
-            | DXGI_FORMAT_R10G10B10A2_UINT
-            | DXGI_FORMAT_R8G8B8A8_UINT
-            | DXGI_FORMAT_R8G8B8A8_SINT
-            | DXGI_FORMAT_R16G16_UINT
-            | DXGI_FORMAT_R16G16_SINT
-            | DXGI_FORMAT_R32_UINT
-            | DXGI_FORMAT_R32_SINT
-            | DXGI_FORMAT_R8G8_UINT
-            | DXGI_FORMAT_R8G8_SINT
-            | DXGI_FORMAT_R16_UINT
-            | DXGI_FORMAT_R16_SINT
-            | DXGI_FORMAT_R8_UINT
-            | DXGI_FORMAT_R8_SINT
-    )
-}
 
 /// A mesh pipeline from the title's graphics state: the pipeline-state
 /// stream form (no input layout).
@@ -1273,46 +1263,6 @@ mod tests {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
         }
-    }
-
-    /// The console blends (MIN, MAX) into integer targets; the host refuses a
-    /// pipeline that enables blending on one, so those targets write
-    /// unblended and the others keep the title's blending.
-    #[test]
-    fn integer_targets_write_unblended() {
-        let state = |independent: bool| {
-            let mut g = GraphicsState {
-                topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-                ..Default::default()
-            };
-            g.blend.IndependentBlendEnable = independent.into();
-            for t in &mut g.blend.RenderTarget {
-                t.BlendEnable = true.into();
-                t.BlendOp = D3D12_BLEND_OP_MAX;
-                t.BlendOpAlpha = D3D12_BLEND_OP_MAX;
-            }
-            g.depth.DepthEnable = false.into();
-            g.targets.NumRenderTargets = 3;
-            g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-            g.targets.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
-            g.targets.RTFormats[2] = DXGI_FORMAT_R8_UINT;
-            g
-        };
-        for independent in [true, false] {
-            let blend = state(independent).host_blend();
-            assert!(blend.IndependentBlendEnable.as_bool(), "{independent}");
-            assert!(blend.RenderTarget[0].BlendEnable.as_bool());
-            assert!(blend.RenderTarget[1].BlendEnable.as_bool());
-            assert_eq!(blend.RenderTarget[1].BlendOp, D3D12_BLEND_OP_MAX);
-            assert!(!blend.RenderTarget[2].BlendEnable.as_bool(), "{independent}");
-        }
-        // No integer target: the title's description as it was.
-        let mut g = state(false);
-        g.targets.RTFormats[2] = DXGI_FORMAT_R8_UNORM;
-        let blend = g.host_blend();
-        assert!(!blend.IndependentBlendEnable.as_bool());
-        assert!(blend.RenderTarget[0].BlendEnable.as_bool());
-        assert!(blend.RenderTarget[2].BlendEnable.as_bool());
     }
 
     /// A direct mesh dispatch forwards the caller's whole group grid: the
@@ -1586,6 +1536,63 @@ mod tests {
         assert!(GraphicsState::from_bytes(&[bytes.as_slice(), &[0]].concat()).is_none());
     }
 
+    /// A title's graphics state blending (MAX, which the console allows on
+    /// integer formats) into three targets, the last `R8_UINT`; with
+    /// `independent` false, target 0's description stands for all three and
+    /// the others keep their defaults (unblended), as a title's need not match.
+    fn blending_into_an_integer_target(independent: bool) -> GraphicsState {
+        let mut g = GraphicsState::default();
+        g.blend.IndependentBlendEnable = independent.into();
+        let described = if independent { 8 } else { 1 };
+        for t in &mut g.blend.RenderTarget[..described] {
+            t.BlendEnable = true.into();
+            t.BlendOp = D3D12_BLEND_OP_MAX;
+            t.BlendOpAlpha = D3D12_BLEND_OP_MAX;
+        }
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8_UINT;
+        g
+    }
+
+    /// The host refuses a pipeline that blends into an integer target, so such
+    /// a target writes unblended and the others keep the title's description.
+    #[test]
+    fn integer_targets_write_unblended() {
+        for independent in [true, false] {
+            let blend = blending_into_an_integer_target(independent).host_blend();
+            assert!(blend.IndependentBlendEnable.as_bool(), "independent: {independent}");
+            assert!(blend.RenderTarget[0].BlendEnable.as_bool());
+            assert!(blend.RenderTarget[1].BlendEnable.as_bool());
+            assert_eq!(blend.RenderTarget[1].BlendOp, D3D12_BLEND_OP_MAX);
+            assert!(!blend.RenderTarget[2].BlendEnable.as_bool(), "independent: {independent}");
+            // Every target in the count: blended unless integer.
+            for i in 0..3 {
+                assert_eq!(blend.RenderTarget[i].BlendEnable.as_bool(), i < 2, "target {i}");
+            }
+        }
+        // No integer target: the title's description as it was, not expanded.
+        let mut g = blending_into_an_integer_target(false);
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let blend = g.host_blend();
+        assert!(!blend.IndependentBlendEnable.as_bool());
+        assert!(blend.RenderTarget[0].BlendEnable.as_bool());
+    }
+
+    /// The integer format list: every typed `*_UINT`/`*_SINT` form and the
+    /// packed 10-bit one, and none of the float, unorm, snorm or typeless forms.
+    #[test]
+    fn the_integer_formats_are_the_typed_ones() {
+        // The values from the windows crate's DXGI_FORMAT constants.
+        for f in [3, 4, 7, 8, 12, 14, 17, 18, 25, 30, 32, 36, 38, 42, 43, 50, 52, 57, 59, 62, 64] {
+            assert!(integer_format(f), "format {f} is integer");
+        }
+        for f in [1, 2, 5, 6, 9, 10, 11, 13, 15, 16, 19, 21, 23, 24, 26, 27, 28, 29, 31, 33, 34, 35, 37, 39, 41, 48, 49, 51, 53, 54, 55, 56, 58, 60, 61, 63, 65, 66] {
+            assert!(!integer_format(f), "format {f} is not integer");
+        }
+    }
+
     const VS: &str = "float4 main(uint i : SV_VertexID) : SV_Position {
         float2 p = float2((i << 1) & 2, i & 2);
         return float4(p * 2.0 - 1.0, 0.5, 1.0);
@@ -1641,7 +1648,7 @@ mod tests {
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(&vs),
             PS: code(&ps),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
