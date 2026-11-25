@@ -864,9 +864,14 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_GROUP_BASE {
+            // The first group of the dispatch being bound: 0 until a split
+            // dispatch sets it before each run but the first ([`State::dispatch`]).
+            return 0;
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -965,6 +970,12 @@ impl State {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
         }
+        if self.depth != 0 {
+            // A depth texture shaders also write: sync what they wrote
+            // before binding, marking depth as written only when depth writes
+            // are enabled.
+            list.twin_use(self.depth as This, false, self.depth_state != DEPTH_READ);
+        }
         if !self.bind(list, p, false) {
             return false;
         }
@@ -1015,8 +1026,6 @@ impl State {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
         if self.depth != 0 {
-            // A depth texture shaders also write: what they wrote, first.
-            list.twin_use(self.depth as This, false, true);
             // A view that writes neither plane keeps the texture readable:
             // the depth read state, together with the shader read states
             // if this draw's shaders read the same texture (the write state
@@ -1048,6 +1057,9 @@ impl State {
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
+        if list.take_plane_clobbered() {
+            self.replay(list);
+        }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
@@ -1286,6 +1298,12 @@ impl State {
                     return false;
                 }
             }
+        }
+        // If a table/resource SRV triggered an inline depth-plane pass,
+        // restore title graphics/compute bindings and re-bind cleanly once.
+        if list.take_plane_clobbered() {
+            self.replay(list);
+            return self.bind(list, p, compute);
         }
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
@@ -2112,6 +2130,48 @@ impl State {
         });
     }
 
+    /// The most groups the host runs in one dimension of a dispatch. The
+    /// console's own limit is higher (a builder pass asks for 77,500 in
+    /// `x`): a dispatch beyond it is run as several ([`State::dispatch`]).
+    const MOST_GROUPS: u32 = 65_535;
+
+    /// The most groups a mesh dispatch runs in all (2^22, the host's grid
+    /// limit): a piece of a split mesh dispatch is cut to it as well.
+    const MOST_MESH_GROUPS: u32 = 1 << 22;
+
+    /// Where a compute or mesh stage's group-ID base is bound, if the stage
+    /// reads its group id: its user-data root parameter and the dword in it
+    /// (`victory_shader::emit::USER_GROUP_BASE`).
+    fn group_base_slot(p: &HostPipeline) -> Option<(u32, u32)> {
+        for stage in &p.stages {
+            let Some((param, _)) = stage.user_data else {
+                continue;
+            };
+            let t = stage.translated();
+            if let Some(u) = t
+                .host
+                .user_data
+                .iter()
+                .find(|u| u.root == RootType::Other(victory_shader::emit::USER_GROUP_BASE))
+            {
+                return Some((param, u.index));
+            }
+        }
+        None
+    }
+
+    /// Sets the group-ID base of the next run of a split dispatch.
+    fn set_group_base(list: &HostList, compute: bool, (param, dword): (u32, u32), base: u32) {
+        // SAFETY: an open list whose root signature has that parameter.
+        unsafe {
+            if compute {
+                list.list.SetComputeRoot32BitConstant(param, base, dword);
+            } else {
+                list.list.SetGraphicsRoot32BitConstant(param, base, dword);
+            }
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
@@ -2160,8 +2220,46 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        // The host runs at most 65,535 groups in a dimension. A console
+        // dispatch over that runs as several, each with the group id where it
+        // starts (`VICTORY_GROUP_SPLIT=0`: the first 65,535 groups only).
+        match Self::group_base_slot(p) {
+            Some(slot) if x > Self::MOST_GROUPS => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::info!(
+                        x,
+                        runs = x.div_ceil(Self::MOST_GROUPS),
+                        "a dispatch asks for more groups in x than the host runs: it runs in pieces, each told where its \
+                         groups start (VICTORY_GROUP_SPLIT=0: the first 65,535 groups only)"
+                    );
+                });
+                let mut at = 0;
+                while at < x {
+                    let n = (x - at).min(Self::MOST_GROUPS);
+                    if at != 0 {
+                        Self::set_group_base(list, true, slot, at);
+                    }
+                    // SAFETY: an open list with everything set.
+                    unsafe { list.list.Dispatch(n, y, z) };
+                    at += n;
+                }
+            }
+            _ => {
+                if x > Self::MOST_GROUPS {
+                    once!(
+                        x,
+                        "a dispatch asks for more groups in x than the host runs and its program reads no group id: \
+                         the groups after 65,535 do not run"
+                    );
+                }
+                // No group id to move: the groups after the host's limit
+                // cannot be run at all (a count over it the host does not
+                // give its driver either).
+                // SAFETY: an open list with everything set.
+                unsafe { list.list.Dispatch(x.min(Self::MOST_GROUPS), y, z) };
+            }
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         self.reflection(list, p);
     }
@@ -2315,8 +2413,47 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}x{y}x{z}"), false));
                     self.mesh_scissor(list, true);
-                    // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, y, z) };
+                    match crate::pipeline::host_pipeline(self.pipeline as This).and_then(Self::group_base_slot) {
+                        Some(slot) if x > Self::MOST_GROUPS => {
+                            static ONCE: std::sync::Once = std::sync::Once::new();
+                            ONCE.call_once(|| {
+                                tracing::info!(
+                                    x,
+                                    runs = x.div_ceil(Self::MOST_GROUPS),
+                                    "a mesh dispatch asks for more groups in x than the host runs: it runs in pieces, \
+                                     each told where its groups start (VICTORY_GROUP_SPLIT=0: the first 65,535 groups only)"
+                                );
+                            });
+                            // A mesh dispatch's pieces are bounded by the
+                            // grid's own limit too, in all three dimensions.
+                            let grid = y.saturating_mul(z).max(1);
+                            let piece = (Self::MOST_MESH_GROUPS / grid).clamp(1, Self::MOST_GROUPS);
+                            let mut at = 0;
+                            while at < x {
+                                let n = (x - at).min(piece);
+                                if at != 0 {
+                                    Self::set_group_base(list, false, slot, at);
+                                }
+                                // SAFETY: an open list with everything set.
+                                unsafe { l6.DispatchMesh(n, y, z) };
+                                at += n;
+                            }
+                        }
+                        _ => {
+                            if x > Self::MOST_GROUPS {
+                                once!(
+                                    x,
+                                    "a mesh dispatch asks for more groups in x than the host runs and its program \
+                                     reads no group id: the groups after 65,535 do not run"
+                                );
+                            }
+                            // As above: no group id to move, and a count
+                            // over the limit the host does not hand its
+                            // driver either.
+                            // SAFETY: an open list with everything set.
+                            unsafe { l6.DispatchMesh(x.min(Self::MOST_GROUPS), y, z) };
+                        }
+                    }
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true

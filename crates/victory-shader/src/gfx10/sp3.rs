@@ -700,6 +700,21 @@ mod tests {
         );
     }
 
+    /// VOP3P 0x18 is `v_dot8_i32_i4`, between `v_dot4_u32_u8` and
+    /// `v_dot8_u32_u4` (RDNA2 ISA). Words and text from
+    /// `llvm-mc -triple=amdgcn -mcpu=gfx1030 --disassemble`.
+    #[test]
+    fn signed_nibble_dot_product_has_its_name() {
+        assert_eq!(
+            one(&[0xCC18_4000, 0x1C0E_0501], true),
+            "v_dot8_i32_i4 v0, v1, v2, v3"
+        );
+        assert_eq!(
+            one(&[0xCC19_4000, 0x1C0E_0501], true),
+            "v_dot8_u32_u4 v0, v1, v2, v3"
+        );
+    }
+
     #[test]
     fn lane_masks_follow_the_wave_size() {
         let cmp = [0x7C08_06F0]; // v_cmp_gt_f32 with 0.5 and v3

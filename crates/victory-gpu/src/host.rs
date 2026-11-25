@@ -950,6 +950,9 @@ pub(crate) struct HostList {
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
+    /// Set by [`HostList::pass_plane`] when it binds its own graphics state
+    /// mid-list so [`crate::draw::State`] replays title state before drawing.
+    plane_clobbered: std::sync::atomic::AtomicBool,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1016,7 +1019,8 @@ struct TwinUse {
     /// The draw or dispatch being prepared writes the twin.
     writing: bool,
     /// The depth plane's twin holds what the plane lacks although the list
-    /// copied the twins since: the plane's pass waits for the list's close.
+    /// copied the twins since: the plane's pass waits for the list's close
+    /// (`VICTORY_PLANE_INLINE=0`).
     late: bool,
 }
 
@@ -1388,10 +1392,13 @@ pub(crate) fn dred_on() -> bool {
     })
 }
 
-/// Indirect mesh dispatches since the last frame line: the largest group
+/// Indirect dispatch records since the last frame line: the largest group
 /// count a record asked for, and the groups asked in all (from the lists'
-/// budget buffers, a run late).
+/// budget buffers, a run late). MESH_GROUPS are the mesh records,
+/// COMPUTE_GROUPS the compute ones.
 static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+static COMPUTE_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
@@ -3136,6 +3143,7 @@ impl Host {
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 _alive: Counted::new(),
+                plane_clobbered: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -4820,6 +4828,7 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.plane_clobbered.store(false, Ordering::Relaxed);
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -4899,6 +4908,20 @@ impl HostList {
         }
     }
 
+    /// Whether the depth plane's pass draws inline, in the list that wrote its
+    /// twin, instead of when the list closes. On by default;
+    /// `VICTORY_PLANE_INLINE=0` waits for the close, as before.
+    fn plane_inline() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_PLANE_INLINE").is_none_or(|v| v != "0"))
+    }
+
+    /// Returns and clears whether [`HostList::pass_plane`] replaced graphics
+    /// pipeline/target state mid-list.
+    pub(crate) fn take_plane_clobbered(&self) -> bool {
+        self.plane_clobbered.swap(false, Ordering::Relaxed)
+    }
+
     /// A use of title texture `resource` about to be recorded, if it is a
     /// depth texture with a colour twin (false if it is not): of the twin
     /// (`colour`: unordered access) or of the depth texture (depth target,
@@ -4909,10 +4932,10 @@ impl HostList {
     /// unordered access state; the caller moves the depth texture to the
     /// state its use needs, as for any texture. A twin still ahead when the
     /// list closes is copied then (`twins_to_depth`).
-    /// shortcut: every depth target bound for a draw counts as written
-    /// (also when the draw only tests), and every unordered access view a
-    /// shader names as written; views a shader picks from the heap by a
-    /// computed index are not seen here at all.
+    /// shortcut: every depth target bound for a draw writes as noted by
+    /// `write`, and every unordered access view a shader names as written;
+    /// views a shader picks from the heap by a computed index are not seen
+    /// here at all.
     pub(crate) fn twin_use(
         &self,
         resource: crate::object::This,
@@ -4955,18 +4978,23 @@ impl HostList {
             (true, false) => u.behind[1] = Some(true),
             (false, _) => {}
         }
-        // shortcut: the depth plane's twin is not drawn into the plane
-        // here: the pass sets a pipeline and a target of ours, which a list
-        // still recording the title's commands cannot take. This use sees
-        // the plane as it was; the pass runs when the list closes
-        // (`twins_to_depth`). Counted.
-        if copy && !colour && twin.plane.is_some() {
+        // The depth plane's pass draws into the depth texture with a pipeline
+        // and target of ours: a list still recording the title's commands
+        // replays its state after it (crate::draw::State). With
+        // `VICTORY_PLANE_INLINE=0` the pass waits for the list's close
+        // (`twins_to_depth`), as before, and a use in the same list sees the
+        // plane as it was.
+        let late = copy && !colour && twin.plane.is_some() && !Self::plane_inline();
+        if late {
             u.late = true;
             crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed);
         }
         drop(twins);
         if copy {
             self.twin_copy(&depth, &twin, colour);
+            if !colour && !late {
+                self.pass_plane(&depth, &twin);
+            }
         } else if colour {
             self.settle(&twin.colour, UNORDERED_ACCESS);
         }
@@ -4979,9 +5007,9 @@ impl HostList {
 
     /// Records the pass that draws the twin of the depth plane of `depth`
     /// into the plane, if `twin` has one, with the moves to the states the
-    /// pass needs; the twin is left in the unordered access state. Only
-    /// for a list that records nothing of the title's afterwards
-    /// (`record_plane_pass`).
+    /// pass needs; the twin is left in the unordered access state. Callers
+    /// recording more title commands afterward check [`take_plane_clobbered`]
+    /// to replay state (`record_plane_pass`).
     fn pass_plane(
         &self,
         depth: &std::sync::Arc<crate::resource::HostTexture>,
@@ -4994,6 +5022,7 @@ impl HostList {
         self.settle(depth, DEPTH_WRITE);
         self.settle(plane, PIXEL_SHADER_RESOURCE);
         record_plane_pass(&self.list, &depth.texture, &plane.texture);
+        self.plane_clobbered.store(true, Ordering::Relaxed);
         self.settle(plane, UNORDERED_ACCESS);
     }
 
@@ -5099,6 +5128,8 @@ impl HostList {
     fn prelude(&self) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
+        const DEPTH_WRITE: u32 = 0x10;
+        const PIXEL_SHADER_RESOURCE: u32 = 0x80;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         // The copies (depth texture, twin, whether into the twin); the
@@ -5120,11 +5151,15 @@ impl HostList {
         }
         drop(twins);
         // A copy runs with its textures in the copy states: each moves
-        // there from its real state, and from there to the state the list
-        // starts with (back to its real state if the list does not use it).
+        // there from its real state, any depth-plane pass draws from its
+        // plane twin to `DEPTH_WRITE`, and then everything moves to the state
+        // the list starts with (back to its real state if unused by the list).
         let mut to_copy = Vec::new();
+        let mut to_plane = Vec::new();
         let mut barriers = Vec::new();
         let mut copying = std::collections::HashMap::new();
+        let mut plane_syncs = Vec::new();
+        let mut touched = Vec::new();
         for (depth, twin, colour) in &syncs {
             let (from, to) = if *colour {
                 (depth, &twin.colour)
@@ -5135,20 +5170,62 @@ impl HostList {
                 let key = std::sync::Arc::as_ptr(texture) as usize;
                 let real = texture.state.load(Ordering::Relaxed);
                 copying.insert(key, state);
+                touched.push(texture);
                 if real != state {
                     to_copy.push(transition(
                         &texture.texture,
                         host_state(real),
                         host_state(state),
                     ));
-                    if !states.contains_key(&key) {
-                        barriers.push(transition(
-                            &texture.texture,
-                            host_state(state),
-                            host_state(real),
-                        ));
-                    }
                 }
+            }
+            if !*colour && let Some(plane) = &twin.plane {
+                let depth_key = std::sync::Arc::as_ptr(depth) as usize;
+                let depth_from = copying.get(&depth_key).copied().unwrap_or(COPY_DEST);
+                let plane_key = std::sync::Arc::as_ptr(plane) as usize;
+                let plane_from = copying
+                    .get(&plane_key)
+                    .copied()
+                    .unwrap_or_else(|| plane.state.load(Ordering::Relaxed));
+                let depth_to = legal_state(&depth.texture, DEPTH_WRITE);
+                let plane_to = legal_state(&plane.texture, PIXEL_SHADER_RESOURCE);
+                if depth_from != depth_to {
+                    to_plane.push(transition(
+                        &depth.texture,
+                        host_state(depth_from),
+                        host_state(depth_to),
+                    ));
+                }
+                if plane_from != plane_to {
+                    to_plane.push(transition(
+                        &plane.texture,
+                        host_state(plane_from),
+                        host_state(plane_to),
+                    ));
+                }
+                copying.insert(depth_key, depth_to);
+                copying.insert(plane_key, plane_to);
+                touched.push(plane);
+                plane_syncs.push((depth, plane));
+            }
+        }
+        for texture in touched {
+            let key = std::sync::Arc::as_ptr(texture) as usize;
+            if !states.contains_key(&key)
+                && let Some(at_end) = copying.remove(&key)
+            {
+                let real = texture.state.load(Ordering::Relaxed);
+                if at_end != real {
+                    barriers.push(transition(
+                        &texture.texture,
+                        host_state(at_end),
+                        host_state(real),
+                    ));
+                }
+            } else if !states.contains_key(&key) {
+                // Already handled above if deduplicated.
+            } else {
+                // Handled in `states` loop below using `copying`.
             }
         }
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
@@ -5177,6 +5254,12 @@ impl HostList {
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
+                }
+                if !to_plane.is_empty() {
+                    list.ResourceBarrier(&to_plane);
+                }
+                for (depth, plane) in &plane_syncs {
+                    record_plane_pass(list, &depth.texture, &plane.texture);
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -5412,14 +5495,18 @@ impl HostList {
             let at = *data;
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
-            // list's last run (mesh dispatches: the largest group count
-            // asked for, the groups asked in all): taken, then zeroed.
+            // list's last run (dispatch records: the largest group count
+            // asked for and the groups asked in all, mesh in words 1 and 2,
+            // compute in words 3 and 4): taken, then zeroed.
             deferred.copies.push(Step::Host(Box::new(move || unsafe {
                 let words = at as *mut u32;
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                for k in 0..3 {
+                let (largest, all) = (words.add(3).read_volatile(), words.add(4).read_volatile());
+                COMPUTE_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
+                COMPUTE_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
+                for k in 0..5 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -6357,8 +6444,13 @@ impl Meter {
         ));
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+        let compute_largest = COMPUTE_GROUPS[0].swap(0, Ordering::Relaxed);
+        let compute_groups = COMPUTE_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
+        );
+        tracing::info!(
+            "indirect compute dispatches: the largest group count asked for {compute_largest} (clamped: at most 65535), {compute_groups:.0} groups asked per frame"
         );
         late_line(frames);
         card_clock_line(frames, ms);
