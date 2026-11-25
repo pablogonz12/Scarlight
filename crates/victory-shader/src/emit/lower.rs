@@ -1006,10 +1006,26 @@ fn f16_nearest_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_F16_NEAREST").is_some_and(|v| v == "1"))
 }
 
+/// `VICTORY_PHI_SAMPLERS=0`: an image operation whose sampler a uniform branch chooses
+/// between two immediate samplers ([`Lower::image`], 40 programs) is lowered as before,
+/// from the one sampler the descriptors name at the site. On by default: the console's
+/// choice is then kept, and both samplers are bound. Off, a program that needs the
+/// switch translates as it did, and the choice of the other edge is the site's sampler.
+fn phi_samplers_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_PHI_SAMPLERS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PHI_SAMPLERS").is_none_or(|v| v != "0"))
+}
+
 #[cfg(test)]
 thread_local! {
     /// A test's choice for [`f16_nearest_on`], for its thread only.
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`phi_samplers_on`], for its thread only.
+    pub(super) static TEST_PHI_SAMPLERS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// `VICTORY_F16_SUM_WIDE=0`: a wave sum of 16-bit floats where not every lane of the wave
@@ -9129,7 +9145,8 @@ impl<'a> Lower<'a> {
 
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let sampler = self.descriptors.get(&((b, i), true)).copied();
-        if let Some(Source::Phi { block, args }) = sampler
+        if phi_samplers_on()
+            && let Some(Source::Phi { block, args }) = sampler
             && let [first @ Source::Constant(_), second @ Source::Constant(_)] = args.as_slice()
             && let [left, right] = self.x.p.blocks[*block].preds.as_slice()
         {
@@ -11572,10 +11589,18 @@ mod tests {
         let (mut layout, mut used) = texture_tables();
         layout[1] = root(RootType::Constants, 1, 1);
         used.truncate(1);
-        let shader = lower_with(&words, layout, used).unwrap();
+        let shader = lower_with(&words, layout.clone(), used.clone()).unwrap();
         assert_eq!(shader.samplers.len(), 2);
         assert!(shader.samplers.contains(&[0, 0, 0, 0]));
         assert!(shader.samplers.contains(&[0x92, 0, 0, 0]));
+        // `VICTORY_PHI_SAMPLERS=0`: the choice is not taken, and the site's own sampler
+        // stands for both edges (as before the switch).
+        let was = super::TEST_PHI_SAMPLERS.replace(Some(false));
+        let off = lower_with(&words, layout, used);
+        super::TEST_PHI_SAMPLERS.set(was);
+        // Off, the site's own sampler is used for both edges (or the program does not
+        // translate, as before the switch): never both samplers.
+        assert!(off.map_or(true, |shader| shader.samplers.len() == 1));
     }
 
     #[test]
