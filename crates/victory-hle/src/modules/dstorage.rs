@@ -369,7 +369,7 @@ struct Lane {
     /// Submitted, by sequence number: reads not started (with the time
     /// the title enqueued them), status entries not written, reads
     /// running, and failures not yet reported.
-    reads: VecDeque<(u64, Request, std::time::Instant)>,
+    reads: VecDeque<(u64, ReadRequest, std::time::Instant)>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
@@ -377,15 +377,15 @@ struct Lane {
 }
 
 // SAFETY: requests point into title memory and our own objects, which stay
-// valid until the title has seen them complete; status arrays count their
-// references atomically.
+// valid until the title has seen them complete; file sources and status
+// arrays count their references atomically.
 unsafe impl Send for Lane {}
 
 /// A read a worker runs.
 struct Job {
     lane: u64,
     seq: u64,
-    request: Request,
+    request: ReadRequest,
     staging: u64,
     /// When the title enqueued it: from there to the worker's start is the
     /// time a request waited (the diagnostics summary's `queue` stage).
@@ -558,13 +558,16 @@ impl Scheduler {
 fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
     loop {
-        let Some(job) = lanes.start() else {
+        let Some(mut job) = lanes.start() else {
             lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
             continue;
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
+        let result = execute(&job.request.request);
+        // Drop the file reference before publishing completion so a caller
+        // that already released the file sees its OS handle closed on wakeup.
+        job.request.release_file();
         // The lock's wait, with 16 workers queueing for a request each: the
         // scheduler's own cost shows up here, not in a read.
         let mark = Mark::begin();
@@ -584,10 +587,10 @@ impl Lanes {
     fn count(&mut self, job: &Job, started: std::time::Instant) {
         let (requests, bytes, busy) = &mut self.done;
         *requests += 1;
-        *bytes += u64::from(job.request.destination_size);
+        *bytes += u64::from(job.request.request.destination_size);
         *busy += started.elapsed();
-        if job.request.options & BCPACK != 0 {
-            self.bcpack.0 += u64::from(job.request.destination_size);
+        if job.request.request.options & BCPACK != 0 {
+            self.bcpack.0 += u64::from(job.request.request.destination_size);
             self.bcpack.1 += started.elapsed();
         }
         // Its enqueue to its start, charged to the queue stage.
@@ -627,17 +630,18 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request, submitted) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let (_, request, submitted) = lane.reads.front()?;
+        let submitted = *submitted;
+        let staging = staging_bytes(&request.request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (seq, request, _) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
-        let size = u64::from(request.destination_size.max(request.source_size)).max(1);
+        let size = u64::from(request.request.destination_size.max(request.request.source_size)).max(1);
         self.now = self.clock[class];
         self.clock[class] += size * COST[class];
         self.lane_now[class] = lane.clock;
@@ -811,8 +815,38 @@ const PAGE: usize = 64 * 1024;
 enum Command {
     /// A read, and when the title enqueued it: the queue stage runs from
     /// there, not from the submission that moved it to the workers.
-    Read(Request, std::time::Instant),
+    Read(ReadRequest, std::time::Instant),
     Status(Status),
+}
+
+/// A read request queued in the scheduler, holding a reference on its file
+/// source (when file-backed) until the read finishes or is dropped.
+struct ReadRequest {
+    request: Request,
+    file: Option<*mut Instance<File>>,
+}
+
+impl ReadRequest {
+    fn new(request: Request) -> Self {
+        let file = (request.options & MEMORY_SOURCE == 0 && !request.source.is_null()).then(|| {
+            let file = request.source.cast_mut().cast::<Instance<File>>();
+            add_ref_instance(file);
+            file
+        });
+        ReadRequest { request, file }
+    }
+
+    fn release_file(&mut self) {
+        if let Some(file) = self.file.take() {
+            release(file);
+        }
+    }
+}
+
+impl Drop for ReadRequest {
+    fn drop(&mut self) {
+        self.release_file();
+    }
 }
 
 
@@ -840,7 +874,7 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
-    queue(this, Command::Read(request, std::time::Instant::now()));
+    queue(this, Command::Read(ReadRequest::new(request), std::time::Instant::now()));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -1626,7 +1660,10 @@ mod tests {
         let mut r = request(options, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
-        lane.unsubmitted.push(Command::Read(r, std::time::Instant::now()));
+        lane.unsubmitted.push(Command::Read(
+            ReadRequest::new(r),
+            std::time::Instant::now(),
+        ));
     }
 
     #[test]
@@ -2023,5 +2060,29 @@ mod tests {
         )
         .expect("a zlib request");
         assert_eq!(bench::page_bytes(pages.numbers(), raw.len()), raw);
+    }
+
+    #[test]
+    fn queued_file_read_survives_caller_releasing_file() {
+        let contents = pattern(256);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("released.bin");
+        std::fs::write(&path, &contents).unwrap();
+        let file = open(&path);
+        let (queue, array) = (new_queue(0), status_array(1));
+
+        let mut out = [0u8; 64];
+        enqueue(queue, &request(0, out.as_mut_ptr().cast(), 64, file, 32, 64));
+        enqueue_status(queue, array, 0);
+
+        // Release the caller's only reference before submitting the queue.
+        let release_fn: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
+        assert_eq!(release_fn(file), 1);
+
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(out, contents[32..96]);
+        // The file handle was released before completion was published.
+        std::fs::remove_file(&path).unwrap();
     }
 }
