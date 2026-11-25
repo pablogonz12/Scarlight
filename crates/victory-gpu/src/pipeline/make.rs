@@ -125,17 +125,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        let started = Instant::now();
         wait(p, crate::frame::current());
-        eprintln!(
-            "[debug] ready: state={} made={:?} waited={:?} frame={}",
-            p.queue_state.load(Ordering::Relaxed),
-            p.made.get().map(|m| m.is_some()),
-            started.elapsed(),
-            crate::frame::current()
-        );
-    } else {
-        eprintln!("[debug] ready: already made");
     }
     p.made.get()?.as_ref()
 }

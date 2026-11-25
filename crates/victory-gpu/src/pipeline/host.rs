@@ -372,7 +372,6 @@ pub(crate) struct HostPipeline {
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
-    eprintln!("[debug] refuse: {reason} for {shaders:?}");
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&reason) {
@@ -389,14 +388,6 @@ impl HostPipeline {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
-        eprintln!(
-            "[debug] new: {} shaders {:?} graphics={} host={} mesh_shaders={:?}",
-            shaders.len(),
-            shaders.iter().map(|s| (s.stage, s.hash.clone(), s.translated.get().is_some())).collect::<Vec<_>>(),
-            g.is_some(),
-            crate::host::host().is_some(),
-            crate::host::host().map(|h| h.mesh_shaders())
-        );
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -644,7 +635,6 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
-                    eprintln!("[debug] mesh pipeline refused: {e:?} name={name}");
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
                     return None;
