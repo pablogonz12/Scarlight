@@ -127,42 +127,14 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
-    /// With the write-back on its own thread (`VICTORY_ASYNC_WRITEBACK=1`):
-    /// jobs it ran and their microseconds, and the title's waits on blocks
-    /// a job held (count and microseconds).
-    AsyncJobs,
-    AsyncUs,
-    AsyncWaits,
-    AsyncWaitUs,
-    /// Textures found written while the view-memory guard said they were
-    /// not (so hashed at every check from then on).
-    TexGuardMissed,
-    /// Presented frames whose texture comes from title memory, and of those
-    /// the ones that had bytes no submitted list uploaded yet (a frame a
-    /// submission old at the present).
-    PresentFilled,
-    PresentPending,
-    /// Presents that put up the title's newest content of the frame's
-    /// texture themselves, and presents that showed content older than the
-    /// staging buffer's.
-    PresentRefilled,
-    PresentBehind,
-    /// Presents that showed a content no older than one already shown (a
-    /// frame out of the order the title wrote), and those whose copy's
-    /// source the title rewrote before the copy ran.
-    PresentReorder,
-    PresentOverwritten,
-    /// Uploads of a texture only part of which is mapped: those where the
-    /// views were narrowed to the resident mips, and those where no mip at
-    /// all was there.
-    ResidentNarrowed,
-    ResidentNone,
-    /// Shader resource views narrowed to their texture's resident mips.
-    ViewNarrowed,
+    /// `watch::writes` kernel askings that failed (the range is not
+    /// write-watched: view memory or not watchable).
+    WatchFailed,
+    /// `watch::writes` askings not made because the range's first block is
+    /// already known to be guarded view memory (no kernel call).
+    WatchKnownView,
 }
-/// 88 (the live-switches base, async write-back's counters among them) plus
-/// intro-fix's seven and tex-resident's three.
-const COUNTERS: usize = 98;
+const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -724,6 +696,11 @@ fn log_memory() {
     let card = crate::host::host()
         .and_then(|h| h.video_memory())
         .unwrap_or_default();
+    // Everything the system says of the two memory groups, beside the
+    // budget and use the lines below print.
+    if let Some(h) = crate::host::host() {
+        h.log_video_memory("with the memory line");
+    }
     // What else holds memory: the map, on a thread of its own, with every
     // sixth line; and what the shader table and the pipeline library keep.
     static LINES: AtomicU64 = AtomicU64::new(0);
@@ -771,6 +748,22 @@ fn log_memory() {
         mb(card[1]),
         mb(card[0]),
         mb(card[3]),
+    );
+    let targets = crate::resource::targets_census();
+    tracing::info!(
+        "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB",
+        targets[0],
+        mb(targets[1]),
+        targets[10],
+        mb(targets[11]),
+        targets[2],
+        mb(targets[3]),
+        targets[4],
+        mb(targets[5]),
+        targets[6],
+        mb(targets[7]),
+        targets[8],
+        mb(targets[9]),
     );
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
@@ -991,6 +984,9 @@ pub(crate) fn recorded(started: std::time::Instant) {
     let ns = started.elapsed().as_nanos() as u64;
     add(C::RecordCalls, 1);
     add(C::RecordNs, ns);
+    crate::framelog::add(crate::framelog::T::RecordCalls, 1);
+    crate::framelog::add(crate::framelog::T::RecordNs, ns);
+    crate::framelog::here(crate::framelog::H::RecordNs, ns);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
@@ -1004,6 +1000,12 @@ pub(crate) fn recorded(started: std::time::Instant) {
         return;
     }
     UNSENT.with(|u| u.set((0, 0)));
+    if crate::framelog::on() {
+        crate::framelog::add(crate::framelog::T::RecordLooks, 1);
+        if crate::framelog::on_slow_core() {
+            crate::framelog::add(crate::framelog::T::RecordSlow, 1);
+        }
+    }
     let id = thread_id();
     let mut all = RECORDERS.lock().unwrap_or_else(|e| e.into_inner());
     match all.iter_mut().find(|r| r.0 == id) {
@@ -1098,10 +1100,7 @@ pub(crate) fn log(frames: f64) {
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
-         changed, {:.1} MB hashed, {:.1} MB of them changed, {:.0} written behind the guard; \
-         presented textures from title memory {:.0}, of them a submission old {:.0}; \
-         put up at the present {:.0}; shown out of order {:.0}, their copy's source \
-         rewritten since {:.0}",
+         changed, {:.1} MB hashed, {:.1} MB of them changed",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -1125,12 +1124,6 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
-        c[C::TexGuardMissed as usize],
-        c[C::PresentFilled as usize],
-        c[C::PresentPending as usize],
-        c[C::PresentRefilled as usize],
-        c[C::PresentReorder as usize],
-        c[C::PresentOverwritten as usize],
     );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
@@ -1159,6 +1152,12 @@ pub(crate) fn log(frames: f64) {
         c[C::GpuWritesLeftOut as usize],
         mb(c[C::GpuWritesLeftOutBytes as usize]),
     );
+    let [together, written, mapped] =
+        [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "guards over several views of a page, since the start: {together} blocks guarded with their other views, \
+         {written} views opened by a write through another, {mapped} ranges opened because a view of them was mapped"
+    );
     // Where the wall clock of a frame goes: the phases of a frame, the
     // processor time of the whole process, and what each submitting and
     // recording thread did.
@@ -1175,8 +1174,7 @@ pub(crate) fn log(frames: f64) {
          until the first submission; {:.1} ms from the last submission to the present call; \
          lists reset in {:.1} ms; the process ran {user:.0} ms user + {kernel:.0} ms kernel on \
          all threads; what shaders wrote: {:.1} ms finding {:.0} pieces that differ, {:.1} ms \
-         putting them back; write-back jobs: {:.0} in {:.1} ms, the title waited for them \
-         {:.0} times {:.1} ms; texture uploads: {:.0} recorded, {:.0} left out; {:.1} held \
+         putting them back; texture uploads: {:.0} recorded, {:.0} left out; {:.1} held \
          submissions run at the present with their waits not met; waits for memory values: \
          {:.0} looks {:.1} ms; {:.0} host lists made {:.1} ms; {:.0} parts of held submissions \
          ran alone that the next part could have run with",
@@ -1187,10 +1185,6 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::BackScanUs as usize]),
         c[C::BackDiffer as usize],
         ms(c[C::BackSyncUs as usize]),
-        c[C::AsyncJobs as usize],
-        ms(c[C::AsyncUs as usize]),
-        c[C::AsyncWaits as usize],
-        ms(c[C::AsyncWaitUs as usize]),
         c[C::TexUploads as usize],
         c[C::TexSkipped as usize],
         c[C::Forced as usize],
@@ -1200,17 +1194,6 @@ pub(crate) fn log(frames: f64) {
         c[C::HostListNs as usize] / 1e6,
         c[C::PartsTogether as usize],
     );
-    // A texture only part of which is mapped: the views of it name the
-    // mips that are there, and how many were narrowed.
-    let narrowed = c[C::ResidentNarrowed as usize];
-    let nothing = c[C::ResidentNone as usize];
-    let views_narrowed = c[C::ViewNarrowed as usize];
-    if narrowed + nothing + views_narrowed > 0.0 {
-        tracing::info!(
-            "resident mips per frame: {narrowed:.1} uploads narrowed to what is there, {nothing:.1} \
-             with no mip there; {views_narrowed:.1} shader resource views narrowed"
-        );
-    }
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut whole: Vec<_> = whole.into_iter().flatten().collect();
@@ -1296,6 +1279,15 @@ pub(crate) fn log(frames: f64) {
             longest as f64 / 1e3
         );
     }
+    tracing::info!(
+        "  write-watch askings per frame that failed in the kernel: {:.0}; not made because the range \
+         is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway); such ranges left \
+         out of the submissions' askings ahead: {:.0}",
+        c[C::WatchFailed as usize],
+        c[C::WatchKnownView as usize],
+        crate::watch::AHEAD_VIEWS.swap(0, Relaxed) as f64 / frames,
+    );
+    crate::draw::window_line(frames);
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \

@@ -17,11 +17,17 @@
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(windows)]
+mod cardmeter;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
 pub mod device;
+#[cfg(windows)]
+mod drvwatch;
+#[cfg(windows)]
+mod spread;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
@@ -29,6 +35,8 @@ pub mod dxgi;
 mod dxc;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+pub mod framelog;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
@@ -39,9 +47,15 @@ pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod plaincopy;
+#[cfg(windows)]
 mod primitive;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod profile;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod queue2;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -53,6 +67,8 @@ mod switches;
 mod memory;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod tiles;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
@@ -67,7 +83,8 @@ pub use host::on_failure;
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
+    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
+    writing as kernel_will_write,
 };
 
 /// Total installed physical RAM in bytes, queried once from the OS.
