@@ -50,8 +50,8 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
-    /// Bit n: immediate sampler n is used for comparisons.
-    pub cmp_samplers: u64,
+    /// Per-slot flag: immediate sampler `n` is used for comparisons.
+    pub cmp_samplers: Vec<bool>,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
@@ -201,7 +201,7 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
-    samplers: Vec<[u32; 4]>,
+    samplers: Vec<([u32; 4], bool)>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
@@ -2276,11 +2276,13 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
-        let cmp_samplers = self.s.cmp_samplers;
+        let cmp_samplers = std::mem::take(&mut self.s.cmp_samplers);
+        let samplers = self.samplers.into_iter().map(|(w, _)| w).collect();
         let wave_size = self.s.wave_size;
         Ok(Lowered {
             wave_size,
             cmp_samplers,
+            samplers,
             root_cbvs,
             root_srvs,
             root_uavs,
@@ -2290,7 +2292,6 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
             user_data,
-            samplers: self.samplers,
         })
     }
 
@@ -6421,18 +6422,18 @@ impl<'a> Lower<'a> {
                     .get(..4)
                     .and_then(|w| w.try_into().ok())
                     .ok_or("a sampler constant")?;
-                let n = match self.samplers.iter().position(|w| *w == words) {
+                // A constant used both for normal and for comparison sampling
+                // gets two static samplers: the host's sampler kind is part of
+                // the static sampler, so one slot cannot be both.
+                let cmp = props.0 & 0x8000 != 0;
+                let n = match self.samplers.iter().position(|&e| e == (words, cmp)) {
                     Some(n) => n,
                     None => {
-                        self.samplers.push(words);
+                        self.samplers.push((words, cmp));
+                        self.s.cmp_samplers.push(cmp);
                         self.samplers.len() - 1
                     }
                 };
-                if props.0 & 0x8000 != 0 {
-                    // shortcut: one sampler used with and without comparison
-                    // would need two static samplers; it becomes a comparison one.
-                    self.s.cmp_samplers |= 1 << n;
-                }
                 Ok(self.s.sampler_handle(self.cur, n as u32))
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
@@ -11491,6 +11492,7 @@ mod tests {
     // Descriptor words read as numbers: kept in their own file (lower.rs is at the size limit).
     mod desc_data;
     mod mad_u16_lerp;
+    mod samplers;
 
     /// Tables of 2D textures at s0 and samplers at s1.
     fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {

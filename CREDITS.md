@@ -90,6 +90,11 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
 - **Mesa** ([aco_opcodes.py](https://gitlab.freedesktop.org/mesa/mesa)), MIT: the reference list of
   RDNA2 instruction forms in `tools/progress/rdna2_isa_forms.txt` is generated from it.
 
+- **HUMAN** ([HumanlyDev/HUMAN](https://github.com/HumanlyDev/HUMAN)) by HumanlyDev and bdycounter-sudo,
+  GPL-3.0-or-later: one immediate sampler constant used both for normal and for comparison sampling takes two
+  static sampler slots (`crates/victory-shader/src/emit/lower.rs`, `samplers`/`cmp_samplers`), where our bit
+  per slot made the normal use sample with a comparison sampler.
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is

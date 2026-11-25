@@ -678,7 +678,7 @@ fn emit_program(
             .enumerate()
             .map(|(n, &w)| {
                 let mut s = StaticSampler::from_words(w);
-                if l.cmp_samplers >> n & 1 != 0 {
+                if l.cmp_samplers.get(n).copied().unwrap_or(false) {
                     s.filter |= 0x80;
                 }
                 s
