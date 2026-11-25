@@ -16,6 +16,17 @@
 //! run empty, saturating without 32-bit wraparound so a list of thousands of
 //! garbage records cannot run for seconds either.
 //!
+//! The budget is device-local memory: D3D12 refuses an unordered access view
+//! on host-visible memory (a real driver faults on it, WARP and CI's runner
+//! included), and the batched clamp passes write these words once per draw,
+//! which across PCIe on a discrete card is slow. Each list's prelude copies
+//! zeroes over them on the card at each submission, and a small list behind
+//! the submission copies them into readback memory: the CPU reads what a
+//! submission left once that submission has been waited for, a submission
+//! late, and nothing needs them sooner (they count what the clamp noted, for
+//! the frame line). The words of a submission sent ahead
+//! (`VICTORY_LATE_WAIT`) are not read at all.
+//!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension and 2^20 per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
@@ -180,10 +191,13 @@ uint compute_clamped(uint kind, uint src_at, out uint2 draw_counts, out uint3 gr
     }
 }
 
+// A record the budget cannot pay for runs empty, every count word of it
+// zeroed: the words the per-record clamp zeroes (`SOURCE`), so a hoisted
+// record and an inline-clamped one come out the same.
 void write_record(uint kind, uint stride, uint src_at, uint dst_at, bool over, uint2 draw_counts, uint3 groups) {
     if (kind <= 1) {
         if (over) {
-            draw_counts.x = 0;
+            draw_counts = uint2(0, 0);
         }
         dst_args.Store2(dst_at, draw_counts);
         for (uint off = 8; off < stride; off += 4) {
@@ -191,7 +205,7 @@ void write_record(uint kind, uint stride, uint src_at, uint dst_at, bool over, u
         }
     } else {
         if (over) {
-            groups.x = 0;
+            groups = uint3(0, 0, 0);
         }
         dst_args.Store3(dst_at, groups);
         for (uint off = 12; off < stride; off += 4) {
@@ -616,14 +630,39 @@ impl HoistedClamps {
         unsafe { list.ResourceBarrier(&barriers) };
     }
 
-    /// Records the batched hoisted clamp pass(es) into `prelude`, moving each
-    /// used scratch chunk `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
+    /// Records the list's budget renewal into `prelude` (its words start at
+    /// zero on the card each submission, and this prelude runs before the
+    /// list and before its own batched passes) and then the batched hoisted
+    /// clamp pass(es), moving each used scratch chunk
+    /// `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
     pub(crate) fn record_prelude(
         &self,
         prelude: &ID3D12GraphicsCommandList,
-        budget_resource: &ID3D12Resource,
-        budget_gpu: u64,
+        budget: &crate::host::Budget,
     ) -> bool {
+        let renew = [
+            transition(
+                &budget.resource,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            ),
+        ];
+        let cleared = [
+            transition(
+                &budget.resource,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            ),
+        ];
+        // SAFETY: an open prelude list; the budget and the zeroed upload
+        // memory are live. The words are zeroed whole: what the last
+        // submission's clamp noted goes into readback memory behind that
+        // submission instead.
+        unsafe {
+            prelude.ResourceBarrier(&renew);
+            prelude.CopyBufferRegion(&budget.resource, 0, &budget.zero, 0, crate::host::BUDGET_BYTES);
+            prelude.ResourceBarrier(&cleared);
+        }
         if self.jobs.is_empty() || self.used == 0 {
             return false;
         }
@@ -631,7 +670,7 @@ impl HoistedClamps {
             return false;
         };
         let mut pre = Vec::with_capacity(self.used + 1);
-        // Earlier lists' shader writes to the title's argument buffers first.
+        // Earlier lists' shader writes (the budget's among them) first.
         pre.push(uav_barrier_of(None));
         for chunk in &self.chunks[..self.used] {
             pre.push(transition(
@@ -648,7 +687,7 @@ impl HoistedClamps {
             prelude.SetComputeRootSignature(&c.root);
             prelude.SetPipelineState(&c.pso);
             prelude.SetComputeRootShaderResourceView(1, upload.gpu);
-            prelude.SetComputeRootUnorderedAccessView(4, budget_gpu);
+            prelude.SetComputeRootUnorderedAccessView(4, budget.gpu());
             let mut run_start = 0usize;
             while run_start < self.jobs.len() {
                 let key = (self.jobs[run_start].src_gpu, self.jobs[run_start].dst_gpu);
@@ -673,7 +712,7 @@ impl HoistedClamps {
                 run_start = run_end;
             }
             let mut post = Vec::with_capacity(self.used + 1);
-            post.push(uav_barrier_of(Some(budget_resource)));
+            post.push(uav_barrier_of(Some(&budget.resource)));
             for chunk in &self.chunks[..self.used] {
                 post.push(transition(
                     chunk,
@@ -951,6 +990,27 @@ void main() {
 }
 "#;
 
+    /// A test's indirect-work budget: device-local, as the layer's is, with
+    /// the zeroed upload memory that clears it on the card and the readback
+    /// memory its words are copied into for the CPU.
+    struct TestBudget {
+        buffer: ID3D12Resource,
+        zero: ID3D12Resource,
+        readback: ID3D12Resource,
+        ptr: *mut u8,
+        gpu: u64,
+    }
+
+    impl TestBudget {
+        /// Word `i` of what the budget held at the copy `budget_read` recorded:
+        /// 0 is the work charged, 1 and 2 what the mesh clamp noted.
+        fn word(&self, i: usize) -> u32 {
+            // SAFETY: mapped readback memory, four words long, after the
+            // submission that copied into it was waited for.
+            unsafe { (self.ptr.cast::<u32>()).add(i).read_volatile() }
+        }
+    }
+
     /// A D3D12 device, queue, allocator, list and fence for one test, on the
     /// adapter `VICTORY_TEST_ADAPTER` picks (WARP, or the card under Wine).
     struct Harness {
@@ -1078,6 +1138,56 @@ void main() {
                     .unwrap();
             }
             buffer.unwrap()
+        }
+
+        /// A list's indirect-work budget in a test: device-local, as the
+        /// layer's is (D3D12 refuses a host-visible resource as a UAV), with
+        /// the zeroed upload memory that clears it on the card and the
+        /// readback memory its words are copied into.
+        fn budget(&self) -> TestBudget {
+            let buffer = self.default_uav(256);
+            let zero = self.default_uav(256);
+            let (readback, ptr, _) = self.shared_buffer(256);
+            // SAFETY: plain creation of a mapping, and a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            TestBudget { buffer, zero, readback, ptr, gpu }
+        }
+
+        /// Records the budget's clearing on the card (`zero` holds zeroes).
+        fn budget_zero(&self, list: &ID3D12GraphicsCommandList, budget: &TestBudget) {
+            // SAFETY: an open list; live buffers.
+            unsafe {
+                list.ResourceBarrier(&[transition(
+                    &budget.buffer,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                list.CopyBufferRegion(&budget.buffer, 0, &budget.zero, 0, 256);
+                list.ResourceBarrier(&[transition(
+                    &budget.buffer,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+        }
+
+        /// Records the copy of the budget's words into readback memory, for a
+        /// read after the submission has been waited for.
+        fn budget_read(&self, list: &ID3D12GraphicsCommandList, budget: &TestBudget) {
+            // SAFETY: an open list; live buffers.
+            unsafe {
+                list.ResourceBarrier(&[transition(
+                    &budget.buffer,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                list.CopyBufferRegion(&budget.readback, 0, &budget.buffer, 0, 256);
+                list.ResourceBarrier(&[transition(
+                    &budget.buffer,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
         }
 
         fn signature(&self, kind: u32, stride: u32) -> ID3D12CommandSignature {
@@ -1267,7 +1377,7 @@ void main() {
         let src_bytes = ARGS_OFFSET + (STRIDE as usize) * (MAX as usize) + 64;
         let (src_buf, src_ptr, _) = harness.shared_buffer(src_bytes as u64);
         let (count_buf, count_ptr, _) = harness.shared_buffer(512);
-        let (_budget_buf, budget_ptr, budget_gpu) = harness.shared_buffer(256);
+        let budget = harness.budget();
         let (_hits_buf, hits_ptr, hits_gpu) = harness.shared_buffer(256);
         let (readback_buf, readback_ptr, _) = harness.shared_buffer((STRIDE * 8) as u64);
         let dst_buf = harness.default_uav(u64::from(STRIDE) * u64::from(MAX));
@@ -1320,7 +1430,7 @@ void main() {
         unsafe {
             std::ptr::copy_nonoverlapping(initial_src.as_ptr(), src_ptr, src_bytes);
             std::ptr::copy_nonoverlapping(initial_count.as_ptr(), count_ptr, 512);
-            (budget_ptr as *mut u32).write_volatile(0);
+            harness.budget_zero(&harness.list, &budget);
             (hits_ptr as *mut u32).write_volatile(0);
             std::ptr::write_bytes(readback_ptr, 0, (STRIDE * 8) as usize);
         }
@@ -1332,7 +1442,7 @@ void main() {
             &harness.clamp,
             &harness.list,
             &dst_buf,
-            budget_gpu,
+            budget.gpu,
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_1 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
@@ -1377,7 +1487,7 @@ void main() {
             &harness.clamp,
             &harness.list,
             &dst_buf,
-            budget_gpu,
+            budget.gpu,
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_2 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
@@ -1397,13 +1507,14 @@ void main() {
             );
         }
         done_on(&harness.list, &dst_buf);
+        harness.budget_read(&harness.list, &budget);
 
         harness.submit_and_wait();
 
         // SAFETY: GPU execution finished; read mapped host results.
         let (hits, spent, after_src, after_count, clamped_words) = unsafe {
             let hits = (hits_ptr as *const u32).read_volatile();
-            let spent = (budget_ptr as *const u32).read_volatile();
+            let spent = budget.word(0);
             let after_src = std::slice::from_raw_parts(src_ptr.cast_const(), src_bytes).to_vec();
             let after_count = std::slice::from_raw_parts(count_ptr.cast_const(), 512).to_vec();
             let words = std::slice::from_raw_parts(
@@ -1483,21 +1594,21 @@ void main() {
         }
         for ahead in [true, false] {
             let (src_buf, src_ptr, _) = harness.shared_buffer(total as u64);
-            let (_budget_buf, budget_ptr, budget_gpu) = harness.shared_buffer(256);
+            let budget = harness.budget();
             let (readback_buf, readback_ptr, _) = harness.shared_buffer(total as u64);
             let dst_buf = harness.default_uav(total as u64);
 
             // SAFETY: mapped buffers of these sizes.
             unsafe {
                 std::ptr::copy_nonoverlapping(src.as_ptr(), src_ptr, total);
-                std::ptr::write_bytes(budget_ptr, 0, 256);
                 std::ptr::write_bytes(readback_ptr, 0, total);
             }
+            harness.budget_zero(&harness.list, &budget);
             assert!(record_clamp_as(
                 &harness.clamp,
                 &harness.list,
                 &dst_buf,
-                budget_gpu,
+                budget.gpu,
                 (&src_buf, 0),
                 None,
                 (KIND_MESH, STRIDE, RECORDS),
@@ -1518,12 +1629,13 @@ void main() {
                     D3D12_RESOURCE_STATE_COMMON,
                 )]);
             }
+            harness.budget_read(&harness.list, &budget);
             harness.submit_and_wait();
             // SAFETY: the work is done; mapped buffers.
             let (spent, largest, out) = unsafe {
                 (
-                    (budget_ptr as *const u32).read_volatile(),
-                    (budget_ptr as *const u32).add(1).read_volatile(),
+                    budget.word(0),
+                    budget.word(1),
                     std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), total / 4).to_vec(),
                 )
             };
@@ -1573,7 +1685,7 @@ void main() {
 
         let total_bytes = (STRIDE * RECORDS) as usize;
         let (src_buf, src_ptr, _) = harness.shared_buffer(total_bytes as u64);
-        let (_budget_buf, budget_ptr, budget_gpu) = harness.shared_buffer(256);
+        let budget = harness.budget();
         let (readback_buf, readback_ptr, _) = harness.shared_buffer(total_bytes as u64);
         let dst_buf = harness.default_uav(total_bytes as u64);
 
@@ -1596,15 +1708,15 @@ void main() {
         // SAFETY: mapped buffers have sufficient capacity.
         unsafe {
             std::ptr::copy_nonoverlapping(initial_src.as_ptr(), src_ptr, total_bytes);
-            (budget_ptr as *mut u32).write_volatile(0);
             std::ptr::write_bytes(readback_ptr, 0, total_bytes);
         }
+        harness.budget_zero(&harness.list, &budget);
 
         assert!(record_clamp(
             &harness.clamp,
             &harness.list,
             &dst_buf,
-            budget_gpu,
+            budget.gpu,
             (&src_buf, 0),
             None,
             (KIND_INDEXED, STRIDE, RECORDS),
@@ -1626,11 +1738,12 @@ void main() {
                 D3D12_RESOURCE_STATE_COMMON,
             )]);
         }
+        harness.budget_read(&harness.list, &budget);
         harness.submit_and_wait();
 
         // SAFETY: GPU work completed.
         let (spent, after_src, out_words) = unsafe {
-            let spent = (budget_ptr as *const u32).read_volatile();
+            let spent = budget.word(0);
             let after_src = std::slice::from_raw_parts(src_ptr.cast_const(), total_bytes).to_vec();
             let out_words = std::slice::from_raw_parts(
                 readback_ptr.cast::<u32>().cast_const(),
@@ -1732,28 +1845,9 @@ void main() {
         list.reset();
     }
 
-    /// Whether the hoisted tests can run on the host device. Their clamp
-    /// charges the list's budget buffer, which is host-visible so the CPU can
-    /// read what the mesh clamp noted; a real D3D12 driver (WARP, and CI's
-    /// Windows runner) refuses a host-visible resource as an unordered access
-    /// view, which faults the process. The layer runs under Wine + vkd3d-proton
-    /// (`VICTORY_TEST_ADAPTER=hw`), where it is allowed.
-    fn clamp_device_here(host: &crate::host::Host) -> bool {
-        if crate::test_device::is_software(&host.device) {
-            eprintln!(
-                "skipped: the indirect budget buffer is host-visible, which a software adapter refuses as a UAV (VICTORY_TEST_ADAPTER=hw runs this)"
-            );
-            return false;
-        }
-        true
-    }
-
     #[test]
     fn batch_argument_clamp_builds() {
         let _once = crate::warptest::lock();
-        if super::host().is_some_and(|h| !clamp_device_here(h)) {
-            return;
-        }
         if super::host().is_none() {
             return;
         }
@@ -1799,9 +1893,6 @@ void main() {
     #[test]
     fn hoisted_clamps_match_inline_bounds_and_budget_order() {
         let _once = crate::warptest::lock();
-        if super::host().is_some_and(|h| !clamp_device_here(h)) {
-            return;
-        }
         let Some(host) = super::host() else {
             return;
         };
@@ -1978,9 +2069,6 @@ void main() {
     #[test]
     fn hoisted_clamps_across_multiple_buffers_and_chunks_preserve_budget_order() {
         let _once = crate::warptest::lock();
-        if super::host().is_some_and(|h| !clamp_device_here(h)) {
-            return;
-        }
         use windows::core::Interface;
         let Some(host) = super::host() else {
             return;
@@ -2044,9 +2132,6 @@ void main() {
     #[test]
     fn hoisted_list_resubmitted_twice_reclamps_cleanly() {
         let _once = crate::warptest::lock();
-        if super::host().is_some_and(|h| !clamp_device_here(h)) {
-            return;
-        }
         let Some(host) = super::host() else {
             return;
         };
@@ -2077,9 +2162,6 @@ void main() {
     #[test]
     fn hoisted_prelude_orders_after_earlier_list_compute_write() {
         let _once = crate::warptest::lock();
-        if super::host().is_some_and(|h| !clamp_device_here(h)) {
-            return;
-        }
         let Some(host) = super::host() else {
             return;
         };
@@ -2123,9 +2205,6 @@ void main() {
     #[test]
     fn hoisted_clamps_cost_one_pass_per_run_of_draws() {
         let _once = crate::warptest::lock();
-        if super::host().is_some_and(|h| !clamp_device_here(h)) {
-            return;
-        }
         let Some(host) = super::host() else {
             return;
         };
@@ -2153,11 +2232,7 @@ void main() {
         }
         let inline = super::clamp_passes() - before;
 
-        let (budget, budget_gpu) = {
-            list.budget().unwrap();
-            let (res, gpu) = list.budget_resource().unwrap();
-            (res.clone(), gpu)
-        };
+        list.budget().unwrap();
         let mut hoisted_locs = Vec::with_capacity(DRAWS);
         for i in 0..DRAWS {
             hoisted_locs.push(
@@ -2166,7 +2241,7 @@ void main() {
         }
         let prelude = host.new_list().unwrap();
         let before = super::clamp_passes();
-        assert!(list.hoisted().record_prelude(&prelude.list, &budget, budget_gpu));
+        assert!(list.hoisted().record_prelude(&prelude.list, list.budget_resource().unwrap()));
         let hoisted = super::clamp_passes() - before;
 
         assert_eq!(inline, DRAWS as u64, "the inline clamp records a pass per draw");
