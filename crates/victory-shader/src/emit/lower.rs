@@ -13,7 +13,7 @@ use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
-use crate::gfx10::{Dpp, Fields, NULL, Operand};
+use crate::gfx10::{Dpp, Fields, NULL, Operand, Valu};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
@@ -134,6 +134,19 @@ enum Numeric {
 /// from its low end to the field (loads are dword-aligned).
 const fn field_in_dword(off: u32) -> (u32, u32) {
     (off & !3, (off & 3) * 8)
+}
+
+/// Whether a source's `abs`/`neg` modifiers (and, for a move, its `clamp` and
+/// `omod`) are taken as host floats again, as main did: `VICTORY_BITWISE_MODS=0`.
+fn host_mods(v: &Valu, clamp_too: bool) -> bool {
+    !switches::mods() && (v.abs != 0 || v.neg != 0 || (clamp_too && (v.clamp || v.omod != 0)))
+}
+
+/// Where a byte or half load at the constant byte `off` lands: the word
+/// [`field_in_dword`] names and the shift, or `None` for the run-time
+/// alignment in main's instruction order (`VICTORY_FIELD_DWORD=0`).
+fn field_at(off: u32) -> Option<(u32, u32)> {
+    switches::field().then(|| field_in_dword(off))
 }
 
 /// A GFX10 buffer format (the unified format of typed buffer loads): the
@@ -6211,9 +6224,8 @@ impl<'a> Lower<'a> {
             // buffer's others: vkd3d-proton reads a load at a computed offset
             // through a per-component raw access, which on NVIDIA misses a
             // dword the same invocation has just stored.
-            match self.s.m.int_value(off) {
-                Some(o) if switches::field() => {
-                    let (at, sh) = field_in_dword(o as u32);
+            match self.s.m.int_value(off).and_then(|o| field_at(o as u32)) {
+                Some((at, sh)) => {
                     let (at, sh) = (self.s.m.i32(at), self.s.m.i32(sh));
                     let w = load(self, at, 1)[0];
                     vec![self.s.m.bin(c, Bin::LShr, w, sh)]
@@ -7106,7 +7118,7 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_mov_b32" => {
-                if !switches::mods() && (v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0) {
+                if host_mods(v, true) {
                     let a = f(self, 0)?;
                     return float(self, a);
                 }
@@ -7607,7 +7619,7 @@ impl<'a> Lower<'a> {
                 };
                 // Sign-bit moves on the bits the select passes (a host
                 // `fabs`/`fneg` may flush a denormal), whatever the mask's use.
-                if !switches::mods() && (v.abs != 0 || v.neg != 0) {
+                if host_mods(v, false) {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
                     let r = self.s.m.select(c, cond, bb, a);
                     return float(self, r);
@@ -8311,7 +8323,8 @@ impl<'a> Lower<'a> {
                 // A fused multiply-add rounds once; a multiply-add (v_mad_f16,
                 // v_mac_f16) may round the product first.
                 "v_fma_f16" | "v_fmac_f16" if switches::fma_once() => self.fmad_half(a, b, acc),
-                "v_mad_f16" | "v_mac_f16" => self.fmad(a, b, acc),
+                // `VICTORY_F16_FMA_ONCE=0`: the fused ones too, in f32.
+                "v_fma_f16" | "v_fmac_f16" | "v_mad_f16" | "v_mac_f16" => self.fmad(a, b, acc),
                 "v_max3_f16" => {
                     let t = self.max_min(true, a, b);
                     self.max_min(true, t, acc)
@@ -12026,4 +12039,5 @@ mod tests {
     // Buffer formats and their widenings: kept in their own file (lower.rs is at the size limit).
     mod formats;
     mod widened_exec;
+    mod switches;
 }
