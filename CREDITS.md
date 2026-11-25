@@ -43,6 +43,18 @@ BlueKaiman, kais7654, pushkarreddyy, shh.
   GPL-3.0: narrowing a host shader resource view of a streamed texture to the mips whose memory is
   there, and remaking it when more levels arrive or a host copy fills the chain
   (`crates/victory-gpu/src/texture.rs`, `crates/victory-gpu/src/descriptor/host.rs`).
+- **Marvisak/VIctory [#2736](https://github.com/Marvisak/VIctory/pull/2736)** (brainbudt), GPL-3.0: copying
+  tiled textures as runs of whole micro-tile columns (one call per row and depth slice, 4-32 bytes at a
+  time) instead of one closure call per span, its `detile_throughput` benchmark, and its idea of keeping
+  the span walk as the reference (`crates/victory-formats/src/texture.rs`, `VICTORY_TEXTURE_RUNS=0`).
+  Reimplemented on this tree's pattern tables: the depth-pitch overlap check its fast path dropped is
+  kept, and a column-by-column fallback replaces its `unreachable!` for any pattern whose run width is
+  not 4-32 bytes.
+- **Marvisak/VIctory [#2735](https://github.com/Marvisak/VIctory/pull/2735)** (brainbudt), GPL-3.0: resolving a
+  BCPack slot through a 256-slot window table (one bit per transition, ranked inside its 64-bit word) instead
+  of a bucket search and an exact-division reciprocal, its `bcpack_decode_throughput` benchmark, and keeping
+  the range scan as the reference (`crates/victory-formats/src/bcpack.rs`, `VICTORY_BCPACK_WINDOWS=0`). Ported
+  whole, including its BC7 endpoint and index packing in `bc7_pack`.
 
 ## Tools
 
