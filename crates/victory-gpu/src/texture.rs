@@ -876,6 +876,12 @@ pub(crate) fn forget(resource: usize) {
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
     }
+    // Its resident window goes too: the address a handle names is given to
+    // other textures, which must not inherit a clamp meant for this one.
+    let mut resident = RESIDENT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = resident.as_mut() {
+        map.remove(&resource);
+    }
     // Its memory may be given to other textures now (run 177: most of the
     // "HERO LEAD" lines were views in memory a released texture had held).
     HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, d| d.5 != resource);
@@ -2070,6 +2076,11 @@ mod resident_tests {
         assert_eq!(resident(resource), Some((2, 6)));
         // Cleared (what a host copy filling the chain does, #616).
         note_resident(resource, (0, 0), true);
+        assert_eq!(resident(resource), None);
+        // The title releasing the resource drops its window: the next one at
+        // that address starts unclamped.
+        note_resident(resource, (4, 2), false);
+        super::forget(resource as usize);
         assert_eq!(resident(resource), None);
         // And noted again after it: one store, both ways.
         note_resident(resource, (1, 2), false);
