@@ -666,7 +666,7 @@ fn create() -> windows::core::Result<Host> {
         if crate::inplace::level() > 0 {
             crate::inplace::check_at_startup(&device);
         }
-        Ok(Host {
+        let host = Host {
             device,
             queue,
             fence,
@@ -681,7 +681,9 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
-        })
+        };
+        host.log_features();
+        Ok(host)
     }
 }
 
@@ -2924,6 +2926,116 @@ impl Host {
             tracing::info!(supported, "host depth bounds support");
             supported
         })
+    }
+
+    /// The adapter and the optional features the host gave us, logged once
+    /// when the device is ready: a hardware report starts with this line
+    /// (docs/hardware.md). A run that quietly takes the non-mesh or
+    /// non-ray path is visible in it.
+    fn log_features(&self) {
+        static DONE: OnceLock<()> = OnceLock::new();
+        DONE.get_or_init(|| {
+            // A tier's raw value is ten times its number, and 1.1 is 11.
+            fn tier(value: i32) -> String {
+                if value % 10 == 0 {
+                    (value / 10).to_string()
+                } else {
+                    format!("{}.{}", value / 10, value % 10)
+                }
+            }
+            // SAFETY: plain adapter and feature queries, each into its own
+            // structure of the given size.
+            unsafe {
+                let mut adapter = String::from("?");
+                let mut vendor = 0u32;
+                let mut device_id = 0u32;
+                if let Some(desc) = self
+                    .adapter
+                    .clone()
+                    .and_then(|a| a.cast::<IDXGIAdapter1>().ok())
+                    .and_then(|a| a.GetDesc1().ok())
+                {
+                    let end = desc.Description.iter().position(|c| *c == 0).unwrap_or(desc.Description.len());
+                    adapter = String::from_utf16_lossy(&desc.Description[..end]);
+                    vendor = desc.VendorId;
+                    device_id = desc.DeviceId;
+                }
+                // The runtime answers with its highest model at or below
+                // the probe; an unknown probe fails, so step down.
+                let mut model = 0i32;
+                for probe in [
+                    D3D_SHADER_MODEL_6_9,
+                    D3D_SHADER_MODEL_6_8,
+                    D3D_SHADER_MODEL_6_7,
+                    D3D_SHADER_MODEL_6_6,
+                    D3D_SHADER_MODEL_6_5,
+                    D3D_SHADER_MODEL_6_4,
+                    D3D_SHADER_MODEL_6_3,
+                    D3D_SHADER_MODEL_6_2,
+                    D3D_SHADER_MODEL_6_1,
+                    D3D_SHADER_MODEL_6_0,
+                ] {
+                    let mut data = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: probe };
+                    if self
+                        .device
+                        .CheckFeatureSupport(
+                            D3D12_FEATURE_SHADER_MODEL,
+                            (&raw mut data).cast(),
+                            size_of_val(&data) as u32,
+                        )
+                        .is_ok()
+                    {
+                        model = data.HighestShaderModel.0;
+                        break;
+                    }
+                }
+                // A refused query leaves its default: tier 0, no.
+                let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+                let mut o4 = D3D12_FEATURE_DATA_D3D12_OPTIONS4::default();
+                let mut o5 = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+                let mut o7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+                let query = |feature, data: *mut core::ffi::c_void, size: u32| {
+                    self.device
+                        .CheckFeatureSupport(feature, data, size)
+                        .is_ok()
+                };
+                query(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut o1).cast(),
+                    size_of_val(&o1) as u32,
+                );
+                query(
+                    D3D12_FEATURE_D3D12_OPTIONS4,
+                    (&raw mut o4).cast(),
+                    size_of_val(&o4) as u32,
+                );
+                query(
+                    D3D12_FEATURE_D3D12_OPTIONS5,
+                    (&raw mut o5).cast(),
+                    size_of_val(&o5) as u32,
+                );
+                query(
+                    D3D12_FEATURE_D3D12_OPTIONS7,
+                    (&raw mut o7).cast(),
+                    size_of_val(&o7) as u32,
+                );
+                tracing::info!(
+                    adapter = %adapter,
+                    vendor = format_args!("{vendor:#06x}"),
+                    device = format_args!("{device_id:#06x}"),
+                    shader_model = if model >= 96 {
+                        format!("6.{}", model - 96)
+                    } else {
+                        String::from("?")
+                    },
+                    mesh_tier = %tier(o7.MeshShaderTier.0),
+                    raytracing_tier = %tier(o5.RaytracingTier.0),
+                    int64_atomics = o1.Int64ShaderOps.as_bool(),
+                    shared_import_tier = o4.SharedResourceCompatibilityTier.0,
+                    "host device features"
+                );
+            }
+        });
     }
 
     /// A new list, open for recording.
