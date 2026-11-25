@@ -33,6 +33,10 @@ BlueKaiman.
 - **xcl** ([ivall/xcl](https://github.com/ivall/xcl) and its fork Bathyal), GPL-2.0-only: the
   wave-pairing approach and the NVIDIA wave lane-assignment report used in
   [docs/wave64-on-wave32.md](docs/wave64-on-wave32.md). No code taken.
+- **VIctory** ([Marvisak/VIctory#2504](https://github.com/Marvisak/VIctory/pull/2504), BastienRdz),
+  GPL-3.0: a write into physical pages tells the GPU side's write watch which of the title's views
+  show the pages *before* it lands, not only after, so an armed page keeps the bytes from before it
+  (`crates/victory-hle/src/modules/xmem.rs`).
 - **JMAN730/victory** ([project-flamingo#671](https://github.com/JMAN730/project-flamingo/pull/671)),
   GPL-3.0: telling the GPU side's write watch which of the title's views a write into physical
   pages (DirectStorage's destinations) landed in, by section and slice rather than page number, and

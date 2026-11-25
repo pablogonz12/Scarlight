@@ -582,6 +582,44 @@ fn stream_pages() -> bool {
     *ON
 }
 
+/// A write into physical pages through our own view of them, as the GPU
+/// side's write watch is told of it ([`write_physical`], [`PageWindow`]):
+/// before the write the title's blocks showing the pages are opened (as a
+/// kernel write's are by `kernel_will_write`), after it the pages are noted
+/// written where the title sees them.
+///
+/// Told only at the end, an armed page kept the bytes streaming put there as
+/// its old ones, and a copy-back put the copy's stale bytes back over them;
+/// and a block a copy-back job holds is given over to this write first, so
+/// the job does not put its bytes over the streamed ones afterwards.
+struct PhysicalWrite;
+
+impl PhysicalWrite {
+    /// Opens the guarded blocks of every title view showing `[within,
+    /// within + bytes)` of `slice`, before our write in `slice` lands. These
+    /// writes do not fault (they are not at the title's addresses), so this
+    /// is the only way the watch hears of them first.
+    fn begin(slice: &Slice, within: usize, bytes: usize) {
+        if !stream_pages() {
+            return;
+        }
+        for at in physical().written_views(slice, within, bytes) {
+            victory_gpu::kernel_will_write(at, PAGE);
+        }
+    }
+
+    /// After the write: the pages as the title's views show them now are
+    /// noted written — a view mapped while the write was under way was never
+    /// opened by [`PhysicalWrite::begin`].
+    fn end(slice: &Slice, within: usize, bytes: usize) {
+        if !stream_pages() {
+            return;
+        }
+        let shown = physical().written_views(slice, within, bytes);
+        victory_gpu::mapped_pages_written(shown.into_iter());
+    }
+}
+
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view
@@ -597,13 +635,9 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
             return false;
         };
         let k = (n * PAGE - within).min(data.len() - done);
+        PhysicalWrite::begin(slice, within, k);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
-        // The title's blocks showing these pages did not fault: note them
-        // written where the title reads them.
-        if stream_pages() {
-            let shown = physical().written_views(slice, within, k);
-            victory_gpu::mapped_pages_written(shown.into_iter());
-        }
+        PhysicalWrite::end(slice, within, k);
         (within, done) = (0, done + k);
     }
     true
@@ -632,10 +666,7 @@ impl Drop for PageWindow {
         // Whatever the decode wrote, the pages changed where the title sees
         // them: tell the write watch, which guards those blocks and cannot
         // see a write through this view.
-        if stream_pages() {
-            let shown = physical().written_views(&self.slice, self.within, self.len);
-            victory_gpu::mapped_pages_written(shown.into_iter());
-        }
+        PhysicalWrite::end(&self.slice, self.within, self.len);
     }
 }
 
@@ -649,8 +680,12 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    let view = View::map(slice, *n)?;
+    // Before anything is decoded into it, not after: opening a block a
+    // copy-back job holds stops the job's stale bytes landing on top.
+    PhysicalWrite::begin(slice, offset % PAGE, len);
     Some(PageWindow {
-        view: View::map(slice, *n)?,
+        view,
         slice: slice.clone(),
         within: offset % PAGE,
         len,
@@ -1542,6 +1577,54 @@ mod tests {
 
         assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
         assert_eq!(XMemMapPhysicalPages(b, 2, std::ptr::null()), b);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// Told only once the write has landed, the watch's blocks were still
+    /// read-only and clean as the bytes went in: a page armed for a copy-back
+    /// kept the streamed bytes as its old ones and the copy put its stale
+    /// bytes back over them, and a block a copy-back job held was written over
+    /// after the stream. The write opens the title's blocks first.
+    #[test]
+    fn physical_writes_open_the_title_views_before_the_bytes_land() {
+        let pages = allocate(2);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        let at = a as usize;
+        // A host copy of the view takes both pages: guarded, clean.
+        let taken = || victory_gpu::written_pages(at, at + 2 * PAGE).expect("view memory");
+        // A newly mapped view is reported written once; then it is clean.
+        let (mapped, reported) = taken();
+        assert_eq!(reported, [(at / PAGE, mapped), (at / PAGE + 1, mapped)]);
+        let (settled, reported) = taken();
+        assert_eq!(reported, [(at / PAGE, mapped), (at / PAGE + 1, mapped)]);
+        assert!(victory_gpu::page_guarded(at) && victory_gpu::page_guarded(at + PAGE));
+
+        // The page the write lands in is opened before it does: its block is
+        // no longer read-only, and the next asking finds it written anew.
+        assert!(write_physical(&pages, PAGE, &[7]));
+        assert!(!victory_gpu::page_guarded(at + PAGE), "opened first");
+        assert!(victory_gpu::page_guarded(at), "only the page written");
+        let (asking, written) = taken();
+        assert!(asking > settled);
+        assert_eq!(written, [(at / PAGE, mapped), (at / PAGE + 1, asking)]);
+
+        // A decode's window opens its pages too, and stays open while it lasts.
+        let window = page_window(&pages, PAGE, PAGE).expect("one run");
+        assert!(!victory_gpu::page_guarded(at + PAGE), "a window's pages");
+        drop(window);
+        let (after, windowed) = taken();
+        assert!(after > asking);
+        assert_eq!(windowed, [(at / PAGE, mapped), (at / PAGE + 1, after)]);
+
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 }
