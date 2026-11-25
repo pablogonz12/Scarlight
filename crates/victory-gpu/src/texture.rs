@@ -619,6 +619,44 @@ fn unmapped_frames() -> u64 {
     })
 }
 
+/// The runs of whole 64 KiB pages of title memory `[start, end)` written
+/// after asking `previous`, as `(offset from `start`, bytes)`: pages outside
+/// the texture are cut away and pages that meet are one run, read in one
+/// call. Offsets are texture-relative because that is the space the
+/// subresource ranges and [`victory_formats::texture::Layout::detile_window`]
+/// use; the address itself is only for the read.
+fn dirty_runs(
+    written: &[(usize, u64)],
+    previous: u64,
+    start: usize,
+    end: usize,
+) -> Vec<(u64, usize)> {
+    let mut pages: Vec<usize> = written
+        .iter()
+        .filter(|&&(_, w)| w > previous)
+        .map(|&(p, _)| p)
+        .collect();
+    if pages.is_empty() {
+        return Vec::new();
+    }
+    pages.sort_unstable();
+    pages.dedup();
+    let mut runs: Vec<(u64, usize)> = Vec::new();
+    for page in pages {
+        let lo = (page * crate::watch::PAGE).max(start);
+        let hi = ((page + 1) * crate::watch::PAGE).min(end);
+        if lo >= hi {
+            continue;
+        }
+        let at = (lo - start) as u64;
+        match runs.last_mut() {
+            Some(last) if last.0 + last.1 as u64 == at => last.1 += hi - lo,
+            _ => runs.push((at, hi - lo)),
+        }
+    }
+    runs
+}
+
 /// Whether a changed texture is detiled only where it changed, the 64 KiB
 /// pages the title wrote since the last asking (`VICTORY_DETILE_DIRTY=0`
 /// detiles the whole texture at every change, as before).
@@ -1380,41 +1418,22 @@ impl Staging {
         let ranges = self.ranges.as_ref()?;
         let start = self.memory as usize;
         let end = start.saturating_add(self.layout.size as usize);
-        let mut pages: Vec<usize> = written
-            .iter()
-            .filter(|&&(_, w)| w > previous)
-            .map(|&(p, _)| p)
-            .collect();
-        if pages.is_empty() {
-            return Some(0);
-        }
-        pages.sort_unstable();
-        pages.dedup();
-        // Whole pages inside the texture, close ones read in one call.
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        for page in pages {
-            let lo = (page * crate::watch::PAGE).max(start);
-            let hi = ((page + 1) * crate::watch::PAGE).min(end);
-            if lo >= hi {
-                continue;
-            }
-            match runs.last_mut() {
-                Some(last) if last.0 + last.1 == lo => last.1 += hi - lo,
-                _ => runs.push((lo, hi - lo)),
-            }
-        }
+        // The runs are offsets from the texture's first byte, as `ranges`
+        // are: the title's memory lies at whatever address the view got.
+        let runs = dirty_runs(written, previous, start, end);
         if runs.is_empty() {
             return Some(0);
         }
         let mut read = 0usize;
-        for &(run_start, run_len) in &runs {
+        for &(run_at, run_len) in &runs {
+            let run_start = start + run_at as usize;
             // SAFETY: a buffer of our own, filled by the copy.
             let mut buf = vec![0u8; run_len];
             // Read through the copy, which stands unmapped pages.
             crate::host::copy_mapped(buf.as_mut_ptr(), run_start as *const u8, run_len, false);
             for (sub, &(rs, re)) in ranges.iter().enumerate() {
-                let a = rs.max(run_start as u64);
-                let b = re.min((run_start + run_len) as u64);
+                let a = rs.max(run_at);
+                let b = re.min(run_at + run_len as u64);
                 if a >= b {
                     continue;
                 }
@@ -1428,7 +1447,7 @@ impl Staging {
                     std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
                 };
                 let (mip, slice) = (sub as u32 % self.mips, sub as u32 / self.mips);
-                let window = &buf[(a as usize - run_start)..(b as usize - run_start)];
+                let window = &buf[(a - run_at) as usize..(b - run_at) as usize];
                 if let Err(e) =
                     self.layout
                         .detile_window(window, a, mip, slice, linear, pitch, pitch * rows)
@@ -2054,6 +2073,38 @@ mod in_place_tests {
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    /// The written pages become texture-relative runs: the address the view
+    /// got plays no part in the intersection with the subresource ranges,
+    /// pages outside the texture are cut away, and pages that meet are one
+    /// read. (An absolute address here skipped every subresource: the
+    /// refresh then advanced its asking and kept the old pixels.)
+    #[test]
+    fn dirty_pages_become_texture_relative_runs() {
+        const PAGE: usize = crate::watch::PAGE;
+        let start = 0x7f00_0000_0000usize;
+        let end = start + 4 * PAGE;
+        let written = [
+            (start / PAGE, 1),
+            (start / PAGE, 2),
+            (start / PAGE + 1, 2),
+            (start / PAGE + 3, 3),
+            (start / PAGE + 4, 3),
+        ];
+        assert_eq!(
+            super::dirty_runs(&written, 1, start, end),
+            vec![(0, 2 * PAGE), (3 * PAGE as u64, PAGE)]
+        );
+        assert_eq!(
+            super::dirty_runs(&written, 2, start, end),
+            vec![(3 * PAGE as u64, PAGE)]
+        );
+        // A page past the texture's end is not part of this one's runs.
+        assert!(super::dirty_runs(&written, 2, start, end).iter().all(|&(at, len)| {
+            at + len as u64 <= 4 * PAGE as u64
+        }));
+        assert!(super::dirty_runs(&written, 3, start, end).is_empty());
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
