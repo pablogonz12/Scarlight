@@ -881,8 +881,10 @@ pub(crate) struct HostList {
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
-    /// shader-writable word, zeroed when the list is submitted.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// device-local shader-writable buffer, zeroed on the card by the list's
+    /// prelude each submission and copied into readback memory at the end of
+    /// it ([`Budget`]).
+    budget: OnceLock<Option<Budget>>,
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
@@ -903,6 +905,11 @@ pub(crate) struct HostList {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// The allocator and list that copy each budget's words into readback
+/// memory behind a submission ([`Host::record_budget_read`]): they come back
+/// once that submission has been waited for, so one of each is enough.
+static BUDGET_LISTS: std::sync::Mutex<Vec<Prelude>> = std::sync::Mutex::new(Vec::new());
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -1710,6 +1717,54 @@ enum Step {
     Texture(std::sync::Arc<crate::texture::Staging>),
 }
 
+/// A list's indirect-work budget's bytes: the work charged so far, then what
+/// the clamp noted of mesh dispatches (the largest group count asked for, the
+/// groups asked in all), then room for what comes next.
+pub(crate) const BUDGET_BYTES: u64 = 256;
+
+/// A list's indirect-work budget: device-local, because D3D12 refuses an
+/// unordered access view on host-visible memory (WARP faults on it, and CI's
+/// Windows runner with it) and because the clamp passes write these words
+/// once per draw, which across PCIe on a discrete card is slow. The list's
+/// prelude copies zeroes over them on the card at each submission, and a
+/// small list behind the submission's copies them into readback memory: the
+/// CPU reads what a submission left once that submission has been waited for
+/// (with `VICTORY_LATE_WAIT` submissions fly and nothing reads them).
+pub(crate) struct Budget {
+    /// The words the clamp passes charge.
+    pub(crate) resource: ID3D12Resource,
+    /// Zeroed upload memory the prelude copies over them.
+    pub(crate) zero: ID3D12Resource,
+    /// Readback memory a submission copies the words into.
+    pub(crate) words: ID3D12Resource,
+    /// The mapped readback words, as an address.
+    pub(crate) data: usize,
+    /// Its GPU virtual address.
+    gpu: u64,
+}
+
+impl Budget {
+    fn new() -> Option<Self> {
+        let host = host()?;
+        let resource = host.uav_in(BUDGET_BYTES, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
+        name(&resource, || format!("indirect budget {BUDGET_BYTES:#x}"));
+        let (zero, mapped) = host.upload_buffer(BUDGET_BYTES)?;
+        // Committed memory starts zeroed, and this is the copy's only source
+        // for every submission: say so rather than trust it.
+        // SAFETY: the upload buffer's own mapped memory, `BUDGET_BYTES` long.
+        unsafe { std::ptr::write_bytes(mapped, 0, BUDGET_BYTES as usize) };
+        let (words, data) = host.readback_buffer(BUDGET_BYTES)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { resource.GetGPUVirtualAddress() };
+        Some(Budget { resource, zero, words, data: data as usize, gpu })
+    }
+
+    /// Its GPU virtual address (what the clamp passes charge).
+    pub(crate) fn gpu(&self) -> u64 {
+        self.gpu
+    }
+}
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -1737,8 +1792,10 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
-    /// Whether a step zeroes the indirect-work budget.
-    budget_zeroed: bool,
+    /// Whether the list charges an indirect-work budget: its prelude clears
+    /// the words on the card at each submission, from the list's first use
+    /// after a reset on.
+    budget_used: bool,
 }
 
 impl Deferred {
@@ -3001,6 +3058,43 @@ impl Host {
         list
     }
 
+    /// Records, in a list of its own, the copy of each budget's words into
+    /// readback memory: it goes behind every list of the submission, so it
+    /// takes what their clamp passes left, and the CPU reads it once the
+    /// submission has been waited for.
+    fn record_budget_read(&self, budgets: &[&Budget]) -> Option<Prelude> {
+        let (allocator, list) = BUDGET_LISTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop()
+            .or_else(|| self.make_prelude())?;
+        // SAFETY: the pair is not executing any more (it came back after the
+        // submission that ran it was waited for); the budgets are live.
+        let recorded = unsafe {
+            allocator.Reset().and_then(|()| {
+                list.Reset(&allocator, None)?;
+                for budget in budgets {
+                    list.ResourceBarrier(&[transition(
+                        &budget.resource,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    list.CopyBufferRegion(&budget.words, 0, &budget.resource, 0, BUDGET_BYTES);
+                    list.ResourceBarrier(&[transition(
+                        &budget.resource,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    )]);
+                }
+                list.Close()
+            })
+        };
+        if let Err(e) = recorded {
+            tracing::warn!(error = %e, "the indirect-work budgets were not copied to readback memory");
+        }
+        Some((allocator, list))
+    }
+
     /// An allocator and a closed list for a prelude.
     fn make_prelude(&self) -> Option<Prelude> {
         // SAFETY: plain object creation.
@@ -4240,6 +4334,29 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        // The words of the lists' indirect-work budgets, copied into readback
+        // memory behind every list of the submission (so they take what the
+        // clamps left) and read once it has been waited for. With
+        // `VICTORY_LATE_WAIT` the submission is not waited for and nothing
+        // reads them: each budget is still cleared on the card by its list's
+        // prelude.
+        let budgets: Vec<&Budget> = if late {
+            Vec::new()
+        } else {
+            runs.iter().filter(|l| l.deferred().budget_used).filter_map(|l| l.budget_resource()).collect()
+        };
+        let mut readback: Option<Prelude> = None;
+        if !budgets.is_empty()
+            && let Some(budget_list) = self.record_budget_read(&budgets)
+        {
+            match budget_list.1.cast::<ID3D12CommandList>() {
+                Ok(list) => {
+                    lists.push(Some(list));
+                    readback = Some(budget_list);
+                }
+                Err(e) => tracing::warn!(error = %e, "the budget readback list was not made a command list it could be run as"),
+            }
+        }
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
@@ -4280,6 +4397,10 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        // Every group of the submission is waited for, so the copy behind its
+        // lists has run: only then are the budget words read and the list
+        // that copied them reused.
+        let mut landed = true;
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -4299,7 +4420,10 @@ impl Host {
                         stood(started);
                         working(true);
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Err(e) => {
+                        landed = false;
+                        tracing::warn!(error = %e, "host submission not waited for");
+                    }
                 }
             }
             // With timing on each group is one of `runs` (and the compare
@@ -4327,6 +4451,23 @@ impl Host {
                 }
             }
             let _ = (i, started);
+        }
+        // Every group was waited for: the copy behind the lists has run, and
+        // the words each budget's clamp passes left are in readback memory.
+        if landed
+            && let Some(budget_list) = readback
+        {
+            for budget in &budgets {
+                // SAFETY: the submission's copy into the list's own mapped
+                // readback words has run; word 0 is the work charged, 1 and 2
+                // what the mesh clamp noted of the run.
+                let words = budget.data as *const u32;
+                let (largest, all) = unsafe { (words.add(1).read_volatile(), words.add(2).read_volatile()) };
+                MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
+                MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
+            }
+            // Not executing any more: the next submission takes it.
+            BUDGET_LISTS.lock().unwrap_or_else(|e| e.into_inner()).push(budget_list);
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
@@ -5029,7 +5170,10 @@ impl HostList {
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
         let has_hoisted = !self.hoisted().is_empty();
-        if barriers.is_empty() && syncs.is_empty() && !has_hoisted {
+        // A list that charges an indirect-work budget gets a prelude too: it
+        // is what clears the words on the card at each submission.
+        let budget = self.budget_resource();
+        if barriers.is_empty() && syncs.is_empty() && !has_hoisted && budget.is_none() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -5053,10 +5197,8 @@ impl HostList {
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
                 }
-                if has_hoisted
-                    && let Some((budget_res, budget_gpu)) = self.budget_resource()
-                {
-                    self.hoisted().record_prelude(list, budget_res, budget_gpu);
+                if let Some(budget) = budget {
+                    self.hoisted().record_prelude(list, budget);
                 }
                 list.Close()
             })
@@ -5275,40 +5417,14 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
-            .budget
-            .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
-            })
-            .as_ref()?;
-        let mut deferred = self.deferred();
-        if !deferred.budget_zeroed {
-            deferred.budget_zeroed = true;
-            let at = *data;
-            // SAFETY: the list's own mapped words, written before it runs.
-            // The words after the budget hold what the clamp noted about the
-            // list's last run (mesh dispatches: the largest group count
-            // asked for, the groups asked in all): taken, then zeroed.
-            deferred.copies.push(Step::Host(Box::new(move || unsafe {
-                let words = at as *mut u32;
-                let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
-                MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
-                MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                for k in 0..3 {
-                    words.add(k).write_volatile(0);
-                }
-            })));
-        }
-        // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
+        let budget = self.budget.get_or_init(Budget::new).as_ref()?;
+        self.deferred().budget_used = true;
+        Some(budget.gpu())
     }
 
-    /// The already-created indirect-work budget buffer and its GPU address.
-    pub(crate) fn budget_resource(&self) -> Option<(&ID3D12Resource, u64)> {
-        let (buffer, _) = self.budget.get()?.as_ref()?;
-        // SAFETY: a live buffer.
-        Some((buffer, unsafe { buffer.GetGPUVirtualAddress() }))
+    /// The already-created indirect-work budget and its GPU address.
+    pub(crate) fn budget_resource(&self) -> Option<&Budget> {
+        self.budget.get()?.as_ref()
     }
 
     pub(crate) fn hoisted(&self) -> std::sync::MutexGuard<'_, crate::indirect::HoistedClamps> {
@@ -6695,6 +6811,12 @@ impl Host {
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.uav_in(size, D3D12_RESOURCE_STATE_COMMON)
+    }
+
+    /// A device-local unordered-access buffer of `size` bytes, created in
+    /// `state`.
+    pub(crate) fn uav_in(&self, size: u64, state: D3D12_RESOURCE_STATES) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -6722,7 +6844,7 @@ impl Host {
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
                 &desc,
-                D3D12_RESOURCE_STATE_COMMON,
+                state,
                 None,
                 &mut buffer,
             )
@@ -6731,6 +6853,57 @@ impl Host {
             Ok(()) => buffer,
             Err(e) => {
                 tracing::warn!(error = %e, size, "no unordered-access buffer");
+                None
+            }
+        }
+    }
+
+    /// A readback buffer of `size` bytes and its mapped memory: what a
+    /// submission copies into it is read once that submission has been
+    /// waited for.
+    pub(crate) fn readback_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a readback buffer.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    let mut at = std::ptr::null_mut();
+                    b.Map(0, None, Some(&mut at))?;
+                    data = at;
+                    Ok(())
+                })
+        };
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no readback buffer");
                 None
             }
         }
