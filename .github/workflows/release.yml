@@ -51,3 +51,86 @@ jobs:
         with:
           name: Scarlight-windows-x64
           path: dist/Scarlight-windows-x64.zip
+      # The Steam compatibility tool ships the same exe, packed by the job below.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: victory-exe
+          path: target/release/victory.exe
+          retention-days: 3
+
+  # The Steam compatibility tool: Scarlight-<version>.tar.gz, whose top folder is
+  # Scarlight/ - the layout a ProtonUp-Qt-style installer expects to extract into
+  # Steam's compatibilitytools.d. Packed from the exe the windows job built plus
+  # vkd3d-proton's own release DLLs (LGPL-2.1: notices and corresponding source
+  # travel with them) and nothing from Microsoft: d3dcompiler_47.dll and DXC's two
+  # DLLs are the user's own, and docs/steam.md says where to put them.
+  steam-tool:
+    needs: windows
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v6
+        with:
+          name: victory-exe
+          path: exe
+      - name: Fetch the redistributable DLLs
+        env:
+          # Pinned, not "latest": LGPL-2.1 section 6 wants the source of the exact
+          # binaries we ship, so the release names its tags and carries that source.
+          VKD3D_TAG: v3.1
+        run: |
+          set -euo pipefail
+          command -v zstd >/dev/null || (sudo apt-get update && sudo apt-get install -y --no-install-recommends zstd)
+          tmp="$(mktemp -d)"
+          echo "VKD3D_TAG=$VKD3D_TAG" >> "$GITHUB_ENV"
+          vkd3d_url="$(curl -fsSL "https://api.github.com/repos/HansKristian-Work/vkd3d-proton/releases/tags/$VKD3D_TAG" \
+            | jq -r '[.assets[].browser_download_url | select(endswith(".tar.zst"))] | first')"
+          curl -fsSL -o "$tmp/vkd3d.tar.zst" "$vkd3d_url"
+          # LGPL-2.1 section 6: the corresponding source is the tag's source tree,
+          # not the release asset (that one is binaries only) - and that tree needs
+          # its submodules (dxil-spirv, Vulkan-Headers, SPIRV-Headers), which a
+          # GitHub tag archive leaves empty. So clone the tag with them and pack it.
+          git clone --quiet --depth 1 --branch "$VKD3D_TAG" \
+            https://github.com/HansKristian-Work/vkd3d-proton.git vkd3d-src
+          git -C vkd3d-src submodule update --init --recursive --depth 1 --quiet
+          tar --exclude-vcs -czf vkd3d-proton-"$VKD3D_TAG"-source.tar.gz vkd3d-src
+          tar -tzf vkd3d-proton-"$VKD3D_TAG"-source.tar.gz > /dev/null
+          ls -l vkd3d-proton-"$VKD3D_TAG"-source.tar.gz
+          mkdir -p "$tmp/vkd3d" dlls-vkd3d
+          zstd -d --stdout "$tmp/vkd3d.tar.zst" | tar -x -C "$tmp/vkd3d"
+          # vkd3d-proton puts x64/d3d12*.dll in its tarball.
+          find "$tmp/vkd3d" -type f -path '*/x64/d3d12*.dll' -exec cp {} dlls-vkd3d/ \;
+          ls -l dlls-vkd3d
+      - name: Build the tarball
+        run: |
+          set -euo pipefail
+          version="${{ github.ref_name }}"
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then version="dev-${{ github.run_number }}"; fi
+          # No --include-dxc: DXC's DLLs stay out of a Linux release (see
+          # package.sh and docs/steam.md, which tell the user how to add their own).
+          tools/steam-compat/package.sh --vkd3d dlls-vkd3d \
+            --exe exe/victory.exe --version "$version" \
+            --vkd3d-version "$VKD3D_TAG" --out dist
+          tar -tzf dist/Scarlight-*.tar.gz
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then tag="dev-${{ github.run_number }}"; fi
+          # The tarball, plus vkd3d-proton's corresponding source for the version
+          # it ships (LGPL-2.1 section 6).
+          assets=(dist/Scarlight-*.tar.gz vkd3d-proton-"$VKD3D_TAG"-source.tar.gz)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" --generate-notes --title "$tag" \
+              --target "$GITHUB_SHA" \
+              --notes "Steam compatibility tool from $tag: extract Scarlight/ into Steam's compatibilitytools.d. Reads files you supply; no game files are included or needed to build. Ships vkd3d-proton $VKD3D_TAG (LGPL-2.1; its corresponding source is attached) and no Microsoft binaries: docs/steam.md says how to add your own DXC DLLs."
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Scarlight-steam-tool
+          path: dist/Scarlight-*.tar.gz
