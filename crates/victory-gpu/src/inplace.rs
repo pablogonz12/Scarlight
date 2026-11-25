@@ -231,11 +231,22 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             // without a word (`HansKristian-Work/vkd3d-proton#3522`). The
             // canary over the title's own bytes is the only way to see it,
             // and a region it does not find is a copy, never a wrong picture.
-            let found = title_pages_arrived(&host.device, &placed, start);
-            if !in_place(found) {
-                STATS[8].fetch_add(1, Ordering::Relaxed);
-                drop(placed);
-                return None;
+            match title_pages_arrived(&host.device, &placed, start, len) {
+                Canary::Arrived => {}
+                Canary::Unfinished => {
+                    // The canary's copy was handed to the GPU and its end is
+                    // not known: the heap and the buffer stay with it (as
+                    // `ask_page` keeps his), rather than being released under
+                    // a submission that may still read them.
+                    STATS[8].fetch_add(1, Ordering::Relaxed);
+                    std::mem::forget(placed);
+                    return None;
+                }
+                _ => {
+                    STATS[8].fetch_add(1, Ordering::Relaxed);
+                    drop(placed);
+                    return None;
+                }
             }
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
@@ -340,15 +351,31 @@ fn canary_on() -> bool {
 /// round trip takes (its bytes are put back).
 const CANARY: usize = 64;
 
-/// What the canary found, as a [`Health`]: the GPU read the title's own bytes
-/// through the placement (`Some(true)`), it read memory of its own because
-/// the import was refused (`Some(false)`), or no canary could be made at all
-/// (`None`, no queue or no host). Only the first keeps a region in place.
-fn found_of(found: Option<bool>) -> Health {
-    match found {
-        Some(true) => Health::Sound,
-        Some(false) => Health::Fallback,
-        None => Health::Unchecked,
+/// What a canary found about the region it was made on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Canary {
+    /// The GPU's copy of the region held the bytes written through the
+    /// title's own address: the placement is the title's pages.
+    Arrived,
+    /// The GPU read memory of its own: the heap was taken and the import was
+    /// refused (the silent fallback), so the region must not be drawn from.
+    Elsewhere,
+    /// No canary could be made (no queue, or a span too short for one):
+    /// nothing was written and nothing was read.
+    Unmade,
+    /// The copy went to the GPU and its end is not known: the placement must
+    /// not be released under it.
+    Unfinished,
+}
+
+impl Canary {
+    /// What this means for a placement: only [`Canary::Arrived`] is a yes.
+    fn found(self) -> Health {
+        match self {
+            Canary::Arrived => Health::Sound,
+            Canary::Elsewhere => Health::Fallback,
+            Canary::Unmade | Canary::Unfinished => Health::Unchecked,
+        }
     }
 }
 
@@ -358,31 +385,35 @@ fn found_of(found: Option<bool>) -> Health {
 /// memory by one path for every heap it makes, so the first region's answer
 /// is every region's, and the region that answers "no" is turned down rather
 /// than drawn from (`pablogonz12/Scarlight#144`).
-fn title_pages_arrived(device: &ID3D12Device, placed: &Placed, at: u64) -> Health {
+fn title_pages_arrived(device: &ID3D12Device, placed: &Placed, at: u64, len: u64) -> Canary {
     static STATE: AtomicU8 = AtomicU8::new(Health::Unknown as u8);
     static LOCK: Mutex<()> = Mutex::new(());
     let known = health_of(STATE.load(Ordering::Relaxed));
     if known != Health::Unknown {
-        return known;
+        return if in_place(known) { Canary::Arrived } else { Canary::Unmade };
     }
     if !canary_on() {
-        return Health::Sound;
+        return Canary::Arrived;
     }
     let _held = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let known = health_of(STATE.load(Ordering::Relaxed));
     if known != Health::Unknown {
-        return known;
+        return if in_place(known) { Canary::Arrived } else { Canary::Unmade };
     }
-    let found = found_of(canary(device, placed, at));
-    STATE.store(found as u8, Ordering::Relaxed);
+    let found = canary(device, placed, at, len);
+    // A submission whose end is not known is not an answer: it must not be
+    // remembered as one (the next region asks again).
+    if found != Canary::Unfinished {
+        STATE.store(found.found() as u8, Ordering::Relaxed);
+    }
     match found {
-        Health::Sound => tracing::info!(
+        Canary::Arrived => tracing::info!(
             "title memory in place: the canary at the title's own address ({at:#x}) came back through the GPU's placement: this region is the GPU's pages"
         ),
         found => tracing::warn!(
             placed = format_args!("{at:#x}"),
             "title memory in place: the canary at the title's own address never came back through the GPU's placement ({}): the import was refused and the host fell back to memory of its own - this region and every later one stay copies, and this is counted",
-            health_name(found)
+            health_name(found.found())
         ),
     }
     found
@@ -390,16 +421,30 @@ fn title_pages_arrived(device: &ID3D12Device, placed: &Placed, at: u64) -> Healt
 
 /// Writes a canary through the title's own address `at`, reads it back through
 /// the GPU's copy of it (a 64-byte copy out of the placed buffer on a queue of
-/// its own) and puts the title's bytes back. `Some(true)` only if the GPU's
-/// copy held the canary: a host that took the heap and then used memory of its
-/// own answers `Some(false)` here, whatever it said to the API.
-fn canary(device: &ID3D12Device, placed: &Placed, at: u64) -> Option<bool> {
-    let mut rig = Rig::new(device).ok()?;
+/// its own) and puts the title's bytes back. [`Canary::Arrived`] only if the
+/// GPU's copy held the canary: a host that took the heap and then used memory
+/// of its own answers [`Canary::Elsewhere`], whatever it said to the API.
+///
+/// The canary needs a 64-byte span in the title's memory the caller asked for
+/// (`len`) and in the placed buffer: beyond either it would write into the
+/// page after the title's memory or read past the buffer (a span too short is
+/// [`Canary::Unmade`], and the region is a copy - a placement that short saves
+/// nothing worth an access violation).
+fn canary(device: &ID3D12Device, placed: &Placed, at: u64, len: u64) -> Canary {
+    // SAFETY: a live buffer; the description is its own.
+    let width = unsafe { placed.buffer.GetDesc() }.Width;
+    let fits_buffer = placed.bias + CANARY as u64 <= width;
+    if len < CANARY as u64 || !fits_buffer {
+        return Canary::Unmade;
+    }
+    let Ok(mut rig) = Rig::new(device) else {
+        return Canary::Unmade;
+    };
     let mut sent = [0u8; CANARY];
     fill(sent.as_mut_ptr(), CANARY, 194);
     let mut kept = [0u8; CANARY];
-    // SAFETY: the region is private memory committed read-write, at least
-    // 64 bytes long (`place_part`'s `private_whole`).
+    // SAFETY: `[at, at + len)` is private memory committed read-write
+    // (`place_part`'s `private_whole`), and `len` is at least `CANARY`.
     unsafe {
         std::ptr::copy_nonoverlapping(at as *const u8, kept.as_mut_ptr(), CANARY);
         std::ptr::copy_nonoverlapping(sent.as_ptr(), at as *mut u8, CANARY);
@@ -407,7 +452,13 @@ fn canary(device: &ID3D12Device, placed: &Placed, at: u64) -> Option<bool> {
     let got = rig.fetch(&placed.buffer, placed.bias, CANARY);
     // SAFETY: as above; the title's bytes go back the way they came.
     unsafe { std::ptr::copy_nonoverlapping(kept.as_ptr(), at as *mut u8, CANARY) };
-    Some(got.is_ok_and(|got| got == sent))
+    match got {
+        Ok(got) if got == sent => Canary::Arrived,
+        Ok(_) => Canary::Elsewhere,
+        // The copy was handed to the GPU: the readback stays with it
+        // (`Rig::fetch`) and so must the placed buffer and its heap.
+        Err(_) => Canary::Unfinished,
+    }
 }
 
 /// The one line the self-check leaves in the log, whatever it found, so
@@ -1574,16 +1625,19 @@ mod tests {
     }
 
     /// A region is kept in place only on the canary's yes: the GPU reading
-    /// memory of its own (the silent fallback, `vkd3d-proton#3522`) and a
-    /// canary that could not be made are both copies (§144).
+    /// memory of its own (the silent fallback, `vkd3d-proton#3522`), a canary
+    /// that could not be made and one whose submission never finished are all
+    /// copies (§144).
     #[test]
     fn only_a_region_the_canary_reached_is_kept_in_place() {
-        assert_eq!(found_of(Some(true)), Health::Sound);
-        assert!(in_place(found_of(Some(true))), "the bytes came back");
-        assert_eq!(found_of(Some(false)), Health::Fallback);
-        assert!(!in_place(found_of(Some(false))), "the GPU read memory of its own: a copy instead");
-        assert_eq!(found_of(None), Health::Unchecked);
-        assert!(!in_place(found_of(None)), "a canary that could not be made is not a yes");
+        assert_eq!(Canary::Arrived.found(), Health::Sound);
+        assert!(in_place(Canary::Arrived.found()), "the bytes came back");
+        assert_eq!(Canary::Elsewhere.found(), Health::Fallback);
+        assert!(!in_place(Canary::Elsewhere.found()), "the GPU read memory of its own: a copy instead");
+        assert_eq!(Canary::Unmade.found(), Health::Unchecked);
+        assert!(!in_place(Canary::Unmade.found()), "a canary that could not be made is not a yes");
+        assert_eq!(Canary::Unfinished.found(), Health::Unchecked);
+        assert!(!in_place(Canary::Unfinished.found()), "a submission whose end is not known is not a yes");
     }
 
     /// The cap counts the pages a heap locks, not the title's span, and what
@@ -1728,14 +1782,14 @@ mod tests {
             let mut rig = Rig::new(&device).expect("a queue of the test's own");
             let reads = rig.fetch(&buffer, 0, K64).is_ok_and(|got| same(memory, &got));
             // The canary over the same placement, at the title's own address.
-            let found = canary(&device, &placed, memory as u64);
-            let kept = in_place(found_of(found));
+            let found = canary(&device, &placed, memory as u64, K64 as u64);
+            let kept = in_place(found.found());
             eprintln!(
                 "in place canary: a committed section through a view, on {}: the GPU reads the view's bytes {reads}, the canary answers {found:?}: {}",
                 if crate::test_device::is_software(&device) { "the software adapter" } else { "the card" },
                 if kept { "kept in place" } else { "turned down, a copy instead" }
             );
-            assert_eq!(found, Some(reads), "the canary is what the GPU really reads of the title's address");
+            assert_eq!(found, if reads { Canary::Arrived } else { Canary::Elsewhere }, "the canary is what the GPU really reads of the title's address");
             assert_eq!(kept, reads, "a region is kept in place only where the GPU reads the title's own bytes");
             assert!(same(memory, &ours[..CANARY]), "the canary put the title's bytes back");
             std::mem::forget(placed);
@@ -1768,10 +1822,14 @@ mod tests {
             let mut theirs = [0u8; CANARY];
             std::ptr::copy_nonoverlapping(base, theirs.as_mut_ptr(), CANARY);
             let placed = place_part(&device, base as u64, 2 * K64 as u64).expect("a part of private memory is placed");
-            let found = canary(&device, &placed, base as u64);
-            assert_eq!(found, Some(true), "the GPU reads the canary at the title's own address");
-            assert_eq!(found_of(found), Health::Sound);
+            let found = canary(&device, &placed, base as u64, 2 * K64 as u64);
+            assert_eq!(found, Canary::Arrived, "the GPU reads the canary at the title's own address");
+            assert_eq!(found.found(), Health::Sound);
             assert!(same(base, &theirs), "the canary put the title's bytes back");
+            // A span shorter than the canary is not touched at all: it is a
+            // copy, and the bytes after it are nobody's to write.
+            let short = canary(&device, &placed, base as u64 + 2 * K64 as u64 - 16, 16);
+            assert_eq!(short, Canary::Unmade, "a 16-byte span is left alone");
             drop(placed);
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }
