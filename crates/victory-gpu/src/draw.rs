@@ -324,6 +324,14 @@ fn mesh_test() -> u8 {
     })
 }
 
+/// `VICTORY_MESH_GRID=0`: the older mesh dispatch call, one group across
+/// `y` and `z` (off means the caller's whole grid is forwarded; on by
+/// default).
+fn mesh_grid() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_MESH_GRID").as_deref() != Ok("0"))
+}
+
 /// `VICTORY_MESH_TEST=keep:<hex digits>[:<hex digits>]`: only the mesh
 /// draws whose mesh shader's hash ends in one of the first digits (and
 /// whose digit before it is one of the second, if given) are issued: a
@@ -2073,6 +2081,8 @@ impl State {
     /// Runs a mesh dispatch with the caller's three-dimensional group grid.
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         self.window = None;
+        // The older call took one group across `y` and `z`.
+        let (x, y, z) = if mesh_grid() { (x, y, z) } else { (x, 1, 1) };
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x * y * z, 0);
         let ran = mesh_test() != 1
