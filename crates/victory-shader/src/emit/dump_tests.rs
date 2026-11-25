@@ -15,20 +15,40 @@
 //! a game run. The rest of a dump's refusals (unrelated programs) are
 //! counted and printed, not asserted on.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-/// The containers in the dump, sorted by name.
+/// The containers in the dump, sorted by name. `None` only when there is no
+/// dump to check: once the variable is set, a directory that cannot be read
+/// or an entry that cannot be taken is a mistake in the invocation and fails
+/// here, rather than passing as "nothing to check".
 fn dump() -> Option<Vec<PathBuf>> {
     let dir = std::env::var_os("BVH_BUILDER_DUMP")?;
-    let mut out: Vec<PathBuf> = std::fs::read_dir(Path::new(&dir))
-        .ok()?
-        .filter_map(|e| {
-            let p = e.ok()?.path();
-            p.extension()
-                .is_some_and(|x| x == "dxbc")
-                .then_some(p)
-        })
-        .collect();
+    let dir = PathBuf::from(dir);
+    let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| {
+        panic!(
+            "BVH_BUILDER_DUMP={}: cannot read the dump: {e}",
+            dir.display()
+        )
+    });
+    let mut out: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let path = entry
+            .unwrap_or_else(|e| {
+                panic!(
+                    "BVH_BUILDER_DUMP={}: cannot read an entry: {e}",
+                    dir.display()
+                )
+            })
+            .path();
+        if path.extension().is_some_and(|x| x == "dxbc") {
+            out.push(path);
+        }
+    }
+    assert!(
+        !out.is_empty(),
+        "BVH_BUILDER_DUMP={}: no .dxbc containers",
+        dir.display()
+    );
     out.sort();
     Some(out)
 }
@@ -111,7 +131,12 @@ fn a_builder_stage_is_a_compute_program_with_a_spilled_user_data_table() {
             continue;
         }
         seen += 1;
-        assert_eq!(programs.len(), 1, "{}: more than one program", path.display());
+        assert_eq!(
+            programs.len(),
+            1,
+            "{}: more than one program",
+            path.display()
+        );
         assert_eq!(
             programs[0].stage,
             crate::HwStage::Cs,

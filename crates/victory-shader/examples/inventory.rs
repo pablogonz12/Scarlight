@@ -29,43 +29,44 @@ fn main() {
                 && let Some(part) = c.part(victory_shader::FourCC::DXIL)
                 && let Ok(list) = victory_shader::native_programs(part.data)
             {
-                        programs = list.len();
-                        for p in &list {
-                            if victory_shader::spill::is_spilled(p) {
-                                spilled += 1;
-                            }
-                            if let Ok(code) = victory_shader::gfx10::decode(&p.code) {
-                                let k = code
-                                    .iter()
-                                    .filter(|i| i.name().is_some_and(|n| n.starts_with("image_bvh")))
-                                    .count();
-                                if k > 0 && bvh == 0 {
-                                    bvh = k;
-                                    threads = match &p.io {
-                                        victory_shader::native::StageIo::Cs(cs) => {
-                                            format!("{}x{}x{}", cs.threads[0], cs.threads[1], cs.threads[2])
-                                        }
-                                        _ => String::new(),
-                                    };
-                                    wave = if p.wave64 { "64" } else { "32" };
+                programs = list.len();
+                for p in &list {
+                    if victory_shader::spill::is_spilled(p) {
+                        spilled += 1;
+                    }
+                    if let Ok(code) = victory_shader::gfx10::decode(&p.code) {
+                        let k = code
+                            .iter()
+                            .filter(|i| i.name().is_some_and(|n| n.starts_with("image_bvh")))
+                            .count();
+                        if k > 0 && bvh == 0 {
+                            bvh = k;
+                            threads = match &p.io {
+                                victory_shader::native::StageIo::Cs(cs) => {
+                                    format!("{}x{}x{}", cs.threads[0], cs.threads[1], cs.threads[2])
                                 }
-                            }
+                                _ => String::new(),
+                            };
+                            wave = if p.wave64 { "64" } else { "32" };
                         }
-                        if let Some(p) = list.first() {
-                            stage = format!("{:?}", p.stage).to_lowercase();
-                            if threads.is_empty() {
-                                threads = match &p.io {
-                                    victory_shader::native::StageIo::Cs(cs) => {
-                                        format!("{}x{}x{}", cs.threads[0], cs.threads[1], cs.threads[2])
-                                    }
-                                    _ => String::new(),
-                                };
-                                wave = if p.wave64 { "64" } else { "32" };
+                    }
+                }
+                if let Some(p) = list.first() {
+                    stage = format!("{:?}", p.stage).to_lowercase();
+                    if threads.is_empty() {
+                        threads = match &p.io {
+                            victory_shader::native::StageIo::Cs(cs) => {
+                                format!("{}x{}x{}", cs.threads[0], cs.threads[1], cs.threads[2])
                             }
-                        }
+                            _ => String::new(),
+                        };
+                        wave = if p.wave64 { "64" } else { "32" };
+                    }
+                }
             }
             let mut map = 0;
-            let result = match std::panic::catch_unwind(|| victory_shader::emit::translate(&bytes)) {
+            let result = match std::panic::catch_unwind(|| victory_shader::emit::translate(&bytes))
+            {
                 Ok(Ok(host)) => {
                     ok += 1;
                     // Title memory by raw address: the directory (SLOT_MEMORY)
@@ -93,8 +94,12 @@ fn main() {
             if map > 0 {
                 with_map += 1;
             }
-            println!("{name}\t{stage}\t{programs}\t{spilled}\t{bvh}\t{threads}\t{wave}\t{map}\t{result}");
+            println!(
+                "{name}\t{stage}\t{programs}\t{spilled}\t{bvh}\t{threads}\t{wave}\t{map}\t{result}"
+            );
         }
     }
-    eprintln!("inventory: {n} containers, {builder} builder, {trace} trace, {with_map} by-address, {ok} translated");
+    eprintln!(
+        "inventory: {n} containers, {builder} builder, {trace} trace, {with_map} by-address, {ok} translated"
+    );
 }

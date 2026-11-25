@@ -1034,7 +1034,10 @@ impl State {
             // Title memory by address: what the shader finds it by. A builder
             // stage's writes through it stay in the copies
             // ([`crate::pipeline::builder_map_host`]): #1198's rule for the
-            // map, and the writes run 98 killed the title with.
+            // map, and the writes run 98 killed the title with. The root UAVs
+            // below still copy back: that is a diff against the submission's
+            // snapshot (`shadow::gpu_writes`), and a page only the map's copies
+            // hold is unchanged there, so nothing is written over it.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 let writes = writes && !crate::pipeline::builder_map_host(self.pipeline as This);
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
