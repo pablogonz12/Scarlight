@@ -66,6 +66,13 @@ impl Pending {
         &self.key
     }
 
+    /// Whether it has a host pipeline: `Some(true)` made, `Some(false)`
+    /// refused (its shaders do not translate, or the host driver would not
+    /// make it), `None` still being made.
+    pub(crate) fn made(&self) -> Option<bool> {
+        self.made.get().map(Option::is_some)
+    }
+
     /// What it is made from.
     pub(crate) fn parts(&self) -> (&[Arc<Shader>], Option<&GraphicsState>) {
         (&self.shaders, self.graphics.as_deref())
