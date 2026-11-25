@@ -311,13 +311,20 @@ fn assert_valid(m: &[u32], what: &str) {
         .arg("vulkan1.3")
         .arg(&path)
         .output();
-    let _ = std::fs::remove_file(&path);
     match out {
-        Ok(o) => assert!(
-            o.status.success(),
-            "{what}: spirv-val: {}",
-            String::from_utf8_lossy(&o.stderr)
-        ),
+        Ok(o) => {
+            // A module that does not validate stays on disk, for spirv-dis.
+            if o.status.success() {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                eprintln!("kept {}", path.display());
+            }
+            assert!(
+                o.status.success(),
+                "{what}: spirv-val: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        }
         Err(e) => eprintln!("no spirv-val ({e}); skipped"),
     }
 }
@@ -536,18 +543,6 @@ fn an_sdwa_source_selects_a_field() {
     assert!(masks >= 1, "the field is not masked: {m:08x?}");
 }
 
-/// DPP is an approximation: a cross-lane permutation is emitted as the
-/// source's own value (documented in the spike's notes), so the module must
-/// still be valid, with the destination written from the source's slot.
-#[test]
-fn a_dpp_permutation_reads_the_source_itself() {
-    let w = v_mov_dpp(1);
-    let m = module(&[w[0], w[1], S_ENDPGM]);
-    assert!(!instructions(&m)
-        .iter()
-        .any(|(op, _)| *op == opin::SAMPLED_IMAGE));
-}
-
 // ---- images -----------------------------------------------------------------
 
 /// An image sample binds its own descriptor and sampler: one
@@ -725,14 +720,363 @@ fn a_group_smaller_than_the_wave_reports_no_full_subgroups() {
     assert!(!prog.full_subgroups());
 }
 
-/// DPP row ops (`quad_perm`, `row_shl/shr`, `row_bcast15/31`) read lanes
-/// inside one 16-lane row of the console wave; the follow-up lowers each to
-/// `OpGroupNonUniformShuffle` with `SubgroupLocalInvocationId` as the lane,
-/// now that the subgroup is pinned to the program's wave size.
+/// `v_mov_b32 vdst, v0` in its DPP16 form: the 9-bit control, the row and
+/// bank masks, and `bound_ctrl` (an out-of-row lane reads itself).
+const fn v_mov_dpp_at(
+    vdst: u8,
+    ctrl: u32,
+    row_mask: u32,
+    bank_mask: u32,
+    bound: bool,
+) -> [u32; 2] {
+    [
+        0x7E00_0000 | (vdst as u32) << 17 | 0x01 << 9 | 0xFA,
+        ctrl << 8 | (row_mask & 0xF) << 28 | (bank_mask & 0xF) << 24 | (bound as u32) << 19,
+    ]
+}
+
+/// `v_min_u32 v1, v0, v0` with a DPP16 second word: the first source is the
+/// permuted one, the second (the same register) is the lane's own.
+const fn v_min_dpp(vdst: u8, ctrl: u32) -> [u32; 2] {
+    [
+        0x013 << 25 | (vdst as u32) << 17 | 0xFA,
+        ctrl << 8 | 0xF << 28 | 0xF << 24,
+    ]
+}
+
+/// The module's count of an opcode.
+fn ops_count(m: &[u32], op: u16) -> usize {
+    instructions(m).iter().filter(|(o, _)| *o == op).count()
+}
+
+/// The value the constant `id` defines, when it is one (`OpConstant`).
+fn constant_of(m: &[u32], id: u32) -> Option<u32> {
+    instructions(m)
+        .into_iter()
+        .find(|(op, ops)| *op == 43 && ops.len() == 3 && ops[1] == id)
+        .map(|(_, ops)| ops[2])
+}
+
+/// The opcode of the instruction that defines `id`.
+fn defining_op(m: &[u32], id: u32) -> Option<u16> {
+    for (op, ops) in instructions(m) {
+        // A type (and a label) starts its operands with its id, a value with
+        // its result type.
+        let at = if (19..=39).contains(&op) || op == 248 {
+            Some(0)
+        } else if has_result_type(op) {
+            Some(1)
+        } else {
+            None
+        };
+        if let Some(at) = at
+            && ops.get(at) == Some(&id)
+        {
+            return Some(op);
+        }
+    }
+    None
+}
+
+/// The emitter's refusal, for a program it cannot model.
+fn refusal(words: &[u32], wave64: bool) -> String {
+    let mut native = program(words);
+    native.wave64 = wave64;
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    match spirv::emit(&native, &p, &Io::default()) {
+        Ok(_) => panic!("the program emitted"),
+        Err(e) => format!("{e}"),
+    }
+}
+
+mod dpp {
+    pub const SHUFFLE: u16 = 345;
+    pub const SHUFFLE_XOR: u16 = 346;
+    pub const QUAD_SWAP: u16 = 366;
+    pub const SELECT: u16 = 169;
+    pub const LESS_THAN: u16 = 176;
+    /// `GLSL.std.450` `UMin`, the ext instruction `row_share` counts with.
+    pub const EXT_INST: u16 = 12;
+    pub const U_MIN: u32 = 38;
+    pub const VECTOR_EXTRACT_DYNAMIC: u16 = 77;
+    pub const CONSTANT_COMPOSITE: u16 = 44;
+    pub const CAP_QUAD: u32 = 68;
+}
+
+/// The hand-built words carry the control, the masks and `bound_ctrl` the
+/// emitter reads: a mis-encoded word must fail here, not look like an
+/// emitter bug.
 #[test]
-#[ignore = "follow-up: DPP row ops -> OpGroupNonUniformShuffle within 16-lane rows"]
-fn dpp_row_ops_become_shuffles_within_16_lane_rows() {
-    todo!()
+fn the_hand_built_dpp_words_decode_with_their_controls() {
+    let w = v_mov_dpp_at(1, 0x104, 0x3, 0x5, true);
+    let add = v_min_dpp(1, 0x141);
+    let code: Vec<u8> = [w[0], w[1], add[0], add[1], S_ENDPGM]
+        .iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
+    let insts = gfx10::decode(&code).expect("the hand-built words decode");
+    assert_eq!(insts[0].name(), Some("v_mov_b32"));
+    assert_eq!(insts[1].name(), Some("v_min_u32"));
+    let gfx10::Fields::Valu(v) = insts[0].fields(false) else {
+        panic!("a move is a VALU instruction");
+    };
+    assert_eq!(
+        v.dpp,
+        Some(gfx10::Dpp::Row {
+            ctrl: 0x104,
+            row_mask: 0x3,
+            bank_mask: 0x5,
+            bound_ctrl: true,
+            fi: false,
+        })
+    );
+    let gfx10::Fields::Valu(a) = insts[1].fields(false) else {
+        panic!("a minimum is a VALU instruction");
+    };
+    assert!(matches!(
+        a.dpp,
+        Some(gfx10::Dpp::Row { ctrl: 0x141, .. })
+    ));
+}
+
+/// `quad_perm:[0,1,2,3]` reads the lane's own value: no cross-lane
+/// instruction at all.
+#[test]
+fn an_identity_quad_permutation_reads_the_lane_itself() {
+    let w = v_mov_dpp_at(1, 0xE4, 0xF, 0xF, false);
+    let m = module(&[w[0], w[1], S_ENDPGM]);
+    assert_eq!(ops_count(&m, dpp::SHUFFLE), 0);
+    assert_eq!(ops_count(&m, dpp::SHUFFLE_XOR), 0);
+    assert_eq!(ops_count(&m, dpp::QUAD_SWAP), 0);
+    // The lane id is an input the module declares either way; the value
+    // written is the source's own.
+    assert!(!capabilities(&m).contains(&dpp::CAP_QUAD), "no quad swap here");
+}
+
+/// The three permutations that swap all four lanes of a quad are
+/// `OpGroupNonUniformQuadSwap` with the direction the ISA names (horizontal,
+/// vertical, diagonal), and that needs the quad capability.
+#[test]
+fn a_whole_quad_permutation_is_a_quad_swap() {
+    for (ctrl, dir) in [(0xB1u32, 0u32), (0x4E, 1), (0x1B, 2)] {
+        let w = v_mov_dpp_at(1, ctrl, 0xF, 0xF, false);
+        let m = module(&[w[0], w[1], S_ENDPGM]);
+        let swaps: Vec<u32> = instructions(&m)
+            .into_iter()
+            .filter(|(op, _)| *op == dpp::QUAD_SWAP)
+            .map(|(_, ops)| constant_of(&m, ops[4]).expect("a constant direction"))
+            .collect();
+        assert_eq!(swaps, [dir], "ctrl {ctrl:#x}: {m:08x?}");
+        assert_eq!(ops_count(&m, dpp::SHUFFLE), 0, "ctrl {ctrl:#x} is a swap");
+        assert!(capabilities(&m).contains(&dpp::CAP_QUAD), "ctrl {ctrl:#x}");
+    }
+}
+
+/// A quad permutation that is not a whole-quad swap is a shuffle with the
+/// lane number read from the quad's own table, indexed by the lane's place in
+/// the quad.
+#[test]
+fn a_mixed_quad_permutation_reads_a_lane_table() {
+    // quad_perm:[0,2,1,3]
+    let w = v_mov_dpp_at(1, 0xD8, 0xF, 0xF, false);
+    let m = module(&[w[0], w[1], S_ENDPGM]);
+    assert_eq!(ops_count(&m, dpp::SHUFFLE), 1, "{m:08x?}");
+    assert_eq!(ops_count(&m, dpp::VECTOR_EXTRACT_DYNAMIC), 1);
+    let (_, table) = instructions(&m)
+        .into_iter()
+        .find(|(op, _)| *op == dpp::CONSTANT_COMPOSITE)
+        .expect("the permutation table");
+    let parts: Vec<u32> = table[2..]
+        .iter()
+        .filter_map(|id| constant_of(&m, *id))
+        .collect();
+    assert_eq!(parts, [0, 2, 1, 3], "the permutation's four lanes");
+}
+
+/// `row_shl:4` reads lane i + 4 of the row; past the row's end a lane reads
+/// zero, or itself under `bound_ctrl`.
+#[test]
+fn a_row_shift_left_reads_up_the_row_and_zero_past_its_end() {
+    for bound in [false, true] {
+        let w = v_mov_dpp_at(1, 0x104, 0xF, 0xF, bound);
+        let m = module(&[w[0], w[1], S_ENDPGM]);
+        assert_eq!(ops_count(&m, dpp::SHUFFLE), 1, "bound_ctrl {bound}");
+        assert_eq!(ops_count(&m, dpp::LESS_THAN), 1, "the row's end");
+        let (_, sel) = instructions(&m)
+            .into_iter()
+            .find(|(op, _)| *op == dpp::SELECT)
+            .expect("the lanes past the row's end");
+        let past = sel[4];
+        if bound {
+            assert_eq!(constant_of(&m, past), None, "bound_ctrl reads the lane");
+        } else {
+            assert_eq!(constant_of(&m, past), Some(0), "zero past the row's end");
+        }
+    }
+}
+
+/// `row_shr` and `row_ror`: a shift reads zero (or the lane itself) below the
+/// row's start, a rotate wraps and so never leaves the row.
+#[test]
+fn a_row_shift_right_and_a_rotate_stay_inside_the_row() {
+    let w = v_mov_dpp_at(1, 0x114, 0xF, 0xF, false);
+    let m = module(&[w[0], w[1], S_ENDPGM]);
+    assert_eq!(ops_count(&m, dpp::SHUFFLE), 1);
+    assert_eq!(ops_count(&m, dpp::SELECT), 1, "zero below the row's start");
+
+    let w = v_mov_dpp_at(1, 0x124, 0xF, 0xF, false);
+    let m = module(&[w[0], w[1], S_ENDPGM]);
+    assert_eq!(ops_count(&m, dpp::SHUFFLE), 1, "row_ror is a shuffle");
+    assert_eq!(ops_count(&m, dpp::SELECT), 0, "a rotate never leaves the row");
+}
+
+/// `row_mirror`, `row_half_mirror` and `row_xmask` are one xor inside the
+/// row, which is `OpGroupNonUniformShuffleXor` with that mask.
+#[test]
+fn the_row_mirrors_and_the_lane_xor_are_shuffle_xors() {
+    for (ctrl, mask) in [(0x140u32, 15u32), (0x141, 8), (0x163, 3)] {
+        let w = v_mov_dpp_at(1, ctrl, 0xF, 0xF, false);
+        let m = module(&[w[0], w[1], S_ENDPGM]);
+        let masks: Vec<u32> = instructions(&m)
+            .into_iter()
+            .filter(|(op, _)| *op == dpp::SHUFFLE_XOR)
+            .map(|(_, ops)| constant_of(&m, ops[4]).expect("a constant mask"))
+            .collect();
+        assert_eq!(masks, [mask], "ctrl {ctrl:#x}: {m:08x?}");
+        assert_eq!(ops_count(&m, dpp::SHUFFLE), 0, "ctrl {ctrl:#x}");
+    }
+}
+
+/// `row_bcast15` broadcasts the last lane of each row; `row_bcast31` the last
+/// lane of a 64-lane wave, which a 32-lane wave does not have.
+#[test]
+fn the_row_broadcasts_name_one_lane() {
+    let w = v_mov_dpp_at(1, 0x142, 0xF, 0xF, false);
+    let m = module(&[w[0], w[1], S_ENDPGM]);
+    assert_eq!(ops_count(&m, dpp::SHUFFLE), 1, "{m:08x?}");
+
+    let w = v_mov_dpp_at(1, 0x143, 0xF, 0xF, false);
+    let prog = program_of(&[w[0], w[1], S_ENDPGM], true, [64, 1, 1]);
+    let ids: Vec<u32> = instructions(&prog.words)
+        .into_iter()
+        .filter(|(op, _)| *op == dpp::SHUFFLE)
+        .map(|(_, ops)| ops[4])
+        .collect();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(constant_of(&prog.words, ids[0]), Some(31), "lane 31");
+    let why = refusal(&[w[0], w[1], S_ENDPGM], false);
+    assert!(why.contains("row_bcast31"), "a 32-lane wave has no lane 31: {why}");
+}
+
+/// `row_share` holds at the row's last lane instead of reading past it.
+#[test]
+fn row_share_stops_at_the_last_lane() {
+    let w = v_mov_dpp_at(1, 0x152, 0xF, 0xF, false);
+    let m = module(&[w[0], w[1], S_ENDPGM]);
+    assert_eq!(ops_count(&m, dpp::SHUFFLE), 1);
+    let mins = instructions(&m)
+        .into_iter()
+        .filter(|(op, ops)| *op == dpp::EXT_INST && ops.len() >= 4 && ops[3] == dpp::U_MIN)
+        .count();
+    assert_eq!(mins, 1, "{m:08x?}");
+    assert_eq!(ops_count(&m, dpp::SELECT), 0);
+}
+
+/// `row_mask` and `bank_mask` leave the lanes they do not name holding the
+/// destination's old value; all ones writes the whole wave and needs no mask.
+#[test]
+fn the_row_and_bank_masks_keep_the_destination_elsewhere() {
+    let w = v_mov_dpp_at(1, 0xE4, 0x3, 0x5, false);
+    let m = module(&[w[0], w[1], S_ENDPGM]);
+    assert_eq!(ops_count(&m, dpp::SELECT), 1, "a masked write blends: {m:08x?}");
+
+    let w = v_mov_dpp_at(1, 0xE4, 0xF, 0xF, false);
+    let m = module(&[w[0], w[1], S_ENDPGM]);
+    assert_eq!(ops_count(&m, dpp::SELECT), 0, "the whole wave is written");
+}
+
+/// DPP replaces the instruction's first source only: a second source that
+/// names the same register is the lane's own value, not the permuted one.
+#[test]
+fn a_dpp_read_replaces_one_source_only() {
+    let w = v_min_dpp(1, 0x104);
+    let m = module(&[w[0], w[1], S_ENDPGM]);
+    let (_, sh) = instructions(&m)
+        .into_iter()
+        .find(|(op, _)| *op == dpp::SHUFFLE)
+        .expect("the permuted source");
+    assert_eq!(
+        constant_of(&m, sh[2]),
+        Some(3),
+        "the shuffle is scoped to the subgroup"
+    );
+    let (_, add) = instructions(&m)
+        .into_iter()
+        .find(|(op, ops)| *op == 12 && ops.len() > 3 && ops[3] == 38)
+        .expect("the unsigned minimum");
+    // An `OpExtInst`'s operands are the set and the instruction first.
+    let (first, second) = (add[4], add[5]);
+    assert_ne!(first, second, "the two sources are not one value");
+    // The second source stays the lane's own value: a load, behind whatever
+    // conversion the instruction does (a bitcast here).
+    let unbitcast = |id: u32| match defining_op(&m, id) {
+        Some(124) => {
+            let (_, bc) = instructions(&m)
+                .into_iter()
+                .find(|(op, ops)| *op == 124 && ops[1] == id)
+                .expect("a bitcast of the source");
+            bc[2]
+        }
+        _ => id,
+    };
+    let (own, permuted) = (unbitcast(second), unbitcast(first));
+    assert_eq!(
+        defining_op(&m, own),
+        Some(61),
+        "the second source is the lane's own load"
+    );
+    assert!(
+        matches!(
+            defining_op(&m, permuted),
+            Some(169) | Some(345) | Some(346) | Some(366)
+        ),
+        "the first source is the permuted value: {:?}",
+        defining_op(&m, permuted)
+    );
+}
+
+/// DPP8: each bank of eight lanes picks one of its own lanes, three bits per
+/// lane, and no write mask applies.
+#[test]
+fn a_dpp8_permutation_reads_inside_eight_lane_banks() {
+    // dpp8:[0,1,2,3,4,5,6,7] is the identity; every lane 7 instead is not.
+    let word = [
+        0x7E00_0000 | 0x01 << 17 | 0x01 << 9 | 0xE9,
+        // sel = eight 3-bit lanes, src0 = v0.
+        0o7_7_7_7_7_7_7_7 << 8,
+    ];
+    let m = module(&[word[0], word[1], S_ENDPGM]);
+    assert_eq!(ops_count(&m, dpp::SHUFFLE), 1, "{m:08x?}");
+    assert_eq!(ops_count(&m, dpp::SELECT), 0, "DPP8 masks no lanes");
+    assert_eq!(
+        constant_of(&m, instructions(&m)
+            .into_iter()
+            .find(|(op, _)| *op == dpp::SHUFFLE)
+            .map(|(_, ops)| ops[4])
+            .expect("the shuffle's id")),
+        None,
+        "the lane is the selector, not a constant"
+    );
+}
+
+/// An undefined DPP control is refused with a reason, not emitted as
+/// something else.
+#[test]
+fn a_dpp_control_this_emitter_does_not_model_is_refused() {
+    // ctrl[7:4] = 3 is not a DPP operation the ISA defines.
+    let w = v_mov_dpp_at(1, 0x134, 0xF, 0xF, false);
+    let why = refusal(&[w[0], w[1], S_ENDPGM], false);
+    assert!(why.contains("DPP control"), "{why}");
 }
 
 /// The pipeline's side: the subgroup size to ask for, whether the console's
@@ -754,3 +1098,4 @@ fn the_subgroup_plan_pins_the_wave_size() {
     assert!(!plan.require_full_subgroups);
     assert!(plan.no_full_subgroups.is_some(), "the reason must be reported");
 }
+
