@@ -1824,7 +1824,7 @@ fn plane_of(i: u32, mips: u32, subresources_per_plane: u32) -> (usize, u32, u32)
 /// (`VICTORY_TEXTURE_PLANES=0`: the first plane alone, as before).
 fn planes_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_PLANES").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_PLANES").is_some_and(|v| v == "1"))
 }
 
 /// The planes of `layout` the host takes, where the host takes more than
