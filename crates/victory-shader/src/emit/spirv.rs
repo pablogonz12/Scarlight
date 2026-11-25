@@ -445,7 +445,6 @@ impl SampleFlags {
 
 pub struct Emitter<'a> {
     m: M,
-    native: &'a NativeProgram,
     p: &'a Program,
     io: &'a Io,
     t_void: u32,
@@ -608,7 +607,7 @@ pub fn emit(native: &NativeProgram, p: &Program, io: &Io) -> Result<SpirvProgram
         cs.threads[2].max(1),
     ];
     let wave_size = wave_size(native);
-    let mut e = Emitter::new(native, p, io, cs.lds_bytes() / 4, local_size);
+    let mut e = Emitter::new(p, io, cs.lds_bytes() / 4, local_size);
     e.build()?;
     let mut pre = std::mem::take(&mut e.m.words);
     let mut consts = std::mem::take(&mut e.consts);
@@ -647,7 +646,6 @@ fn crosses_lanes(p: &Program) -> bool {
 
 impl<'a> Emitter<'a> {
     fn new(
-        native: &'a NativeProgram,
         p: &'a Program,
         io: &'a Io,
         lds_words: u32,
@@ -776,7 +774,6 @@ impl<'a> Emitter<'a> {
         };
         Emitter {
             m,
-            native,
             p,
             io,
             t_void,

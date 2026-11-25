@@ -102,8 +102,6 @@ fn names(words: &[u32]) -> Vec<&'static str> {
 
 /// The emitted module, with the operand types and `spirv-val` checked.
 fn module(words: &[u32]) -> Vec<u32> {
-    let native = program(words);
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     program_of(words, false, [64, 1, 1]).words
 }
 
