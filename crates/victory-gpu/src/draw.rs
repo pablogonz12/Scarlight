@@ -497,6 +497,17 @@ macro_rules! once {
     }};
 }
 
+/// Whether the code of a program, whose used descriptors are `used`, names
+/// the unordered view of `rule` as an entry of a table (`crate::ambient`).
+fn names_view(used: &[UsedResource], rule: &crate::ambient::Rule) -> bool {
+    used.iter().any(|u| {
+        u.kind == ResourceType::Uav
+            && u.root == RootType::Table
+            && u.slot == rule.slot
+            && u.table_offset_dwords == rule.offset
+    })
+}
+
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
     if roots.len() <= slot {
@@ -1988,6 +1999,224 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.stand_ins(list, None);
+    }
+
+    /// The stand-ins `VICTORY_AMBIENT` sets for the bound program
+    /// (`crate::ambient`), after a dispatch ran: how many views were
+    /// cleared, `None` if no rule names the program. `indirect`: the
+    /// records a dispatch may run at most, and its count's buffer and
+    /// offset if it has one ([`Self::stand_ins_of`]).
+    fn stand_ins(
+        &mut self,
+        list: &HostList,
+        indirect: Option<(u32, Option<(ID3D12Resource, u64)>)>,
+    ) -> Option<usize> {
+        let rules = crate::ambient::rules();
+        if rules.is_empty() {
+            return None;
+        }
+        let p = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        let stage = p.stages.first()?;
+        let program = stage.shader.hash.as_str();
+        if !rules.iter().any(|r| r.program == program) {
+            return None;
+        }
+        let used = &stage.translated().used;
+        // The stand-ins follow shader work: no records at most (or none
+        // known to run), nothing to stand in for.
+        let (count, offset) = match indirect {
+            None => return Some(self.stand_in(list, program, used)),
+            Some((0, _)) => return None,
+            Some((_, Some((count, offset)))) => (count, offset),
+            Some((_, None)) => return Some(self.stand_in(list, program, used)),
+        };
+        let Some(word) = crate::host::host().and_then(|h| h.predicate_word()) else {
+            once!("ambient stand-in: no word to gate them on, so an indirect dispatch gets no clears");
+            for _ in rules.iter().filter(|r| r.program == program) {
+                crate::ambient::note(false);
+            }
+            return None;
+        };
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
+        const COMMON: u32 = 0;
+        const PREDICATION: u32 = 0x1000;
+        // SAFETY: an open list; a count read where the execution reads it,
+        // into the low half of our own word (zero elsewhere).
+        unsafe {
+            list.list.CopyBufferRegion(word, 0, &count, offset, 4);
+            list.list.ResourceBarrier(&[crate::host::transition(
+                word,
+                State(COMMON as i32),
+                State(PREDICATION as i32),
+            )]);
+            list.list.SetPredication(word, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        }
+        let filled = self.stand_in(list, program, used);
+        // SAFETY: as above.
+        unsafe {
+            list.list.SetPredication(
+                None::<&ID3D12Resource>,
+                0,
+                D3D12_PREDICATION_OP_EQUAL_ZERO,
+            );
+            list.list.ResourceBarrier(&[crate::host::transition(
+                word,
+                State(PREDICATION as i32),
+                State(COMMON as i32),
+            )]);
+        }
+        Some(filled)
+    }
+
+    /// The views of the rules that name `program`, whose code uses `used`,
+    /// cleared to their values ([`Self::clear_uav`]): how many were.
+    fn stand_in(&mut self, list: &HostList, program: &str, used: &[UsedResource]) -> usize {
+        let mut filled = 0;
+        for rule in crate::ambient::rules()
+            .iter()
+            .filter(|r| r.program == program)
+        {
+            let first = !rule.seen.swap(true, Ordering::Relaxed);
+            let uavs = || -> Vec<String> {
+                used.iter()
+                    .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table)
+                    .map(|u| format!("s{}+{}", u.slot, u.table_offset_dwords))
+                    .collect()
+            };
+            if !names_view(used, rule) {
+                if first {
+                    tracing::warn!(program, view = %rule.view(), views = ?uavs(), "ambient stand-in: the program has no such unordered view in a table");
+                }
+                crate::ambient::note(false);
+                continue;
+            }
+            let view = self.roots_ref(true).get(usize::from(rule.slot)).and_then(
+                |root| match root {
+                    Root::Table(table) => {
+                        crate::descriptor::view(*table + u64::from(rule.offset) * 4)
+                    }
+                    _ => None,
+                },
+            );
+            let Some(View::Unordered(resource, _, words)) = view else {
+                if first {
+                    tracing::warn!(program, view = %rule.view(), "ambient stand-in: not an unordered view of a resource there");
+                }
+                crate::ambient::note(false);
+                continue;
+            };
+            let resource = resource as This;
+            // The formats of the view and of the texture it views, the
+            // title's; the size, for the log.
+            let own = crate::resource::host_resource(resource).map(|texture| {
+                // SAFETY: a live resource, read for its description only.
+                unsafe { texture.GetDesc() }
+            });
+            let Some(own) = own else {
+                if first {
+                    tracing::warn!(program, view = %rule.view(), "ambient stand-in: no host texture there");
+                }
+                crate::ambient::note(false);
+                continue;
+            };
+            if crate::resource::buffer_bytes(resource).is_some() {
+                if first {
+                    tracing::warn!(program, view = %rule.view(), "ambient stand-in: a view of a buffer, which a clear of a view does not take");
+                }
+                crate::ambient::note(false);
+                continue;
+            }
+            let (width, height, own) = (own.Width, own.Height, own.Format.0 as u32);
+            let view = words.map_or(0, |words| words[0]);
+            let format = if view == 0 { own } else { view };
+            let fill = crate::ambient::fill(rule.value, format, own);
+            if first {
+                tracing::info!(
+                    program,
+                    view = %rule.view(),
+                    views = ?uavs(),
+                    format,
+                    texture_format = own,
+                    size = ?(width, height),
+                    value = ?rule.value,
+                    ?fill,
+                    "ambient stand-in: first dispatch of the program"
+                );
+            }
+            let recorded = match fill {
+                Ok(crate::ambient::Fill::Float(rgba)) => {
+                    self.clear_uav(list, resource, view, rgba.map(f32::to_bits), true)
+                }
+                Ok(crate::ambient::Fill::Uint(words)) => {
+                    self.clear_uav(list, resource, view, words, false)
+                }
+                Err(why) => {
+                    if first {
+                        tracing::warn!(program, view = %rule.view(), format, texture_format = own, "ambient stand-in: {why}");
+                    }
+                    false
+                }
+            };
+            crate::ambient::note(recorded);
+            filled += usize::from(recorded);
+        }
+        filled
+    }
+
+    /// Clears the whole of the texture `resource`, seen as its view's
+    /// `format` (0: its own), to `values` (a float clear's bits when
+    /// `floats`): [`Host::uav`]'s two views, the texture left in the state
+    /// it was found in. False if the clear could not be recorded.
+    fn clear_uav(
+        &self,
+        list: &HostList,
+        resource: This,
+        format: u32,
+        values: [u32; 4],
+        floats: bool,
+    ) -> bool {
+        const UNORDERED: u32 = 0x8;
+        let Some(host) = crate::host::host() else {
+            return false;
+        };
+        let Some((cpu, gpu)) = host.uav(resource, format) else {
+            return false;
+        };
+        // The clear is a write: the texture is the unordered state a clear
+        // takes, in a barrier of its own, and left in the state it was found.
+        let Some((texture, before)) = list.transition(resource, UNORDERED) else {
+            return false;
+        };
+        // SAFETY: an open list, a live texture, our own descriptors.
+        unsafe {
+            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
+            list.list.ResourceBarrier(&[crate::host::transition(
+                texture,
+                State(before as i32),
+                State(UNORDERED as i32),
+            )]);
+            if floats {
+                list.list.ClearUnorderedAccessViewFloat(
+                    gpu,
+                    cpu,
+                    texture,
+                    &values.map(f32::from_bits),
+                    &[],
+                );
+            } else {
+                list.list
+                    .ClearUnorderedAccessViewUint(gpu, cpu, texture, &values, &[]);
+            }
+            list.list.ResourceBarrier(&[crate::host::transition(
+                texture,
+                State(UNORDERED as i32),
+                State(before as i32),
+            )]);
+        }
+        // The tracked state follows the barriers above: back to `before`.
+        let _ = list.transition(resource, before);
+        true
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -2762,6 +2991,12 @@ impl State {
         crate::indirect::done(list, &bounded);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            // The stand-in follows the records that ran: none at most, none
+            // with a count of zero.
+            let count = counter
+                .as_ref()
+                .map(|(s, at)| (s.buffer.clone(), s.offset(*at)));
+            self.stand_ins(list, Some((max, count)));
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -3017,7 +3252,56 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::staging_budget_per_frame;
+    use super::{names_view, staging_budget_per_frame};
+    use victory_shader::{ResourceType, RootType, UsedResource};
+
+    /// A view a program names, as a table entry (the stand-in compares
+    /// root parameter and offset in dwords, `crate::ambient`).
+    fn used(kind: ResourceType, root: RootType, slot: u8, offset: u32) -> UsedResource {
+        UsedResource {
+            kind,
+            root,
+            table_offset_dwords: offset,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 4,
+            slot,
+        }
+    }
+
+    #[test]
+    fn the_stand_in_names_a_view_of_a_table() {
+        let rule = crate::ambient::parse("0123456789abcdef:s1+176:0.5,0.5,0.5")
+            .unwrap()
+            .remove(0);
+        assert!(names_view(
+            &[used(ResourceType::Uav, RootType::Table, 1, 176)],
+            &rule
+        ));
+        // Another root parameter, offset or kind, or not a table: no.
+        assert!(!names_view(
+            &[used(ResourceType::Uav, RootType::Table, 2, 176)],
+            &rule
+        ));
+        assert!(!names_view(
+            &[used(ResourceType::Uav, RootType::Table, 1, 168)],
+            &rule
+        ));
+        assert!(!names_view(
+            &[used(ResourceType::Uav, RootType::Table, 1, 180)],
+            &rule
+        ));
+        assert!(!names_view(
+            &[used(ResourceType::Srv, RootType::Table, 1, 176)],
+            &rule
+        ));
+        assert!(!names_view(
+            &[used(ResourceType::Uav, RootType::Descriptor, 1, 176)],
+            &rule
+        ));
+        assert!(!names_view(&[], &rule));
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {

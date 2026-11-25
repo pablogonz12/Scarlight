@@ -38,6 +38,9 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
 
+/// The same for unordered access views a clear takes ([`Host::uav`]).
+const UAV_RING: u32 = 256;
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
@@ -50,6 +53,16 @@ pub(crate) struct Host {
     /// A ring of depth views, used as `rtvs`.
     dsvs: ID3D12DescriptorHeap,
     dsv_size: u32,
+    /// A ring of unordered access views, and its shader-visible copy (a
+    /// clear takes both): [`Host::uav`].
+    uavs: ID3D12DescriptorHeap,
+    uav_size: u32,
+    uav_visible: ID3D12DescriptorHeap,
+    uav_visible_size: u32,
+    next_uav: AtomicU32,
+    /// The word an indirect dispatch's stand-ins are gated on
+    /// ([`Host::predicate_word`]).
+    predicate: OnceLock<Option<ID3D12Resource>>,
     next_dsv: AtomicU32,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
@@ -656,6 +669,23 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        let uavs: ID3D12DescriptorHeap =
+            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: UAV_RING,
+                ..Default::default()
+            })?;
+        let uav_size =
+            device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        let uav_visible: ID3D12DescriptorHeap =
+            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: UAV_RING,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                ..Default::default()
+            })?;
+        let uav_visible_size =
+            device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
@@ -676,6 +706,12 @@ fn create() -> windows::core::Result<Host> {
             rtv_size,
             dsvs,
             dsv_size,
+            uavs,
+            uav_size,
+            uav_visible,
+            uav_visible_size,
+            next_uav: AtomicU32::new(0),
+            predicate: OnceLock::new(),
             next_dsv: AtomicU32::new(0),
             messages,
             next_rtv: AtomicU32::new(0),
@@ -4554,6 +4590,92 @@ impl Host {
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
             handle
         }
+    }
+
+    /// A host unordered access view of the texture `resource`, `format`
+    /// (`0`: the resource's own), in the two forms a clear takes: the CPU
+    /// handle of a heap the shader cannot see, and the GPU handle of one it
+    /// can. Both are valid until the command is recorded; `None` if there
+    /// is no such texture.
+    pub(crate) fn uav(
+        &self,
+        resource: crate::object::This,
+        format: u32,
+    ) -> Option<(D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_GPU_DESCRIPTOR_HANDLE)> {
+        let texture = crate::resource::host_resource(resource)?;
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT(format as i32),
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        let desc = (format != 0).then_some(&desc);
+        let slot = self.next_uav.fetch_add(1, Ordering::Relaxed) % UAV_RING;
+        // SAFETY: a slot of our heaps and a live texture; the description is
+        // ours and read only by the call.
+        unsafe {
+            let mut cpu = self.uavs.GetCPUDescriptorHandleForHeapStart();
+            cpu.ptr += (slot * self.uav_size) as usize;
+            self.device
+                .CreateUnorderedAccessView(texture, None, desc.map(|d| d as *const _), cpu);
+            // The same view where a clear reads it.
+            let mut visible = self.uav_visible.GetCPUDescriptorHandleForHeapStart();
+            visible.ptr += (slot * self.uav_visible_size) as usize;
+            let mut gpu = self.uav_visible.GetGPUDescriptorHandleForHeapStart();
+            gpu.ptr += u64::from(slot * self.uav_visible_size);
+            self.device.CopyDescriptorsSimple(
+                1,
+                visible,
+                cpu,
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+            Some((cpu, gpu))
+        }
+    }
+
+    /// The word an indirect dispatch's clears are gated on
+    /// ([`crate::ambient`]): eight bytes of video memory, zero at creation
+    /// and common between uses. `None` if it could not be made.
+    pub(crate) fn predicate_word(&self) -> Option<&ID3D12Resource> {
+        self.predicate
+            .get_or_init(|| {
+                let heap = D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 8,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                let mut buffer: Option<ID3D12Resource> = None;
+                // SAFETY: plain object creation, with nothing bound.
+                let made = unsafe {
+                    self.device.CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut buffer,
+                    )
+                };
+                match made {
+                    Ok(()) => buffer,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ambient stand-in: no predicate word, so an indirect dispatch gets no clears");
+                        None
+                    }
+                }
+            })
+            .as_ref()
     }
 }
 
