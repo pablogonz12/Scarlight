@@ -530,20 +530,21 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 static DESTINATIONS: Mutex<BTreeMap<usize, (usize, bool)>> = Mutex::new(BTreeMap::new());
 
 /// Forgets the destination answers that overlap `[at, at + len)`: what was
-/// asked there no longer holds.
+/// asked there no longer holds. Every answer whose region reaches into the
+/// range goes, not only the one asked at its first block: an answer asked at
+/// an earlier block (`[0, 4)` after one at `[2, 4)`) still covers blocks of
+/// the range and would otherwise stay positive for a page that changed.
 fn forget(at: usize, len: usize) {
     if len == 0 {
         return;
     }
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut regions = DESTINATIONS.lock().unwrap_or_else(|e| e.into_inner());
-    let mut stale: Vec<usize> = regions.range(first..last).map(|(&start, _)| start).collect();
-    // An answer asked at an earlier block may still reach into the range.
-    if let Some((&start, &(end, _))) = regions.range(..first).next_back()
-        && end > first
-    {
-        stale.push(start);
-    }
+    let stale: Vec<usize> = regions
+        .range(..last)
+        .filter(|&(_, &(end, _))| end > first)
+        .map(|(&start, _)| start)
+        .collect();
     for start in stale {
         regions.remove(&start);
     }
@@ -1884,6 +1885,42 @@ mod tests {
             title_memory_remapped(hole, BLOCK);
             VirtualFree(at as *mut _, 0, MEM_RELEASE);
             VirtualFree(hole as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// An answer kept for a later block does not hide a change in a block
+    /// that an earlier answer also covers.
+    #[test]
+    fn a_change_forgets_every_answer_that_reaches_into_it() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        // SAFETY: a fresh allocation of ours, freed at the end.
+        let at = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * BLOCK,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(at, 0);
+        // An answer asked at the second block, then one asked at the first
+        // that covers it too: two entries, `[2, 4)` and `[0, 4)`.
+        assert!(writable(at + 2 * BLOCK, 2 * BLOCK));
+        assert!(writable(at, 4 * BLOCK));
+        // The title makes the last block read-only and tells us: both
+        // answers reach into it and must go.
+        let mut old = 0;
+        assert_ne!(
+            unsafe { VirtualProtect((at + 3 * BLOCK) as *mut _, BLOCK, PAGE_READONLY, &mut old) },
+            0
+        );
+        title_memory_remapped(at + 3 * BLOCK, BLOCK);
+        assert!(!writable(at + 3 * BLOCK, BLOCK), "the `[0, 4)` answer must go too");
+        assert!(writable(at, 3 * BLOCK), "what did not change is still known");
+        // SAFETY: the allocation above.
+        unsafe {
+            title_memory_remapped(at, 4 * BLOCK);
+            VirtualFree(at as *mut _, 0, MEM_RELEASE);
         }
     }
 

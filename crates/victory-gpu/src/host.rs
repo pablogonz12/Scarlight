@@ -813,12 +813,27 @@ mod tests {
                 std::slice::from_raw_parts(dst.add(N / 2), N / 2).iter().all(|&b| b == 0x5a),
                 "the read-only half is left alone"
             );
-            // The same for a host source copied into title memory
-            // (`copy_mapped`): no fault, and the bytes stay.
-            super::copy_mapped(dst, second.as_ptr(), N, true);
-            assert!(std::slice::from_raw_parts(dst, N / 2).iter().all(|&b| b == 0xa5));
-            assert!(std::slice::from_raw_parts(dst.add(N / 2), N / 2).iter().all(|&b| b == 0x5a));
-            // SAFETY: the region allocated above.
+            // The same for title memory as the source, with mapped evidence
+            // of its own (so `plain` passes for the source): the fallback
+            // pieces must not copy into the read-only destination either.
+            // SAFETY: a fresh allocation of ours, freed at the end.
+            let src = VirtualAlloc(std::ptr::null(), N, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+                .cast::<u8>();
+            assert!(!src.is_null());
+            src.write_bytes(0xa5, N);
+            crate::watch::copied(src as usize, N);
+            super::copy_mapped(dst, src, N, true);
+            assert!(
+                std::slice::from_raw_parts(dst, N / 2).iter().all(|&b| b == 0xa5),
+                "the writable half took the copy"
+            );
+            assert!(
+                std::slice::from_raw_parts(dst.add(N / 2), N / 2).iter().all(|&b| b == 0x5a),
+                "the read-only half is left alone"
+            );
+            // SAFETY: the regions allocated above.
+            crate::watch::title_memory_remapped(src as usize, N);
+            assert_ne!(VirtualFree(src.cast(), 0, MEM_RELEASE), 0);
             crate::watch::title_memory_remapped(dst as usize, N);
             assert_ne!(VirtualFree(dst.cast(), 0, MEM_RELEASE), 0);
         }
@@ -5763,7 +5778,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
             unsafe { to.write_bytes(0, n) };
-        } else if !read_piece(at, to, n) {
+        } else if !read_piece(at, to, n, false) {
             // A mapping may change between query and read.
             read_pieces(at, to, n, false);
         }
@@ -5778,10 +5793,10 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
 fn read_pieces(src: *const u8, dst: *mut u8, len: usize, title_dst: bool) {
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
-        if !read_piece(at as *const u8, to, n) {
+        if !read_piece(at as *const u8, to, n, title_dst) {
             for_pieces(at, n, 4 << 10, |at, n| {
                 let to = dst.wrapping_add(at - src as usize);
-                if !read_piece(at as *const u8, to, n) {
+                if !read_piece(at as *const u8, to, n, title_dst) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
                     if title_dst && !crate::watch::writable(to as usize, n) {
@@ -5811,8 +5826,8 @@ fn read(src: *const u8, dst: *mut u8, len: usize, title_dst: bool) -> bool {
 /// [`read`] for a piece of a range: a piece that reads marks nothing, so a
 /// block the title only has pages of is never taken for one it has whole
 /// (see [`crate::watch::copied`]).
-fn read_piece(src: *const u8, dst: *mut u8, len: usize) -> bool {
-    read_mark(src, dst, len, false, false)
+fn read_piece(src: *const u8, dst: *mut u8, len: usize, title_dst: bool) -> bool {
+    read_mark(src, dst, len, false, title_dst)
 }
 
 fn read_mark(src: *const u8, dst: *mut u8, len: usize, mark: bool, title_dst: bool) -> bool {
