@@ -540,7 +540,7 @@ extern "system" fn tiling(
 
 /// Slot 0x30 `(plane, mip, x, y, z or slice, sample, bit position)`: an
 /// element's byte offset from the texture's start. The title reads
-/// texels of a 128x4 `4KB_S` texture on the CPU through it;
+/// texels of a 128x4 `4KB_S` texture on the CPU through it (title+0x5151c90);
 /// an error returned as an offset made it read wild memory. 0 if outside.
 extern "system" fn element_offset(
     this: This,

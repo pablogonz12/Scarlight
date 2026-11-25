@@ -59,6 +59,10 @@ const EXTENSION_EXCEPTIONS: &[(&str, &str)] = &[
         "docs/brand/divider.svg",
         "the README section divider: a hand-written vector drawing of our own, text only",
     ),
+    (
+        "NOTICE",
+        "third-party notices for the ports we carry: plain text, no extension to judge",
+    ),
 ];
 
 /// Path prefixes holding our own terminal recordings: screencast GIFs of our

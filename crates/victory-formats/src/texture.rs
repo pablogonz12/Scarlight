@@ -581,6 +581,34 @@ impl Layout {
         self.mips.get(mip as usize).map_or(0, |m| m.depth)
     }
 
+    /// The bytes of one slice that hold each mip, `(start, end)` per mip in
+    /// the layout's mip order: where a mip's memory lies, for a texture
+    /// whose pages arrive a few at a time (a streamed texture, the smallest
+    /// mips first). Mips in the tail share the tail block at the start of
+    /// the slice, so each tail mip's range is that whole block: a page
+    /// mapped there holds every tail mip of the slice.
+    pub fn mip_extents(&self) -> Vec<(u64, u64)> {
+        let first_tail = (self.first_tail_mip as usize).min(self.mips.len());
+        // The mips outside the tail, by where they start; each runs up to
+        // the next one's start, the last to the slice's end.
+        let mut sorted: Vec<u64> = self.mips[..first_tail].iter().map(|m| m.offset).collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        // The tail block is what lies before the first of them.
+        let tail_end = sorted.first().copied().unwrap_or(self.slice_size).min(self.slice_size);
+        self.mips
+            .iter()
+            .map(|m| {
+                if m.tail.is_some() {
+                    return (0, tail_end);
+                }
+                let at = sorted.binary_search(&m.offset).unwrap_or(0);
+                let end = sorted.get(at + 1).copied().unwrap_or(self.slice_size);
+                (m.offset, end)
+            })
+            .collect()
+    }
+
     /// Copies one subresource out of tiled memory (the whole texture,
     /// [`Layout::size`] bytes) into linear rows: mip `mip` of array slice
     /// `slice` (3D: every depth slice of the mip, `slice` 0). Rows are
@@ -671,6 +699,13 @@ impl Layout {
             }
             runs.push((first_tiled, first_linear, bytes - first_linear));
         }
+        // A mip can end partway through the last run. Check the other runs
+        // once so each row can copy them with a compile-time length.
+        let (body, last) = runs.split_at(runs.len().saturating_sub(1));
+        let run_len = body
+            .first()
+            .map(|run| run.2)
+            .filter(|&len| body.iter().all(|run| run.2 == len));
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
@@ -681,13 +716,30 @@ impl Layout {
                     copy(tiled_row as usize, linear_row, bytes);
                 } else {
                     let tiled_row = (base + self.row(m, y, inner)) as usize;
-                    for &(tiled, linear, len) in &runs {
-                        copy(tiled_row + tiled, linear_row + linear, len);
+                    match run_len {
+                        Some(8) => copy_runs::<8>(body, tiled_row, linear_row, &mut copy),
+                        Some(16) => copy_runs::<16>(body, tiled_row, linear_row, &mut copy),
+                        Some(32) => copy_runs::<32>(body, tiled_row, linear_row, &mut copy),
+                        _ => copy_runs::<0>(body, tiled_row, linear_row, &mut copy),
                     }
+                    copy_runs::<0>(last, tiled_row, linear_row, &mut copy);
                 }
             }
         }
         Ok(())
+    }
+}
+
+/// Copy micro-tile runs inline at a known width, or use each run's length for N = 0.
+fn copy_runs<const N: usize>(
+    runs: &[(usize, usize, usize)],
+    tiled_row: usize,
+    linear_row: usize,
+    copy: &mut impl FnMut(usize, usize, usize),
+) {
+    for &(tiled, linear, len) in runs {
+        let len = if N == 0 { len } else { N };
+        copy(tiled_row + tiled, linear_row + linear, len);
     }
 }
 
@@ -966,6 +1018,32 @@ mod tests {
 
     /// A 256x256 BC7 chain in 64 KiB `D`: one tail block holding mips 1-8,
     /// then mip 0; mip 1 sits at x = 32 elements, 32 KiB into the tail.
+    #[test]
+    fn mip_extents_cover_each_slice_once_and_the_tail_first() {
+        let l = Layout::new(&desc(64, 64, 9, 16, Swizzle::SW_4KB_S)).unwrap();
+        let e = l.mip_extents();
+        assert_eq!(e.len(), l.mips.len());
+        // The tail block first (every tail mip inside it), then mip 2, 1, 0,
+        // each up to the next one's start, the last up to the slice's end.
+        assert_eq!(e[3], (0, 4096));
+        assert_eq!(e[4], (0, 4096));
+        assert_eq!(e[2], (4096, 8192));
+        assert_eq!(e[1], (8192, 8192 + 16384));
+        assert_eq!(e[0].0, 8192 + 16384);
+        assert_eq!(e[0].1, l.slice_size);
+        // Every mip's range lies in the slice and none overlaps another
+        // outside the tail.
+        for (i, &(start, end)) in e.iter().enumerate() {
+            assert!(end <= l.slice_size, "mip {i}: {start}..{end} of {}", l.slice_size);
+            assert!(start < end, "mip {i} empty");
+        }
+        let mut whole: Vec<(u64, u64)> = e.iter().copied().filter(|&(s, _)| s != 0).collect();
+        whole.sort_unstable();
+        for pair in whole.windows(2) {
+            assert!(pair[0].1 <= pair[1].0, "mips overlap: {pair:?}");
+        }
+    }
+
     #[test]
     fn mip_tail_comes_first() {
         let l = Layout::new(&desc(64, 64, 9, 16, Swizzle::SW_64KB_D)).unwrap();
