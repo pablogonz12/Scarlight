@@ -548,7 +548,8 @@ impl HostPipeline {
                 return refuse_why(
                     "the host GPU's driver does not expose mesh shaders, so a mesh \
                      pipeline is refused before it reaches the driver (it would be \
-                     refused or would abort it): the title's non-mesh path runs instead",
+                     refused or would abort it): the draws that name it are lost, \
+                     other work goes on",
                     host.mesh_family().unwrap_or("-"),
                     shaders,
                 );

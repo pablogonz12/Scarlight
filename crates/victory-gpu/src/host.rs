@@ -837,6 +837,7 @@ mod tests {
         assert_eq!(amd_mesh_family(AMD, 0x687f), Some("gfx9 (Vega)"), "Vega 10");
         assert_eq!(amd_mesh_family(AMD, 0x66af), Some("gfx9 (Vega)"), "Vega 20");
         assert_eq!(amd_mesh_family(AMD, 0x15d8), Some("gfx9 APU"), "Raven");
+        assert_eq!(amd_mesh_family(AMD, 0x164c), Some("gfx9 APU"), "Lucienne");
         assert_eq!(amd_mesh_family(AMD, 0x731f), Some("gfx10.1 (RDNA1)"), "16");
         assert_eq!(amd_mesh_family(AMD, 0x7360), Some("gfx10.1 (RDNA1)"), "14");
         // Mesh shaders exist from RDNA2 up, and on the test machine: no
@@ -844,6 +845,10 @@ mod tests {
         assert_eq!(amd_mesh_family(AMD, 0x73bf), None, "Navi 21 (RDNA2)");
         assert_eq!(amd_mesh_family(AMD, 0x744c), None, "Navi 31 (RDNA3)");
         assert_eq!(amd_mesh_family(AMD, 0x7550), None, "RX 9070 XT (RDNA4)");
+        // Van Gogh and Mendocino are APUs of RDNA2, not Vega: they keep
+        // their mesh pipelines.
+        assert_eq!(amd_mesh_family(AMD, 0x163f), None, "Van Gogh (gfx1033)");
+        assert_eq!(amd_mesh_family(AMD, 0x1506), None, "Mendocino (gfx1037)");
         // Intel, NVIDIA and Microsoft adapters: not ours to guess at.
         assert_eq!(amd_mesh_family(0x8086, 0xe20b), None, "Arc B580");
         assert_eq!(amd_mesh_family(0x10de, 0x2684), None, "RTX 4090");
@@ -4663,9 +4668,10 @@ fn amd_mesh_family(vendor: u32, device: u32) -> Option<&'static str> {
         // Vega 10 (gfx900), Vega 12 (gfx904), Vega 20 (gfx906): the 82 mesh
         // programs abort RADV's compiler here instead of being refused.
         0x6860..=0x687f | 0x69a0..=0x69af | 0x66a0..=0x66af => Some("gfx9 (Vega)"),
-        // Vega APUs: Raven Ridge, Picasso, Renoir, Lucienne, Cezanne, Van
-        // Gogh, Mendocino (gfx902/gfx909/gfx90c/gfx1033).
-        0x15d8 | 0x15dd | 0x1636 | 0x1638 | 0x163f | 0x164c | 0x1506 => Some("gfx9 APU"),
+        // Vega APUs: Raven Ridge, Raven2, Picasso, Renoir, Cezanne,
+        // Lucienne (gfx902/gfx909/gfx90c). Van Gogh (0x163f, gfx1033) and
+        // Mendocino (0x1506, gfx1037) are RDNA2 and stay out of this arm.
+        0x15d8 | 0x15dd | 0x1636 | 0x1638 | 0x164c => Some("gfx9 APU"),
         // Navi 10/12/14 (gfx1010-1012): the 82 create, but the driver does
         // not advertise VK_EXT_mesh_shader, so a mesh draw cannot run.
         0x7310..=0x731f | 0x7340..=0x734f | 0x7360..=0x736f => Some("gfx10.1 (RDNA1)"),

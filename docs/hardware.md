@@ -46,11 +46,11 @@ ended the process inside RADV instead of being refused.
 Both families below RDNA2 are now handled before the driver sees a mesh pipeline. In a run the check
 reads the D3D12 mesh-shader tier and, when that says yes, the adapter's device id: RADV exposes
 `VK_EXT_mesh_shader` from RDNA2 up, so a Vega or Navi 1x adapter is named by id and its mesh pipeline
-is refused once, with the family in the warning, instead of being created. The title's own non-mesh
-path then runs — the draws that named the refused pipeline are skipped — where before the pipeline
-went to a driver that either refused it or, on Vega, aborted the process. Nothing changes on RDNA2
-and newer: the RX 9070 XT still creates all 751. The same two families are the ones the offline matrix
-above skips.
+is refused once, with the family in the warning, instead of being created. That pipeline is gone for
+the run: its draws are lost while everything else goes on, where before it went to a driver that
+either refused it or, on Vega, aborted the process and took every other draw with it. Nothing changes
+on RDNA2 and newer — APUs included: Van Gogh and Mendocino are RDNA2, not Vega, and the RX 9070 XT
+still creates all 751. The same two families are the ones the offline matrix above skips.
 
 The one Intel miss on Arc A and Xe-LPG stops on the shim's own `drm_i915_query_item` gap, not on a
 shader the compiler refused.
