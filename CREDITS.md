@@ -147,3 +147,10 @@ Missing or wrong name? Open an issue.
   enables blending on one, so those targets are made to write unblended, per target and with independent
   blending turned on only where it was needed (`crates/victory-gpu/src/pipeline/host.rs`,
   `VICTORY_HOST_BLEND=0`). Its host-pipeline device test used `D3DCompile`; ours checks the state itself.
+
+- **avatarmanz/VIctory-7900XTX [3a99ee610](https://github.com/avatarmanz/VIctory-7900XTX/commit/3a99ee610)**
+  (avatarmanz), GPL-3.0-or-later: list calls that only write down their arguments, translated by threads of ours
+  beside the title's recording, on a list of ours that the title never sees (`VICTORY_THIN=1`, off by default;
+  `crates/victory-gpu/src/list/thin.rs`), reimplemented on this tree's lists: the render target and depth view
+  records, arrays and structures are copied at the call, and a recording the title resets or releases without
+  submitting is not run further.

@@ -527,6 +527,15 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        // With list calls written down (`VICTORY_THIN=1`), the lists are
+        // translated into lists of ours first, and those are submitted as any
+        // other (where a wait for a memory value cuts them, they are cut then).
+        if crate::list::thin::on() {
+            let recordings = crate::list::thin::submitted(lists);
+            let backs = recordings.backs().to_vec();
+            submit_list(host, this, &backs);
+            return;
+        }
         if cuts() && !this.is_null() {
             submit_cut(this, lists);
             return;
@@ -535,53 +544,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             submit_split(this, lists);
             return;
         }
-        // A list that waits for a memory value not there yet: the queue
-        // holds the submission, as it does behind a fence.
-        if waits() && !this.is_null() {
-            let unmet = crate::list::unmet_waits(lists);
-            if !unmet.is_empty() {
-                static SEEN: AtomicU64 = AtomicU64::new(0);
-                if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
-                    tracing::info!(kind = queue(this).kind, ?unmet, "a submission is held for a memory value");
-                }
-                lock(&queue(this).held).extend(unmet.into_iter().map(Held::Value));
-                let mut waiting = lock(&WAITING);
-                if !waiting.contains(&(this as usize)) {
-                    waiting.push(this as usize);
-                }
-            }
-        }
-        let kept = hold(this, || {
-            let (taken, order) = crate::list::detach(lists);
-            Held::Run(taken, order)
-        });
-        // Diagnostics: the order submissions are made in, next to the
-        // commands of the frame's `ops` file (which are in recording order).
-        #[cfg(feature = "diagnostics")]
-        crate::capture::op(this as usize, || {
-            let kind = (!this.is_null()).then(|| queue(this).kind);
-            // The lists as the frame's other lines name them (their host sides).
-            let named: Vec<String> = lists
-                .iter()
-                .map(|&l| match crate::list::host_list(l) {
-                    Some(h) => format!("{:#x}", std::ptr::from_ref(h) as usize),
-                    None => format!("title {l:?}"),
-                })
-                .collect();
-            format!("SUBMIT queue kind {kind:?} held {kept} lists {named:?}")
-        });
-        if kept {
-            return;
-        }
-        let host_lists: Vec<_> = lists
-            .iter()
-            .filter_map(|&l| crate::list::host_list(l))
-            .collect();
-        host.execute(&host_lists);
-        crate::list::tables_done(lists);
-        // What the lists wrote at the bottom of the pipe may be a fence
-        // another queue waits for.
-        release_held(false);
+        submit_list(host, this, lists);
         return;
     }
     let _ = this;
@@ -598,8 +561,63 @@ pub(crate) struct Plane {
     count: u32,
     resources: *const This,
 }
+
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
+///
+/// Runs submitted lists on the queue: cut at their waits, split, held behind
+/// what the queue holds, and submitted to the host.
+#[cfg(windows)]
+fn submit_list(host: &crate::host::Host, this: This, lists: &[This]) {
+    // A list that waits for a memory value not there yet: the queue
+    // holds the submission, as it does behind a fence.
+    if waits() && !this.is_null() {
+        let unmet = crate::list::unmet_waits(lists);
+        if !unmet.is_empty() {
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::info!(kind = queue(this).kind, ?unmet, "a submission is held for a memory value");
+            }
+            lock(&queue(this).held).extend(unmet.into_iter().map(Held::Value));
+            let mut waiting = lock(&WAITING);
+            if !waiting.contains(&(this as usize)) {
+                waiting.push(this as usize);
+            }
+        }
+    }
+    let kept = hold(this, || {
+        let (taken, order) = crate::list::detach(lists);
+        Held::Run(taken, order)
+    });
+    // Diagnostics: the order submissions are made in, next to the
+    // commands of the frame's `ops` file (which are in recording order).
+    #[cfg(feature = "diagnostics")]
+    crate::capture::op(this as usize, || {
+        let kind = (!this.is_null()).then(|| queue(this).kind);
+        // The lists as the frame's other lines name them (their host sides).
+        let named: Vec<String> = lists
+            .iter()
+            .map(|&l| match crate::list::host_list(l) {
+                Some(h) => format!("{:#x}", std::ptr::from_ref(h) as usize),
+                None => format!("title {l:?}"),
+            })
+            .collect();
+        format!("SUBMIT queue kind {kind:?} held {kept} lists {named:?}")
+    });
+    if kept {
+        return;
+    }
+    let host_lists: Vec<_> = lists
+        .iter()
+        .filter_map(|&l| crate::list::host_list(l))
+        .collect();
+    host.execute(&host_lists);
+    crate::list::tables_done(lists);
+    // What the lists wrote at the bottom of the pipe may be a fence
+    // another queue waits for.
+    release_held(false);
+}
+
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
     execute(this, count, lists);
 }
