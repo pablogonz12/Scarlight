@@ -1579,7 +1579,20 @@ pub(crate) mod bench {
             tag: 0,
             name: std::ptr::null(),
         };
-        execute(&request).map_err(|hr| format!("{:#010x}", hr as u32))
+        // One worker's buffers per calling thread, as a load's worker keeps
+        // them: the bench must measure the path the title's reads take.
+        thread_local! {
+            static WORKER: std::cell::RefCell<Option<Worker>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        WORKER.with(|worker| {
+            let mut worker = worker.borrow_mut();
+            let worker = match worker.as_mut() {
+                Some(worker) => worker,
+                None => worker.insert(Worker::new().ok_or("no worker event")?),
+            };
+            execute(&request, worker).map_err(|hr| format!("{:#010x}", hr as u32))
+        })
     }
 
     /// `len` bytes of physical pages, through a view of our own (the tests
