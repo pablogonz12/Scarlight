@@ -84,6 +84,9 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   later overlapping range does not put the copy's older bytes back over a title write (`merge_back` in
   `crates/victory-gpu/src/shadow.rs`). Reimplemented: theirs changes `copy_back_marked`, which this tree has no
   equivalent of (its `copy_back` merges into the copy and keeps one snapshot per submission).
+- **Marvisak/VIctory [#2507](https://github.com/Marvisak/VIctory/pull/2507)** (TheGrayOrange), GPL-3.0: the
+  DirectStorage staging buffer takes the capacities the console documents (0, 16, 20, 24, 28, 32 MiB) and refuses
+  any other size, keeping the one the scheduler has (`crates/victory-hle/src/modules/dstorage.rs`).
 
 ## Tools
 

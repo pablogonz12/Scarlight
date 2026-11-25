@@ -216,11 +216,39 @@ extern "system" fn create_queue(
     )
 }
 
+/// The staging capacities the console has, in bytes: zero, for a title whose
+/// queues are all from memory, and 16, 20, 24, 28 and 32 MiB.
+const STAGING_SIZES: [u32; 6] = [0, 16 << 20, 20 << 20, 24 << 20, 28 << 20, 32 << 20];
+
+/// The capacity `size` asks for, if the console has it; `None` for any other
+/// size, which leaves the scheduler's as it is.
+fn staging_capacity(size: u32) -> Option<u64> {
+    (STAGING_SIZES.contains(&size) || !staging_checked()).then_some(u64::from(size))
+}
+
+/// Whether a size outside [`STAGING_SIZES`] is refused: on by default,
+/// `VICTORY_DSTORAGE_STAGING_CHECK=0` takes any size and copies it, as this
+/// module did before.
+fn staging_checked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_STAGING_CHECK").is_none_or(|v| v != "0"))
+}
+
 /// The title asks for 32 MiB and stops if this fails.
+///
+/// The console takes the sizes [`STAGING_SIZES`] lists and nothing else: one
+/// it has none of keeps the capacity the scheduler already has. What the
+/// console answers that is not documented in the interface; `E_INVALIDARG` is
+/// what this module answers for out-of-range values elsewhere, not a verified
+/// code.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     tracing::info!(size, "dstorage: staging buffer size");
+    let Some(capacity) = staging_capacity(size) else {
+        tracing::warn!(size, "dstorage: a staging buffer size the console has none of");
+        return E_INVALIDARG;
+    };
     if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
+        scheduler.lock().staging = capacity;
     }
     S_OK
 }
@@ -1627,6 +1655,40 @@ mod tests {
         enqueue_status(queue, array, 0); // the second of four: no submit needed
         assert_eq!(wait(array, 0), S_OK);
         assert_eq!(out, pattern(64)[8..24]);
+    }
+
+    /// The staging buffer takes the capacities the console documents and
+    /// nothing else: a size it has none of is refused, and the capacity the
+    /// scheduler had is kept.
+    #[test]
+    fn staging_buffer_sizes_the_console_has_none_of_are_refused() {
+        for size in [0, 16 << 20, 20 << 20, 24 << 20, 28 << 20, 32 << 20] {
+            assert_eq!(staging_capacity(size), Some(u64::from(size)), "{size}");
+        }
+        for size in [
+            1,
+            8 << 20,
+            (16 << 20) - 1,
+            (16 << 20) + 1,
+            18 << 20,
+            30 << 20,
+            (32 << 20) + 1,
+            64 << 20,
+            u32::MAX,
+        ] {
+            assert_eq!(staging_capacity(size), None, "{size}");
+        }
+        // Through the factory method: refused, and the capacity kept.
+        let before = scheduler()
+            .expect("no scheduler")
+            .lock()
+            .staging;
+        assert_eq!(
+            set_staging_buffer_size(std::ptr::null(), (20 << 20) + 1),
+            E_INVALIDARG
+        );
+        assert_eq!(set_staging_buffer_size(std::ptr::null(), 8 << 20), E_INVALIDARG);
+        assert_eq!(scheduler().unwrap().lock().staging, before);
     }
 
     /// Lanes without workers: what `start` picks, and when statuses land.
