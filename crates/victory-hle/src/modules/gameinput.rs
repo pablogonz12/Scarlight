@@ -1144,14 +1144,34 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
-            Some(convert(&state.Gamepad))
+            #[allow(unused_mut)]
+            let mut pad = convert(&state.Gamepad);
+            // The scripted keys (`VICTORY_KEYS`) also press the first
+            // pad's buttons, by the stand-in pad's table: with a real pad
+            // connected the stand-in is not there, and a title that listens
+            // to the pad (the title's start screen) saw nothing.
+            #[cfg(feature = "diagnostics")]
+            if slot == 0 {
+                for vk in scripted() {
+                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                        pad.buttons |= button;
+                    }
+                }
+            }
+            Some(pad)
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
             #[cfg(feature = "diagnostics")]
             let mut down = scripted();
+            // Buttons the debug tool's control folder asks for (see
+            // `victory_core::ctl`), with or without focus.
+            #[cfg(feature = "diagnostics")]
+            down.extend(victory_core::ctl::held());
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
+            down.sort_unstable();
+            down.dedup();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1167,7 +1187,8 @@ mod host {
                     // SAFETY: plain query.
                     scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
                     virtual_key: vk,
-                    // shortcut: no characters (code point 0); the title reads scan codes and virtual keys only.
+                    // shortcut: no characters (code point 0);
+                    // the title reads scan codes and virtual keys only.
                     ..Default::default()
                 })
                 .collect()
