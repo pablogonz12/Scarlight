@@ -93,6 +93,11 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   source-counted progress page (reference instruction forms, history chart). No code taken.
 - **Mesa** ([aco_opcodes.py](https://gitlab.freedesktop.org/mesa/mesa)), MIT: the reference list of
   RDNA2 instruction forms in `tools/progress/rdna2_isa_forms.txt` is generated from it.
+- **Marvisak/VIctory [#2513](https://github.com/Marvisak/VIctory/pull/2513)** (Calvix2k), GPL-3.0: the idea
+  that a copy-back brings a declared range's snapshot in step with the bytes it takes from title memory, so that a
+  later overlapping range does not put the copy's older bytes back over a title write (`merge_back` in
+  `crates/victory-gpu/src/shadow.rs`). Reimplemented: theirs changes `copy_back_marked`, which this tree has no
+  equivalent of (its `copy_back` merges into the copy and keeps one snapshot per submission).
 
 ## Tools
 
