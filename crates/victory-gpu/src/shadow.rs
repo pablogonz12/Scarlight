@@ -2051,10 +2051,15 @@ impl Shadow {
                     continue;
                 }
                 for piece in self.pieces(from, to) {
-                    if kept.0[piece] {
-                        continue;
-                    }
                     let (lo, hi) = self.piece(piece);
+                    if kept.0[piece] {
+                        // Kept until the runtime unmapped or remapped the
+                        // block: what is there now is not what was kept.
+                        if !crate::watch::remapped_block(self.start as usize + lo) {
+                            continue;
+                        }
+                        kept.0[piece] = false;
+                    }
                     let whole = from <= lo && hi <= to;
                     let (lo, hi) = (lo.max(from), hi.min(to));
                     // SAFETY: as below; `hi <= total`.
@@ -2062,9 +2067,17 @@ impl Shadow {
                         std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
                     }
                     kept.0[piece] = whole;
+                    crate::watch::remapped_taken(self.start as usize + lo, hi - lo);
                 }
             }
             return;
+        }
+        // The parts' bytes are taken afresh: a remapping before them is in
+        // the snapshot now, so a copy-back may put the GPU's bytes back.
+        for &(from, to) in &parts {
+            if from < to {
+                crate::watch::remapped_taken(self.start as usize + from, to - from);
+            }
         }
         if wide_back() {
             // Noted, and taken with the submission's other snapshots when
@@ -2142,6 +2155,12 @@ impl Shadow {
             }
             let mut title = vec![0u8; PIECE];
             for (at, n) in differing {
+                // The runtime unmapped or remapped this block while the
+                // submission was pending: what it shows is someone else's
+                // now, so the copy's bytes for it stay out (FIND-14).
+                if crate::watch::remapped_block(start + at) {
+                    continue;
+                }
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };

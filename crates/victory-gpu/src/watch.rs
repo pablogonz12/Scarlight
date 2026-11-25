@@ -373,6 +373,92 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
+/// Title memory the runtime unmapped or remapped, as ranges (start, end),
+/// since a copy took its bytes: the copy's snapshot of them is stale, so its
+/// copy-back leaves them alone ([`copy_back_skips_remapped`]). A copy that
+/// takes a range afresh clears it ([`remapped_taken`]); a range no copy takes
+/// again costs nothing beyond one entry.
+static REMAPPED: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+fn remapped() -> std::sync::MutexGuard<'static, BTreeMap<usize, usize>> {
+    REMAPPED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether a copy-back leaves blocks the runtime remapped alone
+/// (`VICTORY_SKIP_REMAPPED=0` puts back its bytes as before).
+pub(crate) fn copy_back_skips_remapped() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_REMAPPED").is_none_or(|v| v != "0"))
+}
+
+/// Notes that title memory `[at, at + len)` was unmapped or remapped: what a
+/// copy took of it before is stale.
+fn remapped_range(at: usize, len: usize) {
+    if !copy_back_skips_remapped() {
+        return;
+    }
+    let (from, to) = (at, at.saturating_add(len));
+    if to <= from {
+        return;
+    }
+    let mut map = remapped();
+    let (mut start, mut end) = (from, to);
+    if let Some((&s, &e)) = map.range(..=from).next_back()
+        && e >= from
+    {
+        (start, end) = (s, end.max(e));
+        map.remove(&s);
+    }
+    loop {
+        let next = map.range(start..).next().map(|(&s, &e)| (s, e));
+        match next {
+            Some((s, e)) if s <= end => {
+                end = end.max(e);
+                map.remove(&s);
+            }
+            _ => break,
+        }
+    }
+    map.insert(start, end);
+}
+
+/// Whether block `at` lies in title memory the runtime unmapped or remapped
+/// since a copy took its bytes: the copy-back must not put the snapshot's
+/// bytes over the new mapping.
+pub(crate) fn remapped_block(at: usize) -> bool {
+    if !copy_back_skips_remapped() {
+        return false;
+    }
+    // A mark on any part of the block keeps the copy's bytes out of it: the
+    // snapshot's bytes of the rest are as stale as the marked part's.
+    let lo = at / BLOCK * BLOCK;
+    let map = remapped();
+    map.range(..lo + BLOCK).next_back().is_some_and(|(_, &e)| e > lo)
+}
+
+/// A copy took the bytes of `[at, at + len)` afresh: what the runtime did to
+/// them before is in its snapshot now.
+pub(crate) fn remapped_taken(at: usize, len: usize) {
+    if !copy_back_skips_remapped() {
+        return;
+    }
+    let (from, to) = (at, at.saturating_add(len));
+    if to <= from {
+        return;
+    }
+    let mut map = remapped();
+    let covered: Vec<(usize, usize)> = map.range(..to).filter(|&(_, &e)| e > from).map(|(&s, &e)| (s, e)).collect();
+    for (s, e) in covered {
+        map.remove(&s);
+        if s < from {
+            map.insert(s, from);
+        }
+        if e > to {
+            map.insert(to, e);
+        }
+    }
+}
+
 struct Guards {
     /// Blocks we made read-only.
     protected: BTreeSet<usize>,
@@ -832,6 +918,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         g.protected.remove(&block);
         g.clean.remove(&block);
     }
+    // A copy whose submission is still pending took what was here before:
+    // its copy-back must leave the new mapping's bytes alone.
+    remapped_range(at, len);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -1396,10 +1485,16 @@ mod tests {
 
 #[cfg(test)]
 mod mapping_tests {
-    use super::{title_memory_reading, title_memory_remapping};
+    use super::{
+        BLOCK, copy_back_skips_remapped, remapped, remapped_block, remapped_taken, title_memory_reading,
+        title_memory_remapped, title_memory_remapping,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
 
     /// A change of mapping waits for a read in place that is under way, and
     /// a read in place waits for a change of mapping.
@@ -1441,5 +1536,40 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+
+    /// A range the runtime unmapped or remapped is marked once, joined with
+    /// the marks next to it, until a copy takes it afresh or part of it:
+    /// that is what keeps a pending copy-back's bytes out of a new mapping.
+    #[test]
+    fn remapping_marks_blocks_until_a_copy_takes_them_again() {
+        if !copy_back_skips_remapped() {
+            return; // VICTORY_SKIP_REMAPPED=0: nothing is marked.
+        }
+        // SAFETY: two blocks of private memory, freed at the end.
+        let at = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(at, 0, "the pool allocates");
+        remapped().clear();
+        title_memory_remapped(at, BLOCK);
+        assert!(remapped_block(at), "a remapped block is marked");
+        assert!(!remapped_block(at + BLOCK), "the block after it is not");
+        assert_eq!(remapped().len(), 1, "one range holds both blocks");
+        remapped_taken(at, BLOCK);
+        assert!(!remapped_block(at), "a copy that takes it clears the mark");
+        // Two blocks remapped apart are one range; a copy taking one of them
+        // leaves the other marked.
+        title_memory_remapped(at + BLOCK, BLOCK);
+        title_memory_remapped(at, BLOCK);
+        assert_eq!(remapped().len(), 1, "the marks next to each other join");
+        assert!(remapped_block(at) && remapped_block(at + BLOCK));
+        remapped_taken(at + BLOCK, BLOCK);
+        assert!(!remapped_block(at + BLOCK), "the taken bytes are current");
+        assert!(remapped_block(at), "the block no copy took stays marked");
+        remapped_taken(at, 2 * BLOCK);
+        assert!(!remapped_block(at) && !remapped_block(at + BLOCK));
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
 }
