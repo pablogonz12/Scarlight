@@ -8545,7 +8545,11 @@ impl<'a> Lower<'a> {
             | "max_u16" | "min_u16" | "max_i16" | "min_i16" => 2,
             _ => return Err("a packed 16-bit operation"),
         };
-        if v.omod != 0 || !float && (v.clamp || v.neg != 0 || v.neg_hi != 0) {
+        let saturates = matches!(
+            op,
+            "add_u16" | "sub_u16" | "mad_u16" | "add_i16" | "sub_i16" | "mad_i16"
+        );
+        if v.omod != 0 || !float && ((v.clamp && !saturates) || v.neg != 0 || v.neg_hi != 0) {
             return Err("modifiers on a packed integer operation");
         }
         let c = self.cur;
@@ -8595,7 +8599,7 @@ impl<'a> Lower<'a> {
                     }
                 }
                 let k15 = self.s.m.i32(15);
-                match op {
+                let r = match op {
                     "add_u16" | "add_i16" => self.s.m.bin(c, Bin::Add, xs[0], xs[1]),
                     "sub_u16" | "sub_i16" => self.s.m.bin(c, Bin::Sub, xs[0], xs[1]),
                     "mul_lo_u16" => self.s.m.bin(c, Bin::Mul, xs[0], xs[1]),
@@ -8627,6 +8631,34 @@ impl<'a> Lower<'a> {
                         let t = self.s.m.cmp(c, p, xs[0], xs[1]);
                         self.s.m.select(c, t, xs[0], xs[1])
                     }
+                };
+                if v.clamp && saturates {
+                    match op {
+                        // Unsigned: add/mad fit in u32 (max 65535*65535+65535 <= u32::MAX);
+                        // sub is in [-65535, 65535] so signed < 0 catches underflow.
+                        "add_u16" | "mad_u16" => {
+                            let hi = self.s.m.i32(0xFFFF);
+                            let over = self.s.m.cmp(c, pred::IUGT, r, hi);
+                            self.s.m.select(c, over, hi, r)
+                        }
+                        "sub_u16" => {
+                            let z = self.s.m.i32(0);
+                            let under = self.s.m.cmp(c, pred::SLT, r, z);
+                            self.s.m.select(c, under, z, r)
+                        }
+                        // Signed: operands are sign-extended i16 in i32, so add/sub/mad
+                        // never wrap i32 (|r| <= 32768*32768 + 32768 < 2^31).
+                        _ => {
+                            let lo = self.s.m.i32(i32::from(i16::MIN) as u32);
+                            let hi = self.s.m.i32(i32::from(i16::MAX) as u32);
+                            let under = self.s.m.cmp(c, pred::SLT, r, lo);
+                            let t = self.s.m.select(c, under, lo, r);
+                            let over = self.s.m.cmp(c, pred::SGT, t, hi);
+                            self.s.m.select(c, over, hi, t)
+                        }
+                    }
+                } else {
+                    r
                 }
             };
             let m = self.s.m.i32(0xFFFF);

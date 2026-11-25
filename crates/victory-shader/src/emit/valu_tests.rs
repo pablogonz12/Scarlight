@@ -1978,3 +1978,118 @@ fn cmp16_sdwa_preserves_word_selects() {
         }
     }
 }
+
+/// VOP3P `op vdst, src0, src1, src2` with standard packed lane selects
+/// (`opsel = 0b000`, `opsel_hi = 0b111`) and optional `clamp`.
+const fn vop3p(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16, clamp: bool) -> [u32; 2] {
+    [
+        0x33 << 26
+            | (op as u32 & 0x7F) << 16
+            | (clamp as u32) << 15
+            | (1 << 14) // opsel_hi[2] = 1
+            | vdst as u32,
+        (0b11 << 27) // opsel_hi[1:0] = 0b11
+            | (src0 as u32 & 0x1FF)
+            | (src1 as u32 & 0x1FF) << 9
+            | (src2 as u32 & 0x1FF) << 18,
+    ]
+}
+
+#[test]
+fn v_pk_int16_clamp_saturates_as_rdna2() {
+    let pack_u = |lo: u16, hi: u16| u32::from(lo) | (u32::from(hi) << 16);
+    let pack_i = |lo: i16, hi: i16| pack_u(lo as u16, hi as u16);
+
+    // VOP3P opcodes: 0x00=mad_i16, 0x02=add_i16, 0x03=sub_i16, 0x09=mad_u16, 0x0a=add_u16, 0x0b=sub_u16.
+    let add_u16 = build_valu_cs(&vop3p(0x0a, 0, vgpr(1), vgpr(2), 0, true));
+    let sub_u16 = build_valu_cs(&vop3p(0x0b, 0, vgpr(1), vgpr(2), 0, true));
+    let mad_u16 = build_valu_cs(&vop3p(0x09, 0, vgpr(1), vgpr(2), vgpr(3), true));
+    let add_i16 = build_valu_cs(&vop3p(0x02, 0, vgpr(1), vgpr(2), 0, true));
+    let sub_i16 = build_valu_cs(&vop3p(0x03, 0, vgpr(1), vgpr(2), 0, true));
+    let mad_i16 = build_valu_cs(&vop3p(0x00, 0, vgpr(1), vgpr(2), vgpr(3), true));
+
+    // add_u16 clamp: lo overflows (60000+10000 -> 65535), hi fits (100+200 -> 300)
+    run_cases(
+        &add_u16,
+        &[
+            [pack_u(60000, 100), pack_u(10000, 200), 0, 0],
+            [pack_u(u16::MAX, 0), pack_u(u16::MAX, 0), 0, 0],
+        ],
+        |backend, i, _, got| {
+            let want = [pack_u(u16::MAX, 300), pack_u(u16::MAX, 0)][i];
+            assert_eq!(got, want, "{backend}: v_pk_add_u16 clamp case {i}");
+        },
+    );
+
+    // sub_u16 clamp: lo underflows (5-10 -> 0), hi fits (500-200 -> 300)
+    run_cases(
+        &sub_u16,
+        &[
+            [pack_u(5, 500), pack_u(10, 200), 0, 0],
+            [pack_u(0, u16::MAX), pack_u(u16::MAX, 0), 0, 0],
+        ],
+        |backend, i, _, got| {
+            let want = [pack_u(0, 300), pack_u(0, u16::MAX)][i];
+            assert_eq!(got, want, "{backend}: v_pk_sub_u16 clamp case {i}");
+        },
+    );
+
+    // mad_u16 clamp: lo max*max+max -> 65535 (tests no u32 wrap!), hi 20*30+40 -> 640
+    run_cases(
+        &mad_u16,
+        &[[
+            pack_u(u16::MAX, 20),
+            pack_u(u16::MAX, 30),
+            pack_u(u16::MAX, 40),
+            0,
+        ]],
+        |backend, _, _, got| {
+            let want = pack_u(u16::MAX, 640);
+            assert_eq!(got, want, "{backend}: v_pk_mad_u16 clamp");
+        },
+    );
+
+    // add_i16 clamp: lo +overflow (30000+10000 -> 32767), hi -overflow (-30000-10000 -> -32768)
+    run_cases(
+        &add_i16,
+        &[
+            [pack_i(30000, -30000), pack_i(10000, -10000), 0, 0],
+            [pack_i(100, -50), pack_i(-25, 20), 0, 0],
+        ],
+        |backend, i, _, got| {
+            let want = [pack_i(i16::MAX, i16::MIN), pack_i(75, -30)][i];
+            assert_eq!(got, want, "{backend}: v_pk_add_i16 clamp case {i}");
+        },
+    );
+
+    // sub_i16 clamp: lo -overflow (-30000-10000 -> -32768), hi +overflow (30000-(-10000) -> 32767)
+    run_cases(
+        &sub_i16,
+        &[
+            [pack_i(-30000, 30000), pack_i(10000, -10000), 0, 0],
+            [pack_i(0, -100), pack_i(i16::MIN, -200), 0, 0],
+        ],
+        |backend, i, _, got| {
+            let want = [pack_i(i16::MIN, i16::MAX), pack_i(i16::MAX, 100)][i];
+            assert_eq!(got, want, "{backend}: v_pk_sub_i16 clamp case {i}");
+        },
+    );
+
+    // mad_i16 clamp: lo (-32768)*(-32768)+32767 -> 32767, hi (-32768)*(32767)-32768 -> -32768
+    run_cases(
+        &mad_i16,
+        &[
+            [
+                pack_i(i16::MIN, i16::MIN),
+                pack_i(i16::MIN, i16::MAX),
+                pack_i(i16::MAX, i16::MIN),
+                0,
+            ],
+            [pack_i(-10, 5), pack_i(20, -4), pack_i(50, -3), 0],
+        ],
+        |backend, i, _, got| {
+            let want = [pack_i(i16::MAX, i16::MIN), pack_i(-150, -23)][i];
+            assert_eq!(got, want, "{backend}: v_pk_mad_i16 clamp case {i}");
+        },
+    );
+}
