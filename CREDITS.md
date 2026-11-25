@@ -84,6 +84,10 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   bits of each operand (`crates/victory-shader/src/emit/lower/valu_int.rs`). Reimplemented on this tree's
   `mul_hi`, which moved to `lower/valu_int.rs` after that fork; its tests came across in spirit.
 
+- **Chezzuss/VIctory batch 7 (unpublished), GPL-3.0**: clearing the ray-traced reflection image while the
+  ray-tracing structures are unbuilt, as `VICTORY_REFLECTION=miss`
+  (`crates/victory-gpu/src/reflection.rs`). Its `alpha`, `water` and `history` values and the sky-probe fallback
+  tracking that tells the passes apart are not taken: this tree clears one image, the opaque pass's.
 - **fxceless/victory-fork [PR #979](https://github.com/fxceless/victory-fork/pull/979)** (gmanka), GPL-3.0: the
   guarded views' clean blocks kept as contiguous runs (`CleanBlocks`, `crates/victory-gpu/src/watch.rs`), so a
   refresh of a mostly clean view heap walks only its dirty gaps instead of collecting one entry per 64 KiB
