@@ -136,6 +136,12 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   allocation and fence tracked so a remapped or released allocation is not landed
   (`crates/victory-gpu/src/texback.rs`).
 
+- **fxceless/victory-fork [PR #976](https://github.com/fxceless/victory-fork/pull/976)** (MoscaLosca), GPL-3.0: a
+  compute or mesh dispatch asking for more than the host's 65,535 groups in `x` runs as pieces, each told where
+  its groups start in a host-computed user-data dword the translated program adds to its group id
+  (`USER_GROUP_BASE`, `crates/victory-shader/src/emit/shader.rs`, `Lower::compute_id`;
+  `State::dispatch`/`dispatch_mesh`, `crates/victory-gpu/src/draw.rs`, `VICTORY_GROUP_SPLIT=0`), and the clamp's
+  budget words now count the largest group count a compute record asked for as well as the mesh one.
 - **fxceless/victory-fork [PR #981](https://github.com/fxceless/victory-fork/pull/981)** (avt0m4t), GPL-3.0: an
   embedded shader keys and translates on its declared DXBC bytes, so a packed record whose payload runs on past
   the container gets the same BLAKE3 as its standalone copy (`Container::as_bytes()`,
