@@ -2122,6 +2122,10 @@ impl State {
     /// `x`): a dispatch beyond it is run as several ([`State::dispatch`]).
     const MOST_GROUPS: u32 = 65_535;
 
+    /// The most groups a mesh dispatch runs in all (2^22, the host's grid
+    /// limit): a piece of a split mesh dispatch is cut to it as well.
+    const MOST_MESH_GROUPS: u32 = 1 << 22;
+
     /// Where a compute or mesh stage's group-ID base is bound, if the stage
     /// reads its group id: its user-data root parameter and the dword in it
     /// (`victory_shader::emit::USER_GROUP_BASE`).
@@ -2229,11 +2233,13 @@ impl State {
                 }
             }
             _ => {
-                once!(
-                    x,
-                    "a dispatch asks for more groups in x than the host runs and its program reads no group id: the \
-                     groups after 65,535 do not run"
-                );
+                if x > Self::MOST_GROUPS {
+                    once!(
+                        x,
+                        "a dispatch asks for more groups in x than the host runs and its program reads no group id: \
+                         the groups after 65,535 do not run"
+                    );
+                }
                 // No group id to move: the groups after the host's limit
                 // cannot be run at all (a count over it the host does not
                 // give its driver either).
@@ -2405,9 +2411,13 @@ impl State {
                                      each told where its groups start (VICTORY_GROUP_SPLIT=0: the first 65,535 groups only)"
                                 );
                             });
+                            // A mesh dispatch's pieces are bounded by the
+                            // grid's own limit too, in all three dimensions.
+                            let grid = y.saturating_mul(z).max(1);
+                            let piece = (Self::MOST_MESH_GROUPS / grid).clamp(1, Self::MOST_GROUPS);
                             let mut at = 0;
                             while at < x {
-                                let n = (x - at).min(Self::MOST_GROUPS);
+                                let n = (x - at).min(piece);
                                 if at != 0 {
                                     Self::set_group_base(list, false, slot, at);
                                 }
