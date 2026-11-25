@@ -233,11 +233,17 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
-/// What the cap is charged for `len` bytes of title memory: the 64 KiB pages
-/// the heap locks, rounded up (`place_part`'s `bytes`), because the host locks
-/// and imports whole pages whatever the title's span is.
+/// What the cap is charged for `len` bytes of title memory at `start`: the
+/// pages a heap locks for it, and never less. It is the upper bound of
+/// [`place_part`]'s `bytes`, ((start + len).ceil to a page - (start's page)),
+/// from `len` alone: `len` rounded up, plus the one page that the span's own
+/// offset inside its first page can add. Charging the bound rather than the
+/// exact count keeps the number a function of what [`gone`] is told (the
+/// window's span, not its address) and can only ever hold the cap tighter,
+/// never let it past: `len` bytes of `0x2000` starting at page offset
+/// `0xf000` lock 128 KiB, and so do the 96 KiB this counts for `0x2000`.
 fn charged(len: u64) -> u64 {
-    len.next_multiple_of(K64 as u64)
+    len.max(1).next_multiple_of(K64 as u64) + K64 as u64
 }
 
 /// What [`place_for`] gave is gone. The bytes are the title's span, so they
@@ -758,7 +764,13 @@ impl Rig {
     fn fetch(&mut self, resource: &ID3D12Resource, offset: u64, size: usize) -> windows::core::Result<Vec<u8>> {
         let back = self.committed(D3D12_HEAP_TYPE_READBACK, size as u64, D3D12_RESOURCE_STATE_COPY_DEST)?;
         // SAFETY: two live buffers, the range inside both.
-        self.run(|list| unsafe { list.CopyBufferRegion(&back, 0, resource, offset, size as u64) })?;
+        // A run that does not complete leaves `back` the GPU's, not ours: it
+        // stays (a `forget`, 64 KiB once) rather than being released under a
+        // copy whose end is unknown.
+        if let Err(e) = self.run(|list| unsafe { list.CopyBufferRegion(&back, 0, resource, offset, size as u64) }) {
+            std::mem::forget(back);
+            return Err(e);
+        }
         let mut data = std::ptr::null_mut();
         // SAFETY: the mapping holds `size` bytes until unmapped.
         unsafe {
@@ -780,7 +792,12 @@ impl Rig {
             up.Unmap(0, None);
         }
         // SAFETY: two live buffers, the range inside both.
-        self.run(|list| unsafe { list.CopyBufferRegion(resource, offset, &up, 0, bytes.len() as u64) })
+        // As in `fetch`: a submission whose end is not known keeps its source.
+        let run = self.run(|list| unsafe { list.CopyBufferRegion(resource, offset, &up, 0, bytes.len() as u64) });
+        if run.is_err() {
+            std::mem::forget(up);
+        }
+        run
     }
 
     /// A compute shader stores, through a root unordered-access view at
@@ -1420,12 +1437,20 @@ mod tests {
     /// of imports under a 1 MiB cap, not the 68 KiB their lengths add up to.
     #[test]
     fn the_cap_is_charged_the_pages_that_are_locked() {
-        assert_eq!(charged(0), 0);
-        assert_eq!(charged(4 * 1024), K64 as u64);
-        assert_eq!(charged(K64 as u64), K64 as u64);
-        assert_eq!(charged(K64 as u64 + 1), 2 * K64 as u64);
-        assert_eq!(charged(4 * 1024) * 17, 1088 * 1024);
-        assert!(charged(4 * 1024) * 17 > 1 << 20, "a 1 MiB cap admits these seventeen spans, so the count must be the pages");
+        // Never zero for a span place_part would import at least one page for.
+        assert_eq!(charged(0), 2 * K64 as u64);
+        assert!(charged(4 * 1024) >= K64 as u64);
+        // A span that crosses a page line locks one page more than its own
+        // rounded length: 0x2000 from page offset 0xf000 is 128 KiB, and the
+        // charge is at least that.
+        let (start, len) = (0xf000u64, 0x2000u64);
+        let pages = (start + len).next_multiple_of(K64 as u64) - (start & !(K64 as u64 - 1));
+        assert_eq!(pages, 2 * K64 as u64);
+        assert!(charged(len) >= pages, "the charge is an upper bound of what place_part imports");
+        // What a heap locked and what gone() gives back are the same number.
+        assert_eq!(charged(len) - charged(len), 0);
+        // And the seventeen 4 KiB spans of a 1 MiB cap are over it.
+        assert!(charged(4 * 1024) * 17 > 1 << 20);
     }
 
     /// The strict opening takes one shape only (vkd3d-proton
