@@ -2254,6 +2254,12 @@ impl Shadow {
                 self.changed(at, at + n);
             }
             let mut title = vec![0u8; PIECE];
+            // The runtime's remapping is held off from each test to the last
+            // byte written, once for this copy-back and not once a piece: a
+            // remap already under way is waited for 2 ms only, since it may
+            // itself be waiting for the blocks this copy-back's job holds.
+            // The writes go on as before without the reading.
+            let _reading = crate::watch::title_memory_reading_within(std::time::Duration::from_millis(2));
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
@@ -2299,14 +2305,8 @@ impl Shadow {
                     // Only the bytes the runtime did not unmap or remap
                     // while the submission was pending: what it shows there
                     // is someone else's now, so the copy's bytes stay out
-                    // (FIND-14). The reading holds the runtime's remapping
-                    // off from the test to the last byte written; a remap
-                    // already under way is waited for 2 ms only, since a
-                    // remap could itself be waiting for this copy-back's
-                    // blocks (the writes go on as before without it).
+                    // (FIND-14).
                     let base = start + at;
-                    let reading =
-                        crate::watch::title_memory_reading_within(std::time::Duration::from_millis(2));
                     if !crate::watch::remapped_any(base, n) {
                         crate::watch::writing(base, n);
                         crate::host::write_mapped(base as *mut u8, title.as_ptr(), n);
@@ -2321,7 +2321,6 @@ impl Shadow {
                             written += n;
                         }
                     }
-                    drop(reading);
                 }
             }
             // Our write shows as a title write at the copy's next refresh,

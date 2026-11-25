@@ -486,7 +486,7 @@ fn remapped_range(at: usize, len: usize) {
     if let Some((&s, &(e, g))) = map.range(..=from).next_back()
         && e >= from
     {
-        (start, end, generation) = (s, end.max(e), generation.min(g));
+        (start, end, generation) = (s, end.max(e), generation.max(g));
         map.remove(&s);
     }
     loop {
@@ -494,7 +494,9 @@ fn remapped_range(at: usize, len: usize) {
         match next {
             Some((s, e, g)) if s <= end => {
                 end = end.max(e);
-                generation = generation.min(g);
+                // The newest remap of the range is the one a copy has to
+                // have read: a mark older than it must not clear it.
+                generation = generation.max(g);
                 map.remove(&s);
             }
             _ => break,
@@ -528,7 +530,17 @@ pub(crate) fn unremapped_runs(at: usize, len: usize) -> Vec<(usize, usize)> {
     let map = remapped();
     let mut runs = Vec::new();
     let mut run = at;
-    for (&s, &(e, _)) in map.range(..to) {
+    // The one range that may start before `at`, then the ones that start
+    // inside: nothing below them can overlap.
+    let mut keys: Vec<usize> = Vec::new();
+    if let Some((&s, &(e, _))) = map.range(..=at).next_back()
+        && e > at
+    {
+        keys.push(s);
+    }
+    keys.extend(map.range(at..to).map(|(&s, _)| s));
+    for s in keys {
+        let e = map[&s].0;
         if e <= run {
             continue;
         }
@@ -552,10 +564,13 @@ fn clear_marks(map: &mut BTreeMap<usize, (usize, u64)>, from: usize, to: usize, 
     if to <= from {
         return;
     }
-    let covered: Vec<(usize, usize, u64)> = map
-        .range(..to)
-        .filter(|&(_, &(e, _))| e > from)
-        .map(|(&s, &(e, g))| (s, e, g))
+    // The one range that may start before `from`, then the ones that start
+    // inside: nothing below them can overlap.
+    let before = map.range(..=from).next_back().map(|(&s, &(e, g))| (s, e, g));
+    let covered: Vec<(usize, usize, u64)> = before
+        .filter(|&(_, e, _)| e > from)
+        .into_iter()
+        .chain(map.range(from..to).map(|(&s, &(e, g))| (s, e, g)))
         .collect();
     for (s, e, g) in covered {
         if g > generation {
