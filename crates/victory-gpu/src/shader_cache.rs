@@ -1,9 +1,12 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
-//! cache folder, keyed by the container's content and by the VIctory build
-//! that translated it (the BLAKE3 of our executable), so a rebuilt
-//! translator never serves an old translation. Entries go through
-//! `victory-pipeline`'s content-addressed cache, which writes them
-//! atomically; an entry that does not read back is translated again.
+//! cache folder, keyed by the container's content, by the VIctory build
+//! that translated it (the BLAKE3 of our executable), by every translation
+//! switch that build runs with and by what it learned about the host GPU
+//! (see [`build`] and [`entry_key`]), so neither a rebuilt translator nor
+//! one run with other switches nor another card is served an old
+//! translation. Entries go through `victory-pipeline`'s content-addressed
+//! cache, which writes them atomically; an entry that does not read back is
+//! translated again.
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
 //! must be added to `encode` and `decode` too (entries of older builds
