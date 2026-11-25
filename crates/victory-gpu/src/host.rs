@@ -912,6 +912,17 @@ fn lazy_prelude() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
 }
 
+/// Whether the presented texture's move to the copy state is the present
+/// list's, as it is any list's (`HostList::settle`): its real state is
+/// swapped at submission, in `prelude`, and no barrier is recorded when it
+/// is already there. Off (`VICTORY_PRESENT_PRELUDE=0`): the move is
+/// recorded by hand from the state it was recorded in, and back, even when
+/// that is `COPY_SOURCE` itself.
+fn present_prelude() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_PRELUDE").is_none_or(|v| v != "0"))
+}
+
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
@@ -1734,6 +1745,11 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    /// Title textures of the kinds copied back ([`crate::texback`]) that
+    /// the list's shaders write, copied when the list closes.
+    back_wanted: Vec<crate::texback::Target>,
+    /// Those copies, whose texels go to title memory once the list has run.
+    texture_backs: Vec<crate::texback::Back>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -2055,6 +2071,8 @@ struct Sent {
     number: u64,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    /// Title-memory ranges written when its shader textures are copied back.
+    texture_back_ranges: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
 }
@@ -2070,6 +2088,7 @@ struct Flight {
     order: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    texture_back_ranges: Vec<(usize, usize)>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -2083,8 +2102,8 @@ enum Late {
 
 struct Line {
     line: Vec<Late>,
-    /// The title memory the flights' shaders may write (address, end), in
-    /// order and joined.
+    /// The title memory the flights' shaders and texture readbacks may write
+    /// (address, end), in order and joined.
     written: Vec<(usize, usize)>,
     /// Host lists in the flights.
     lists: usize,
@@ -2797,6 +2816,11 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    // Textures shaders wrote that the title reads on the CPU
+    // ([`crate::texback`]).
+    for back in &list.deferred().texture_backs {
+        crate::texback::land(back);
+    }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -3660,6 +3684,7 @@ impl Host {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                    ranges.extend(flight.texture_back_ranges.iter().copied());
                 }
             }
             join_ranges(written, ranges);
@@ -3834,7 +3859,13 @@ impl Host {
         let most = {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(
+                written,
+                sent.back
+                    .iter()
+                    .flat_map(|(_, ranges)| ranges.iter().copied())
+                    .chain(sent.texture_back_ranges.iter().copied()),
+            );
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -3844,6 +3875,7 @@ impl Host {
                 order,
                 card: sent.card,
                 back: sent.back,
+                texture_back_ranges: sent.texture_back_ranges,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -3878,7 +3910,13 @@ impl Host {
         {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(
+                written,
+                sent.back
+                    .iter()
+                    .flat_map(|(_, ranges)| ranges.iter().copied())
+                    .chain(sent.texture_back_ranges.iter().copied()),
+            );
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -3888,6 +3926,7 @@ impl Host {
                 order: Vec::new(),
                 card: sent.card,
                 back: sent.back,
+                texture_back_ranges: sent.texture_back_ranges,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -4249,6 +4288,10 @@ impl Host {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
             let back = declared_writes(runs);
+            let mut texture_back_ranges = Vec::new();
+            for list in runs {
+                texture_back_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
+            }
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
@@ -4258,6 +4301,7 @@ impl Host {
                 number: this_submission,
                 card,
                 back,
+                texture_back_ranges,
                 writes,
             };
             working(was_working);
@@ -4687,6 +4731,7 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         self.twins_to_depth();
+        self.textures_back();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -4767,7 +4812,7 @@ impl HostList {
     /// as [`HostList::transition`] does a title resource's host copy, and
     /// records the barrier: for textures that are not a title resource's
     /// host copy (colour twins) and for the copies between the two.
-    fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
+    pub(crate) fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
         let wanted = legal_state(&copy.texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
@@ -4946,6 +4991,34 @@ impl HostList {
         }
     }
 
+    /// A draw or dispatch being prepared writes title texture `resource`
+    /// through unordered access: if it is of a kind copied back
+    /// ([`crate::texback`]), the list copies it when it closes.
+    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+        if !crate::texback::wanted(resource) {
+            return;
+        }
+        let mut deferred = self.deferred();
+        if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
+            && let Some(target) = crate::texback::Target::new(resource)
+        {
+            deferred.back_wanted.push(target);
+        }
+    }
+
+    /// Before the list closes: the textures its shaders wrote that are copied
+    /// back go into read-back buffers ([`crate::texback::record`]).
+    fn textures_back(&self) {
+        const COPY_SOURCE: u32 = 0x800;
+        let wanted = std::mem::take(&mut self.deferred().back_wanted);
+        for target in wanted {
+            self.settle(&target.copy, COPY_SOURCE);
+            if let Some(back) = crate::texback::record(&self.list, target) {
+                self.deferred().texture_backs.push(back);
+            }
+        }
+    }
+
     /// The draw or dispatch just prepared is recorded: the twins it writes
     /// now hold what their depth textures lack.
     pub(crate) fn twins_written(&self) {
@@ -5112,7 +5185,8 @@ impl HostList {
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
-                && deferred.backs.is_empty())
+                && deferred.backs.is_empty()
+                && deferred.texture_backs.is_empty())
             {
                 return false;
             }
@@ -6390,21 +6464,21 @@ impl Meter {
 }
 
 impl Host {
-    /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `resource` is the title
-    /// resource it is the host copy of, and `fill`: put up the title's
-    /// newest content of it in this present's own list first
-    /// ([`crate::texture::present_fill_pending`]). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
+    /// Shows `source`, the title texture's host copy, as frame `frame` (saved
+    /// if captures are on). `resource` is the title resource it is the host
+    /// copy of, and `fill`: put up the title's newest content of it in this
+    /// present's own list first ([`crate::texture::present_fill_pending`]).
+    /// `None` if nothing was shown; else, in diagnostics builds, whether the
+    /// frame was black.
     pub(crate) fn present(
         &self,
         resource: crate::object::This,
-        texture: &ID3D12Resource,
-        state: u32,
+        source: &std::sync::Arc<crate::resource::HostTexture>,
         frame: u64,
         fill: bool,
     ) -> Option<bool> {
-        // SAFETY: a live resource.
+        let texture = &source.texture;
+        // SAFETY: a live resource held alive by `source`.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
@@ -6438,8 +6512,8 @@ impl Host {
                 }
             }
         }
-        let state = D3D12_RESOURCE_STATES(state as i32);
-        // SAFETY: our swap chain, list and a live source texture.
+        let state = D3D12_RESOURCE_STATES(source.state.load(Ordering::Relaxed) as i32);
+        // SAFETY: our swap chain, list and a live source texture held by `source`.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
@@ -6476,30 +6550,55 @@ impl Host {
             // texture uploaded -- one recorded before its refresh found the
             // newest bytes holds a frame behind, and two textures taking
             // turns then show their frames out of order (the intro's movie).
+            // The texture's move to the copy state is the list's, as it is
+            // any list's: the first use here records nothing and the list's
+            // prelude moves it from its real state at submission, under the
+            // submission lock, recording no barrier at all when it is
+            // already in a copy state (the title may have left it in
+            // `COPY_SOURCE`, and `COPY_SOURCE -> COPY_SOURCE` is illegal).
+            // It ends in `COPY_SOURCE`, which is what the prelude then
+            // records as its real state.
+            let by_hand = !present_prelude();
             let filling = fill
                 && slot.is_none()
                 && crate::texture::title_written(texture)
                 && crate::texture::present_fill_pending(resource);
             if filling {
-                list.ResourceBarrier(&[transition(texture, state, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                if by_hand {
+                    list.ResourceBarrier(&[transition(texture, state, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                } else {
+                    copy.settle(source, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+                }
                 crate::texture::present_fill(copy, resource, texture);
             }
-            list.ResourceBarrier(&[
-                transition(
-                    texture,
-                    if filling {
-                        D3D12_RESOURCE_STATE_COPY_DEST
-                    } else {
-                        state
-                    },
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                ),
-                transition(
+            if by_hand {
+                list.ResourceBarrier(&[
+                    transition(
+                        texture,
+                        if filling {
+                            D3D12_RESOURCE_STATE_COPY_DEST
+                        } else {
+                            state
+                        },
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    ),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ),
+                ]);
+            } else {
+                // The copy up runs with the texture in `COPY_SOURCE`: after
+                // the fill it is in `COPY_DEST`, and `settle` records that
+                // move too.
+                copy.settle(source, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+                list.ResourceBarrier(&[transition(
                     &back,
                     D3D12_RESOURCE_STATE_PRESENT,
                     D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
+                )]);
+            }
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
             let shot = crate::capture::take_request();
@@ -6511,14 +6610,25 @@ impl Host {
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
+            if by_hand {
+                list.ResourceBarrier(&[
+                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    ),
+                ]);
+            } else {
+                // The texture stays in `COPY_SOURCE`, as the list's prelude
+                // recorded it: the title's own lists then move it from
+                // there (`HostList::prelude`).
+                list.ResourceBarrier(&[transition(
                     &back,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+                )]);
+            }
             copy.close();
             match slot {
                 Some(i) => {
@@ -7119,3 +7229,112 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+
+#[cfg(test)]
+mod copy_source_state_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    use super::*;
+
+    const COPY_DEST: u32 = 0x400;
+    const COPY_SOURCE: u32 = 0x800;
+    const RENDER_TARGET: u32 = 0x4;
+
+    /// A committed texture in `state` and its host copy, as the host copy of
+    /// a texture the title presents has one.
+    fn texture(host: &Host, state: u32) -> Arc<crate::resource::HostTexture> {
+        let mut resource: Option<ID3D12Resource> = None;
+        // SAFETY: plain committed 2D texture on the live host device.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: 64,
+                        Height: 64,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATES(state as i32),
+                    None,
+                    &mut resource,
+                )
+                .unwrap();
+        }
+        Arc::new(crate::resource::HostTexture::new(
+            resource.unwrap(),
+            state,
+        ))
+    }
+
+    /// A texture the title left in `COPY_SOURCE`, as the present finds it:
+    /// the present list's first use of it records no barrier at all, so no
+    /// illegal `COPY_SOURCE -> COPY_SOURCE` reaches the card, and its
+    /// recorded state stays where it is.
+    #[test]
+    fn a_copy_source_texture_is_moved_nowhere_by_the_present_list() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let source = texture(host, COPY_SOURCE);
+        let list = host.new_list().unwrap();
+        // What the present does before its copy up.
+        list.settle(&source, COPY_SOURCE);
+        assert!(list.prelude().is_none(), "no self-transition is recorded");
+        assert_eq!(source.state.load(Relaxed), COPY_SOURCE);
+        // And what it does after a fill: the same state again.
+        list.settle(&source, COPY_SOURCE);
+        assert!(list.prelude().is_none());
+        assert_eq!(source.state.load(Relaxed), COPY_SOURCE);
+    }
+
+    /// From another state the move is recorded once, by the prelude, which
+    /// is where the recorded state becomes `COPY_SOURCE` (what the copy
+    /// leaves the texture in). The next present records nothing more.
+    #[test]
+    fn a_texture_in_another_state_is_moved_to_copy_source_once() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let source = texture(host, RENDER_TARGET);
+        let list = host.new_list().unwrap();
+        list.settle(&source, COPY_SOURCE);
+        assert!(
+            list.prelude().is_some(),
+            "the move from the state it was left in is recorded"
+        );
+        assert_eq!(source.state.load(Relaxed), COPY_SOURCE);
+        let next = host.new_list().unwrap();
+        next.settle(&source, COPY_SOURCE);
+        assert!(next.prelude().is_none(), "the card is there already");
+    }
+
+    /// The fill goes through `COPY_DEST` and is given back to `COPY_SOURCE`
+    /// in the list: the prelude moves it to the copy destination only, and
+    /// the card is left in `COPY_SOURCE`.
+    #[test]
+    fn a_filled_present_starts_in_copy_dest_and_ends_in_copy_source() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let source = texture(host, RENDER_TARGET);
+        let list = host.new_list().unwrap();
+        list.settle(&source, COPY_DEST);
+        list.settle(&source, COPY_SOURCE);
+        assert!(list.prelude().is_some());
+        assert_eq!(source.state.load(Relaxed), COPY_SOURCE);
+    }
+}

@@ -1098,6 +1098,12 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     let file = &unsafe { &*request.source.cast::<Instance<File>>() }
         .state
         .file;
+    // A title's offset and size are its own numbers: the sum is checked
+    // before anything is read there, so a request naming bytes past
+    // `u64::MAX` fails instead of reading from a wrapped offset.
+    if request.offset.checked_add(out.len() as u64).is_none() {
+        return Err(END_OF_FILE);
+    }
     let mark = Mark::begin();
     let started = std::time::Instant::now();
     let mut done = 0;
@@ -1105,7 +1111,10 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         if done == out.len() {
             break Ok(());
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
+        let Some(at) = request.offset.checked_add(done as u64) else {
+            break Err(END_OF_FILE);
+        };
+        match file.seek_read(&mut out[done..], at) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
             Err(error) => break Err(from_win32(&error)),
@@ -1114,6 +1123,20 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     mark.end(Stage::Read);
     result
+}
+
+/// Copies the title's page list into `pages`, one number per 64 KiB.
+///
+/// Read volatile rather than as a slice: the title may still be filling its
+/// list (a late number is a page it made a moment ago) while the request is
+/// in flight, so no shared slice is made over memory it writes.
+fn page_list(source: *const usize, pages: &mut [usize]) {
+    for (i, slot) in pages.iter_mut().enumerate() {
+        // SAFETY: the title passes a page number per 64 KiB of destination,
+        // so its list holds at least `pages.len()` entries; the read is
+        // volatile, as the title may be writing them.
+        *slot = unsafe { source.add(i).read_volatile() };
+    }
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
@@ -1138,18 +1161,18 @@ fn into_destination(
         return fill(out).map(drop);
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
+    // The page count is the title's own numbers added up: a destination at
+    // the end of its list with a size that runs past it would otherwise
+    // count pages off the end of the list.
+    let Some(page_count) = offset.checked_add(len).map(|n| n.div_ceil(PAGE)) else {
+        return Err(E_INVALIDARG);
     };
+    let mut pages = vec![0usize; page_count];
+    page_list(request.destination.cast::<usize>(), &mut pages);
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     let mark = Mark::begin();
-    let window = super::xmem::page_window(pages, offset, len);
+    let window = super::xmem::page_window(&pages, offset, len);
     mark.end(Stage::Destination);
     if let Some(mut window) = window {
         return fill(window.bytes()).map(drop);
@@ -1165,14 +1188,17 @@ fn into_destination(
         std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(12)
     });
     let mark = Mark::begin();
-    let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
+    let mut written = super::xmem::write_physical(&pages, offset, &data[..n]);
     mark.end(Stage::Destination);
     let mut tries = 0;
     while !written && tries < retries {
         std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
         tries += 1;
+        // The list is read again: a late page is a new number, not the one
+        // the failed pass used.
+        page_list(request.destination.cast::<usize>(), &mut pages);
         let mark = Mark::begin();
-        written = super::xmem::write_physical(pages, offset, &data[..n]);
+        written = super::xmem::write_physical(&pages, offset, &data[..n]);
         mark.end(Stage::Destination);
     }
     if written {
@@ -1181,7 +1207,7 @@ fn into_destination(
         }
         Ok(())
     } else {
-        let known = super::xmem::pages_known(pages, offset, len);
+        let known = super::xmem::pages_known(&pages, offset, len);
         tracing::warn!(known, last_error = std::io::Error::last_os_error().raw_os_error(), "dstorage: retries used up");
         // Said aloud: the title never reads a request's result
         // (it only polls for completion), so a destination left unwritten
@@ -1965,6 +1991,35 @@ mod tests {
     /// The bench drives `execute` itself: a raw read into physical pages
     /// (the title's destination form) lands there byte for byte, and the
     /// zlib form inflates into them.
+    #[test]
+    fn overflowing_file_read_offset_fails_with_eof() {
+        let (_dir, file) = file_with(&pattern(64));
+        let (queue, array) = (new_queue(0), status_array(1));
+        let mut out = [0xccu8; 16];
+        // Hand-built: 16 bytes from `u64::MAX - 4` run past the end of u64.
+        enqueue(
+            queue,
+            &request(0, out.as_mut_ptr().cast(), 16, file, u64::MAX - 4, 16),
+        );
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), END_OF_FILE);
+        assert_eq!(out, [0xccu8; 16]);
+    }
+
+    #[test]
+    fn a_page_destination_whose_offset_and_size_overflow_fails() {
+        let mut out = [0x0102_0304_0506_0708u64; 2];
+        // Hand-built: a 64 KiB offset with a size that runs past the address
+        // space, so the page count would overflow.
+        let request = Request {
+            page_offset: 0xffff,
+            ..request(PAGE_DESTINATION, out.as_mut_ptr().cast(), 16, std::ptr::null(), 0, 16)
+        };
+        assert_eq!(into_destination(&request, usize::MAX, |_| Ok(0)), Err(E_INVALIDARG));
+        assert_eq!(out, [0x0102_0304_0506_0708u64; 2]);
+    }
+
     #[cfg(feature = "diagnostics")]
     #[test]
     fn bench_requests_write_their_destinations() {
