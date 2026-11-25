@@ -20,8 +20,9 @@ The first of these directories that exists and holds a profile for the image is 
 | 3 | `$XDG_CONFIG_HOME/victory/titles`, else `~/.config/victory/titles` | tried through Wine's `Z:` drive when this is a Windows build, before the plain path; some Proton wrappers drop `XDG_CONFIG_HOME`, so use 1 or 2 if it is not found |
 
 Every `*.toml` in a directory is read. A file that does not parse is logged and skipped; one bad
-profile must not keep a title from running. When nothing matches, the log says so, with the
-short hash of the image and the directories searched:
+profile must not keep a title from running. A hook that carries a field this loader does not know
+is skipped on its own, with one warning naming it, and the rest of the profile still applies. When
+nothing matches, the log says so, with the short hash of the image and the directories searched:
 
 ```
 title profile: Z:\home\you\.config\victory\titles\build.toml matched, 2 hooks
