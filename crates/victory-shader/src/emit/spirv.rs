@@ -219,16 +219,19 @@ mod glsl {
 }
 
 /// The register dwords the machine can name, mapped into one space.
-const SCC_SLOT: u32 = 390;
+const SCC_SLOT: u32 = 384;
 const VGPR_BASE: u32 = 128;
-const SLOTS: u32 = 391;
+/// Slots past the machine's scalars: the scalars `ir` parked in VGPR lanes.
+const PARKED_BASE: u32 = 320;
+/// One slot per scalar code the IR can name (0-127 and the parked ones).
+const SLOTS: u32 = PARKED_BASE + (256 - crate::ir::PARKED as u32);
 
 fn slot(reg: Reg) -> u32 {
     match reg {
-        Reg::S(code) => u32::from(code),
+        Reg::S(code) if code < crate::ir::PARKED => u32::from(code),
+        Reg::S(code) => PARKED_BASE + u32::from(code) - u32::from(crate::ir::PARKED),
         Reg::V(reg) => VGPR_BASE + u32::from(reg),
         Reg::Scc => SCC_SLOT,
-        Reg::Spill(r) => 301 + u32::from(r) - 16,
     }
 }
 

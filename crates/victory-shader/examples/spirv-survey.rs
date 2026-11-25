@@ -89,9 +89,7 @@ fn survey(bytes: &[u8]) -> Result<S, String> {
             )
         })
         .ok_or("no program")?;
-    let p =
-        victory_shader::ir::build_with(&native.patched_code(), native.wave64, native.vgprs, false)
-            .map_err(|e| e.to_string())?;
+    let p = victory_shader::spill::build(&native).map_err(|e| e.to_string())?;
     let mut ops: BTreeMap<String, u32> = BTreeMap::new();
     let mut all = BTreeSet::new();
     let mut insts = 0;
