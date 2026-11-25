@@ -33,6 +33,16 @@ BlueKaiman.
 - **xcl** ([ivall/xcl](https://github.com/ivall/xcl) and its fork Bathyal), GPL-2.0-only: the
   wave-pairing approach and the NVIDIA wave lane-assignment report used in
   [docs/wave64-on-wave32.md](docs/wave64-on-wave32.md). No code taken.
+- **fxceless's fork** ([fxceless/victory-fork](https://github.com/fxceless/victory-fork),
+  GPL-3.0): the translation and GPU performance work this tree is built on, authored as
+  fxceless and kept with its commits' authorship.
+- **Wasler's fork** ([Wasler/VIctory](https://github.com/Wasler/VIctory) `fxceless-test`,
+  GPL-3.0): the heap-buffer interval, the gap-coalesced descriptor rehash and the integer
+  blend bypass in `victory-gpu` (commit `474e2fcc0`, kept with its authorship), and the
+  switch names `VICTORY_RENDER_SCALE` and `VICTORY_OWN_UPSCALER`.
+- **vitutu1** by **ZigZagBoi1** ([ZigZagBoi1/ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort),
+  GPL-3.0-or-later): the resolution and upscaler levers, which here are profile hooks and the
+  switches above rather than code that names a title.
 
 ## Tools
 
