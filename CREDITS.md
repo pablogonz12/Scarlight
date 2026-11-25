@@ -21,18 +21,22 @@ JMAN730, julio, KaiserBloo, KoLolX3, lameloball2813-ui, LaunchDoesntCode, LF2000
 localshotgun, lordon1a, Louis Faust, LUIS LARIOS, Luiz Neves, Lyrnc, Manuel Pérez, Maraco91,
 marquezini, Marvis, Matheus, meower, nathanbzrr, Nikita Romanovich, Noname0202, Nostyxx, Ortomanic,
 pablogonz12, Pablo González, Pedro Fortunato, Peter Bonanni, QB, quaternion, r4., raffclar,
-ruvenesh, Saitken91, Sakura-Byte, SkippySteve, swarm, tedin7, TG0000, undeadhuman37, Vanthys,
+ruvenesh, Saitken91, Sakura-Byte, SkippySteve, swarm, tedin7, TG0000, undeadhuman37, uwutaube, Vanthys,
 wrothgaril, Yaekai.
 
 ## Co-authors
 
-BlueKaiman, Calvix2k.
+BlueKaiman, Calvix2k, kais7654, pushkarreddyy.
 
 ## Design notes
 
 - **xcl** ([ivall/xcl](https://github.com/ivall/xcl) and its fork Bathyal), GPL-2.0-only: the
   wave-pairing approach and the NVIDIA wave lane-assignment report used in
   [docs/wave64-on-wave32.md](docs/wave64-on-wave32.md). No code taken.
+- **JMAN730/victory** ([project-flamingo#672](https://github.com/JMAN730/project-flamingo/pull/672)),
+  GPL-3.0: narrowing a host shader resource view of a streamed texture to the mips whose memory is
+  there, and remaking it when more levels arrive or a host copy fills the chain
+  (`crates/victory-gpu/src/texture.rs`, `crates/victory-gpu/src/descriptor/host.rs`).
 
 ## Tools
 
