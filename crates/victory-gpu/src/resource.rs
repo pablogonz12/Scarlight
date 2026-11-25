@@ -2979,6 +2979,245 @@ void main() {
         }
     }
 
+    /// A depth-stencil texture the title fills itself uploads both of its
+    /// planes: a VIctory `CopyResource` of a 2 × 2 R32G8X24_TYPELESS texture
+    /// with two mips and two array slices comes back with its depth plane and
+    /// its stencil plane, and a write of one byte into the stencil alone
+    /// refreshes the stencil plane at the next copy, the depth plane staying
+    /// as it was.
+    #[cfg(windows)]
+    #[test]
+    fn a_copy_resource_uploads_the_stencil_plane() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let desc = ResourceDesc {
+            depth_or_array_size: 2,
+            ..texture(2, 2, 19, 2) // R32G8X24_TYPELESS, sampled or copied
+        };
+        let layout = texture_layout(&desc).expect("a console layout");
+        assert_eq!(layout.planes.len(), 2, "depth and stencil");
+        // The title's memory holds the texture in its console layout.
+        let mut memory = vec![0u8; layout.size as usize];
+        let (mut src, mut dst) = (null, null);
+        assert_eq!(
+            create_at_address(
+                null,
+                memory.as_ptr() as u64,
+                &desc,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut src
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &desc,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut dst
+            ),
+            S_OK
+        );
+        // The texels of two mips (2 × 2, then 1 × 1) in each of two slices,
+        // put where the console layout lays them out.
+        let depth_values = [
+            vec![0.125f32, 0.375, 0.625, 0.875],
+            vec![0.25],
+            vec![0.5, 0.25, 0.125, 0.75],
+            vec![0.75],
+        ];
+        let depth: Vec<Vec<u8>> = depth_values
+            .iter()
+            .map(|values| values.iter().flat_map(|v| v.to_le_bytes()).collect())
+            .collect();
+        let mut stencil: Vec<Vec<u8>> = vec![
+            vec![7u8, 11, 13, 17],
+            vec![19],
+            vec![23, 29, 31, 37],
+            vec![41],
+        ];
+        {
+            for (plane, values) in layout.planes.iter().zip([&depth, &stencil]) {
+                let start = plane.offset as usize;
+                for (i, bytes) in values.iter().enumerate() {
+                    let (mip, slice) = (i as u32 % 2, i as u32 / 2);
+                    let row = bytes.len() / (2 >> mip) as usize;
+                    plane
+                        .layout
+                        .tile(&mut memory[start..], mip, slice, bytes, row, bytes.len())
+                        .expect("the texels in the layout");
+                }
+            }
+        }
+
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let mut allocator = null;
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        // A VIctory copy of the title texture, as a title submits one.
+        let submit = || {
+            let mut list = null;
+            assert_eq!(
+                crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+                S_OK
+            );
+            slot::<extern "system" fn(This, This, This)>(list, 0x88)(list, dst, src);
+            assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+            host.execute(&[crate::list::host_list(list).unwrap()]);
+            slot::<Release>(list, 0x10)(list);
+        };
+
+        let image = host_resource(dst).expect("the copy's host texture");
+        let mut footprints = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 8];
+        let mut sizes = [0u64; 8];
+        let mut rows = [0u32; 8];
+        let mut total = 0;
+        // SAFETY: the image is live and the arrays hold its eight subresources.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &image.GetDesc(),
+                0,
+                8,
+                0,
+                Some(footprints.as_mut_ptr()),
+                Some(rows.as_mut_ptr()),
+                Some(sizes.as_mut_ptr()),
+                Some(&mut total),
+            );
+        }
+        // Each subresource of the host texture, as it stands.
+        let sample = || {
+            let mut readback: Option<ID3D12Resource> = None;
+            let back = host.new_list().unwrap();
+            let (_, before) = host_transition(dst, 0x800).expect("the destination texture");
+            let readback_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: total,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            // SAFETY: live resources, matching footprints, an open list.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_READBACK,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &readback_desc,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut readback,
+                    )
+                    .unwrap();
+                back.list.ResourceBarrier(&[crate::host::transition(
+                    image,
+                    D3D12_RESOURCE_STATES(before as i32),
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                for (index, footprint) in footprints.into_iter().enumerate() {
+                    let from = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&image),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            SubresourceIndex: index as u32,
+                        },
+                    };
+                    let to = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(readback.as_ref().unwrap()),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            PlacedFootprint: footprint,
+                        },
+                    };
+                    back.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                }
+            }
+            back.close();
+            host.execute(&[&back]);
+            let readback = readback.unwrap();
+            let mut mapped: *mut std::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: execute waited for the copies; the buffer holds `total` bytes.
+            let read = unsafe {
+                readback
+                    .Map(0, None, Some(&mut mapped))
+                    .unwrap();
+                std::slice::from_raw_parts(mapped.cast::<u8>(), total as usize)
+            };
+            let actual = (0..8)
+                .map(|i| {
+                    let at = footprints[i].Offset as usize;
+                    let pitch = footprints[i].Footprint.RowPitch as usize;
+                    (0..rows[i] as usize)
+                        .flat_map(|row| read[at + row * pitch..][..sizes[i] as usize].iter().copied())
+                        .collect::<Vec<u8>>()
+                })
+                .collect::<Vec<_>>();
+            // SAFETY: the bytes are copied out and the mapping is live.
+            unsafe { readback.Unmap(0, None) };
+            actual
+        };
+
+        submit();
+        let actual = sample();
+        for (i, want) in depth.iter().enumerate() {
+            assert_eq!(&actual[i], want, "depth subresource {i}");
+        }
+        for (i, want) in stencil.iter().enumerate() {
+            assert_eq!(&actual[4 + i], want, "stencil subresource {i}");
+        }
+
+        // A write of one byte into the stencil alone refreshes the stencil
+        // plane at the next copy.
+        let plane = &layout.planes[1];
+        let at = plane.offset + plane.layout.offset(1, 0, 0, 1).expect("the last texel");
+        stencil[3][0] = 53;
+        // SAFETY: one byte of the texture's memory, ours and mapped.
+        unsafe { memory.as_mut_ptr().add(at as usize).write_volatile(53) };
+        submit();
+        let refreshed = sample();
+        for (i, want) in depth.iter().enumerate() {
+            assert_eq!(&refreshed[i], want, "depth subresource {i} survives a stencil write");
+        }
+        for (i, want) in stencil.iter().enumerate() {
+            assert_eq!(&refreshed[4 + i], want, "stencil subresource {i} refreshed");
+        }
+        for object in [allocator, src, dst] {
+            slot::<Release>(object, 0x10)(object);
+        }
+    }
+
     /// A 16-bit depth texture the title also asks unordered access for gets
     /// a colour twin, and the host copies one into the other, both ways: a
     /// pattern put into the twin is copied to the depth texture, the twin
