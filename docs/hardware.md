@@ -66,8 +66,8 @@ Three settings decide what a report's numbers mean, and the form asks for all th
   [linux.md](linux.md#switches), and a switch can change both the load path and the picture;
 - the `host device features` line from the startup log (`VICTORY_LOG=info`): it names the adapter,
   vendor and device id, the highest shader model, the mesh-shader and ray-tracing tiers, 64-bit
-  integer atomics and the shared-resource import tier — which optional paths the run took is decided
-  by it.
+  integer shader ops (`Int64ShaderOps`, not an atomics guarantee) and the shared-resource import
+  tier — which optional paths the run took is decided by it.
 
 A row moves when a report shows the build reaching the world and the picture being right enough to
 look at. A card that fails is at least as useful: a failure on a gated path is our bug, and a failure

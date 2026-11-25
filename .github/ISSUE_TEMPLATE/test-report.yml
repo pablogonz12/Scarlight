@@ -96,7 +96,8 @@ body:
     attributes:
       label: host device features line (optional)
       description: The `host device features` line from the startup log (`VICTORY_LOG=info`). It
-        names the shader model, mesh-shader and ray-tracing tiers and 64-bit atomics the driver
+        names the shader model, mesh-shader and ray-tracing tiers and 64-bit integer shader ops the
+        driver
         gave the run, so a quiet fallback path is visible without guessing.
       render: shell
       placeholder: 'INFO victory_gpu::host: host device features adapter=... shader_model=6.8
