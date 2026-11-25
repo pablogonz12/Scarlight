@@ -181,7 +181,16 @@ mod tests {
         let subscription = unsafe {
             EvtSubscribe(0, std::ptr::null_mut(), channel.as_ptr(), query.as_ptr(), 0, std::ptr::null(), Some(on_event), EvtSubscribeToFutureEvents)
         };
-        assert_ne!(subscription, 0, "{}", std::io::Error::last_os_error());
+        if subscription == 0 {
+            let e = std::io::Error::last_os_error();
+            // Wine's wevtapi has no subscription to give: the call returns 0
+            // and sets no error at all. Pass there, and fail on Windows.
+            if e.raw_os_error().unwrap_or(0) == 0 {
+                eprintln!("no event log subscription here (Wine): the call set no error");
+                return;
+            }
+            panic!("{e}");
+        }
         // SAFETY: our own subscription.
         unsafe { windows_sys::Win32::System::EventLog::EvtClose(subscription) };
     }
