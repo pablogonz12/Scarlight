@@ -823,6 +823,9 @@ mod tests {
 
     #[test]
     fn a_read_only_unbuffered_open_accepts_an_unaligned_read() {
+        if !file_cache() {
+            return; // VICTORY_FILE_CACHE=0 keeps the title's own flags
+        }
         let read = unaligned_read_of_an_unbuffered_open(GENERIC_READ);
 
         assert_eq!(read.as_deref(), Some(&b"0123456789"[..]));
@@ -830,6 +833,9 @@ mod tests {
 
     #[test]
     fn an_unbuffered_open_by_a_narrow_path_stays_unbuffered() {
+        if !file_cache() {
+            return; // VICTORY_FILE_CACHE=0 keeps the title's own flags
+        }
         use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, OPEN_EXISTING};
         let (_dir, path) = ten_bytes();
         let narrow_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();

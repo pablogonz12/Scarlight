@@ -798,6 +798,9 @@ fn close_lane(id: u64) {
     lane.closed = true;
     lane.unsubmitted.clear();
     lane.held.clear();
+    // The commands dropped above may have been what a start was waiting
+    // behind: let it look again.
+    scheduler.work.notify_all();
     lane.reads.clear();
     lane.statuses.clear(); // releases their arrays
     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
@@ -2113,6 +2116,9 @@ mod tests {
     }
     #[test]
     fn a_queue_that_submits_itself_holds_reads_into_pages() {
+        if !held_reads() {
+            return; // VICTORY_DSTORAGE_HELD=0 submits the held reads at once
+        }
         let mut l = lanes(STAGING);
         l.lanes.insert(0, Lane::new(0, 64));
         let array = status_array(1).cast::<Instance<StatusArray>>();
@@ -2138,6 +2144,9 @@ mod tests {
 
     #[test]
     fn a_page_list_the_title_changes_before_its_submit() {
+        if !held_reads() {
+            return; // VICTORY_DSTORAGE_HELD=0 submits the held reads at once
+        }
         use crate::modules::xmem;
         let (mut given, mut pages) = (2usize, [0usize; 2]);
         assert_eq!(
