@@ -795,6 +795,9 @@ pub(crate) fn host_written(resource: This) {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
         set.get_or_insert_with(Default::default).insert(resource as usize)
     };
+    // The host chain is complete; the window title memory was last found
+    // with is stale and must not clamp the views of it any more (#616).
+    note_resident(resource, (0, 0), true);
     // Diagnostics (run 177): where its title memory is, for placed views
     // the title reads that memory through ([`placed_in_host_written`]).
     if new && let Some((at, desc)) = crate::resource::texture_memory(resource) {
@@ -1635,6 +1638,51 @@ pub(crate) fn resident(resource: This) -> Option<(u32, u32)> {
     map.as_ref()?.get(&(resource as usize)).copied()
 }
 
+/// Whether views of a part-resident texture are narrowed to the mips whose
+/// memory is there (`VICTORY_RESIDENT_MIPS`; on unless 0). A streamed
+/// texture's mips that have not arrived read as zeros, and the console
+/// clamps the level of detail to what it holds; the host has no clamp but
+/// the view's own window ([`narrowed`]). idea from JMAN730/victory#672
+/// (jman/cursor/gpu-streamed-mip-view-616-111a).
+pub(crate) fn resident_mips_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Live (crate::switches): asked per view.
+    crate::switches::b(
+        "VICTORY_RESIDENT_MIPS",
+        *ON.get_or_init(|| std::env::var_os("VICTORY_RESIDENT_MIPS").is_none_or(|v| v != "0")),
+    )
+}
+
+/// Whether the host GPU wrote `resource` (a copy or resolve), so its
+/// contents are on the host and title-memory residency says nothing about
+/// what its views may name.
+pub(crate) fn is_host_written(resource: This) -> bool {
+    HOST_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&(resource as usize)))
+}
+
+/// The window a host view of `resource` asking for `asked` should name now:
+/// the title's own range once a host copy filled the chain
+/// ([`is_host_written`]), else the mips that are there ([`narrowed`]).
+pub(crate) fn wanted(
+    asked: (u32, u32),
+    resident: Option<(u32, u32)>,
+    mips: u32,
+    host_written: bool,
+) -> (u32, u32) {
+    let all = (asked.0, if asked.1 == 0 { mips.saturating_sub(asked.0) } else { asked.1 });
+    if host_written {
+        return all;
+    }
+    match resident {
+        Some(window) if window.1 > 0 => narrowed(asked, window, mips),
+        _ => all,
+    }
+}
+
 /// Notes the resident mip window of `resource` (`(0, 0)` when none of its
 /// mips is there): a view of it is narrowed to it while it stands, and
 /// widened when more has arrived.
@@ -1976,5 +2024,42 @@ mod present_tests {
         assert_eq!(o.content, 4);
         assert_eq!(o.staged, 4);
         assert!(!o.back);
+    }
+}
+
+#[cfg(test)]
+mod resident_tests {
+    use super::{narrowed, wanted};
+
+    /// A view of a part-resident texture names the resident suffix of what
+    /// it asked for, and never a mip that is not there. Hand-built windows
+    /// only: the mip counts are the ones `Layout::mip_extents` yields.
+    #[test]
+    fn the_window_is_clamped_to_the_resident_mips() {
+        // Eight mips asked for, the five smallest (3..8) arrived: those.
+        assert_eq!(narrowed((0, 0), (3, 5), 8), (3, 5));
+        // The whole chain arrived: as the title asked.
+        assert_eq!(narrowed((0, 0), (0, 8), 8), (0, 8));
+        // 0..3 asked for, only 2..6 there: the one mip of both, 2.
+        assert_eq!(narrowed((0, 3), (2, 4), 8), (2, 1));
+        // Nothing it asked for is there: the most detailed resident mip
+        // alone (the smallest mip is the picture, not a window of none).
+        assert_eq!(narrowed((0, 2), (5, 3), 8), (5, 1));
+        // A window reaching past the chain is cut at its end.
+        assert_eq!(narrowed((2, 0), (1, 2), 8), (2, 1));
+        // One level, and that level arrived: unchanged.
+        assert_eq!(narrowed((6, 1), (6, 2), 8), (6, 1));
+    }
+
+    /// A slot follows the resident suffix while it streams, and the title's
+    /// own range again once a host copy filled its chain (#616).
+    #[test]
+    fn a_host_copy_widens_it_back_to_the_titles_range() {
+        assert_eq!(wanted((0, 0), Some((4, 4)), 8, false), (4, 4));
+        assert_eq!(wanted((0, 0), Some((4, 4)), 8, true), (0, 8));
+        // Nothing known yet: what the title asked for, `0` levels being the
+        // rest of the chain.
+        assert_eq!(wanted((1, 0), None, 8, false), (1, 7));
+        assert_eq!(wanted((0, 3), Some((0, 8)), 8, false), (0, 3));
     }
 }
