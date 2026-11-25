@@ -126,6 +126,21 @@ A gamepad works. Otherwise the keyboard acts as a pad while the title's window h
 | W A S D / I J K L | left / right stick |
 | Q / E, Z / C, F / H | shoulders, triggers, stick clicks |
 
+## Wine's shader compiler
+
+A few host passes are written in HLSL and compiled when the host starts: the indirect-argument
+clamp, the compare of copies in card memory, the depth-plane twins and the in-place probe. Wine's
+builtin `d3dcompiler_47` (vkd3d-shader) does not compile them as written: `RWByteAddressBuffer` has
+no `Load` (`E5005`), and it drops the `[RootSignature]` the shaders ask for. A failed compile costs
+that pass only, and the log says which: `no argument clamp: indirect execution dropped`, or card
+compares switched off.
+
+This build therefore compiles those shaders with DXC (`dxcompiler.dll`) and signs the container with
+`dxil.dll`; under Wine DXC is tried first. Keep `dxcompiler.dll` and `dxil.dll` next to
+`victory.exe` (the Windows SDK ships both), or name them with `VICTORY_DXC` / `VICTORY_DXIL`. With
+neither, `WINEDLLOVERRIDES=d3dcompiler_47=n,b` makes Wine use Microsoft's compiler from the prefix,
+which does compile them.
+
 ## Troubleshooting
 
 | Problem | Try |
