@@ -37,6 +37,11 @@ BlueKaiman.
   GPL-3.0: narrowing a host shader resource view of a streamed texture to the mips whose memory is
   there, and remaking it when more levels arrive or a host copy fills the chain
   (`crates/victory-gpu/src/texture.rs`, `crates/victory-gpu/src/descriptor/host.rs`).
+- **Marvisak/VIctory** ([#2628](https://github.com/Marvisak/VIctory/pull/2628)), GPL-3.0, by moe-miau:
+  the host's dynamic view-heap slots stay a fixed distance below the heap's null slot, and a view
+  index the title made itself is clamped below them, so a title whose heap is larger than the host's
+  cannot name one of the host's own tables (`crates/victory-shader/src/emit/shader.rs`,
+  `crates/victory-shader/src/emit/lower.rs`, `crates/victory-gpu/src/descriptor/host.rs`).
 
 ## Tools
 

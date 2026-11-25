@@ -19,6 +19,9 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
+    /// The first dynamic slot: the title's slots, then unused ones up to
+    /// this, then the dynamic range (see [`view_layout`]).
+    base: u32,
     /// Dynamic slots past `count`: [`DYNAMIC`] in view heaps, none in
     /// sampler heaps. (Upstream falls back to 2^16 on a capped host heap;
     /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
@@ -603,6 +606,36 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// The title slots a view heap that the title asked `requested` slots of has
+/// room for, the first dynamic slot, and the heap's size; `null` is the last
+/// slot of the heap, which shaders clamp view indices to (0: no host limit
+/// probed).
+///
+/// The dynamic slots sit a fixed distance below the null slot, not right
+/// after the title's: shaders are translated before the title makes its heap
+/// and clamp the view slots the title made itself below them
+/// (`victory_shader`'s `title_view_limit`), so a title heap larger than the
+/// room left must not put the title's slots where the dynamic ones are.
+/// Upstream PR #2628 (moe-miau) for the same layout.
+fn view_layout(requested: u32, null: u32) -> (u32, u32, u32) {
+    view_layout_with(requested, null, victory_shader::emit::title_view_clamp())
+}
+
+/// [`view_layout`], with the title clamp's switch given.
+fn view_layout_with(requested: u32, null: u32, clamp: bool) -> (u32, u32, u32) {
+    if null == 0 {
+        return (requested, requested, requested + DYNAMIC);
+    }
+    let size = null + 1;
+    let base = null.saturating_sub(DYNAMIC);
+    if !clamp {
+        // Switched off: the dynamic slots follow the title's, as before.
+        let fitted = if requested + DYNAMIC <= null { requested } else { base };
+        return (fitted, fitted, size);
+    }
+    (requested.min(base), base, size)
+}
+
 /// A slot the host made from a view narrowed to a part-resident texture's
 /// mips ([`narrow_to_resident`]): the texture, the window the title asked
 /// for and the one the host view names.
@@ -651,30 +684,18 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
-        let (heap, count, size) = if null == 0 {
-            match make(count + extra) {
-                Ok(heap) => (heap, count, count + extra),
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
-                }
-            }
-        } else {
-            let size = null + 1;
-            let fitted = if count + extra <= null {
-                count
-            } else {
-                // shortcut: descriptors past the host's limit are left out; a title that reaches
-                // them needs remapping. They read the null slot instead.
-                tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
-                null - extra
-            };
-            match make(size) {
-                Ok(heap) => (heap, fitted, size),
-                Err(e) => {
-                    tracing::warn!(error = %e, count, size, "no host view heap");
-                    return None;
-                }
+        let requested = count;
+        let (count, base, size) = view_layout(requested, null);
+        if null != 0 && count < requested {
+            // shortcut: descriptors past the host's limit are left out; a title that reaches
+            // them needs remapping. They read the null slot instead.
+            tracing::warn!(requested, count, size, "host view heap capped at {size}; views past it read a null slot");
+        }
+        let heap = match make(size) {
+            Ok(heap) => heap,
+            Err(e) => {
+                tracing::warn!(error = %e, count, size, sampler, "no host descriptor heap");
+                return None;
             }
         };
         // SAFETY: a live heap.
@@ -711,12 +732,13 @@ impl HostHeap {
             cpu,
             step,
             count,
+            base,
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             narrowed: Mutex::default(),
             narrowed_count: std::sync::atomic::AtomicUsize::new(0),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
+            kept: Mutex::new(vec![None; size as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -854,7 +876,7 @@ impl HostHeap {
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % DYNAMIC as usize) as u32;
-        Some(self.count + first as u32)
+        Some(self.base + first as u32)
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -1182,7 +1204,7 @@ impl HostHeap {
     ///
     /// [`dynamic`]: HostHeap::dynamic
     pub(crate) fn release(&self, first: u32, n: u32) {
-        let Some(at) = first.checked_sub(self.count) else {
+        let Some(at) = first.checked_sub(self.base) else {
             return;
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
@@ -2631,6 +2653,28 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host's dynamic slots sit below the null slot that shaders clamp
+    /// view indices to, never right after the title's, so an index the title
+    /// made itself past its slots cannot name one of them. The count shaders
+    /// assume is the GPU's `DYNAMIC`.
+    #[test]
+    fn dynamic_slots_sit_below_the_null_slot() {
+        assert_eq!(DYNAMIC, victory_shader::emit::DYNAMIC_VIEWS);
+        let limit = (1 << 21) - 1;
+        // A title heap that fits: its own slots stay, the dynamic ones below null.
+        assert_eq!(view_layout_with(1_245_184, limit, true), (1_245_184, limit - DYNAMIC, limit + 1));
+        // A capped host (1,000,000 slots): the title's slots give way.
+        let portable = 1_000_000 - 1;
+        let (count, base, size) = view_layout_with(1_245_184, portable, true);
+        assert_eq!((count, base, size), (portable - DYNAMIC, portable - DYNAMIC, portable + 1));
+        // A small title heap: the dynamic slots still lie below null.
+        assert_eq!(view_layout_with(100, limit, true), (100, limit - DYNAMIC, limit + 1));
+        // No host heap probed: the dynamic slots follow the title's.
+        assert_eq!(view_layout_with(100, 0, true), (100, 100, 100 + DYNAMIC));
+        // Switched off: as before, the dynamic slots follow the title's.
+        assert_eq!(view_layout_with(100, limit, false), (100, 100, limit + 1));
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.

@@ -115,8 +115,15 @@ pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit, view_heap_limit,
+    set_view_heap_limit, title_view_clamp, title_view_limit, view_heap_limit,
 };
+
+/// The host's dynamic slots in a view heap (`victory-gpu`'s `DYNAMIC`): tables
+/// a draw needs made afresh are made there. They follow the title's slots, at
+/// a place shaders know before the title's heap is made, so a shader that
+/// names a view slot the title made itself is clamped below them
+/// ([`title_view_limit`]) instead of naming one of the host's tables.
+pub const DYNAMIC_VIEWS: u32 = 1 << 18;
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
