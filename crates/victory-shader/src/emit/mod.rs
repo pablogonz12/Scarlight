@@ -14,6 +14,22 @@
 //!   for sampler tables (the console's descriptor sizes; the code adds
 //!   offsets in those units). The heap bases of dynamic resources are 0
 //!   and not listed.
+//! * **Heap bounds** are constants of the code ([`view_bounds`], from the
+//!   limit `set_view_heap_limit` gives): every host view heap ends at that
+//!   limit with [`HEAP_DYNAMIC`] dynamic slots, whose last
+//!   [`HEAP_GUARDS`]`.len()` hold one null view of each kind, the title's
+//!   slots begin it. A view index the code computes is bounded by the
+//!   title's slots when read straight from the heap (past them lie the
+//!   host's tables of other draws), by the first guard slot when read
+//!   through a table; out of bounds it reads `guard + heap_guard(kind)`, a
+//!   null view of its own kind (a null view is defined only when read as
+//!   its kind). The host gives no table a guard slot, and sampler heaps
+//!   have all 2,048 slots a clamped sampler index reaches. No user data and
+//!   no root-signature space.
+//!   shortcut: a table's entries are bounded by the guards alone, not by
+//!   the table's own length: an entry past it, or a title table indexed
+//!   past the title's slots, still reads the dynamic slots, other draws'
+//!   tables among them, as before the bounds.
 //! * **Descriptors** through SM 6.6 `ResourceDescriptorHeap[]` and
 //!   `SamplerDescriptorHeap[]`, at the index the console address gives, so
 //!   the host heaps keep the title's descriptor order. The root signature
@@ -80,6 +96,10 @@
 //!   shaders and draws triangle lists with the title's own vertex counts.
 //!   It binds nothing.
 
+#[cfg(all(test, windows))]
+mod bindless_bounds_tests;
+#[cfg(all(test, windows))]
+mod bindless_kinds_tests;
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
@@ -115,9 +135,9 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit, view_heap_limit,
+    HEAP_DYNAMIC, HEAP_GUARDS, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS,
+    SLOT_MEMORY, SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
+    USER_VIEW_BIAS, set_view_heap_limit, view_bounds, view_bounds_of, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.

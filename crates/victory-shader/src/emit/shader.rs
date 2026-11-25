@@ -69,6 +69,87 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// The views a view heap's guard slots hold, from its guard slot on (see
+/// the module notes), as the first word of the DXIL resource properties a
+/// heap read is annotated with: the resource kind, `0x1000` for a UAV. A
+/// null view reads as zero and drops writes only where it is of the kind
+/// the shader reads (D3D12 binding spec, "NULL Descriptors"; GPU-based
+/// validation reports any other), so each kind has its own: SRVs of every
+/// texture kind and of typed, raw and structured buffers, UAVs of the
+/// kinds a UAV can be, and a constant buffer.
+/// The raw UAV's guard is the last: it is the heap's last slot, the one
+/// `VIEW_LIMIT` clamps the host's own computed indices to (`memory()`,
+/// title memory read through raw views), so that read meets its kind too.
+pub const HEAP_GUARDS: [u32; 21] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, // SRVs
+    0x1001, 0x1002, 0x1004, 0x1006, 0x1007, 0x100A, 0x100C, // UAVs
+    13,     // constant buffer
+    0x100B, // raw UAV
+];
+
+/// Dynamic slots of a host view heap (tables the host makes per draw),
+/// the guard slots included: `victory-gpu`'s `descriptor::host::DYNAMIC`.
+pub const HEAP_DYNAMIC: u32 = 1 << 18;
+
+/// The bounds of a host view heap whose last slot is the null slot
+/// `set_view_heap_limit` names, as (title slots, first guard slot), or
+/// `None` without a limit. Known when a shader is translated, so they are
+/// constants of its code and take no root-signature space: every host view
+/// heap ends at that slot with its dynamic slots (the guards their last
+/// [`HEAP_GUARDS`]`.len()`), and the title's slots before them.
+pub fn view_bounds() -> Option<(u32, u32)> {
+    view_bounds_of(view_limit())
+}
+
+/// [`view_bounds`] of a host view heap whose last slot is `null_slot` (0:
+/// no limit). The host lays its view heaps out by this too
+/// (`victory-gpu`'s `descriptor::host::view_layout`), so the slots a
+/// shader holds as constants and the slots the host makes are one figure.
+pub fn view_bounds_of(null_slot: u32) -> Option<(u32, u32)> {
+    if null_slot == 0 {
+        return None;
+    }
+    let slots = null_slot.checked_add(1)?;
+    if slots <= HEAP_DYNAMIC {
+        return None;
+    }
+    Some((slots - HEAP_DYNAMIC, slots - HEAP_GUARDS.len() as u32))
+}
+
+/// The limit translations use: [`VIEW_LIMIT`], or in tests a limit set
+/// for this thread alone ([`with_view_limit`]), so that tests translating
+/// at the same time keep theirs.
+fn view_limit() -> u32 {
+    #[cfg(test)]
+    if let Some(limit) = TEST_LIMIT.with(std::cell::Cell::get) {
+        return limit;
+    }
+    VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LIMIT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests: `f` translated with the host view heap limit `limit` (0: none)
+/// on this thread, as a host with that heap sets it.
+#[cfg(test)]
+pub(crate) fn with_view_limit<T>(limit: u32, f: impl FnOnce() -> T) -> T {
+    let before = TEST_LIMIT.with(|c| c.replace(Some(limit)));
+    let out = f();
+    TEST_LIMIT.with(|c| c.set(before));
+    out
+}
+
+/// Which of [`HEAP_GUARDS`] a heap read annotated with `props0` reads in
+/// place of an index out of bounds: its own kind's, else the 2D texture
+/// SRV's.
+pub(crate) fn heap_guard(props0: u32) -> u32 {
+    let kind = props0 & 0x10FF;
+    let at = |k| HEAP_GUARDS.iter().position(|&g| g == k);
+    at(kind).or_else(|| at(2)).unwrap_or(0) as u32
+}
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -114,7 +195,10 @@ pub(crate) struct Geometry {
 }
 
 /// The null slot every host view heap keeps at its end (0: no limit). Shaders translated while
-/// it is set read that slot for any view index at or past it. A read past a heap's end is
+/// it is set read that slot for any view index at or past it that `heap_handle` clamps: the
+/// indices the host computes (`memory()`). An index the title's code computes is bounded before
+/// (`Lower::heap_bound`, [`view_bounds`]) and reads the null view of its own kind among the
+/// heap's last slots, of which this one is the raw UAV's. A read past a heap's end is
 /// undefined: a host that caps its heap (NVIDIA at 1 000 000 views; a retail game's heap is
 /// larger) hung its GPU (GPU-based validation: "descriptor heap index out of bounds"), and AMD
 /// RDNA3 took a page fault and removed the device.
@@ -155,6 +239,9 @@ pub(crate) struct Shader {
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
+    /// Heap indices already bounded to the host's heap (`Lower::heap_bound`):
+    /// `heap_handle` needs no clamp of its own for them.
+    pub bounded: std::collections::HashSet<V>,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
@@ -212,6 +299,7 @@ impl Shader {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             flags: 0,
+            bounded: std::collections::HashSet::new(),
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
@@ -403,9 +491,13 @@ impl Shader {
         props: (u32, u32),
     ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
-        let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+        let limit = view_limit();
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
-        let index = if !sampler && limit != 0 {
+        // An index `Lower::heap_bound` bounded is at most the heap's last
+        // guard, inside the heap: the clamp would change nothing. That bound
+        // is a compare and select too, but emitted where the index is
+        // computed, not here, and its bitcode validates (`dxil.dll`).
+        let index = if !sampler && limit != 0 && !self.bounded.contains(&index) {
             let null = self.m.i32(limit);
             let i32t = self.t.i32;
             let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, null]);
@@ -965,5 +1057,25 @@ mod tests {
         assert_eq!(elems[1].interp, 1);
         assert_eq!(elems[2].interp, 3);
         assert_eq!(elems[3].interp, 3);
+    }
+
+    /// Every kind of heap read the lowering annotates (resource kinds 1-13,
+    /// `0x1000` for a UAV) has a guard slot of its own kind, so an index out
+    /// of bounds reads a null view of the kind the shader reads.
+    #[test]
+    fn every_heap_read_has_a_guard_of_its_kind() {
+        let srvs = [1, 2, 4, 5, 6, 7, 10, 11, 12];
+        let uavs = [1, 2, 4, 6, 7, 10, 11, 12].map(|k| k | 0x1000);
+        for props in srvs.into_iter().chain(uavs).chain([13]) {
+            assert_eq!(HEAP_GUARDS[heap_guard(props) as usize], props, "{props:#x}");
+        }
+        // Flags beyond the kind and the UAV bit do not change it.
+        assert_eq!(HEAP_GUARDS[heap_guard(0x8000 | 2) as usize], 2);
+        // A kind with no guard of its own reads the 2D texture SRV's.
+        assert_eq!(HEAP_GUARDS[heap_guard(0x1005) as usize], 2);
+        // Each guard once.
+        for (i, g) in HEAP_GUARDS.iter().enumerate() {
+            assert_eq!(heap_guard(*g) as usize, i, "{g:#x}");
+        }
     }
 }

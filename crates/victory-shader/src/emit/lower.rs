@@ -62,6 +62,9 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    /// Heap indices bounded to the host's heap (`Lower::heap_bound`).
+    #[cfg(test)]
+    pub bounded: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -2286,6 +2289,8 @@ impl<'a> Lower<'a> {
             root_uavs,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            bounded: self.s.bounded.len(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
@@ -6400,13 +6405,20 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
+        // Which guard slot an index out of bounds reads: one of this read's
+        // kind (`HEAP_GUARDS`).
+        let guard = if sampler {
+            0
+        } else {
+            super::shader::heap_guard(props.0)
+        };
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
-                let index = self.heap_index(*load, *first, sampler)?;
+                let index = self.heap_index(*load, *first, sampler, guard)?;
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
@@ -6472,7 +6484,7 @@ impl<'a> Lower<'a> {
             }
             Source::Phi { block, args } => {
                 let _ = site;
-                let phi = self.descriptor_phi(*block, args, sampler, 8)?;
+                let phi = self.descriptor_phi(*block, args, sampler, guard, 8)?;
                 Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
             }
             Source::Select { scc, args } => {
@@ -6488,16 +6500,17 @@ impl<'a> Lower<'a> {
                     Val::Bit(x) => x,
                     _ => return Err("SCC without a value"),
                 };
-                let set = self.heap_index(a, fa, sampler)?;
-                let clear = self.heap_index(b, fb, sampler)?;
+                let set = self.heap_index(a, fa, sampler, guard)?;
+                let clear = self.heap_index(b, fb, sampler, guard)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
+                self.bounded_if(index, &[set, clear]);
                 Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
                 // A descriptor each lane has its own of (a waterfall loop
                 // reads it from the first active lane): each lane's heap
                 // index, non-uniform.
-                let index = self.lane_heap_index(src, sampler)?;
+                let index = self.lane_heap_index(src, sampler, guard)?;
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
@@ -6513,6 +6526,7 @@ impl<'a> Lower<'a> {
         block: usize,
         args: &[Source],
         sampler: bool,
+        guard: u32,
         depth: u32,
     ) -> Result<V, Why> {
         const WHY: Why = "a descriptor chosen by control flow";
@@ -6527,12 +6541,12 @@ impl<'a> Lower<'a> {
             let index = match arg {
                 Source::Loaded { load, first } => {
                     let here = std::mem::replace(&mut self.cur, at);
-                    let index = self.heap_index(*load, *first, sampler);
+                    let index = self.heap_index(*load, *first, sampler, guard);
                     self.cur = here;
                     index?
                 }
                 Source::Phi { block: inner, args: inner_args } if depth > 0 => {
-                    self.descriptor_phi(*inner, inner_args, sampler, depth - 1)?
+                    self.descriptor_phi(*inner, inner_args, sampler, guard, depth - 1)?
                 }
                 _ => return Err(WHY),
             };
@@ -6540,8 +6554,18 @@ impl<'a> Lower<'a> {
         }
         let join = self.block[block].ok_or(WHY)?;
         let phi = self.s.m.phi(join, self.s.t.i32);
+        let inputs: Vec<V> = incoming.iter().map(|&(v, _)| v).collect();
         self.s.m.set_phi(phi, incoming);
+        self.bounded_if(phi, &inputs);
         Ok(phi)
+    }
+
+    /// Marks `v`, a select or phi of `inputs`, as bounded when they all are
+    /// (`Lower::heap_bound`): it is one of them.
+    fn bounded_if(&mut self, v: V, inputs: &[V]) {
+        if !inputs.is_empty() && inputs.iter().all(|i| self.s.bounded.contains(i)) {
+            self.s.bounded.insert(v);
+        }
     }
 
     /// The bytes per element of the buffer view `src` names, if the program
@@ -6565,13 +6589,25 @@ impl<'a> Lower<'a> {
             return Ok(Some(v));
         }
         let c = self.cur;
-        let slot = self.heap_index(*load, *first, false)?;
+        // The same bounded slot as the raw view read there (a guard slot's
+        // stride is 0).
+        let slot = self.heap_index(*load, *first, false, super::shader::heap_guard(11))?;
         // Inside the table whatever the index (lanes that do not run
-        // compute one too): a root view has no bounds of its own.
-        let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
-        let i32t = self.s.t.i32;
-        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
-        self.s.m.tag(slot, Tag::Clamp);
+        // compute one too): a root view has no bounds of its own. A slot
+        // bounded to the host's heap is inside it already (every host view
+        // heap's last slot is below `SLOT_STRIDES_COUNT`, asserted where
+        // `victory-gpu` sizes them, `descriptor::host`).
+        let slot = if self.s.bounded.contains(&slot) {
+            slot
+        } else {
+            let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
+            let i32t = self.s.t.i32;
+            let slot = self
+                .s
+                .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+            self.s.m.tag(slot, Tag::Clamp);
+            slot
+        };
         let two = self.s.m.i32(2);
         let byte = self.s.m.bin(c, Bin::Shl, slot, two);
         let h = self.s.root_srv_handle(super::shader::SLOT_STRIDES);
@@ -6595,10 +6631,10 @@ impl<'a> Lower<'a> {
     /// The heap index of a descriptor that may differ between lanes,
     /// computed in the current block (or, chosen by control flow, at the
     /// join).
-    fn lane_heap_index(&mut self, src: &Source, sampler: bool) -> Result<V, Why> {
+    fn lane_heap_index(&mut self, src: &Source, sampler: bool, guard: u32) -> Result<V, Why> {
         match src {
-            Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
-            Source::Fetched { load, first } => self.fetched_index(*load, *first, sampler),
+            Source::Loaded { load, first } => self.heap_index(*load, *first, sampler, guard),
+            Source::Fetched { load, first } => self.fetched_index(*load, *first, sampler, guard),
             Source::Lanes { mask, args } | Source::Select { scc: mask, args } => {
                 let [a, b] = &args[..] else {
                     return Err("a descriptor chosen per lane");
@@ -6617,9 +6653,11 @@ impl<'a> Lower<'a> {
                         _ => return Err("SCC without a value"),
                     }
                 };
-                let set = self.lane_heap_index(a, sampler)?;
-                let clear = self.lane_heap_index(b, sampler)?;
-                Ok(self.s.m.select(self.cur, cond, set, clear))
+                let set = self.lane_heap_index(a, sampler, guard)?;
+                let clear = self.lane_heap_index(b, sampler, guard)?;
+                let index = self.s.m.select(self.cur, cond, set, clear);
+                self.bounded_if(index, &[set, clear]);
+                Ok(index)
             }
             Source::LanePhi { block, args } => {
                 // Each predecessor computes its heap index at its end (what
@@ -6639,16 +6677,23 @@ impl<'a> Lower<'a> {
                     let index = match arg {
                         Some(arg) => {
                             let here = std::mem::replace(&mut self.cur, at);
-                            let index = self.lane_heap_index(arg, sampler);
+                            let index = self.lane_heap_index(arg, sampler, guard);
                             self.cur = here;
                             index?
                         }
-                        None => self.s.m.i32(0),
+                        None => {
+                            // Slot 0 is inside every heap.
+                            let zero = self.s.m.i32(0);
+                            self.s.bounded.insert(zero);
+                            zero
+                        }
                     };
                     incoming.push((index, at));
                 }
                 let phi = self.s.m.phi(join, self.s.t.i32);
+                let inputs: Vec<V> = incoming.iter().map(|&(v, _)| v).collect();
                 self.s.m.set_phi(phi, incoming);
+                self.bounded_if(phi, &inputs);
                 Ok(phi)
             }
             _ => Err("a per-lane descriptor from neither a heap load nor a choice of them"),
@@ -6658,16 +6703,23 @@ impl<'a> Lower<'a> {
     /// The heap index of the descriptor at dword `first` of what the global
     /// load at `load` reads, in each lane: its address (base plus offsets)
     /// over the descriptor size.
-    fn fetched_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
+    fn fetched_index(
+        &mut self,
+        load: Site,
+        first: u8,
+        sampler: bool,
+        guard: u32,
+    ) -> Result<V, Why> {
         const WHY: Why = "a per-lane descriptor load";
         let a = *self
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
-        match self.x.native.layout.get(a.param).map(|p| p.root) {
-            Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
+        let direct = match self.x.native.layout.get(a.param).map(|p| p.root) {
+            Some(RootType::Table) => false,
+            Some(RootType::ResourceHeap | RootType::SamplerHeap) => true,
             _ => return Err("a descriptor outside the heaps"),
-        }
+        };
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Flat {
             addr: Some(Operand::Vector { reg, .. }),
@@ -6694,20 +6746,22 @@ impl<'a> Lower<'a> {
             .i32((offset as i32 as u32).wrapping_add(4 * u32::from(first)));
         at = self.s.m.bin(c, Bin::Add, at, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, at, shift))
+        let index = self.s.m.bin(c, Bin::LShr, at, shift);
+        Ok(self.heap_bound(index, sampler, direct, guard))
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
     /// load at `load` reads, computed in the current block.
-    fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
+    fn heap_index(&mut self, load: Site, first: u8, sampler: bool, guard: u32) -> Result<V, Why> {
         let a = *self
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
-        match self.x.native.layout.get(a.param).map(|p| p.root) {
-            Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
+        let direct = match self.x.native.layout.get(a.param).map(|p| p.root) {
+            Some(RootType::Table) => false,
+            Some(RootType::ResourceHeap | RootType::SamplerHeap) => true,
             _ => return Err("a descriptor outside the heaps"),
-        }
+        };
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Smem {
             base,
@@ -6734,7 +6788,48 @@ impl<'a> Lower<'a> {
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
+        let index = self.s.m.bin(c, Bin::LShr, addr, shift);
+        Ok(self.heap_bound(index, sampler, direct, guard))
+    }
+
+    /// `index` where the host has a slot for it, else a guard slot of the
+    /// read's kind. A heap index is an address the title's data computes;
+    /// on the console a wrong one reads some memory as a descriptor, but on
+    /// the host an index past the heap is undefined (see `VIEW_LIMIT` for
+    /// what hosts did with one), one inside the host's dynamic slots reads
+    /// a descriptor another draw made there, and a null view read as
+    /// another kind than it is is undefined as well. The bounds
+    /// are constants ([`super::view_bounds`]), the same for every host view
+    /// heap:
+    ///
+    /// * a view heap read directly (`direct`: through the heap, not a
+    ///   table) is bounded by the title's slots: past them lie the host's
+    ///   tables of other draws;
+    /// * a read through a table, whose entries may lie in those dynamic
+    ///   slots (a table the host made afresh), by the first guard slot;
+    /// * out of bounds, the guard of the read's kind (`HEAP_GUARDS`, the
+    ///   one at `guard_kind` in it).
+    ///
+    /// shortcut: a table read is bounded by the guards alone, not by the
+    /// table's own length. An entry past it, or a title table indexed past
+    /// the title's slots, still reads the dynamic slots (other draws'
+    /// tables among them), as before the bounds.
+    ///
+    /// Sampler heaps are not bounded here: the host makes each of 2,048
+    /// slots, all the host can address (`heap_handle` clamps to 2,047).
+    /// Without a heap limit (`set_view_heap_limit` not called) nothing is
+    /// bounded, as before.
+    fn heap_bound(&mut self, index: V, sampler: bool, direct: bool, guard_kind: u32) -> V {
+        let Some((title, guard)) = (!sampler).then(super::shader::view_bounds).flatten() else {
+            return index;
+        };
+        let c = self.cur;
+        let limit = self.s.m.i32(if direct { title } else { guard });
+        let target = self.s.m.i32(guard + guard_kind);
+        let inside = self.s.m.cmp(c, pred::IULT, index, limit);
+        let v = self.s.m.select(c, inside, index, target);
+        self.s.bounded.insert(v);
+        v
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -11529,6 +11624,42 @@ mod tests {
             // dwords: no wave operation is left.
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
+        }
+    }
+
+    /// Per-lane descriptors loaded with `global_load` (`fetched_index`)
+    /// are bounded like those loaded with `s_load`: in this program only
+    /// the image comes from the view heap, through that per-lane path, so
+    /// a bounded index is its (the sampler's heap has every slot a clamped
+    /// index reaches and needs no bound). Without a limit nothing is
+    /// bounded: the control.
+    #[test]
+    fn per_lane_heap_indices_are_bounded_too() {
+        use crate::resource::tests::{WATERFALL_FETCHED_WAVE32, WATERFALL_FETCHED_WAVE64};
+        for (words, wave64) in [
+            (WATERFALL_FETCHED_WAVE32, false),
+            (WATERFALL_FETCHED_WAVE64, true),
+        ] {
+            use super::super::shader::with_view_limit;
+            let (layout, used) = texture_tables();
+            // The bounds are constants of the code (`view_bounds`): a
+            // limit as a capped host sets it, and no user data for them.
+            let l = with_view_limit(999_999, || lower_wave(words, layout, used, wave64)).unwrap();
+            assert!(
+                l.bounded > 0,
+                "wave64 {wave64}: the per-lane view index is bounded"
+            );
+            let (layout, used) = texture_tables();
+            let plain = with_view_limit(0, || lower_wave(words, layout, used, wave64)).unwrap();
+            assert_eq!(
+                plain.bounded, 0,
+                "wave64 {wave64}: nothing bounded without a limit"
+            );
+            let heap_data = l
+                .user_data
+                .iter()
+                .any(|u| matches!(u.root, RootType::ResourceHeap | RootType::SamplerHeap));
+            assert!(!heap_data, "wave64 {wave64}: no user data for the bounds");
         }
     }
 
