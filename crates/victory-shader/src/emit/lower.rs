@@ -275,6 +275,9 @@ struct Lower<'a> {
     mask_ok: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
     ballots: HashMap<Value, (V, V)>,
+    /// Ballots taken for a phi's incoming edge, by predecessor block (a ballot
+    /// cached for another read need not dominate this edge's use).
+    edge_ballots: HashMap<usize, HashMap<Value, (V, V)>>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
@@ -1565,6 +1568,7 @@ impl<'a> Lower<'a> {
             },
             mask_ok: false,
             ballots: HashMap::new(),
+            edge_ballots: HashMap::new(),
             balloting: HashSet::new(),
             def_block: p
                 .blocks
@@ -4800,6 +4804,49 @@ impl<'a> Lower<'a> {
     // ---- instructions ----
     // ---- instructions ----
 
+    /// Whether a pixel or vertex program may read a lane mask as data in the
+    /// instruction `name`: only uses that mean the same on any wave.
+    fn host_mask_use(name: &str) -> bool {
+        name.starts_with("s_bcnt1_i32_")
+            || name.starts_with("s_ff1_i32_")
+            || name.starts_with("v_mbcnt_")
+            || matches!(
+                name,
+                "s_cmp_eq_u32" | "s_cmp_lg_u32" | "s_cmp_eq_u64" | "s_cmp_lg_u64"
+            )
+    }
+
+    /// Whether every read of `v`, through further joins, is one a pixel or
+    /// vertex program may make of a lane mask ([`Self::host_mask_use`]).
+    fn read_only_as_host_mask(&self, v: Value) -> bool {
+        let mut seen = HashSet::new();
+        let mut work = vec![v];
+        while let Some(v) = work.pop() {
+            if !seen.insert(v) {
+                continue;
+            }
+            for block in &self.x.p.blocks {
+                work.extend(
+                    block
+                        .phis
+                        .iter()
+                        .filter(|phi| phi.args.contains(&v))
+                        .map(|phi| phi.value),
+                );
+                let reads = |i: &&Inst| i.reads.iter().any(|r| r.1 == v);
+                if block
+                    .insts
+                    .iter()
+                    .filter(reads)
+                    .any(|i| !Self::host_mask_use(i.name()))
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
@@ -4809,15 +4856,7 @@ impl<'a> Lower<'a> {
             || name.starts_with("v_mbcnt_");
         self.mask_ok = match self.mask_data {
             MaskData::Console => true,
-            MaskData::Host => {
-                name.starts_with("s_bcnt1_i32_")
-                    || name.starts_with("s_ff1_i32_")
-                    || name.starts_with("v_mbcnt_")
-                    || matches!(
-                        name,
-                        "s_cmp_eq_u32" | "s_cmp_lg_u32" | "s_cmp_eq_u64" | "s_cmp_lg_u64"
-                    )
-            }
+            MaskData::Host => Self::host_mask_use(name),
             // Mesh: only "do all lanes hold the first lane's value?" (`uniform_test`), which
             // each host wave answers for itself.
             MaskData::None => self.uniform_test(inst),
@@ -10911,8 +10950,10 @@ impl<'a> Lower<'a> {
                     .any(|a| matches!(self.vals.get(a), Some(Val::I32(_))));
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
-                let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let Some(pred_tail) = self.tail[q] else {
+                    continue;
+                };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(pred_tail);
                 let arg = phi.args[n];
                 if self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
                     let _ = self.lazy_barycentric(arg);
@@ -10927,16 +10968,34 @@ impl<'a> Lower<'a> {
                 }
                 // A lane mask dword this path left in the register: in a pixel
                 // or vertex program (the host's wave) the join is read only
-                // through a zero test or a count, so the ballot of the host
-                // wave stands in for it.
+                // through a use that means the same on any wave, so the ballot
+                // of the host wave stands in for it.
                 let lo = self.x.st.highs.get(&arg).copied().unwrap_or(arg);
+                // A wave64 mask's high dword has a ballot word only on a 64-lane
+                // host (zero on a 32-lane one), so a zero test of it would be true
+                // whatever the console's upper lanes held. Refused.
+                let high_of_wave64 = self.x.native.wave64 && self.x.st.highs.contains_key(&arg);
                 let ballot_ok = self.mask_data == MaskData::Host
                     && !bit
+                    && !high_of_wave64
                     && self.read_phis.contains(&phi.value)
                     && self.x.st.masks.contains_key(&lo)
-                    && self.def_block.get(&lo).is_some_and(|&d| d != self.cur_ir);
+                    && self.read_only_as_host_mask(phi.value);
                 let ballot = if ballot_ok {
-                    self.mask_dword(arg).ok()
+                    // Every block is lowered by now: place the ballot as a read at
+                    // the end of the phi's predecessor, whose edge uses it, not
+                    // where this edge happens to be filled from (after a loop that
+                    // does not dominate the join). Each edge takes its own, since a
+                    // ballot cached for another read may not dominate this one.
+                    let saved = (self.cur, self.cur_ir);
+                    (self.cur, self.cur_ir) = (pred_tail, q);
+                    let mut cache = self.edge_ballots.remove(&q).unwrap_or_default();
+                    std::mem::swap(&mut self.ballots, &mut cache);
+                    let ballot = self.mask_dword(arg).ok();
+                    std::mem::swap(&mut self.ballots, &mut cache);
+                    self.edge_ballots.insert(q, cache);
+                    (self.cur, self.cur_ir) = saved;
+                    ballot
                 } else {
                     None
                 };

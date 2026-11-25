@@ -913,6 +913,106 @@ mod tests {
         }
     }
 
+    /// Emits a pixel program of `words` (wave32 unless `wave64`) with one TEXCOORD input and
+    /// SV_Depth/SV_StencilRef out: translated, or refused with a reason.
+    fn pixel_emits(words: &[u32], wave64: bool) -> Result<(), crate::ShaderError> {
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![crate::native::PsInput {
+                    usage: crate::native::Usage::Generic,
+                    row: 0,
+                    mask: 0b1000,
+                    attr: 0,
+                    flat: false,
+                    fp16: false,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let el = |name: &str, kind, comp| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp,
+            interp: 0,
+            row: Some(0),
+            col: 3,
+            cols: 1,
+            usage: 1,
+            half: false,
+        };
+        let isg1 = container::signature(&[el("TEXCOORD", 0, 9)], true);
+        let osg1 =
+            container::signature(&[el("SV_Depth", 17, 9), el("SV_StencilRef", 20, 5)], false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        emit(&c, &native, &p, &st, &io, &res).map(|_| ())
+    }
+
+    /// A pixel program whose one register holds a lane mask on one path and a number on the
+    /// other, counted after the join (`s_bcnt1_i32_b32`): a use that means the same on any
+    /// wave, so the host wave's ballot stands in for the mask, taken at the end of the phi's
+    /// predecessor.
+    #[test]
+    fn a_lane_mask_joined_with_a_number_lowers_for_a_wave_independent_reader() {
+        let words = [
+            0x7E00_0283, // v_mov_b32 v0, 3
+            0x7E02_0285, // v_mov_b32 v1, 5
+            0x7D88_0101, // v_cmp_gt_u32 vcc_lo, v1, v0 (every lane)
+            0xBE94_036A, // s_mov_b32 s20, vcc_lo
+            0xBE95_0F14, // s_bcnt1_i32_b32 s21, s20
+            0xBF06_8015, // s_cmp_eq_u32 s21, 0
+            0xBF85_0001, // s_cbranch_scc1 over the next word
+            0xBE94_0385, // s_mov_b32 s20, 5 (the number path)
+            0xBE96_0F14, // s_bcnt1_i32_b32 s22, s20 (the join, read as a number)
+            0x7E00_0216, // v_mov_b32 v0, s22
+            0x7E02_0300, // v_mov_b32 v1, v0
+            0xF800_1883, // exp mrtz v0, v1, off, off done vm
+            0x0000_0100,
+            0xBF81_0000, // s_endpgm
+        ];
+        pixel_emits(&words, false).expect("a lane mask counted after a join");
+    }
+
+    /// The same join read by anything else: the ballot's bit n is host lane n, which a
+    /// 64-lane host numbers differently from the console's 32, so the number the register
+    /// holds is not the console's. Refused rather than silently different.
+    #[test]
+    fn a_lane_mask_joined_with_a_number_is_refused_for_other_readers() {
+        let words = [
+            0x7E00_0283, // v_mov_b32 v0, 3
+            0x7E02_0285, // v_mov_b32 v1, 5
+            0x7D88_0101, // v_cmp_gt_u32 vcc_lo, v1, v0
+            0xBE94_036A, // s_mov_b32 s20, vcc_lo
+            0xBE95_0F14, // s_bcnt1_i32_b32 s21, s20
+            0xBF06_8015, // s_cmp_eq_u32 s21, 0
+            0xBF85_0001, // s_cbranch_scc1 over the next word
+            0xBE94_0385, // s_mov_b32 s20, 5
+            0xBE96_0314, // s_mov_b32 s22, s20 (the join, copied as a whole number)
+            0x7E00_0216, // v_mov_b32 v0, s22
+            0x7E02_0300, // v_mov_b32 v1, v0
+            0xF800_1883, // exp mrtz v0, v1, off, off done vm
+            0x0000_0100,
+            0xBF81_0000, // s_endpgm
+        ];
+        let r = pixel_emits(&words, false);
+        assert!(r.is_err(), "a joined mask copied as a number must be refused");
+    }
+
     /// A wave64 compute program that writes only EXEC's high dword
     /// (`s_mov_b32 exec_hi, 0`) before a vector instruction. The new mask was
     /// opaque and keyed by the unchanged low dword, so building its lane bit
