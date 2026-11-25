@@ -6448,10 +6448,14 @@ impl Host {
             &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         ),
     ) -> Option<bool> {
-        let mut overlay = overlay.and_then(|(overlay, state)| {
-            let extent = crate::present_compositor::extent(texture, overlay)?;
-            Some((overlay, D3D12_RESOURCE_STATES(state as i32), extent))
-        });
+        // What decides against composing also settles the extent: the base
+        // plane's, so the copy below and the back buffer agree.
+        let mut overlay = overlay
+            .filter(|_| fill.is_none() && !late_free_present())
+            .and_then(|(overlay, state)| {
+                let extent = crate::present_compositor::extent(texture, overlay)?;
+                Some((overlay, D3D12_RESOURCE_STATES(state as i32), extent))
+            });
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -6517,11 +6521,9 @@ impl Host {
             p.compositor = Some(compositor);
             tracing::info!(width, height, "compositing two present planes");
         }
-        // The compositor writes its descriptor heap as it records, so it
-        // goes in a list that is waited for: never one sent ahead.
-        let composition = overlay
-            .zip(p.compositor.as_ref())
-            .filter(|_| fill.is_none() && !late_free_present());
+        // The compositor writes its descriptor heap as it records, and goes
+        // in a list that is waited for ([`late_free_present`] checked above).
+        let composition = overlay.zip(p.compositor.as_ref());
         let state = D3D12_RESOURCE_STATES(state as i32);
         // SAFETY: our swap chain, list and live source textures. Lists are
         // waited for before the presenter can reuse its descriptors.
