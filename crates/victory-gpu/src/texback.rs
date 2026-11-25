@@ -36,19 +36,24 @@ fn kinds() -> &'static [(u64, u32, u32)] {
             Ok(spec) => spec.to_owned(),
             Err(_) => String::new(),
         };
-        let kinds: Vec<(u64, u32, u32)> = list
-            .split(',')
-            .filter_map(|k| {
-                let (size, format) = k.trim().split_once('f')?;
-                let (w, h) = size.split_once('x')?;
-                Some((w.parse().ok()?, h.parse().ok()?, format.parse().ok()?))
-            })
-            .collect();
+        let kinds = parse_kinds(&list);
         if !kinds.is_empty() {
             tracing::info!(?kinds, "textures of these kinds that shaders write are copied back into title memory (VICTORY_TEXTURE_BACK)");
         }
         kinds
     })
+}
+
+/// The kinds a `VICTORY_TEXTURE_BACK` list names: `<width>x<height>f<format>`,
+/// comma-separated; entries that are not that are left out.
+fn parse_kinds(list: &str) -> Vec<(u64, u32, u32)> {
+    list.split(',')
+        .filter_map(|k| {
+            let (size, format) = k.trim().split_once('f')?;
+            let (w, h) = size.split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?, format.parse().ok()?))
+        })
+        .collect()
 }
 
 /// Whether title texture `resource` is of a kind copied back.
@@ -270,5 +275,16 @@ mod tests {
         released(93);
         assert!(!far.valid.load(Ordering::Acquire));
         assert!(track(94, 0x2000, 0x3000).valid.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_kind_list_names_width_height_and_format() {
+        assert_eq!(parse_kinds("256x256f41,64x64f16"), vec![(256, 256, 41), (64, 64, 16)]);
+    }
+
+    #[test]
+    fn entries_that_are_not_a_kind_are_left_out() {
+        assert_eq!(parse_kinds("256x256f41,,garbage,64x64f16,128x128"), vec![(256, 256, 41), (64, 64, 16)]);
+        assert!(parse_kinds("").is_empty());
     }
 }

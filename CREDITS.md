@@ -75,6 +75,12 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   did not come over: measured under Wine + vkd3d-proton + RADV, a committed section opens and the import under it
   is refused, silently substituting the driver's own memory (`xcl-bin/notes/zero-copy.md` 6).
 
+- **fxceless/victory-fork** (Geckomacabre, Codex), GPL-3.0: textures a list's shaders write that the title's own
+  code then reads on the CPU are copied into a read-back buffer when the list closes and tiled into the texture's
+  title memory in the console's layout, by kind (`VICTORY_TEXTURE_BACK`, off by default), with each read-back's
+  allocation and fence tracked so a remapped or released allocation is not landed
+  (`crates/victory-gpu/src/texback.rs`).
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is

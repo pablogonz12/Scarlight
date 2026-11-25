@@ -65,6 +65,7 @@ mod texture;
 mod warptest;
 #[cfg(windows)]
 mod watch;
+mod writeback;
 
 #[cfg(windows)]
 pub use host::on_failure;
