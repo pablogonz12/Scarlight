@@ -33,4 +33,4 @@ jobs:
         env:
           RUST_BACKTRACE: "1"
           VICTORY_D3D12_DEBUG: "1"
-        run: cargo test -p victory-gpu --lib --locked --features diagnostics -- --test-threads=1 --nocapture
+        run: cargo test -p victory-gpu --lib --locked -- --test-threads=1 --nocapture

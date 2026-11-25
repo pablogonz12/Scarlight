@@ -3061,6 +3061,7 @@ void main() {
             }
         }
 
+        println!("STEP tiled");
         let allocator_iid = guid(
             0x6102dee4,
             0xaf59,
@@ -3209,8 +3210,10 @@ void main() {
             actual
         };
 
+        println!("STEP submit");
         submit();
         let actual = sample();
+        println!("STEP sample");
         for (i, want) in depth.iter().enumerate() {
             assert_eq!(&actual[i], want, "depth subresource {i}");
         }
@@ -3225,8 +3228,10 @@ void main() {
         stencil[3][0] = 53;
         // SAFETY: one byte of the texture's memory, ours and mapped.
         unsafe { memory.as_mut_ptr().add(at as usize).write_volatile(53) };
+        println!("STEP submit2");
         submit();
         let refreshed = sample();
+        println!("STEP sample2");
         for (i, want) in depth.iter().enumerate() {
             assert_eq!(&refreshed[i], want, "depth subresource {i} survives a stencil write");
         }
