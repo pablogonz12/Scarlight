@@ -1788,10 +1788,33 @@ const ALWAYS: u32 = 8;
 /// reads, rather than running on at once (`VICTORY_WAIT_UNREAD=0`, as before).
 /// Memory that is not mapped is taken as not holding what is waited for
 /// unless the comparison does not look at the value (1..=7 do,
-/// `ValueWait::holds_for`).
+/// `ValueWait::holds_for`), and it is taken as met after the bound
+/// (`VICTORY_WAIT_UNREAD_MS`) with a warning, so memory that never reads
+/// cannot hold a queue forever.
 fn unread_holds() -> bool {
     static HOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *HOLD.get_or_init(|| std::env::var("VICTORY_WAIT_UNREAD").as_deref() != Ok("0"))
+}
+
+/// How long a wait may stand on memory that cannot be read before it is taken
+/// as met (`VICTORY_WAIT_UNREAD_MS`, 2000 ms; `0` waits forever).
+fn unread_bound() -> std::time::Duration {
+    static BOUND: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *BOUND.get_or_init(|| {
+        let ms = std::env::var("VICTORY_WAIT_UNREAD_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000);
+        std::time::Duration::from_millis(ms)
+    })
+}
+
+/// The unread waits seen: address, when a look first found it unreadable, and
+/// whether the bound's warning has been logged.
+fn unread_seen() -> &'static std::sync::Mutex<Vec<(u64, std::time::Instant, bool)>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<Vec<(u64, std::time::Instant, bool)>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
 impl ValueWait {
@@ -1850,6 +1873,9 @@ impl ValueWait {
         if !crate::host::read_into(self.address as *const u8, &mut raw[..bytes]) {
             return self.unread_met();
         }
+        if unread_holds() && (1..ALWAYS).contains(&self.comparison) {
+            self.unread_read();
+        }
         self.holds_for(u64::from_le_bytes(raw))
     }
 
@@ -1857,8 +1883,59 @@ impl ValueWait {
     /// comparison that does not look at the value is (`holds_for` says what
     /// the 1..=7 codes compare), or, with `VICTORY_WAIT_UNREAD=0`, every one,
     /// as before.
+    ///
+    /// Otherwise it is not met until it has stood on that address longer than
+    /// the bound (`VICTORY_WAIT_UNREAD_MS`, 2 s), then it is taken as met with
+    /// one warning: memory that never reads would hold its queue forever
+    /// (nothing releases a held queue on a timer, only a submission, a signal
+    /// or a present).
     fn unread_met(&self) -> bool {
-        !unread_holds() || !(1..ALWAYS).contains(&self.comparison)
+        self.unread_met_at(std::time::Instant::now(), unread_bound())
+    }
+
+    /// `unread_met` with the time and bound given.
+    fn unread_met_at(&self, now: std::time::Instant, bound: std::time::Duration) -> bool {
+        if !unread_holds() || !(1..ALWAYS).contains(&self.comparison) {
+            return true;
+        }
+        if bound.is_zero() {
+            return false;
+        }
+        let mut seen = unread_seen().lock().unwrap_or_else(|e| e.into_inner());
+        let i = match seen.iter().position(|&(at, ..)| at == self.address) {
+            Some(i) => i,
+            None => {
+                if seen.len() >= 64 {
+                    seen.retain(|&(_, first, _)| now.duration_since(first) < bound);
+                }
+                seen.push((self.address, now, false));
+                return false;
+            }
+        };
+        let (_, first, warned) = seen[i];
+        if now.duration_since(first) < bound {
+            return false;
+        }
+        if !warned {
+            seen[i].2 = true;
+            tracing::warn!(
+                address = format_args!("{:#x}", self.address),
+                comparison = self.comparison,
+                reference = format_args!("{:#x}", self.reference),
+                ms = bound.as_millis() as u64,
+                "a wait on memory that cannot be read was taken as met at the bound (VICTORY_WAIT_UNREAD_MS)"
+            );
+        }
+        true
+    }
+
+    /// The wait reads after standing on unreadable memory: the bound starts
+    /// over if it is unreadable again.
+    fn unread_read(&self) {
+        unread_seen()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&(at, ..)| at != self.address);
     }
 
     /// Where the value waited for is: address and bytes.
@@ -2326,10 +2403,54 @@ mod tests {
         assert_eq!(unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) }, 1);
     }
 
+    /// A wait on memory that never reads is taken as met at the bound, with
+    /// one warning: nothing else releases a held queue (only a submission, a
+    /// signal or a present does), so without it the queue would stand there.
     #[cfg(windows)]
     #[test]
-    fn idle_most_scales_with_ram_and_cores() {
-        const GIB: u64 = 1 << 30;
+    fn an_unreadable_wait_is_met_at_the_bound() {
+        let wait = ValueWait {
+            address: 0x7FF0_0000_0000,
+            comparison: 3,
+            reference: 5,
+            wide: false,
+        };
+        let bound = std::time::Duration::from_millis(2000);
+        let first = std::time::Instant::now();
+        assert!(!wait.unread_met_at(first, bound), "held at the first look");
+        assert!(
+            !wait.unread_met_at(first + std::time::Duration::from_millis(1999), bound),
+            "still held below the bound"
+        );
+        assert!(
+            wait.unread_met_at(first + bound, bound),
+            "met at the bound, so the queue runs"
+        );
+        let warned = unread_seen()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&(at, .., warned)| at == wait.address && warned)
+            .count();
+        assert_eq!(warned, 1, "one warning for the address");
+        assert!(
+            wait.unread_met_at(first + bound, bound),
+            "still met after the bound"
+        );
+        wait.unread_read();
+        assert!(
+            !wait.unread_met_at(first + bound, bound),
+            "the bound starts over once it reads"
+        );
+        assert!(
+            !wait.unread_met_at(first, std::time::Duration::ZERO),
+            "VICTORY_WAIT_UNREAD_MS=0 waits forever"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn idle_most_scales_with_ram_and_cores() {        const GIB: u64 = 1 << 30;
         const MIB: u64 = 1 << 20;
         assert_eq!(idle_most(None, 8), (128, 256 * MIB));
         assert_eq!(idle_most(Some(8 * GIB), 4), (64, 128 * MIB));
