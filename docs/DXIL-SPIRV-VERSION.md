@@ -58,9 +58,15 @@ again, because a converter from before either one is a converter we must not shi
   three-program crash above and this hang are independent, so a bump that fixes only one is
   still a bad pin.
 
-The commit is not in the DLL's strings. Check the checkout the DLL was built from, which is
-the subproject inside the vkd3d-proton tree and **not** the standalone stock checkout the
-offline gates use:
+The commit is not in the DLL's strings. Record it from the checkout the DLL is built from —
+the subproject inside the vkd3d-proton tree, **not** the standalone stock checkout the
+offline gates use — and keep that revision with the build:
 
-    git -C <vkd3d-proton tree>/subprojects/dxil-spirv merge-base --is-ancestor 7f5a7780 HEAD \
+    git -C <vkd3d-proton tree>/subprojects/dxil-spirv rev-parse HEAD
+
+`VERSIONS.txt` in a release already names it (`DXIL_SPIRV_COMMIT`, see above); for a build made
+by hand, put the line in the folder the DLLs came from. Check the **recorded** revision, not
+whatever the checkout points at now (it can be moved after the build):
+
+    git -C <vkd3d-proton tree>/subprojects/dxil-spirv merge-base --is-ancestor 7f5a7780 <recorded> \
       && echo "has the fix"
