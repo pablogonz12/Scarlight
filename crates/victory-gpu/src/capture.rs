@@ -20,51 +20,139 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 /// too, and their draws traced at debug level.
 pub(crate) fn listed(n: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| {
-        let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
+    let named = LIST
+        .get_or_init(|| {
+            let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
+            list.split(',')
+                .filter_map(|f| f.trim().parse().ok())
+                .collect()
+        })
+        .contains(&n);
+    // `VICTORY_CAPTURE_WORLD`: also the 2nd and the 6th frame after the first
+    // one that ran 500 draws or more (a title's first 3D frames: their
+    // numbers depend on how long the menus were shown), and the 30th and
+    // the 80th (the title opens with a cutscene made in the
+    // engine: later shots of it, in case the first is dark by design).
+    //
+    // `VICTORY_CAPTURE_WORLD_ALSO` (comma-separated): more frames counted
+    // from that first one (the title's blue patches show from
+    // about the 118th frame on, when the window's model has arrived and
+    // the reflections hold values: none of the four above has them).
+    static ALSO: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let also = ALSO.get_or_init(|| {
+        let list = std::env::var("VICTORY_CAPTURE_WORLD_ALSO").unwrap_or_default();
         list.split(',')
             .filter_map(|f| f.trim().parse().ok())
             .collect()
-    })
-    .contains(&n)
-        || n == NEXT_BUSY.load(std::sync::atomic::Ordering::Relaxed)
+    });
+    let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
+    let after = n.wrapping_sub(first);
+    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
 }
 
-/// `VICTORY_CAPTURE_BUSY=<draws>[,<count>]`: the frame after one that ran
-/// more than `<draws>` draws and dispatches on the host is listed too (as if
-/// named in `VICTORY_CAPTURE_FRAMES`), up to `<count>` times (default 2),
-/// every 8th frame: the world, whose frame numbers vary run to run.
-static NEXT_BUSY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// At the present of `frame`, after `ran` host draws and dispatches since
-/// the last present: lists a later frame if `VICTORY_CAPTURE_BUSY` says so.
-pub(crate) fn note_busy(frame: u64, ran: u64) {
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    static SETTING: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
-    static DONE: AtomicU64 = AtomicU64::new(0);
-    static LAST: AtomicU64 = AtomicU64::new(0);
-    let Some((draws, count)) = *SETTING.get_or_init(|| {
-        let v = std::env::var("VICTORY_CAPTURE_BUSY").ok()?;
-        let mut it = v.split(',').map(|x| x.trim().parse::<u64>().ok());
-        Some((it.next()??, it.next().flatten().unwrap_or(2)))
-    }) else {
+/// With a capture folder, for the frames [`listed`]: `what` is added to
+/// the frame's `frame-<n>-ops.txt`, one line per draw, dispatch, copy or
+/// drop in the order recorded (the title records on several threads, so
+/// lines of different lists interleave; each names its list). The file
+/// says which pass writes which target, to find the pass whose output
+/// stays empty.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
+    use std::io::Write;
+    let frame = crate::queue::presented() + 1;
+    if !listed(frame) {
+        // Before the world: the last lines are kept, and written out when
+        // it starts (`before-world-ops.txt`): what the title drew just
+        // before (the title shows a title card there, whose text
+        // did not show).
+        if world_on() && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX {
+            // At most 300 lines of a frame: the world's first frame alone
+            // (thousands of operations, recorded before it is known to be
+            // the world's) pushed everything before it out.
+            static IN_FRAME: std::sync::Mutex<(u64, u32)> = std::sync::Mutex::new((0, 0));
+            {
+                let mut in_frame = IN_FRAME.lock().unwrap_or_else(|e| e.into_inner());
+                if in_frame.0 != frame {
+                    *in_frame = (frame, 0);
+                }
+                in_frame.1 += 1;
+                if in_frame.1 > 300 {
+                    return;
+                }
+            }
+            let what = what();
+            let mut ring = RING.lock().unwrap_or_else(|e| e.into_inner());
+            if ring.len() >= RING_LINES {
+                ring.pop_front();
+            }
+            ring.push_back(format!("frame {frame} list {list:#x} {what}"));
+        }
+        return;
+    }
+    let Some(folder) = folder() else {
         return;
     };
-    if ran > draws
-        && DONE.load(Relaxed) < count
-        && frame >= LAST.load(Relaxed) + 8
-        && NEXT_BUSY.load(Relaxed) <= frame
+    static FILE: std::sync::Mutex<Option<(u64, u64, std::fs::File)>> = std::sync::Mutex::new(None);
+    let what = what();
+    let mut file = FILE.lock().unwrap_or_else(|e| e.into_inner());
+    if file.as_ref().is_none_or(|f| f.0 != frame) {
+        let Ok(made) = std::fs::File::create(folder.join(format!("frame-{frame}-ops.txt"))) else {
+            return;
+        };
+        *file = Some((frame, 0, made));
+    }
+    if let Some((_, n, f)) = file.as_mut() {
+        *n += 1;
+        let _ = writeln!(f, "{n} list {list:#x} {what}");
+    }
+}
+
+/// The last lines of [`op`] before the world.
+#[cfg(feature = "diagnostics")]
+static RING: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+#[cfg(feature = "diagnostics")]
+const RING_LINES: usize = 6000;
+
+/// Whether `VICTORY_CAPTURE_WORLD` is set.
+fn world_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_WORLD").is_some())
+}
+
+/// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
+static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// At the present of `frame`: the draws run on the host so far.
+pub(crate) fn frame_drew(frame: u64, drawn: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let before = LAST.swap(drawn, Relaxed);
+    if world_on()
+        && drawn.saturating_sub(before) >= 500
+        && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
     {
-        NEXT_BUSY.store(frame + 1, Relaxed);
-        LAST.store(frame + 1, Relaxed);
-        DONE.fetch_add(1, Relaxed);
-        tracing::info!(frame = frame + 1, ran, "VICTORY_CAPTURE_BUSY: capturing the next frame");
+        tracing::info!(frame, "the first frame of 500 draws or more: frames {} and {} are captured", frame + 2, frame + 6);
+        #[cfg(feature = "diagnostics")]
+        if let Some(folder) = folder() {
+            let lines: Vec<String> = std::mem::take(&mut *RING.lock().unwrap_or_else(|e| e.into_inner())).into();
+            let _ = std::fs::write(folder.join("before-world-ops.txt"), lines.join("
+"));
+        }
     }
 }
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
-    folder().is_some() && (n.is_power_of_two() || listed(n))
+    // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
+    // (small pictures of menus, loading screens and title cards).
+    let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
+    // In the world: every 8th frame's picture, a timeline of the opening
+    // cutscene (its shots do not fall on the same frame numbers from run to
+    // run, so single frames cannot be compared between runs).
+    let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
+    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
+    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -75,6 +163,11 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let Some(folder) = folder() else { return };
+    save_png(&folder.join(format!("{name}.png")), width, height, pitch, bgra, rows);
+}
+
+/// Saves 8-bit RGBA or BGRA rows at `path`, at half size.
+fn save_png(path: &std::path::Path, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let (w, h) = ((width / 2).max(1), (height / 2).max(1));
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
@@ -96,14 +189,12 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     header.extend(h.to_be_bytes());
     header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
     chunk(&mut png, b"IHDR", &header);
-    chunk(
-        &mut png,
-        b"IDAT",
-        &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 3),
-    );
+    let mut compressed = vec![0u8; zlib_rs::compress_bound(raw.len())];
+    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, &raw, zlib_rs::DeflateConfig::new(3));
+    debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
+    chunk(&mut png, b"IDAT", idat);
     chunk(&mut png, b"IEND", &[]);
-    let path = folder.join(format!("{name}.png"));
-    match std::fs::write(&path, png) {
+    match std::fs::write(path, png) {
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
         Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
     }
@@ -136,6 +227,17 @@ pub(crate) fn read_back(
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
 ) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
+    read_back_of(device, list, texture, 0)
+}
+
+/// As [`read_back`], of subresource `sub` (the stencil plane of a
+/// one-level, one-slice depth-stencil texture is subresource 1).
+fn read_back_of(
+    device: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    texture: &ID3D12Resource,
+    sub: u32,
+) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
     let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     let mut total = 0;
     // SAFETY: a live texture; outputs for one subresource.
@@ -143,7 +245,7 @@ pub(crate) fn read_back(
         let desc = texture.GetDesc();
         device.GetCopyableFootprints(
             &desc,
-            0,
+            sub,
             1,
             0,
             Some(&mut footprint),
@@ -194,7 +296,7 @@ pub(crate) fn read_back(
             pResource: std::mem::transmute_copy(texture),
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: 0,
+                SubresourceIndex: sub,
             },
         };
         list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
@@ -231,8 +333,122 @@ pub(crate) fn save_read_back(
     }
 }
 
-/// With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in
-/// `VICTORY_CAPTURE_FRAMES` render to or write, in first-use order, saved
+/// The shot asked for by the control folder, remembered at a present by
+/// [`poll`] and taken by the next one that can read the presented source.
+static PENDING: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
+
+/// Looks at the control folder, at most every 250 ms ([`victory_core::ctl`]
+/// takes the key requests itself) and remembers a shot for the frame being
+/// presented. With nothing requested this is a few `stat` calls.
+pub(crate) fn poll() {
+    let request = victory_core::ctl::tick();
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    // A shot not saved yet stays pending: the newest one wins, and keys keep
+    // being taken meanwhile (they are held from `tick`).
+    if pending.is_none()
+        && let Some(victory_core::ctl::Request::Shot(label)) = request
+    {
+        *pending = Some(label);
+    }
+}
+
+/// The label of the shot the presented frame should be saved under, taken
+/// (so a frame reads the request once).
+pub(crate) fn take_request() -> Option<Option<String>> {
+    PENDING.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+/// Puts a shot the frame could not save back for the next one.
+pub(crate) fn put_back(label: Option<String>) {
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    if pending.is_none() {
+        *pending = Some(label);
+    }
+}
+
+/// The stats line the meter last worked out (fps, the split of a frame,
+/// draws, drops); `None` before a second of frames.
+static STATS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Records the meter's line for the stats file of a shot.
+pub(crate) fn note_stats(line: String) {
+    *STATS.lock().unwrap_or_else(|e| e.into_inner()) = Some(line);
+}
+
+/// Saves a frame read back by [`read_back`] as `<ctl>/shots/<stamp>-f<frame>.png`
+/// (the folder's label too, when the request had one), and one line of
+/// stats as the same name with `.txt`: what the meter last said, and the
+/// reasons draws and dispatches were dropped without a host pipeline.
+pub(crate) fn save_shot(
+    frame: u64,
+    label: Option<String>,
+    buffer: &ID3D12Resource,
+    footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+) {
+    let Some(ctl) = victory_core::ctl::dir() else { return };
+    let f = footprint.Footprint;
+    let bgra = match f.Format {
+        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => false,
+        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => true,
+        other => {
+            tracing::warn!(format = other.0, "shot not saved: not 8-bit color");
+            return;
+        }
+    };
+    let shots = ctl.join("shots");
+    if let Err(e) = std::fs::create_dir_all(&shots) {
+        tracing::warn!(error = %e, path = %shots.display(), "shots folder not made");
+        return;
+    }
+    let stamp = victory_core::ctl::stamp();
+    let name = match &label {
+        Some(label) => format!("{stamp}-f{frame}-{label}"),
+        None => format!("{stamp}-f{frame}"),
+    };
+    let mut data = std::ptr::null_mut();
+    // SAFETY: the copy finished (every submission is waited for); the
+    // mapping spans the footprint's rows.
+    unsafe {
+        if buffer.Map(0, None, Some(&mut data)).is_err() {
+            return;
+        }
+        let len = f.RowPitch as usize * f.Height as usize;
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
+        save_png(
+            &shots.join(format!("{name}.png")),
+            f.Width,
+            f.Height,
+            f.RowPitch as usize,
+            bgra,
+            rows,
+        );
+        buffer.Unmap(0, None);
+    }
+    let stats = STATS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_else(|| "no stats yet (fewer than a second of frames)".to_owned());
+    let mut line = format!("{stamp} frame={frame} {stats}");
+    let drops = crate::pipeline::drops_snapshot();
+    if !drops.is_empty() {
+        let reasons: Vec<String> = drops
+            .iter()
+            .map(|(why, n)| format!("{why} x{n}"))
+            .collect();
+        line.push_str(&format!(
+            " | without a host pipeline: {}",
+            reasons.join(", ")
+        ));
+    }
+    let path = shots.join(format!("{name}.txt"));
+    if let Err(e) = std::fs::write(&path, format!("{line}\n")) {
+        tracing::warn!(error = %e, path = %path.display(), "shot stats not saved");
+    }
+    tracing::info!(shot = %name, "shot saved");
+}
+
+/// With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in/// `VICTORY_CAPTURE_FRAMES` render to or write, in first-use order, saved
 /// at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`
 /// (what each holds at the end of the frame; formats normalized to show
 /// structure: floats scaled by their largest value, depth by its range).
@@ -246,94 +462,10 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
-/// `VICTORY_SHOW_TARGET=<n>`: every frame shows the `n`th texture it
-/// rendered to or wrote (first-use order, the `<i>` of a target dump's file
-/// names) instead of what the title presents; frames with fewer targets show
-/// the title's own picture. `VICTORY_SHOW_TARGET=busiest`: the displayable
-/// target (8-bit, 10-bit or 16-bit float colour, 16:9, at least 1280 wide) the
-/// most draws wrote, which in a world frame is a G-buffer layer. A debugging
-/// view: it shows a buffer as it is (a G-buffer layer unlit, say), not a
-/// finished picture.
-#[derive(Clone, Copy)]
-pub(crate) enum Show {
-    Index(usize),
-    Busiest,
-}
-
-pub(crate) fn show_index() -> Option<Show> {
-    static N: std::sync::OnceLock<Option<Show>> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        let v = std::env::var("VICTORY_SHOW_TARGET").ok()?;
-        let v = v.trim();
-        let show = if v.eq_ignore_ascii_case("busiest") {
-            Show::Busiest
-        } else {
-            Show::Index(v.parse().ok()?)
-        };
-        tracing::warn!(target = v, "VICTORY_SHOW_TARGET: showing a render target instead of the title's picture");
-        Some(show)
-    })
-}
-
-/// Draws that wrote each noted target this frame (show mode `busiest`).
-static HITS: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
-
-/// At the present of `frame` in show mode: the noted target to show, if the
-/// frame has one. Clears the frame's list unless a dump still needs it.
-pub(crate) fn shown(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTexture>> {
-    let show = show_index()?;
-    let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-    let mut hits = HITS.lock().unwrap_or_else(|e| e.into_inner());
-    if frame.is_power_of_two() && frame >= 256 {
-        let list: Vec<String> = targets
-            .iter()
-            .enumerate()
-            .map(|(i, (r, c))| {
-                // SAFETY: a live resource.
-                let d = unsafe { c.texture.GetDesc() };
-                let n = hits.iter().find(|h| h.0 == *r).map_or(0, |h| h.1);
-                format!("{i}: {}x{} f{} ({n} draws)", d.Width, d.Height, d.Format.0)
-            })
-            .collect();
-        tracing::info!(frame, ?list, "VICTORY_SHOW_TARGET: this frame's targets");
-    }
-    let pick = match show {
-        Show::Index(n) => targets.get(n).map(|(_, c)| c.clone()),
-        Show::Busiest => targets
-            .iter()
-            .filter(|(_, c)| {
-                // SAFETY: a live resource.
-                let d = unsafe { c.texture.GetDesc() };
-                d.Width >= 1280
-                    // Screen-shaped (16:9): not a shadow map, which more draws write.
-                    && d.Width * 9 == u64::from(d.Height) * 16
-                    && matches!(d.Format.0, 9..=14 | 23..=25 | 27..=32 | 87 | 90 | 91)
-            })
-            .max_by_key(|(r, _)| hits.iter().find(|h| h.0 == *r).map_or(0, |h| h.1))
-            .map(|(_, c)| c.clone()),
-    };
-    if !(dump_on() && listed(frame)) {
-        targets.clear();
-    }
-    hits.clear();
-    pick
-}
-
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() {
+    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
         return;
-    }
-    let dumping = dump_on() && listed(crate::queue::presented() + 1);
-    if !dumping && show_index().is_none() {
-        return;
-    }
-    if show_index().is_some() {
-        let mut hits = HITS.lock().unwrap_or_else(|e| e.into_inner());
-        match hits.iter_mut().find(|h| h.0 == resource as usize) {
-            Some(h) => h.1 += 1,
-            None => hits.push((resource as usize, 1)),
-        }
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
     if !targets.iter().any(|&(r, _)| r == resource as usize)
@@ -380,14 +512,27 @@ fn dump_one(
                 .ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
         }
         let read = read_back(&host.device, &list.list, texture);
+        // The stencil plane of a depth-stencil target, which the title's
+        // lighting reads (material class in the low bits; 0x08 "inside a
+        // room", which the lamps of a room are multiplied by): the plane
+        // after the depth plane of a one-level, one-slice texture.
+        let stencil = (matches!(d.Format.0, 19..=22 | 44..=47)
+            && d.MipLevels == 1
+            && d.DepthOrArraySize == 1)
+            .then(|| read_back_of(&host.device, &list.list, texture, 1))
+            .flatten();
         if state != copy {
             list.list
                 .ResourceBarrier(&[crate::host::transition(texture, copy, state)]);
         }
-        read
+        (read, stencil)
     };
+    let (read, stencil) = read;
     list.close();
     host.execute(&[&list]);
+    if let Some((buffer, footprint)) = stencil {
+        stencil_values(&buffer, &footprint, frame, resource);
+    }
     let Some((buffer, footprint)) = read else { return };
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();
@@ -398,6 +543,26 @@ fn dump_one(
         }
         let pitch = f.RowPitch as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        // A 24-bit depth plane comes back as 32-bit words: which depth values
+        // (low 24 bits) and which top bytes it holds, the most common first.
+        if matches!(d.Format.0, 44..=47) {
+            let mut depths = std::collections::HashMap::<u32, u32>::new();
+            let mut tops = std::collections::HashMap::<u32, u32>::new();
+            for y in 0..f.Height as usize {
+                for x in 0..f.Width as usize {
+                    let at = y * pitch + x * 4;
+                    let w = u32::from_le_bytes(rows[at..at + 4].try_into().unwrap_or([0; 4]));
+                    *depths.entry(w & 0xff_ffff).or_default() += 1;
+                    *tops.entry(w >> 24).or_default() += 1;
+                }
+            }
+            let most = |m: std::collections::HashMap<u32, u32>| {
+                let mut v: Vec<(u32, u32)> = m.into_iter().collect();
+                v.sort_by_key(|e| std::cmp::Reverse(e.1));
+                (v.len(), v.into_iter().take(12).collect::<Vec<_>>())
+            };
+            tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
+        }
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let name = format!(
                 "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
@@ -407,6 +572,67 @@ fn dump_one(
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }
+        buffer.Unmap(0, None);
+    }
+}
+
+/// Logs which values a stencil plane read back by [`read_back_of`] holds
+/// (the most common first), how many texels have each of its bits, and the
+/// box of the texels with bit 3 (0x08).
+fn stencil_values(
+    buffer: &ID3D12Resource,
+    footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    frame: u64,
+    resource: crate::object::This,
+) {
+    let f = footprint.Footprint;
+    let (w, h, pitch) = (f.Width as usize, f.Height as usize, f.RowPitch as usize);
+    let mut data = std::ptr::null_mut();
+    // SAFETY: the copy finished; the mapping spans the footprint's rows of
+    // one byte a texel, the last row without its padding.
+    unsafe {
+        if h == 0 || w == 0 || buffer.Map(0, None, Some(&mut data)).is_err() {
+            return;
+        }
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * (h - 1) + w);
+        let mut values = [0u32; 256];
+        let mut bits = [0u32; 8];
+        // Left, top, right, bottom of the texels with bit 3.
+        let mut inside = [u32::MAX, u32::MAX, 0, 0];
+        for y in 0..h {
+            for (x, &v) in rows[y * pitch..y * pitch + w].iter().enumerate() {
+                values[usize::from(v)] += 1;
+                for (bit, count) in bits.iter_mut().enumerate() {
+                    *count += u32::from(v >> bit & 1);
+                }
+                if v & 8 != 0 {
+                    inside = [
+                        inside[0].min(x as u32),
+                        inside[1].min(y as u32),
+                        inside[2].max(x as u32),
+                        inside[3].max(y as u32),
+                    ];
+                }
+            }
+        }
+        let mut most: Vec<(usize, u32)> = values
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|v| v.1 != 0)
+            .collect();
+        most.sort_by_key(|v| std::cmp::Reverse(v.1));
+        most.truncate(16);
+        tracing::info!(
+            frame,
+            ?resource,
+            width = w,
+            height = h,
+            values = ?most,
+            texels_with_bit = ?bits,
+            bit3_box = ?inside,
+            "stencil plane values (value, texels)"
+        );
         buffer.Unmap(0, None);
     }
 }
@@ -501,9 +727,90 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         (0.0, finite.fold(0.0f32, f32::max))
     };
     let range = (high - low).max(1e-20);
-    tracing::info!(format, low, high, "target values");
+    // How much of the target holds anything: a lit scene and one bright
+    // lamp on black have the same highest value.
+    let above = values.iter().filter(|v| v.iter().any(|c| c.is_finite() && *c > low)).count();
+    let nonzero_percent = above as f32 * 100.0 / values.len().max(1) as f32;
+    tracing::info!(format, low, high, nonzero_percent, "target values");
+    // Small float colour targets (the 1x1 luminance and exposure targets):
+    // every texel's four channels as numbers. The picture has no alpha and
+    // eight bits a channel.
+    if matches!(format, 1..=2 | 9..=10) && w * h <= 16 {
+        for y in 0..h {
+            for x in 0..w {
+                let b = px(x, y, n);
+                let texel: [f32; 4] = if n == 16 {
+                    [0, 1, 2, 3].map(|i| f32::from_bits(u32_at(b, i)))
+                } else {
+                    [0, 1, 2, 3].map(|i| half(u16_at(b, i)))
+                };
+                tracing::info!(format, x, y, ?texel, "target texel");
+            }
+        }
+    }
+    // R32_UINT targets hold packed light (the title reads them back as
+    // R9G9B9E5): as floats their low, high and share above the lowest say
+    // nothing. How many texels hold any bit, and the highest channel value
+    // of the packed reading.
+    if format == 42 {
+        let (mut set, mut packed_high) = (0usize, 0f32);
+        for y in 0..h {
+            for x in 0..w {
+                let v = u32_at(px(x, y, 4), 0);
+                set += usize::from(v != 0);
+                let scale = 2f32.powi((v >> 27) as i32 - 24);
+                for k in 0..3 {
+                    packed_high = packed_high.max((v >> (9 * k) & 0x1ff) as f32 * scale);
+                }
+            }
+        }
+        let nonzero_bits_percent = set as f32 * 100.0 / (w * h).max(1) as f32;
+        tracing::info!(format, nonzero_bits_percent, packed_high, "target values as packed light");
+        // The same words as plain numbers, by class. Tables of indices and
+        // masks say nothing as floats or as packed light: in the title's
+        // shadow-mask table 0 is a block in full shadow, a word up to 255
+        // one value for the block, above that a block of the atlas, and all
+        // ones a texel never written.
+        let mut classes = [0usize; 6];
+        let mut highest_below_ones = 0u32;
+        for y in 0..h {
+            for x in 0..w {
+                let v = u32_at(px(x, y, 4), 0);
+                classes[match v {
+                    0 => 0,
+                    1..=15 => 1,
+                    16..=255 => 2,
+                    256..=0x00ff_ffff => 3,
+                    u32::MAX => 5,
+                    _ => 4,
+                }] += 1;
+                if v != u32::MAX {
+                    highest_below_ones = highest_below_ones.max(v);
+                }
+            }
+        }
+        tracing::info!(
+            format,
+            width = w,
+            height = h,
+            zero = classes[0],
+            one_to_15 = classes[1],
+            to_255 = classes[2],
+            to_24_bits = classes[3],
+            larger = classes[4],
+            all_ones = classes[5],
+            highest_below_ones,
+            "target values as words"
+        );
+    }
+    // Float colours (scene light) go through a cube root: scaled linearly,
+    // a night scene under one lamp of 50 units came out all black.
+    let curved = matches!(format, 1..=2 | 9..=10 | 26);
     for v in values {
-        let c = v.map(|c| (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8);
+        let c = v.map(|c| {
+            let t = ((c - low) / range).clamp(0.0, 1.0);
+            ((if curved { t.cbrt() } else { t }) * 255.0) as u8
+        });
         out.extend([c[0], c[1], c[2], 255]);
     }
     Some(out)

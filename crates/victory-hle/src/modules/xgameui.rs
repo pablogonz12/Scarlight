@@ -18,7 +18,7 @@ pub const PROVIDER: Guid = Guid::new(
     0x4043,
     [0xba, 0x07, 0x35, 0xd6, 0x07, 0xdf, 0x98, 0xb0],
 );
-/// As the title asks for it; the slots it calls (0x38,
+/// As the title (2026) asks for it; the slots it calls (0x38,
 /// 0x40, 0x88-0x98) take the public API's arguments in the 2020 order.
 pub const IID_2026: Guid = Guid::new(
     0xeaf6_69df,
@@ -111,9 +111,15 @@ fn limit(typed: &str, max: u32) -> String {
 }
 
 /// Asks the user in a modal host dialog; `None` if dismissed.
-#[cfg(not(test))]
+#[cfg(all(windows, not(test)))]
 fn ask(title: &str, description: &str, default: &str, max: u32) -> Option<String> {
     dialog::ask(title, description, default, max)
+}
+
+/// Off Windows there is no host dialog: the user dismisses it.
+#[cfg(all(not(windows), not(test)))]
+fn ask(_: &str, _: &str, _: &str, _: u32) -> Option<String> {
+    None
 }
 
 /// Tests answer for the user: "typed" for a title starting with "Type",
@@ -123,6 +129,7 @@ fn ask(title: &str, _: &str, default: &str, _: u32) -> Option<String> {
     title.starts_with("Type").then(|| format!("{default}typed"))
 }
 
+#[cfg(windows)]
 mod dialog {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;

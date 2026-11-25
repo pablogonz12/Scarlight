@@ -20,7 +20,7 @@ pub const PROVIDER: Guid = Guid::new(
     [0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e],
 );
 
-/// As the title asks for it. Its slots up to 0xd0 take the
+/// As the title (2026) asks for it. Its slots up to 0xd0 take the
 /// arguments the public API lists in the same order; 0x110 uninstalls a
 /// package, 0x128/0x130 mount one with UI, 0x138 enumerates packages.
 pub const IID_2026: Guid = Guid::new(

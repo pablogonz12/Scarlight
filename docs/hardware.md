@@ -43,16 +43,17 @@ draws correctly, and it does not prove a card has the features at run time: on R
 programs create, yet RADV does not advertise `VK_EXT_mesh_shader` there, and on Vega asking for one
 ended the process inside RADV instead of being refused.
 
-Both families below RDNA2 are now handled before the driver sees a mesh pipeline. The check asks the
-feature first: `VK_EXT_mesh_shader` in the offline harness, the D3D12 mesh-shader tier plus the
-adapter's device id in a run (RADV exposes mesh shaders from RDNA2 up, so a Vega or Navi 1x adapter is
-named by id). A mesh pipeline that cannot run is refused once, with the family in the warning, instead
-of being created; the title's own non-mesh path runs, the draws that named the refused pipeline are
-skipped, and the log counts how many were lost. Nothing changes on RDNA2 and newer: the RX 9070 XT
-still creates all 751.
+Both families below RDNA2 are now handled before the driver sees a mesh pipeline. In a run the check
+reads the D3D12 mesh-shader tier and, when that says yes, the adapter's device id: RADV exposes
+`VK_EXT_mesh_shader` from RDNA2 up, so a Vega or Navi 1x adapter is named by id and its mesh pipeline
+is refused once, with the family in the warning, instead of being created. The title's own non-mesh
+path then runs — the draws that named the refused pipeline are skipped — where before the pipeline
+went to a driver that either refused it or, on Vega, aborted the process. Nothing changes on RDNA2
+and newer: the RX 9070 XT still creates all 751. The same two families are the ones the offline matrix
+above skips.
 
-The one Intel miss on Arc A
-and Xe-LPG stops on the shim's own `drm_i915_query_item` gap, not on a shader the compiler refused.
+The one Intel miss on Arc A and Xe-LPG stops on the shim's own `drm_i915_query_item` gap, not on a
+shader the compiler refused.
 Only RDNA4 has actually been run, and every row above changes to Tested the day a report shows a run
 on it.
 

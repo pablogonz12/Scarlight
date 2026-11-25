@@ -177,7 +177,7 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
 }
 
 /// A title's wide path: the host path when it is on a virtual drive, else
-/// The title's own pointer.
+/// the title's own pointer.
 struct Wide(*const u16, Option<Vec<u16>>);
 
 impl Wide {

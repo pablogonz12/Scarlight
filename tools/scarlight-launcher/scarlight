@@ -506,6 +506,85 @@ rt_supported() {
 CHK_L=(); CHK_T=(); CHK_F=()
 chk() { CHK_L+=("$1"); CHK_T+=("$2"); CHK_F+=("${3:-}"); }
 
+# ---------- title profiles -------------------------------------------------
+# A profile says what one build of the title needs beyond the generic path
+# (code hooks, shaders to leave out). It is optional: without one the layer
+# runs with no title patches. The loader reads the first folder that holds one
+# for the image it is about to run: VICTORY_PROFILE_DIR, %APPDATA%\victory\
+# titles inside the prefix, then $XDG_CONFIG_HOME/victory/titles
+# (~/.config/victory/titles). Format: docs/title-profiles.md.
+# VICTORY_PROFILE_DIR is written for the Windows side (`Z:\home\you\...`),
+# so translate a drive path back to Unix: `Z:` is /, any other drive is the
+# prefix's drive_c. Nothing is done to a path that is already Unix.
+unix_path() { # unix_path <path>
+  case "$1" in
+    [A-Za-z]:[\\/]*)
+      local drive=${1%%:*} rest=${1#?:}
+      rest=${rest//\\//}
+      rest=${rest#/}
+      case "$drive" in
+        z|Z) printf '/%s\n' "$rest" ;;
+        *) printf '%s\n' "${PREFIX:-/nonexistent}/drive_${drive,,}/$rest" ;;
+      esac ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+profile_dirs() {
+  local d
+  [ -n "${VICTORY_PROFILE_DIR:-}" ] && unix_path "$VICTORY_PROFILE_DIR"
+  for d in "${PREFIX:-/nonexistent}"/drive_c/users/*/AppData/Roaming/victory/titles; do
+    [ -d "$d" ] && printf '%s\n' "$d"
+  done
+  printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/victory/titles"
+}
+
+# every profile file the folders above hold
+profile_files() {
+  local d f
+  while IFS= read -r d; do
+    [ -d "$d" ] || continue
+    for f in "$d"/*.toml; do
+      [ -f "$f" ] && printf '%s\n' "$f"
+    done
+  done <<EOF
+$(profile_dirs | awk '!seen[$0]++')
+EOF
+}
+
+# Ask the build itself (same lookup order, same hash) and translate the one
+# line it prints. Without a prefix or Wine it falls back to what the folders
+# hold, which is all a launch would find either.
+check_title_profile() {
+  local w out line f
+  [ -n "$PORT_EXE" ] && [ -f "$PORT_EXE" ] || return 0
+  [ -n "$GAME_EXE" ] && [ -f "$GAME_EXE" ] || return 0
+  w=$(wine_bin)
+  # `wine` may come from PATH: ask for it instead of testing the string.
+  if [ -d "$PREFIX" ] && command -v -- "$w" >/dev/null 2>&1 && have timeout; then
+    out=$(WINEPREFIX="$PREFIX" WINEDEBUG=-all VICTORY_LOG=error timeout 120 \
+          "$w" "$PORT_EXE" title-id "$GAME_EXE" 2>/dev/null) || out=""
+    line=$(printf '%s\n' "$out" | awk '/^profile /{ sub(/^profile +/, ""); print; exit }')
+    if [ -n "$line" ]; then
+      case "$line" in
+        # The build prints "none" or "none (searched ...)"; a profile path may
+        # start with "none" too, so match the sentinel exactly.
+        none|"none ("*) chk warn "No title profile for this build" \
+                 "the layer runs with no title patches; a profile is optional, see docs/title-profiles.md (VICTORY_PROFILE_DIR)" ;;
+        *) chk ok "Title profile: $line" ;;
+      esac
+      return 0
+    fi
+  fi
+  f=$(profile_files | head -n 1)
+  if [ -n "$f" ]; then
+    chk ok "Title profile: $f (the build decides at launch whether it is its own)"
+  else
+    chk warn "No title profile for this build" \
+             "the layer runs with no title patches; a profile is optional, see docs/title-profiles.md (VICTORY_PROFILE_DIR)"
+  fi
+}
+
 run_checks() {
   CHK_L=(); CHK_T=(); CHK_F=()
   local k maj ram p d w have_d3d12=0 have_dxil=0
@@ -636,6 +715,8 @@ EOF
   else
     chk warn "Wine prefix: $PREFIX does not exist yet" "it is created on the first launch, which takes a minute; nothing to do"
   fi
+
+  check_title_profile
 
   # report
   local i=0 fails=0 warns=0

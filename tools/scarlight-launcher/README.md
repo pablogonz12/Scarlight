@@ -35,8 +35,12 @@ the `Exec=` line to the full path. Nothing else is installed.
 
 1. **System check** - GPU and Vulkan driver (RADV/ANV/NVK, Vulkan 1.3+), Mesa version,
    kernel, RAM, Proton/GE builds found, vkd3d-proton and DXC DLLs present, build and game
-   exe set. Every line is `ok`, `warn` or `FAIL`, and a `FAIL` carries the one command or
-   step that fixes it.
+   exe set, and whether the build has a title profile. Every line is `ok`, `warn` or
+   `FAIL`, and a `FAIL` carries the one command or step that fixes it. A missing title
+   profile is a `warn`, not a failure: profiles are optional, the layer runs without one
+   and applies no title patches ("No title profile for this build"). The check asks the
+   build itself (`victory.exe title-id <exe>`) and reads the same folders the loader
+   reads, so the line matches what Play will do; see `docs/title-profiles.md`.
 2. **Main menu** - `Play` (the last setup), `Quick setup` (the three questions above),
    `Presets`, `Advanced`, `Logs`, `Help`.
 3. **Presets** - `Play`, `Performance`, `Picture debug`, `Developer` (skips the intros,

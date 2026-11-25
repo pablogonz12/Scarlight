@@ -1,53 +1,232 @@
 name: Release
 
+# A Scarlight release is <GE major>.<GE release>.<revision>: Scarlight 11.14.1
+# runs on GE-Proton11-14, and the revision counts within that GE release, so the
+# next GE rebase starts at 11.15.1. docs/RELEASES.md holds the scheme and the
+# cadence; tools/steam-compat/BASE names the GE-Proton, and package.sh derives
+# the version from it and the tags.
+#
+# Push a tag `v<major>.<release>.<revision>` (v11.14.1) and this builds the exe
+# on Linux, builds the vkd3d-proton pair the layer needs, packs the Steam
+# compatibility tool, and publishes a **pre-release** with the tarball, its
+# sha256, and the changelog section for that version as the body.
+#
+# Asset policy: nothing from any game, ever. What a release carries is our own
+# GPL-3.0 build, a vkd3d-proton pair built here from source (LGPL-2.1, whose
+# corresponding source is the archive this job attaches), and licence texts.
+# Microsoft's d3dcompiler_47.dll and DXC's two DLLs are never shipped: the user
+# supplies their own (docs/steam.md).
+
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*.*.*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (empty: use the ref, or a dev- run number)"
+        required: false
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
+  # vkd3d-proton at a pinned commit, not a release: 3.1 does not take the
+  # host-pointer import path the layer relies on (563eb6c is not in 3.1), and the
+  # dxil-spirv vkd3d-proton's own pin (34f0ff84) crashes on three of the 2,912
+  # runtime programs. So build both: the last measured pair, master ec20719 with
+  # dxil-spirv b540c8a2 (docs/DXIL-SPIRV-VERSION.md). Bumping either is a release
+  # note of its own: change it here and nowhere else.
+  VKD3D_REPO: https://github.com/HansKristian-Work/vkd3d-proton.git
+  VKD3D_COMMIT: ec20719
+  DXIL_SPIRV_REPO: https://github.com/HansKristian-Work/dxil-spirv.git
+  DXIL_SPIRV_COMMIT: b540c8a2
 
 jobs:
-  windows:
-    runs-on: windows-latest
+  exe:
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
-      # The version and components pinned in rust-toolchain.toml, as in ci.yml.
+      # The version, target and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
+      - name: Cross-build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang lld llvm
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-xwin
       - uses: Swatinem/rust-cache@v2
-      # The assets contain the binary, the licence and the docs only: no game files, ever.
-      - name: Build
-        run: cargo build --release -p victory --locked
-      - name: Stage assets
-        shell: pwsh
+        with:
+          key: release-xwin
+      - name: Build the Windows exe on Linux
+        run: cargo xwin build --release -p victory --target x86_64-pc-windows-msvc --locked
+      - uses: actions/upload-artifact@v7
+        with:
+          name: victory-exe
+          path: target/x86_64-pc-windows-msvc/release/victory.exe
+          if-no-files-found: error
+          retention-days: 3
+
+  # The two DLLs the layer hands the title's D3D12 calls to. Built here, from
+  # source, at the pinned pair above: no upstream release asset is binary-compatible
+  # with what the layer needs. Cached on the two commit ids, so a release that does
+  # not move them rebuilds nothing.
+  vkd3d:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        id: cache
+        with:
+          path: |
+            dlls-vkd3d
+            vkd3d-proton-source.tar.gz
+            vkd3d-submodules.txt
+          key: vkd3d-${{ env.VKD3D_COMMIT }}-dxilspirv-${{ env.DXIL_SPIRV_COMMIT }}
+      - name: Build vkd3d-proton at the pinned commit
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          $stage = "dist/Scarlight"
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item "target/release/victory.exe" $stage
-          Copy-Item "LICENSE", "README.md", "CREDITS.md", "victory.example.toml" $stage
-          Copy-Item "docs" $stage -Recurse
-          Compress-Archive -Path $stage -DestinationPath "dist/Scarlight-windows-x64.zip" -Force
-      - name: Release
-        shell: pwsh
+          set -euo pipefail
+          sudo apt-get update
+          # glslang: vkd3d-proton's meson.build wants glslangValidator even with
+          # -Denable_tests=false (it validates the builtin shaders it compiles).
+          sudo apt-get install -y --no-install-recommends \
+            build-essential meson ninja-build mingw-w64 python3 glslang-tools
+          # A short id is enough to check out once the history is here, and it is
+          # readable in the release notes; the full id is in VERSION and here.
+          git clone --quiet "$VKD3D_REPO" vkd3d-src
+          git -C vkd3d-src checkout --quiet "$VKD3D_COMMIT"
+          git -C vkd3d-src submodule update --init --recursive --quiet
+          echo "vkd3d-proton $(git -C vkd3d-src rev-parse HEAD)"
+          # Replace vkd3d-proton's own dxil-spirv pin with the one that survives
+          # the runtime program set (docs/DXIL-SPIRV-VERSION.md).
+          rm -rf vkd3d-src/subprojects/dxil-spirv
+          git clone --quiet "$DXIL_SPIRV_REPO" vkd3d-src/subprojects/dxil-spirv
+          git -C vkd3d-src/subprojects/dxil-spirv checkout --quiet "$DXIL_SPIRV_COMMIT"
+          git -C vkd3d-src/subprojects/dxil-spirv submodule update --init --recursive --quiet
+          echo "dxil-spirv $(git -C vkd3d-src/subprojects/dxil-spirv rev-parse HEAD)"
+          # The submodule switch is cached too, so the build that produced the pair
+          # is the one the source archive below holds.
+          git -C vkd3d-src submodule status | tee vkd3d-submodules.txt
+          meson setup vkd3d-src/build vkd3d-src \
+            --cross-file vkd3d-src/build-win64.txt --buildtype release \
+            -Denable_tests=false
+          ninja -C vkd3d-src/build
+          mkdir -p dlls-vkd3d
+          find vkd3d-src/build -type f \( -name d3d12.dll -o -name d3d12core.dll \) \
+            -exec cp '{}' dlls-vkd3d/ \;
+          ls -l dlls-vkd3d
+          # LGPL-2.1 section 6: the corresponding source of exactly that pair,
+          # with both submodules, travels with the release.
+          tar --exclude-vcs -czf vkd3d-proton-source.tar.gz vkd3d-src
+          tar -tzf vkd3d-proton-source.tar.gz > /dev/null
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vkd3d-dlls
+          path: |
+            dlls-vkd3d/*.dll
+            vkd3d-proton-source.tar.gz
+            vkd3d-submodules.txt
+          if-no-files-found: error
+          retention-days: 3
+
+  tool:
+    needs: [exe, vkd3d]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # package.sh counts the release tags of the GE series to pick the
+          # revision, so it needs the tags.
+          fetch-depth: 0
+      - uses: actions/download-artifact@v6
+        with:
+          name: victory-exe
+          path: exe
+      - uses: actions/download-artifact@v6
+        with:
+          name: vkd3d-dlls
+          path: dlls
+      - name: Pack the Steam compatibility tool
+        run: |
+          set -euo pipefail
+          # The version comes from package.sh - BASE plus the release tags of
+          # that GE series - unless a tag or a dispatch input names one; then it
+          # is the name of the tarball that was written.
+          version=""
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            version="${{ inputs.tag }}"
+          else
+            version="$GITHUB_REF_NAME"
+          fi
+          version="${version#v}"
+          # No --include-dxc: Microsoft's DLLs stay out of a Linux release.
+          tools/steam-compat/package.sh \
+            --vkd3d dlls/dlls-vkd3d \
+            --exe exe/victory.exe \
+            --version "$version" \
+            --vkd3d-version "master ${VKD3D_COMMIT} + dxil-spirv ${DXIL_SPIRV_COMMIT}" \
+            --vkd3d-source "this release's vkd3d-proton-source.tar.gz (vkd3d-proton ${VKD3D_COMMIT} with dxil-spirv ${DXIL_SPIRV_COMMIT})" \
+            --out dist
+          tarball="$(ls dist/Scarlight-*.tar.gz)"
+          version="$(basename "$tarball" .tar.gz)"
+          version="${version#Scarlight-}"
+          echo "PACKAGED_VERSION=$version" >> "$GITHUB_ENV"
+          tar -tzf "$tarball"
+      - name: Write the release body from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          version="$PACKAGED_VERSION"
+          {
+            echo "Scarlight $version — the Steam compatibility tool, running on GE-Proton11-14."
+            echo
+            # The changelog section for this version, verbatim: one place writes it.
+            awk -v v="$version" '
+              $0 == "## [" v "]" || $0 ~ "^## \\[" v "\\] - " { on = 1; next }
+              on && /^## / { exit }
+              on { print }
+            ' CHANGELOG.md
+            echo
+            echo "## Install"
+            echo
+            echo '```'
+            echo "mkdir -p ~/.local/share/Steam/compatibilitytools.d"
+            echo "tar -xzf Scarlight-$version.tar.gz -C ~/.local/share/Steam/compatibilitytools.d/"
+            echo '```'
+            echo
+            echo "Restart Steam, then pick **Scarlight $version** in the game's Properties > Compatibility."
+            echo "Needs GE-Proton11-14 (or a newer GE-Proton11-*): [proton-ge-custom releases](https://github.com/GloriousEggroll/proton-ge-custom/releases)."
+            echo "Full instructions: [docs/RELEASES.md](https://github.com/${{ github.repository }}/blob/main/docs/RELEASES.md)."
+            echo "DXC's dxil.dll and dxcompiler.dll are yours to add (docs/steam.md): Microsoft's terms leave them out of a Linux release."
+            echo "Ships vkd3d-proton ${VKD3D_COMMIT} with dxil-spirv ${DXIL_SPIRV_COMMIT} (LGPL-2.1); its corresponding source is attached."
+            echo "No game files, ever: Scarlight runs a copy of a game you own."
+          } > notes.md
+          cat notes.md
+      - name: Create the pre-release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ github.ref_name }}"
-          if ("${{ github.event_name }}" -eq "workflow_dispatch") { $tag = "dev-${{ github.run_number }}" }
-          gh release view $tag 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag "dist/Scarlight-windows-x64.zip" --clobber
-          } else {
-            gh release create $tag "dist/Scarlight-windows-x64.zip" --generate-notes --title $tag `
-              --target "$env:GITHUB_SHA" `
-              --notes "Windows x64 build from $tag. Reads files you supply; no game files are included or needed to build."
-          }
+          set -euo pipefail
+          tag="v$PACKAGED_VERSION"
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then tag="dev-${{ github.run_number }}"; fi
+          assets=(dist/Scarlight-"$PACKAGED_VERSION".tar.gz dlls/vkd3d-proton-source.tar.gz)
+          sha256sum "${assets[@]}" | sed 's#  .*/#  #' | tee SHA256SUMS.txt
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" SHA256SUMS.txt --clobber
+          else
+            gh release create "$tag" "${assets[@]}" SHA256SUMS.txt \
+              --prerelease --title "Scarlight $PACKAGED_VERSION" \
+              --target "$GITHUB_SHA" --notes-file notes.md
+          fi
       - uses: actions/upload-artifact@v7
         with:
-          name: Scarlight-windows-x64
-          path: dist/Scarlight-windows-x64.zip
+          name: Scarlight-steam-tool
+          path: |
+            dist/Scarlight-*
+            notes.md

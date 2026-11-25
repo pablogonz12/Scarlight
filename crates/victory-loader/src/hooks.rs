@@ -1,88 +1,335 @@
-//! Opt-in compatibility hooks for known title builds.
+//! Compatibility hooks placed in the title build being run.
 //!
-//! Only per-build offsets and short byte signatures live here (asset policy:
-//! nothing of the title itself). Every hook checks the build's hash and the
-//! exact bytes it replaces, and does nothing otherwise.
+//! What to patch and where comes from that build's profile
+//! (`victory_core::profile`), which the user keeps outside the repository;
+//! this module knows how to place a byte-checked patch, not what any one
+//! title needs. Nothing is applied unless `VICTORY_HOOKS` is set and the
+//! profile for the mapped image lists hooks.
 
 use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
-use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+use windows_sys::Win32::System::Memory::{
+    MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_NOACCESS,
+    VirtualProtect, VirtualQuery,
+};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-/// First 16 hex digits of the BLAKE3 of the Series X 1.0.2.1 executable.
-const BUILD_1_0_2_1: &str = "b99f876b74d4a77f";
+/// Environment variable that turns the profile's hooks on.
+pub(crate) const HOOKS_ENV: &str = "VICTORY_HOOKS";
+/// What the same switch was called before profiles carried the patches.
+pub(crate) const LEGACY_HOOKS_ENV: &str = "VICTORY_NO_WATCHDOG";
 
-/// Environment variable that turns the watchdog hook on.
-pub(crate) const NO_WATCHDOG_ENV: &str = "VICTORY_NO_WATCHDOG";
-
-/// One code patch: `rva` must hold exactly `expect` before `new` is written.
-struct Patch {
-    what: &'static str,
-    rva: usize,
-    expect: &'static [u8],
-    new: &'static [u8],
+/// Whether the user asked for the profile's hooks to be placed.
+pub(crate) fn enabled() -> bool {
+    [HOOKS_ENV, LEGACY_HOOKS_ENV]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some())
 }
 
-/// The title's watchdog thread ends the process on purpose when its main
-/// thread has not advanced for about 30 one-second ticks. Two places do it:
-/// the handler it calls (`mov dword ptr [0], imm32`) and, when the handler
-/// returns or is unset, a fallback right after the call (`mov dword ptr [0],
-/// 0; int3`). Jumping over the whole block returns the loop to its normal
-/// path; the first patch makes the handler harmless if something else calls it.
-const WATCHDOG: &[Patch] = &[
-    Patch {
-        what: "watchdog: skip the call and the fallback fault",
-        rva: 0x2215c27,
-        // mov rax, [rip + disp32] (the handler pointer)
-        expect: &[0x48, 0x8B, 0x05, 0x1A, 0x07, 0xFA, 0x04],
-        // jmp +0x18 (to the loop's normal continuation), then NOPs
-        new: &[0xEB, 0x18, 0x90, 0x90, 0x90, 0x90, 0x90],
-    },
-    Patch {
-        what: "watchdog: handler's deliberate fault",
-        rva: 0x23cf683,
-        expect: &[0xC7, 0x04, 0x25, 0, 0, 0, 0, 0x21, 0xD4, 0x8B, 0x4D],
-        // an eleven-byte NOP
-        new: &[0x66, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0, 0, 0, 0, 0],
-    },
-];
-
-/// Applies the watchdog patches whose bytes match. Returns how many applied.
+/// Applies the hooks the profile for `hash` lists. Returns how many applied.
+///
+/// A profile is the user's file, so every hook is checked before it is
+/// touched: the bytes must decode, `new` must be as long as `expect`, and
+/// `rva..rva+expect.len()` must lie inside the mapped image. Anything else is
+/// logged and skipped; a bad profile never faults the process.
 ///
 /// # Safety
-/// `base` is the mapped image whose original BLAKE3 is `hash`, and no title
-/// code is running yet.
-pub(crate) unsafe fn disarm_watchdog(base: usize, hash: &blake3::Hash) -> usize {
-    if !hash.to_hex().starts_with(BUILD_1_0_2_1) {
+/// `base` is the mapped image whose original BLAKE3 is `hash` and whose size
+/// is `size`, and no title code is running yet.
+pub(crate) unsafe fn apply_profile(base: usize, size: usize, hash: &blake3::Hash) -> usize {
+    let Some(profile) = victory_core::profile::current() else {
+        tracing::debug!("no title profile: no hooks to place");
+        return 0;
+    };
+    if !profile.matches(&hash.to_hex()) {
         return 0;
     }
-    WATCHDOG
-        .iter()
-        // SAFETY: forwarded from this function's contract.
-        .filter(|p| unsafe { apply(base, p) })
-        .count()
+    let mut applied = 0;
+    for hook in &profile.hooks {
+        let (Ok(expect), Ok(new)) = (hook.expected(), hook.replacement()) else {
+            tracing::warn!(what = hook.what, "hook skipped: its bytes do not decode");
+            continue;
+        };
+        if let Some(why) = unusable(&expect, &new, hook.rva, size) {
+            tracing::warn!(what = hook.what, "hook skipped: {why}");
+            continue;
+        }
+        // SAFETY: forwarded from this function's contract, and `unusable`
+        // checked that the whole hook lies inside the image.
+        if unsafe { apply(base, hook.rva as usize, &expect, &new, &hook.what) } {
+            applied += 1;
+        }
+    }
+    applied
 }
 
-/// # Safety
-/// See `disarm_watchdog`.
-unsafe fn apply(base: usize, p: &Patch) -> bool {
-    let at = (base + p.rva) as *mut u8;
-    // SAFETY: the offset is inside the mapped .text of this exact build.
-    let now = unsafe { std::slice::from_raw_parts(at, p.expect.len()) };
-    if now != p.expect || p.new.len() != p.expect.len() {
-        tracing::warn!(what = p.what, "hook skipped: the bytes are not the expected ones");
-        return false;
+/// Why a hook cannot be applied to an image of `size` bytes, if it cannot.
+fn unusable(expect: &[u8], new: &[u8], rva: u64, size: usize) -> Option<&'static str> {
+    if expect.is_empty() {
+        return Some("it has no bytes");
     }
-    let mut old = 0;
-    // SAFETY: changing the protection of those bytes only, restored below.
-    if unsafe { VirtualProtect(at as _, p.new.len(), PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
+    if new.len() != expect.len() {
+        return Some("its new bytes differ in length from its expect bytes");
+    }
+    match usize::try_from(rva) {
+        Ok(at) if at.checked_add(expect.len()).is_some_and(|end| end <= size) => None,
+        _ => Some("it lies outside the mapped image"),
+    }
+}
+
+/// One run of the hook's range and the protection it had: a range can span
+/// pages with different protections (code read-execute next to read-only
+/// data), and each must be given back what it had.
+struct Region {
+    at: usize,
+    len: usize,
+    protect: u32,
+}
+
+/// Makes `at..at+len` writable, one memory region at a time, returning what
+/// each region's protection was, or `None` if any part of it is not committed
+/// readable memory (a hook must never touch a guard page or a free range).
+///
+/// # Safety
+/// `at` must be an address a query may be asked about.
+unsafe fn writable(at: usize, len: usize) -> Option<Vec<Region>> {
+    let mut regions: Vec<Region> = Vec::new();
+    let end = at.checked_add(len)?;
+    let mut start = at;
+    while start < end {
+        // SAFETY: the buffer is a full `MEMORY_BASIC_INFORMATION`.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above; `VirtualQuery` writes at most one struct.
+        let asked = unsafe {
+            VirtualQuery(
+                start as *const _,
+                &mut info,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if asked == 0 {
+            // SAFETY: the regions taken so far are ours to give back.
+            unsafe { restore(&regions) };
+            return None;
+        }
+        let base = info.BaseAddress as usize;
+        let region_end = base.saturating_add(info.RegionSize);
+        let stop = region_end.min(end);
+        if info.State != MEM_COMMIT || !readable(info.Protect) || stop <= start {
+            // SAFETY: the regions taken so far are ours to give back.
+            unsafe { restore(&regions) };
+            return None;
+        }
+        let mut old = 0;
+        // SAFETY: the bytes belong to this image and stay mapped.
+        if unsafe { VirtualProtect(start as _, stop - start, PAGE_EXECUTE_READWRITE, &mut old) }
+            == 0
+        {
+            // SAFETY: the regions taken so far are ours to give back.
+            unsafe { restore(&regions) };
+            return None;
+        }
+        regions.push(Region {
+            at: start,
+            len: stop - start,
+            protect: old,
+        });
+        start = stop;
+    }
+    Some(regions)
+}
+
+/// Whether a protection lets us read the bytes.
+fn readable(protect: u32) -> bool {
+    protect & 0xff != PAGE_NOACCESS && protect & PAGE_GUARD == 0
+}
+
+/// Gives each region back the protection it had.
+///
+/// # Safety
+/// The ranges must still be the ones [`writable`] changed.
+unsafe fn restore(regions: &[Region]) {
+    for region in regions {
+        let mut old = 0;
+        // SAFETY: this range was made writable by `writable`.
+        unsafe { VirtualProtect(region.at as _, region.len, region.protect, &mut old) };
+    }
+}
+
+/// Writes `new` over `expect` at `base + rva` if the bytes there are the
+/// ones the profile says they are.
+///
+/// # Safety
+/// See [`apply_profile`].
+unsafe fn apply(base: usize, rva: usize, expect: &[u8], new: &[u8], what: &str) -> bool {
+    let at = (base + rva) as *mut u8;
+    // The hook may cross a page boundary, whose other side can be freed or
+    // guarded by the time we get here: ask before reading.
+    // SAFETY: the range was checked to lie inside the image; the query only
+    // reads the page tables.
+    let Some(regions) = (unsafe { writable(at as usize, expect.len()) }) else {
+        tracing::warn!(
+            what,
+            "hook skipped: its range is not committed readable memory"
+        );
+        return false;
+    };
+    // SAFETY: the range is committed, readable and now writable for its
+    // whole length.
+    let now = unsafe { std::slice::from_raw_parts(at, expect.len()) };
+    if now != expect {
+        // SAFETY: the regions are the ones `writable` changed.
+        unsafe { restore(&regions) };
+        tracing::warn!(what, "hook skipped: the bytes are not the expected ones");
         return false;
     }
     // SAFETY: writable now; the bytes are the ones checked above.
     unsafe {
-        std::ptr::copy_nonoverlapping(p.new.as_ptr(), at, p.new.len());
-        VirtualProtect(at as _, p.new.len(), old, &mut old);
-        FlushInstructionCache(GetCurrentProcess(), at as _, p.new.len());
+        std::ptr::copy_nonoverlapping(new.as_ptr(), at, new.len());
+        FlushInstructionCache(GetCurrentProcess(), at as _, new.len());
     }
-    tracing::info!(what = p.what, "hook applied");
+    // SAFETY: the regions are the ones `writable` changed.
+    unsafe { restore(&regions) };
+    tracing::info!(what, "hook applied");
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unusable;
+    use windows_sys::Win32::System::Memory::{
+        MEM_RELEASE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_READONLY, PAGE_READWRITE,
+        VirtualFree, VirtualProtect, VirtualQuery,
+    };
+
+    /// The protection `*at` has now, one page into its region.
+    fn protection(at: usize) -> u32 {
+        // SAFETY: a caller-chosen address in this process.
+        unsafe {
+            let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let asked = VirtualQuery(
+                at as *const _,
+                &mut info,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            );
+            assert_ne!(asked, 0, "VirtualQuery failed");
+            info.Protect
+        }
+    }
+
+    /// Two committed pages, `[0..page)` read-only and `[page..2page)` executable
+    /// read, filled with 0xAA.
+    struct Pages {
+        base: usize,
+    }
+
+    impl Pages {
+        fn new() -> Self {
+            use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, VirtualAlloc};
+            // SAFETY: a fresh reservation of two pages, filled by us.
+            unsafe {
+                let base = VirtualAlloc(
+                    std::ptr::null(),
+                    2 * page(),
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_READWRITE,
+                ) as usize;
+                assert_ne!(base, 0, "VirtualAlloc failed");
+                std::ptr::write_bytes(base as *mut u8, 0xAA, 2 * page());
+                let mut old = 0;
+                assert_ne!(
+                    VirtualProtect(base as _, page(), PAGE_READONLY, &mut old),
+                    0
+                );
+                assert_ne!(
+                    VirtualProtect((base + page()) as _, page(), PAGE_EXECUTE_READ, &mut old),
+                    0
+                );
+                Self { base }
+            }
+        }
+    }
+
+    impl Drop for Pages {
+        fn drop(&mut self) {
+            // SAFETY: the reservation made in `new`.
+            unsafe { VirtualFree(self.base as *mut _, 0, MEM_RELEASE) };
+        }
+    }
+
+    /// x86-64 Windows pages are 4 KiB, which is what these tests need to put
+    /// a hook across a boundary.
+    fn page() -> usize {
+        4096
+    }
+
+    #[test]
+    fn a_hook_across_two_pages_gives_each_page_its_own_protection_back() {
+        let pages = Pages::new();
+        // Four bytes centred on the boundary: two in each page.
+        let rva = page() - 2;
+        // SAFETY: both pages are ours, readable, and the hook lies inside them.
+        let applied = unsafe { super::apply(pages.base, rva, &[0xAA; 4], &[0xBB; 4], "test") };
+        assert!(applied);
+        // SAFETY: the four bytes were just written inside our own pages.
+        let bytes = unsafe { std::slice::from_raw_parts((pages.base + rva) as *const u8, 4) };
+        assert_eq!(bytes, [0xBB; 4]);
+        assert_eq!(protection(pages.base), PAGE_READONLY);
+        assert_eq!(protection(pages.base + page()), PAGE_EXECUTE_READ);
+    }
+
+    #[test]
+    fn a_hook_whose_range_is_not_committed_is_skipped_not_faulted() {
+        let pages = Pages::new();
+        // One byte into the second page, four bytes long: the last two are
+        // past the reservation, an unmapped range.
+        let rva = 2 * page() - 1;
+        // SAFETY: the first page is ours; the rest is not touched, only queried.
+        let applied = unsafe { super::apply(pages.base, rva, &[0xAA; 4], &[0xBB; 4], "test") };
+        assert!(!applied);
+        assert_eq!(protection(pages.base), PAGE_READONLY);
+    }
+
+    /// An image of 0x1000 bytes with a five-byte hook at 0x100.
+    const SIZE: usize = 0x1000;
+
+    #[test]
+    fn a_hook_inside_the_image_is_usable() {
+        assert_eq!(unusable(&[1, 2, 3], &[4, 5, 6], 0x100, SIZE), None);
+        // The last byte of the image is still inside it.
+        assert_eq!(unusable(&[1, 2, 3], &[4, 5, 6], 0xffd, SIZE), None);
+    }
+
+    #[test]
+    fn a_hook_past_the_end_of_the_image_is_refused() {
+        assert_eq!(
+            unusable(&[1, 2, 3], &[4, 5, 6], 0xffe, SIZE),
+            Some("it lies outside the mapped image")
+        );
+        assert_eq!(
+            unusable(&[1], &[4], 0x1000, SIZE),
+            Some("it lies outside the mapped image")
+        );
+    }
+
+    #[test]
+    fn an_rva_beyond_the_address_space_is_refused_not_wrapped() {
+        assert_eq!(
+            unusable(&[1, 2, 3], &[4, 5, 6], u64::MAX, SIZE),
+            Some("it lies outside the mapped image")
+        );
+        // The end would overflow `usize`: refused, not wrapped to a low one.
+        assert_eq!(
+            unusable(&[1, 2], &[3, 4], u64::MAX - 1, usize::MAX),
+            Some("it lies outside the mapped image")
+        );
+    }
+
+    #[test]
+    fn a_hook_whose_new_bytes_differ_in_length_is_refused() {
+        assert_eq!(
+            unusable(&[1, 2, 3], &[4, 5], 0x100, SIZE),
+            Some("its new bytes differ in length from its expect bytes")
+        );
+        assert_eq!(unusable(&[], &[], 0x100, SIZE), Some("it has no bytes"));
+    }
 }
