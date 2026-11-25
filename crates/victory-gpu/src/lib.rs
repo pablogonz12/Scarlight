@@ -40,6 +40,10 @@ mod inplace;
 pub mod list;
 pub mod object;
 pub mod pipeline;
+// Picked compares are the Windows paths' (`shadow`); the rule itself and
+// its tests run anywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod picked;
 #[cfg(windows)]
 mod primitive;
 pub mod query;

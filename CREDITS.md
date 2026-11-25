@@ -135,6 +135,13 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   `crates/victory-shader/src/dxbc.rs`; `Source::bytes()` for both the raw and the `SGD5` paths,
   `apps/victory/src/shader.rs`). Reimplemented on this tree's `victory translate`, which has no `warm` command.
 
+- **avatarmanz/VIctory-7900XTX** (GPL-3.0), commit [b1da72814](https://github.com/avatarmanz/VIctory-7900XTX/commit/b1da72814):
+  the scheme of `VICTORY_PICKED_WRITES`: a declared range is not compared whole, only the pages its shaders wrote,
+  learned from the compares themselves, with one page in 64 looked at in turn so that nothing stays missed, and
+  what is found late still landed (`crates/victory-gpu/src/picked.rs`; 69 -> 6 ms of page compares a frame on
+  his machine). Reimplemented for this tree's compares, which keep the snapshot per copy rather than the card's
+  hashes, and so need `VICTORY_KEEP_SNAPSHOTS=1`.
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
