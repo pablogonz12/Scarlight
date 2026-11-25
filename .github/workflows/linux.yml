@@ -53,7 +53,7 @@ jobs:
       # The launcher and the tooling are shell we ship; lint them where they run.
       - name: Shellcheck the shell under tools/
         run: |
-          mapfile -t scripts < <(git ls-files 'tools/*.sh' 'tools/**/*.sh' 'tools/scarlight-launcher/scarlight')
+          mapfile -t scripts < <(git ls-files 'tools/*.sh' 'tools/**/*.sh' 'tools/scarlight-launcher/scarlight' 'tools/steam-compat/scarlight')
           printf 'shellcheck %s\n' "${scripts[*]}"
           shellcheck --version | head -2
           shellcheck -x -S warning "${scripts[@]}"
