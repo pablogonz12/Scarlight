@@ -528,3 +528,183 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+#[test]
+fn ends_trivially_strips_execnz_setpc_trampoline() {
+    // s_cbranch_execnz +5 -> skip trampoline (s_getpc_b64 + s_add_u32 + s_addc_u32 + s_setpc_b64 -> s_endpgm)
+    let words = [
+        0xBF89_0005, // s_cbranch_execnz label_body (+5 dwords)
+        0xBE80_1F00, // s_getpc_b64 s[0:1] (PC after this = +4B; body starts after +20B, +1 word = +24B total)
+        0x8000_FF00, // s_add_u32 s0, s0, lit(20) -> jumps over trampoline (16B) + 1-word body (4B)
+        20,
+        0x8201_8001, // s_addc_u32 s1, s1, 0
+        0xBE80_2000, // s_setpc_b64 s[0:1]
+        0x7E00_0280, // v_mov_b32 v0, 0
+        S_ENDPGM,
+    ];
+    let n = native(&words);
+    let p = ir::build(&n.code, n.wave64, n.vgprs).expect("ir::build");
+    let eo = ir::without_early_outs(&p).expect("without_early_outs should strip execnz+setpc trampoline");
+    let sk = ir::without_skips(&p, false).expect("without_skips should strip execnz+setpc trampoline");
+    for form in [eo, sk] {
+        let branches = form
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.exit, ir::Exit::Branch { .. }))
+            .count();
+        assert_eq!(branches, 0);
+    }
+}
+
+#[test]
+fn multi_wave_widen_runs_group_any_on_hardware() {
+    let mut words = vec![
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
+        0x340E_0B06, // v_lshlrev_b32 v7, v6, v5
+        0x7D82_0000, // v_cmp_lt_u32 vcc, s0, v0 (true for t > s0)
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0017, // s_cbranch_execz +23 (past WAVE_OR + store)
+    ];
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend_from_slice(&[
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        0xBEFE_040C,          // s_mov_b64 exec, s[12:13]
+    ]);
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let br_block = p
+        .blocks
+        .iter()
+        .position(|b| b.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+        .expect("branch block");
+    let wide = HashSet::from([br_block]);
+    let shader = lowered(&native, &p, &wide).expect("multi-wave widen lowers on Wave32");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program (waves of 32?): {e}; not run");
+            return;
+        }
+    };
+    // Case 1: s0 = 96 -> only Wave 1 (lanes 97..127) is active; Wave 0 has EXEC = 0 on all 64 lanes.
+    // group_any lets both waves enter without deadlocking; only Wave 1 stores (0..31 -> 15..31 set => 0xFFFF_0000).
+    let expected: u32 = (97..128u32).fold(0u32, |acc, t| acc | (1u32 << ((t >> 1) & 31)));
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(vec![96, 0, 0, 0]))],
+                views: &[View::RawUav(1)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    assert_eq!(out[0][0], expected, "got {:#x}, expected {expected:#x}", out[0][0]);
+    // Case 2: s0 = 200 -> neither wave has any active lane; group_any skips store cleanly.
+    let out_empty = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(vec![200, 0, 0, 0]))],
+                views: &[View::RawUav(1)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    assert_eq!(out_empty[0][0], 0);
+}
+
+#[test]
+fn multi_wave_widen_rejects_divergent_scalar_branch() {
+    // Divergent scalar branch (`s_bcnt1` on `vcc` -> `s_cbranch_scc0`) enclosing a widened `s_cbranch_execz`
+    let mut words = vec![
+        0x7D82_0000, // v_cmp_lt_u32 vcc, s0, v0 (differs between wave 0 and wave 1 for s0=63)
+        0xBE80_106A, // s_bcnt1_i32_b64 s0, vcc
+        0xBF84_001D, // s_cbranch_scc0 label_end (+29)
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
+        0x340E_0B06, // v_lshlrev_b32 v7, v6, v5
+        0x7D82_0000, // v_cmp_lt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0017, // s_cbranch_execz +23
+    ];
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend_from_slice(&[
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16,
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ]);
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let br_block = p
+        .blocks
+        .iter()
+        .position(|b| b.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+        .expect("branch block");
+    let err = match lowered(&native, &p, &HashSet::from([br_block])) {
+        Ok(_) => panic!("must refuse wave-wide branch inside divergent scalar branch"),
+        Err(e) => e,
+    };
+    assert!(matches!(
+        err,
+        ShaderError::Unsupported { what, .. } if what.contains("divergent scalar branch")
+    ));
+}
+
+#[test]
+fn single_lane_readfirstlane_lowers_inside_divergent_scalar_branch() {
+    // Divergent scalar branch (`s_bcnt1` -> `s_cbranch_scc0`) containing a singleton `v_cmpx_eq(s_ff1(exec), v_mbcnt(-1))`
+    // and `v_readfirstlane_b32` whose result feeds only that single-lane store before restoring `EXEC`.
+    let words = [
+        0x7D82_0000, // v_cmp_lt_u32 vcc, s0, v0
+        0xBE80_106A, // s_bcnt1_i32_b64 s0, vcc
+        0xBF84_000C, // s_cbranch_scc0 +12 (to S_ENDPGM)
+        0xD765_0001, 0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xBE80_147E, // s_ff1_i32_b64 s0, exec
+        0xBE98_047E, // s_mov_b64 s[24:25], exec
+        0xD766_0001, 0x0002_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1
+        0x7D24_0200, // v_cmpx_eq_i32 exec, s0, v1
+        0x7E04_0500, // v_readfirstlane_b32 s2, v0 (v0 varies per lane; only one lane runs)
+        0x7E08_0202, // v_mov_b32 v4, s2
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16 | 4 << 8, // buffer_store_dword v4, off, s[8:11], 0
+        0xBEFE_0418, // s_mov_b64 exec, s[24:25]
+    ];
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource");
+    let io_v = io::raise(&p, &native).expect("io");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let out = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io_v,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    });
+    lower::TEST_HOST_WAVE.set(was);
+    let lowered = out.expect("single-lane readfirstlane should lower cleanly without barrier");
+    assert_eq!(lowered.wave_size, Some(32));
+}
