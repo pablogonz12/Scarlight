@@ -7721,10 +7721,12 @@ impl<'a> Lower<'a> {
         } else {
             (if high { v.opsel_hi } else { v.opsel }) >> k & 1 != 0
         };
-        let x = if float {
-            self.f16_operand(inst, &op)?
-        } else {
-            self.operand(inst, &op)?
+        // src0 as DPP fetched it (another lane's dword) comes first: the
+        // operand read would see this lane's own register.
+        let x = match (k, self.src0) {
+            (0, Some(x)) => x,
+            _ if float => self.f16_operand(inst, &op)?,
+            _ => self.operand(inst, &op)?,
         };
         let c = self.cur;
         let x = if sel {
