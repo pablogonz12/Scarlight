@@ -207,6 +207,34 @@ impl GraphicsState {
         )
     }
 
+    /// Whether this state describes a pass over the screen: no vertex input,
+    /// no depth or stencil testing, and triangles (the console's rectangle
+    /// and quad types draw as triangles on the host). Such passes fill
+    /// lighting tables once at world entry, and their shaders are few.
+    pub(crate) fn screen_pass(&self) -> bool {
+        let triangles = self.topology.0 == RECTANGLES
+            || self.topology.0 == QUADS
+            || self.topology.0 == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0;
+        self.inputs.is_empty()
+            && (self.depth_format == DXGI_FORMAT_UNKNOWN
+                || (!self.depth.DepthEnable.as_bool() && !self.depth.StencilEnable.as_bool()))
+            && triangles
+    }
+
+    /// A screen-pass state (see [`GraphicsState::screen_pass`]), for tests
+    /// of the routing to the screen pool in `make`.
+    #[cfg(test)]
+    pub(crate) fn screen_triangle_state() -> GraphicsState {
+        GraphicsState {
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            depth: D3D12_DEPTH_STENCIL_DESC {
+                DepthEnable: false.into(),
+                ..Default::default()
+            },
+            ..GraphicsState::default()
+        }
+    }
+
     /// The state as bytes for the warm-up file (`super::warmfile`): the
     /// plain structures as they are in memory (none holds a pointer), the
     /// input elements field by field with their names.
@@ -1485,5 +1513,38 @@ mod tests {
             255,
             "depth 0.5 inside [0.4, 0.6] must pass"
         );
+    }
+
+    /// A pass over the screen is triangles, no inputs, and no depth or
+    /// stencil test (a depth format alone does not make it one).
+    #[test]
+    fn screen_pass_requires_triangles_without_inputs_or_depth() {
+        let mut g = GraphicsState {
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            depth_format: DXGI_FORMAT_UNKNOWN,
+            ..Default::default()
+        };
+        assert!(g.screen_pass());
+
+        // The console's rectangle and quad types draw as triangles.
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(RECTANGLES);
+        assert!(g.screen_pass());
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(QUADS);
+        assert!(g.screen_pass());
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE.0);
+        assert!(!g.screen_pass());
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+
+        g.depth_format = DXGI_FORMAT_D32_FLOAT;
+        g.depth.DepthEnable = true.into();
+        assert!(!g.screen_pass());
+        g.depth.DepthEnable = false.into();
+        assert!(g.screen_pass());
+        g.depth.StencilEnable = true.into();
+        assert!(!g.screen_pass());
+        g.depth.StencilEnable = false.into();
+
+        g.inputs.push(D3D12_INPUT_ELEMENT_DESC::default());
+        assert!(!g.screen_pass());
     }
 }
