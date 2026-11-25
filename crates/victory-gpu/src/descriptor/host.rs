@@ -13,6 +13,70 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+/// How the "title slot past the host heap" line reads (`VICTORY_SLOT_DIAG`,
+/// read once at start-up).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SlotDiag {
+    /// The first slot past the heap says it, and no other. The title walks
+    /// its slots in increasing order, so a line per new high-water mark is a
+    /// line per slot: 199 846 of the first 200 000 lines of a run, ~8 000 a
+    /// second, on the thread recording the frame - the whole of the first
+    /// frame's 21 s stall (Marvisak/VIctory#2634).
+    Once,
+    /// One line per slot, as before: for a run that has to count them.
+    All,
+    /// Silent.
+    Off,
+}
+
+impl SlotDiag {
+    /// `VICTORY_SLOT_DIAG`: unset or `once` reads once, `all` reads every
+    /// slot (the old way), `0` or `off` reads none.
+    fn parse(value: Option<&str>) -> Self {
+        match value {
+            None | Some("once") => Self::Once,
+            Some("all") => Self::All,
+            Some("0" | "off") => Self::Off,
+            Some(_) => Self::Once,
+        }
+    }
+
+    /// The mode this process runs with.
+    fn now() -> Self {
+        static MODE: std::sync::OnceLock<SlotDiag> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| Self::parse(std::env::var("VICTORY_SLOT_DIAG").ok().as_deref()))
+    }
+}
+
+/// Says the "slot past the host heap" line for `index` in `mode`, reusing
+/// `once` to say it once per process (a `static` at the call site; a value of
+/// its own in the tests).
+fn say_slot_past(
+    once: &std::sync::Once,
+    mode: SlotDiag,
+    index: u32,
+    count: u32,
+    for_draw: bool,
+) {
+    let says = match mode {
+        SlotDiag::Off => false,
+        SlotDiag::All => true,
+        SlotDiag::Once => {
+            let mut says = false;
+            once.call_once(|| says = true);
+            says
+        }
+    };
+    if says {
+        tracing::warn!(
+            index,
+            count,
+            for_draw,
+            "title slot past the host heap: slots above the host heap's count are not mirrored"
+        );
+    }
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -1924,17 +1988,12 @@ impl HostHeap {
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
-            // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
-            static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
-                tracing::warn!(
-                    index,
-                    count = self.count,
-                    for_draw,
-                    "title slot past the host heap"
-                );
-            }
+            // Diagnostic (heap cap): slots above the host heap's count are not
+            // mirrored. The title walks them in increasing order, so a line per
+            // new high-water mark is one line per slot; `VICTORY_SLOT_DIAG`
+            // takes once (the default), every slot (the old way) or none.
+            static SAID: std::sync::Once = std::sync::Once::new();
+            say_slot_past(&SAID, SlotDiag::now(), index, self.count, for_draw);
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
@@ -3111,6 +3170,82 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A subscriber that only counts the lines said: what a diagnostic's cost
+    /// comes to offline.
+    #[derive(Clone, Default)]
+    struct Lines(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Lines {
+        fn said(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl tracing::Subscriber for Lines {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// The title asks for 1 245 184 slots, more than the 1 000 000 a host heap
+    /// holds, and walks them in increasing order. "Line when the high-water
+    /// mark moves" was therefore a line per slot: 199 846 of the first 200 000
+    /// lines of a run, ~8 000 a second, on the thread recording the frame,
+    /// which was the whole of the first frame's 21 s stall. A quarter of a
+    /// million slots past the heap now cost one line.
+    #[test]
+    fn a_slot_past_the_host_heap_is_said_once_not_per_slot() {
+        let lines = Lines::default();
+        tracing::subscriber::with_default(lines.clone(), || {
+            let once = std::sync::Once::new();
+            for index in 0..250_000u32 {
+                say_slot_past(&once, SlotDiag::Once, index, 1_000_000, true);
+            }
+        });
+        assert_eq!(lines.said(), 1);
+    }
+
+    /// The line can still be had per slot (the way it was, for a run that has
+    /// to count them) or not at all, and either way once it has been said in
+    /// the "once" mode it is not said again.
+    #[test]
+    fn the_slot_past_the_host_heap_follows_its_switch() {
+        let lines = Lines::default();
+        {
+            let lines = lines.clone();
+            tracing::subscriber::with_default(lines.clone(), move || {
+                let once = std::sync::Once::new();
+                for index in 0..3 {
+                    say_slot_past(&once, SlotDiag::All, index, 2, false);
+                }
+                assert_eq!(lines.said(), 3);
+                for index in 0..3 {
+                    say_slot_past(&once, SlotDiag::Off, index, 2, false);
+                }
+                assert_eq!(lines.said(), 3, "off says nothing");
+                say_slot_past(&once, SlotDiag::Once, 0, 2, false);
+                say_slot_past(&once, SlotDiag::Once, 1, 2, false);
+                assert_eq!(lines.said(), 4, "once, whatever the mode before it");
+            });
+        }
+        assert_eq!(SlotDiag::parse(None), SlotDiag::Once, "on by default");
+        assert_eq!(SlotDiag::parse(Some("once")), SlotDiag::Once);
+        assert_eq!(SlotDiag::parse(Some("all")), SlotDiag::All);
+        assert_eq!(SlotDiag::parse(Some("0")), SlotDiag::Off);
+        assert_eq!(SlotDiag::parse(Some("off")), SlotDiag::Off);
+        assert_eq!(SlotDiag::parse(Some("1")), SlotDiag::Once);
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
