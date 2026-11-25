@@ -89,6 +89,15 @@ enum Stop {
     Fail(ShaderError),
 }
 
+/// Whether a fixed load through a descriptor built around the program's code
+/// counts the byte it reads (its base plus the load's offset) when the
+/// constant table's start is chosen. `VICTORY_CODE_READS=0` turns it off: the
+/// table then starts at the descriptor's base again.
+fn code_reads_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CODE_READS").is_none_or(|v| v != "0"))
+}
+
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
@@ -1622,7 +1631,15 @@ impl<'a> Lower<'a> {
                     // A built descriptor's base is not the byte a load
                     // through it reads: that is the base plus the load's own
                     // offset, which can lie below the base.
-                    .chain(self.x.res.code_reads.iter().copied())
+                    .chain(
+                        if code_reads_on() {
+                            self.x.res.code_reads.as_slice()
+                        } else {
+                            &[]
+                        }
+                        .iter()
+                        .copied(),
+                    )
                     .filter(|a| a.param == CODE)
                     .map(|a| a.offset & !3)
                     .min()
