@@ -37,6 +37,30 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
+/// A name for this build, 16 hex digits of its BLAKE3: the same executable
+/// the shader cache keys its translations on, shortened for a directory
+/// name. A pipeline library is keyed on it, so a rebuilt VIctory never
+/// reads pipelines another build made (its entries are named after
+/// translated shaders, which a rebuild changes). `None` when our executable
+/// cannot be read: nothing about this run may be trusted to a name, so
+/// nothing is pruned either.
+pub(crate) fn build_name() -> Option<String> {
+    static NAME: OnceLock<Option<String>> = OnceLock::new();
+    NAME.get_or_init(|| {
+        // The executable's bytes alone: this is asked before the host GPU
+        // exists (the pipeline library is opened first), so nothing here
+        // may probe it as `build()` does.
+        match std::env::current_exe().and_then(std::fs::read) {
+            Ok(bytes) => Some(blake3::hash(&bytes).to_hex()[..16].to_owned()),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot read our executable; no other run's pipeline library is read");
+                None
+            }
+        }
+    })
+    .clone()
+}
+
 /// What identifies this build: the BLAKE3 of our executable file and of
 /// the translation settings it runs with (the loop limit, which a
 /// diagnostics build can change at run time).

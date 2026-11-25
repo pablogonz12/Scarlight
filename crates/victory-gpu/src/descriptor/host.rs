@@ -90,6 +90,13 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// [`HostHeap::made`] again in atomics, for the hit path of
+    /// [`HostHeap::mirror`]: the same key stored under the lock with Release,
+    /// so a slot already made from the record a draw names is recognised
+    /// without taking it. A slot is made once and then read by every draw and
+    /// every pass in between, so the lock was being taken for a lookup that
+    /// almost always found the slot up to date.
+    made_fast: Vec<std::sync::atomic::AtomicU64>,
     /// The slots made from a view narrowed to a part-resident texture's mips
     /// ([`narrow_to_resident`]): the texture, the mips the title asked for
     /// and those the host view names. More levels arriving (or a host copy
@@ -778,6 +785,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            made_fast: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             narrowed: Mutex::default(),
             narrowed_count: std::sync::atomic::AtomicUsize::new(0),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
@@ -1055,6 +1063,8 @@ impl HostHeap {
         if key == 0 {
             return;
         }
+        // Null from here on: the hit path must not read the slot as made.
+        self.made_fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
         match view_at(key as u32, (key >> 32) as u32) {
             Some(view) => null_for(&view, self.cpu(index)),
             None => null_view(self.cpu(index)),
@@ -1502,6 +1512,19 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        // The hit path: the slot was made from this very record and nothing
+        // has narrowed it since. `widen_due` is asked all the same: a host
+        // copy that brought more mips of a narrowed texture in wants a wider
+        // slot without the title's descriptor changing (#672).
+        if mirror_fast_on()
+            && tag == VIEW_TAG
+            && key != 0
+            && self.made_fast[index as usize].load(std::sync::atomic::Ordering::Acquire) == key
+            && !self.widen_due(index)
+            && let Some(view) = view_at(i, generation)
+        {
+            return Some(view);
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
@@ -1509,6 +1532,7 @@ impl HostHeap {
             // title released): nothing to read.
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
+                self.made_fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
@@ -1554,6 +1578,7 @@ impl HostHeap {
                 return Some(view);
             }
             made[index as usize] = if later { 0 } else { key };
+            self.made_fast[index as usize].store(if later { 0 } else { key }, std::sync::atomic::Ordering::Release);
             let kept = if later {
                 self.forget_narrowed(index);
                 None
@@ -1597,6 +1622,19 @@ impl HostHeap {
         }
         Some(text)
     }
+}
+
+/// Whether [`HostHeap::mirror`] may take its hit path without the lock
+/// (`VICTORY_MIRROR_FAST=0` off, the slow way: every slot through the mutex).
+fn mirror_fast_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| mirror_fast_from(std::env::var("VICTORY_MIRROR_FAST").ok().as_deref()))
+}
+
+/// [`mirror_fast_on`] from the variable's text: unset or anything but `0` is
+/// on, `0` is the slow way.
+fn mirror_fast_from(text: Option<&str>) -> bool {
+    text.map(str::trim) != Some("0")
 }
 
 /// Logs `what` the first time it happens.
@@ -2741,6 +2779,15 @@ mod tests {
     /// lines of a run, ~8 000 a second, on the thread recording the frame,
     /// which was the whole of the first frame's 21 s stall. A quarter of a
     /// million slots past the heap now cost one line.
+    #[test]
+    fn the_mirror_hit_path_is_on_by_default_and_has_an_off_switch() {
+        assert!(mirror_fast_from(None));
+        assert!(mirror_fast_from(Some("")));
+        assert!(mirror_fast_from(Some("1")));
+        assert!(!mirror_fast_from(Some("0")));
+        assert!(!mirror_fast_from(Some(" 0 ")));
+    }
+
     #[test]
     fn a_slot_past_the_host_heap_is_said_once_not_per_slot() {
         let lines = Lines::default();

@@ -54,7 +54,8 @@
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::sync::{Mutex, RwLock};
+use std::sync::Mutex;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
@@ -577,10 +578,19 @@ struct Views {
     sections: Vec<(usize, u64, bool)>,
 }
 
-static VIEWS: Mutex<Views> = Mutex::new(Views { views: BTreeMap::new(), sections: Vec::new() });
+static VIEWS: RwLock<Views> = RwLock::new(Views { views: BTreeMap::new(), sections: Vec::new() });
 
-fn views() -> std::sync::MutexGuard<'static, Views> {
-    VIEWS.lock().unwrap_or_else(|e| e.into_inner())
+/// The views, for reading. Every in-place ask asks [`cover`], and the level-2
+/// default asks it for every window and every title buffer, while the runtime
+/// writes a view only when it maps one: a read lock keeps those asks off each
+/// other instead of queueing them behind one mutex.
+fn views_read() -> RwLockReadGuard<'static, Views> {
+    VIEWS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The views, for the runtime to change them.
+fn views_write() -> RwLockWriteGuard<'static, Views> {
+    VIEWS.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The runtime's placeholder reservations (`MEM_RESERVE_PLACEHOLDER`, made by
@@ -632,7 +642,7 @@ pub(crate) fn placeholder_mapped_bytes(start: usize, len: usize) -> Option<u64> 
         return None;
     }
     PLACEHOLDER_HITS[2].fetch_add(1, Ordering::Relaxed);
-    Some(mapped_bytes_in(&views(), start, start.saturating_add(len)))
+    Some(mapped_bytes_in(&views_read(), start, start.saturating_add(len)))
 }
 
 /// The merged runs `(from, to)` of 64 KiB blocks of `[from_block, to_block)`
@@ -646,7 +656,7 @@ pub(crate) fn placeholder_mapped_blocks(from_block: usize, to_block: usize) -> O
     if !placeholder_range(start, end) {
         return None;
     }
-    let v = views();
+    let v = views_read();
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut push = |lo: usize, hi: usize| {
         let (lo, hi) = ((lo / K64).max(from_block), hi.div_ceil(K64).min(to_block));
@@ -689,7 +699,7 @@ fn mapped_bytes_in(v: &Views, start: usize, end: usize) -> u64 {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
-    let mut v = views();
+    let mut v = views_write();
     v.sections.retain(|s| s.0 != section);
     v.sections.push((section, bytes, committed));
 }
@@ -697,14 +707,14 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
-    views().views.insert(at, (len, section, offset));
+    views_write().views.insert(at, (len, section, offset));
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
 /// the views that touch it are forgotten (the runtime tells again those it
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
-    let mut v = views();
+    let mut v = views_write();
     if v.views.is_empty() {
         return;
     }
@@ -749,7 +759,7 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
 
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.
 pub(crate) fn cover(at: usize, len: usize) -> Cover {
-    cover_in(&views().views, at, len)
+    cover_in(&views_read().views, at, len)
 }
 
 /// Whether `[at, at + len)` is private memory, all committed and
@@ -1324,7 +1334,7 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
             }
         }
     }
-    let v = views();
+    let v = views_read();
     let (count, bytes) = (v.views.len(), v.views.values().map(|view| view.0 as u64).sum::<u64>());
     let pages = v.views.values().filter(|view| view.0 == K64).count();
     let big = v.views.values().map(|view| view.0).max().unwrap_or(0);
@@ -1334,13 +1344,26 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         big >> 20
     ));
     for &(_, bytes, committed) in &v.sections {
-        lines.push(format!(
-            "census, a section of {} MB, {}",
-            bytes >> 20,
-            if committed { "committed: it can be opened as one heap" } else { "reserved: refused as a heap until it is made with SEC_COMMIT" }
-        ));
+        lines.push(format!("census, a section of {} MB, {}", bytes >> 20, section_verdict(committed)));
     }
     lines
+}
+
+/// What the census says of a section's memory, by whether it was made with
+/// `SEC_COMMIT`. Not "it can be opened as one heap": measured on this machine
+/// (`xcl-bin/notes/zero-copy.md` 6), a committed section cannot be. Its handle
+/// and its view both open, and the import under them fails (RADV refuses a
+/// file-backed host pointer, `VkAllocateMemory` giving `hr 0x8007000e`), after
+/// which vkd3d-proton quietly hands the buffers memory of its own: the API
+/// says yes, the GPU reads and writes somewhere else, and 267,386,880 of
+/// 268,435,456 bytes read back at the title's own address are wrong. Only
+/// private memory committed whole is placed, which is what [`From`] has.
+fn section_verdict(committed: bool) -> &'static str {
+    if committed {
+        "committed: not openable under Wine (the import of a section's pages is refused; measured, notes/zero-copy.md 6)"
+    } else {
+        "reserved: refused as a heap until it is made with SEC_COMMIT, and to no use then (the same refusal)"
+    }
 }
 
 /// With [`probe_level`] 2: one part of the title's own private memory
@@ -1517,6 +1540,18 @@ mod tests {
     /// The self-check decides the whole run: only "the bytes arrived both
     /// ways" keeps title memory in place; a refusal, a silent fallback and a
     /// check that could not be made leave every copy a copy.
+    #[test]
+    fn the_census_does_not_promise_a_section_heap() {
+        // #1117 places buffers over committed sections; under Wine the import
+        // is refused and vkd3d silently substitutes its own memory, so the
+        // census must never read as an invitation to place over one.
+        for committed in [true, false] {
+            let said = section_verdict(committed);
+            assert!(!said.contains("can be opened"), "{said}");
+            assert!(said.contains("not openable") || said.contains("no use"), "{said}");
+        }
+    }
+
     #[test]
     fn only_a_host_that_reads_our_pages_keeps_memory_in_place() {
         assert!(in_place(Health::Sound));
