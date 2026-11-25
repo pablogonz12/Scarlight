@@ -6372,6 +6372,14 @@ impl Meter {
     }
 }
 
+/// What a present shows: the base plane, the overlay composed over it when
+/// there is one, and the title resource whose newest content goes up first.
+#[derive(Clone, Copy)]
+struct Presenting<'a> {
+    overlay: Option<(&'a ID3D12Resource, u32)>,
+    fill: Option<crate::object::This>,
+}
+
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `resource` is the title
@@ -6390,9 +6398,11 @@ impl Host {
         self.present_planes(
             texture,
             state,
-            None,
+            Presenting {
+                overlay: None,
+                fill: fill.then_some(resource),
+            },
             frame,
-            fill.then_some(resource),
             PresentCompositor::new,
             #[cfg(all(test, feature = "diagnostics"))]
             |_, _| {},
@@ -6415,24 +6425,23 @@ impl Host {
         self.present_planes(
             texture,
             state,
-            Some((overlay, overlay_state)),
+            Presenting {
+                overlay: Some((overlay, overlay_state)),
+                fill: None,
+            },
             frame,
-            None,
             PresentCompositor::new,
             #[cfg(all(test, feature = "diagnostics"))]
             |_, _| {},
         )
     }
 
-    /// `fill`: the title resource whose newest content this present puts up
-    /// first ([`crate::texture::present_fill_pending`]), if any.
     fn present_planes(
         &self,
         texture: &ID3D12Resource,
         state: u32,
-        overlay: Option<(&ID3D12Resource, u32)>,
+        Presenting { overlay, fill }: Presenting<'_>,
         frame: u64,
-        fill: Option<crate::object::This>,
         create: impl Fn(&ID3D12Device, DXGI_FORMAT) -> windows::core::Result<PresentCompositor>,
         #[cfg(all(test, feature = "diagnostics"))] inspect: impl FnOnce(
             &ID3D12Resource,

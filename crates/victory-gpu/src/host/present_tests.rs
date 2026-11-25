@@ -129,9 +129,11 @@ fn check_present(
     let result = host.present_planes(
         primary,
         SOURCE_STATE,
-        Some((overlay, SOURCE_STATE)),
+        Presenting {
+            overlay: Some((overlay, SOURCE_STATE)),
+            fill: None,
+        },
         frame,
-        None,
         create,
         |buffer, footprint| {
             assert_pixels(buffer, footprint, expected, case);
