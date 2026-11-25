@@ -46,6 +46,7 @@ pub mod pipeline;
 mod primitive;
 pub mod query;
 pub mod queue;
+mod reflection;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -62,6 +63,8 @@ mod shadow;
 pub mod signature;
 #[cfg(all(windows, test))]
 mod test_device;
+#[cfg(windows)]
+mod texback;
 #[cfg(windows)]
 mod texture;
 #[cfg(all(test, windows))]
