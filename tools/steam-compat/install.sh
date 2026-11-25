@@ -80,6 +80,19 @@ if [ -n "$PROTON" ] && [ "${PROTON#/}" != "$PROTON" ]; then
   [ -x "$PROTON/files/bin/wine" ] || { echo "no Wine at $PROTON/files/bin/wine" >&2; exit 1; }
 else
   if [ -z "$PROTON" ]; then
+    # The GE-Proton this checkout is built for (the BASE file next to this
+    # script), then the newest Proton installed.
+    BASE="$(sed -n '1{s/[[:space:]]*$//;p;}' "$HERE/BASE" 2>/dev/null || true)"
+    if [ -n "$BASE" ]; then
+      for name in "$BASE-x86_64" "$BASE"; do
+        if [ -x "$DEST/$name/files/bin/wine" ]; then
+          PROTON="$name"
+          break
+        fi
+      done
+    fi
+  fi
+  if [ -z "$PROTON" ]; then
     PROTON="$(cd "$DEST" && { ls -d GE-Proton* Proton* 2>/dev/null || true; } | sort -V | tail -1)"
   fi
   [ -n "$PROTON" ] && [ -x "$DEST/$PROTON/files/bin/wine" ] || {
@@ -122,6 +135,8 @@ fi
 
 mkdir -p "$T/files"
 install -m 755 "$HERE/scarlight" "$T/scarlight"
+# The GE-Proton this checkout is built for: the entry script reads it from here.
+install -m 644 "$HERE/BASE" "$T/BASE"
 install -m 644 "$EXE" "$T/files/victory-default.exe"
 for f in d3d12.dll d3d12core.dll dxil.dll dxcompiler.dll; do
   install -m 644 "$DLLS/$f" "$T/files/"

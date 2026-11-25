@@ -76,6 +76,25 @@ def row_table(area):
     return "\n".join(out)
 
 
+def isa_section():
+    """The source-counted ISA section, written by shader_scan.py.
+
+    It lives in its own file so this renderer stays the only writer of
+    docs/PROGRESS.md and the per-title numbers stay the only thing
+    collect.sh touches.
+    """
+    path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "docs",
+        "progress",
+        "isa.md",
+    )
+    if not os.path.exists(path):
+        return ""
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+
 def page(doc):
     head = doc["header"]
     lines = ["# Progress", ""]
@@ -108,6 +127,10 @@ def page(doc):
     for row in doc["method"]:
         lines.append("- **%s**: %s" % (row["area"], row["how"]))
     lines.append("")
+    isa = isa_section()
+    if isa:
+        lines.append(isa)
+        lines.append("")
     lines.append(doc["footer"])
     lines.append("")
     return "\n".join(lines)

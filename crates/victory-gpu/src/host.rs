@@ -912,6 +912,17 @@ fn lazy_prelude() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
 }
 
+/// Whether the presented texture's move to the copy state is the present
+/// list's, as it is any list's (`HostList::settle`): its real state is
+/// swapped at submission, in `prelude`, and no barrier is recorded when it
+/// is already there. Off (`VICTORY_PRESENT_PRELUDE=0`): the move is
+/// recorded by hand from the state it was recorded in, and back, even when
+/// that is `COPY_SOURCE` itself.
+fn present_prelude() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_PRELUDE").is_none_or(|v| v != "0"))
+}
+
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
@@ -4767,7 +4778,7 @@ impl HostList {
     /// as [`HostList::transition`] does a title resource's host copy, and
     /// records the barrier: for textures that are not a title resource's
     /// host copy (colour twins) and for the copies between the two.
-    fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
+    pub(crate) fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
         let wanted = legal_state(&copy.texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
@@ -6053,6 +6064,19 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// When the last frame was counted, and the submission counters as they
+    /// were then, for the frame budget (`crate::frame_budget`): what of a
+    /// frame is ours and its card's, taken off the sums the line above uses.
+    shown: std::time::Instant,
+    counters: [u64; 5],
+    /// What a delta could not take at the last sample, carried to the next
+    /// one (see `budget`): positive when the one-second line's `swap(0)`
+    /// consumed it first, negative when a worker's provisional addition was
+    /// taken back (`PREPARING[0]`), so every increment is in exactly one
+    /// frame's report and the sums of the deltas are the counters' own.
+    carry: [i64; 5],
+    /// When the frame budget last said a line (a present holds the meter).
+    said: Option<std::time::Instant>,
 }
 
 impl Meter {
@@ -6066,6 +6090,57 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            shown: now,
+            counters: [0; 5],
+            carry: [0; 5],
+            said: None,
+        }
+    }
+
+    /// Says what a frame past the budget was bound by
+    /// ([`crate::frame_budget`]): its parts, the largest named.
+    fn budget(&mut self) {
+        // With the report off nothing is measured: not the clock, not the
+        // counters (`VICTORY_FRAME_BUDGET=0`).
+        if !crate::frame_budget::enabled() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let frame = now.saturating_duration_since(self.shown);
+        self.shown = now;
+        let counters = [
+            SUBMISSION_US[0].load(Ordering::Relaxed),
+            SUBMISSION_US[1].load(Ordering::Relaxed),
+            COPY_BACK[0].load(Ordering::Relaxed),
+            PREPARING[0].load(Ordering::Relaxed),
+            PREPARING[2].load(Ordering::Relaxed),
+        ];
+        // A delta is what the counter holds now less what the last sample
+        // took, plus what that sample could not take: signed, because a
+        // worker adds its time before `Batch::flush` takes back the part
+        // over the wall time, so a counter can go down between two samples.
+        let mut parts = [std::time::Duration::ZERO; 5];
+        let mut carry = [0_i64; 5];
+        for i in 0..5 {
+            let delta = counters[i] as i64 - self.counters[i] as i64;
+            let total = self.carry[i].saturating_add(delta);
+            if total < 0 {
+                carry[i] = total;
+            } else {
+                parts[i] = std::time::Duration::from_micros(total as u64);
+            }
+        }
+        let phases = crate::frame_budget::Phases {
+            preparing: parts[0],
+            gpu: parts[1],
+            back: parts[2],
+            copies: parts[3],
+            textures: parts[4],
+        };
+        self.counters = counters;
+        self.carry = carry;
+        if let Some(text) = crate::frame_budget::say(frame, &phases, &mut self.said) {
+            tracing::warn!("{text}");
         }
     }
 
@@ -6075,6 +6150,7 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
+        self.budget();
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
@@ -6091,16 +6167,27 @@ impl Meter {
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
-        let [cpu, gpu] = [0, 1].map(|i| {
-            SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
-        });
-        let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
-            let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
-            PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
-        });
-        let [back_ms, back_mb] = [0, 1].map(|i| {
-            COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
-        });
+        let cpu_gpu = [0, 1].map(|i| SUBMISSION_US[i].swap(0, Ordering::Relaxed));
+        let preparing = [0, 1, 2, 3].map(|i| PREPARING[i].swap(0, Ordering::Relaxed));
+        let back = [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed));
+        let [cpu, gpu] = cpu_gpu.map(|us| us as f64 / 1000.0 / frames);
+        let [copy_ms, copy_mb, texture_ms, texture_mb] = [
+            preparing[0] as f64 / 1e3 / frames,
+            preparing[1] as f64 / 1e6 / frames,
+            preparing[2] as f64 / 1e3 / frames,
+            preparing[3] as f64 / 1e6 / frames,
+        ];
+        let [back_ms, back_mb] = [back[0] as f64 / 1e3 / frames, back[1] as f64 / 1e6 / frames];
+        // The sums above are from zero again. What landed between the frame
+        // budget's last sample and these swaps was taken here and not there,
+        // so the next frame's delta starts with it: every increment is in
+        // exactly one of the two.
+        let swapped = [cpu_gpu[0], cpu_gpu[1], back[0], preparing[0], preparing[2]];
+        for i in 0..5 {
+            let landed = swapped[i] as i64 - self.counters[i] as i64;
+            self.carry[i] = self.carry[i].saturating_add(landed);
+        }
+        self.counters = [0; 5];
         let dropped = crate::draw::take_dropped() as f64 / frames;
         // Of those, the ones whose pipeline was refused (lost every frame)
         // and those still being made (lost this one).
@@ -6314,21 +6401,21 @@ impl Meter {
 }
 
 impl Host {
-    /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `resource` is the title
-    /// resource it is the host copy of, and `fill`: put up the title's
-    /// newest content of it in this present's own list first
-    /// ([`crate::texture::present_fill_pending`]). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
+    /// Shows `source`, the title texture's host copy, as frame `frame` (saved
+    /// if captures are on). `resource` is the title resource it is the host
+    /// copy of, and `fill`: put up the title's newest content of it in this
+    /// present's own list first ([`crate::texture::present_fill_pending`]).
+    /// `None` if nothing was shown; else, in diagnostics builds, whether the
+    /// frame was black.
     pub(crate) fn present(
         &self,
         resource: crate::object::This,
-        texture: &ID3D12Resource,
-        state: u32,
+        source: &std::sync::Arc<crate::resource::HostTexture>,
         frame: u64,
         fill: bool,
     ) -> Option<bool> {
-        // SAFETY: a live resource.
+        let texture = &source.texture;
+        // SAFETY: a live resource held alive by `source`.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
@@ -6362,8 +6449,8 @@ impl Host {
                 }
             }
         }
-        let state = D3D12_RESOURCE_STATES(state as i32);
-        // SAFETY: our swap chain, list and a live source texture.
+        let state = D3D12_RESOURCE_STATES(source.state.load(Ordering::Relaxed) as i32);
+        // SAFETY: our swap chain, list and a live source texture held by `source`.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
@@ -6400,30 +6487,55 @@ impl Host {
             // texture uploaded -- one recorded before its refresh found the
             // newest bytes holds a frame behind, and two textures taking
             // turns then show their frames out of order (the intro's movie).
+            // The texture's move to the copy state is the list's, as it is
+            // any list's: the first use here records nothing and the list's
+            // prelude moves it from its real state at submission, under the
+            // submission lock, recording no barrier at all when it is
+            // already in a copy state (the title may have left it in
+            // `COPY_SOURCE`, and `COPY_SOURCE -> COPY_SOURCE` is illegal).
+            // It ends in `COPY_SOURCE`, which is what the prelude then
+            // records as its real state.
+            let by_hand = !present_prelude();
             let filling = fill
                 && slot.is_none()
                 && crate::texture::title_written(texture)
                 && crate::texture::present_fill_pending(resource);
             if filling {
-                list.ResourceBarrier(&[transition(texture, state, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                if by_hand {
+                    list.ResourceBarrier(&[transition(texture, state, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                } else {
+                    copy.settle(source, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+                }
                 crate::texture::present_fill(copy, resource, texture);
             }
-            list.ResourceBarrier(&[
-                transition(
-                    texture,
-                    if filling {
-                        D3D12_RESOURCE_STATE_COPY_DEST
-                    } else {
-                        state
-                    },
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                ),
-                transition(
+            if by_hand {
+                list.ResourceBarrier(&[
+                    transition(
+                        texture,
+                        if filling {
+                            D3D12_RESOURCE_STATE_COPY_DEST
+                        } else {
+                            state
+                        },
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    ),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ),
+                ]);
+            } else {
+                // The copy up runs with the texture in `COPY_SOURCE`: after
+                // the fill it is in `COPY_DEST`, and `settle` records that
+                // move too.
+                copy.settle(source, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+                list.ResourceBarrier(&[transition(
                     &back,
                     D3D12_RESOURCE_STATE_PRESENT,
                     D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
+                )]);
+            }
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
             let shot = crate::capture::take_request();
@@ -6435,14 +6547,25 @@ impl Host {
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
+            if by_hand {
+                list.ResourceBarrier(&[
+                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    ),
+                ]);
+            } else {
+                // The texture stays in `COPY_SOURCE`, as the list's prelude
+                // recorded it: the title's own lists then move it from
+                // there (`HostList::prelude`).
+                list.ResourceBarrier(&[transition(
                     &back,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+                )]);
+            }
             copy.close();
             match slot {
                 Some(i) => {
@@ -7043,3 +7166,112 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+
+#[cfg(test)]
+mod copy_source_state_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    use super::*;
+
+    const COPY_DEST: u32 = 0x400;
+    const COPY_SOURCE: u32 = 0x800;
+    const RENDER_TARGET: u32 = 0x4;
+
+    /// A committed texture in `state` and its host copy, as the host copy of
+    /// a texture the title presents has one.
+    fn texture(host: &Host, state: u32) -> Arc<crate::resource::HostTexture> {
+        let mut resource: Option<ID3D12Resource> = None;
+        // SAFETY: plain committed 2D texture on the live host device.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: 64,
+                        Height: 64,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATES(state as i32),
+                    None,
+                    &mut resource,
+                )
+                .unwrap();
+        }
+        Arc::new(crate::resource::HostTexture::new(
+            resource.unwrap(),
+            state,
+        ))
+    }
+
+    /// A texture the title left in `COPY_SOURCE`, as the present finds it:
+    /// the present list's first use of it records no barrier at all, so no
+    /// illegal `COPY_SOURCE -> COPY_SOURCE` reaches the card, and its
+    /// recorded state stays where it is.
+    #[test]
+    fn a_copy_source_texture_is_moved_nowhere_by_the_present_list() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let source = texture(host, COPY_SOURCE);
+        let list = host.new_list().unwrap();
+        // What the present does before its copy up.
+        list.settle(&source, COPY_SOURCE);
+        assert!(list.prelude().is_none(), "no self-transition is recorded");
+        assert_eq!(source.state.load(Relaxed), COPY_SOURCE);
+        // And what it does after a fill: the same state again.
+        list.settle(&source, COPY_SOURCE);
+        assert!(list.prelude().is_none());
+        assert_eq!(source.state.load(Relaxed), COPY_SOURCE);
+    }
+
+    /// From another state the move is recorded once, by the prelude, which
+    /// is where the recorded state becomes `COPY_SOURCE` (what the copy
+    /// leaves the texture in). The next present records nothing more.
+    #[test]
+    fn a_texture_in_another_state_is_moved_to_copy_source_once() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let source = texture(host, RENDER_TARGET);
+        let list = host.new_list().unwrap();
+        list.settle(&source, COPY_SOURCE);
+        assert!(
+            list.prelude().is_some(),
+            "the move from the state it was left in is recorded"
+        );
+        assert_eq!(source.state.load(Relaxed), COPY_SOURCE);
+        let next = host.new_list().unwrap();
+        next.settle(&source, COPY_SOURCE);
+        assert!(next.prelude().is_none(), "the card is there already");
+    }
+
+    /// The fill goes through `COPY_DEST` and is given back to `COPY_SOURCE`
+    /// in the list: the prelude moves it to the copy destination only, and
+    /// the card is left in `COPY_SOURCE`.
+    #[test]
+    fn a_filled_present_starts_in_copy_dest_and_ends_in_copy_source() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let source = texture(host, RENDER_TARGET);
+        let list = host.new_list().unwrap();
+        list.settle(&source, COPY_DEST);
+        list.settle(&source, COPY_SOURCE);
+        assert!(list.prelude().is_some());
+        assert_eq!(source.state.load(Relaxed), COPY_SOURCE);
+    }
+}

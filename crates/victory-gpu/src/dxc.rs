@@ -245,11 +245,15 @@ fn dxc(source: &str, entry: &str, target: &str) -> windows::core::Result<Vec<u8>
 fn library() -> windows::core::Result<HMODULE> {
     let mut paths: Vec<PathBuf> = Vec::new();
     if let Some(p) = std::env::var_os("VICTORY_DXC").map(PathBuf::from) {
-        paths.push(if p.is_dir() {
+        let p = if p.is_dir() {
             p.join("dxcompiler.dll")
         } else {
             p
-        });
+        };
+        // `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` wants a fully qualified path, so
+        // a relative one (`VICTORY_DXC=.\sdk`) is resolved against this
+        // process's working directory first.
+        paths.push(std::path::absolute(&p).unwrap_or(p));
     }
     if let Some(dir) = victory_shader::emit::validator::Validator::default_path()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
