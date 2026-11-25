@@ -51,9 +51,20 @@ pub(crate) fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
+        // The compute programs' own limit is part of their translation too: a
+        // run with only `VICTORY_SHADER_LOOP_LIMIT_CS` changed must not be
+        // served the compute translations an earlier run cached.
+        let compute = victory_shader::emit::compute_loop_limit();
+        if compute != limit {
+            tracing::warn!(
+                compute,
+                "VICTORY_SHADER_LOOP_LIMIT_CS: translated compute loops stop sooner"
+            );
+        }
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                bytes.extend_from_slice(&compute.to_le_bytes());
                 // So is the view heap's null slot (it differs by host GPU):
                 // a translation cached without the clamp must not be served.
                 crate::descriptor::host::probe_view_limit();
