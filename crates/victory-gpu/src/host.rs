@@ -5949,7 +5949,8 @@ impl Meter {
             "{fps:.1} fps {ms:.1} ms/frame (preparing {cpu:.1} ms: copies {copy_ms:.1} ms \
              {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} ms on \
              the GPU; copying back {back_ms:.1} ms {back_mb:.1} MB), {draws:.0} draws/frame, \
-             dropped {dropped:.0} without a host pipeline ({refused_per_frame:.0} refused, {} being made), \
+             dropped {dropped:.0} without a host pipeline ({refused_per_frame:.0} refused, \
+             {waiting_per_frame:.0} waiting for one, {} being made), \
              {indirect:.0} indirect",
             crate::pipeline::making()
         ));
