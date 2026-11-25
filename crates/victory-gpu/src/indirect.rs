@@ -1243,6 +1243,10 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn card_compare_stores_the_hash_it_made_when_told() {
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "MARK card_compare_stores_the_hash_it_made_when_told");
+        }
         let _once = crate::warptest::lock();
         let Some(mut harness) = Harness::new() else {
 
@@ -1362,6 +1366,10 @@ void main() {
     ///     records into `dst_args` at offset `0`.
     #[test]
     fn count_buffer_ignores_garbage_tail_and_preserves_source() {
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "MARK count_buffer_ignores_garbage_tail_and_preserves_source");
+        }
         let _once = crate::warptest::lock();
         let Some(mut harness) = Harness::new() else {
 
@@ -1574,6 +1582,10 @@ void main() {
     /// to the most and spend the budget.
     #[test]
     fn window_leaves_unfilled_slots_empty_and_uncharged() {
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "MARK window_leaves_unfilled_slots_empty_and_uncharged");
+        }
         let _once = crate::warptest::lock();
         let Some(mut harness) = Harness::new() else {
 
@@ -1673,6 +1685,10 @@ void main() {
 
     #[test]
     fn budget_saturates_without_wraparound_and_preserves_draw_fields() {
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "MARK budget_saturates_without_wraparound_and_preserves_draw_fields");
+        }
         let _once = crate::warptest::lock();
         let Some(mut harness) = Harness::new() else {
 
@@ -1787,6 +1803,10 @@ void main() {
     /// and `HostList::reset` end-to-end on the host device.
     #[test]
     fn host_list_reuses_and_grows_scratch_across_submissions() {
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "MARK host_list_reuses_and_grows_scratch_across_submissions");
+        }
         // The one device at a time every test that opens one takes (`#137`:
         // parallel WARP devices crash CI).
         let _once = crate::warptest::lock();
@@ -1850,6 +1870,10 @@ void main() {
 
     #[test]
     fn batch_argument_clamp_builds() {
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "MARK batch_argument_clamp_builds");
+        }
         let _once = crate::warptest::lock();
         if super::host().is_none() {
             return;
@@ -1895,6 +1919,10 @@ void main() {
     /// title's source buffer completely unmodified.
     #[test]
     fn hoisted_clamps_match_inline_bounds_and_budget_order() {
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "MARK hoisted_clamps_match_inline_bounds_and_budget_order");
+        }
         let _once = crate::warptest::lock();
         let Some(host) = super::host() else {
             return;
@@ -2071,6 +2099,10 @@ void main() {
     /// and upload buffer across `HostList::reset()`.
     #[test]
     fn hoisted_clamps_across_multiple_buffers_and_chunks_preserve_budget_order() {
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "MARK hoisted_clamps_across_multiple_buffers_and_chunks_preserve_budget_order");
+        }
         let _once = crate::warptest::lock();
         use windows::core::Interface;
         let Some(host) = super::host() else {
@@ -2134,6 +2166,10 @@ void main() {
     /// its own scratch chunks without mutating the title's source buffer.
     #[test]
     fn hoisted_list_resubmitted_twice_reclamps_cleanly() {
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "MARK hoisted_list_resubmitted_twice_reclamps_cleanly");
+        }
         let _once = crate::warptest::lock();
         let Some(host) = super::host() else {
             return;
@@ -2164,6 +2200,10 @@ void main() {
     /// to the hoisted prelude of the following list.
     #[test]
     fn hoisted_prelude_orders_after_earlier_list_compute_write() {
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "MARK hoisted_prelude_orders_after_earlier_list_compute_write");
+        }
         let _once = crate::warptest::lock();
         let Some(host) = super::host() else {
             return;
@@ -2207,6 +2247,10 @@ void main() {
     /// reading the same argument buffer into the same scratch chunk.
     #[test]
     fn hoisted_clamps_cost_one_pass_per_run_of_draws() {
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "MARK hoisted_clamps_cost_one_pass_per_run_of_draws");
+        }
         let _once = crate::warptest::lock();
         let Some(host) = super::host() else {
             return;
