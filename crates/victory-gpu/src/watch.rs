@@ -20,7 +20,7 @@
 //! hashed, not guarded. A system call writing into a guarded block fails
 //! (none is known to).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use crate::writeback::Done;
@@ -648,7 +648,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let known = in_placeholder
         || (!*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
             let g = guards();
-            g.protected.contains(first) || g.absent.contains(first)
+            g.protected.contains(&first) || g.absent.contains(&first)
         });
     if !known && !is_view(start, end) {
         return None;
@@ -771,7 +771,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         g.protected.extend(from..to);
         g.clean.insert(from, to);
         // The kernel only made committed memory read-only: it is there.
-        g.mapped.insert_range(from, to);
+        g.mapped.extend(from..to);
     };
     // Made read-only by our hand: not a plain copy's destination now.
     forget(from * BLOCK, (to - from) * BLOCK);
@@ -787,8 +787,8 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         let mut cursor = from;
         let note_holes = |g: &mut Guards, from: usize, to: usize| {
             if from < to {
-                g.absent.insert_range(from, to);
-                g.mapped.remove_range(from, to);
+                g.absent.extend(from..to);
+                g.mapped.retain(|b| *b < from || *b >= to);
                 crate::inplace::PLACEHOLDER_HITS[1]
                     .fetch_add((to - from) as u64, std::sync::atomic::Ordering::Relaxed);
             }
@@ -803,7 +803,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
                         note(g, block, block + 1);
                     } else if block < uncommitted_end(block) {
                         g.absent.insert(block);
-                        g.mapped.remove(block);
+                        g.mapped.remove(&block);
                     }
                 }
             }
@@ -817,7 +817,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             note(g, block, block + 1);
         } else if block < uncommitted_end(block) {
             g.absent.insert(block);
-            g.mapped.remove(block);
+            g.mapped.remove(&block);
         }
     }
 }
@@ -873,8 +873,7 @@ pub(crate) fn mapped(at: usize, len: usize) -> bool {
         return false;
     }
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    // One pass over the words, not a lookup a block at a time.
-    guards().mapped.count_range(first, last) == last - first
+    guards().mapped.range(first..last).count() == last - first
 }
 
 /// A kernel copy took all of `[at, at + len)` of title memory: every block
@@ -886,7 +885,7 @@ pub(crate) fn copied(at: usize, len: usize) {
         return;
     }
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    guards().mapped.insert_range(first, last);
+    guards().mapped.extend(first..last);
 }
 
 /// Blocks a write-back job holds `(a flag, whether the block was being given
@@ -1149,13 +1148,13 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     forget(at, len);
     let mut g = guards();
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    g.absent.remove_range(first, last);
+    g.absent.retain(|b| *b < first || *b >= last);
     // What is there now is new: a copy must ask the kernel again.
-    let was: Vec<usize> = g.mapped.range(range.clone()).copied().collect();
+    let was: Vec<usize> = g.mapped.range(first..last).copied().collect();
     for block in was {
         g.mapped.remove(&block);
     }
-    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
+    let blocks: Vec<usize> = g.protected.range(first..last).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(block);
@@ -1241,8 +1240,8 @@ fn install() {
                     written = is_write,
                     protect = format_args!("{:#x}", if n != 0 { info.Protect } else { 0 }),
                     noaccess = n != 0 && info.Protect == PAGE_NOACCESS,
-                    guarded = g.protected.contains(at / BLOCK),
-                    absent = g.absent.contains(at / BLOCK),
+                    guarded = g.protected.contains(&(at / BLOCK)),
+                    absent = g.absent.contains(&(at / BLOCK)),
                     owed = back().get(&(at / BLOCK)).is_some(),
                     "an access fault this handler cannot resolve: not writable, not a write-back job's block"
                 );
@@ -1362,10 +1361,12 @@ mod tests {
                 // forget, and tests run in threads of their own.
                 let (from, to) = (base as usize / BLOCK, (base as usize + len) / BLOCK);
                 let mut g = guards();
-                g.protected.remove_range(from, to);
-                g.clean.remove_range(from, to);
-                g.absent.remove_range(from, to);
-                g.mapped.remove_range(from, to);
+                g.protected.retain(|b| *b < from || *b >= to);
+                for block in from..to {
+                    g.clean.remove(block);
+                }
+                g.absent.retain(|b| *b < from || *b >= to);
+                g.mapped.retain(|b| *b < from || *b >= to);
             }
             let written = guard(base as usize, base as usize + len).expect("a placeholder is view memory");
             assert_eq!(written.len(), blocks * BLOCK / PAGE, "every block of it is asked about");
