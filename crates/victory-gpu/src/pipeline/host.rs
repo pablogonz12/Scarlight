@@ -1177,6 +1177,15 @@ mod tests {
             ),
             S_OK
         );
+        // Made here, not waited for: a pipeline is made by a worker within
+        // the frame's wait budget, and no frame advances in a test, so a
+        // budget another test's wait spent (`make::wait`, the frame it
+        // belongs to) would leave this one unmade and the test failing
+        // without a pipeline ever being tried.
+        assert!(
+            super::super::make::now(&super::super::pipeline(pipeline).host),
+            "the mesh pipeline could not be made"
+        );
         assert!(
             crate::pipeline::host_pipeline(pipeline).is_some(),
             "native mesh pipeline did not build"
