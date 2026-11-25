@@ -63,10 +63,14 @@ shaders and emulates the one instruction.
 
 ## The switch that turns live ray tracing on
 
-Whether the world is lit by ray tracing is decided by one switch, the
-builder's: the trace and shading programs always run, and the structures they
-walk are only built while `VICTORY_BVH_BUILDER=1` is set. Everything else about
-the builder is a check on top of it, or a way back:
+Whether the world is lit by ray tracing follows one switch, the builder's, and
+that switch is necessary but not sufficient: the trace and shading programs
+always run, the structures they walk are only built while
+`VICTORY_BVH_BUILDER=1` is set, and even then the builder's first dispatch runs
+only if every builder pipeline the title has created has a host pipeline —
+otherwise the builder stays off for the rest of the run (`builder_runs` in
+`crates/victory-gpu/src/pipeline.rs`). Everything else about the builder is a
+check on top of it, or a way back:
 
 | switch | default | effect |
 |---|---|---|
@@ -81,10 +85,11 @@ VICTORY_TEXTURE_ROOM_PERCENT=82`: with it, "the cell interior in the first scene
 is lit (walls, photos, bunk); without the builder it is black".
 
 Offline on the branch that carries the node-test fix (25 Nov, RADV gfx1201):
-751/751 programs translate and pipeline, 2,912/2,912 on the run dump (the three
-known `image_bvh*` core dumps in dxil-spirv aside), and the builder's own set
-52/52. One program's DXIL changed in the 751 set, 14 in the run set: the node
-test's new rules, below.
+751/751 programs translate and pipeline; on the run dump 2,909/2,912, the three
+failures being the known `image_bvh*` core dumps in dxil-spirv
+(dxil-spirv-crash.md), unchanged by this branch; and the builder's own set 52/52.
+One program's DXIL changed in the 751 set, 14 in the run set: the node test's
+new rules, below.
 
 ## Known gaps
 
