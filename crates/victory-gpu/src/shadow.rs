@@ -35,6 +35,11 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
+    /// The asking at which every page of the copy was last copied whole
+    /// (0: not yet): no page of it is stale at that asking, so a refresh
+    /// copies nothing while the journal has no page of the range written
+    /// after it ([`Shadow::clean`]).
+    all_copied: AtomicU64,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -1143,6 +1148,97 @@ pub(crate) fn wide_back() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
 }
 
+/// Whether a host copy whose memory nothing wrote since it was last brought
+/// up to date is left out of the submission's refreshes (`VICTORY_SKIP_CLEAN=0`
+/// turns it off; safe to change live, taken per copy at each flush).
+///
+/// Lists whose shaders use title memory ask for every host copy there is at
+/// each submission (about 4,100 in the world), and again after every title
+/// copy: 254,139 change checks a frame over 92.8 GB, 99.7 % of it unchanged.
+/// Each went through the flush's maps, the write-watch journal and the
+/// copy's pages to find nothing to copy, about 330 ns each in a synthetic
+/// frame of the same volumes (half the preparing time). A copy the journal
+/// shows no write in since its last whole copy has nothing to copy, and
+/// skipping it leaves the same bytes in it as the check did.
+pub(crate) fn skip_clean() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let start = *ON.get_or_init(|| {
+        skip_clean_enabled(std::env::var("VICTORY_SKIP_CLEAN").ok().as_deref())
+    });
+    crate::switches::b("VICTORY_SKIP_CLEAN", start)
+}
+
+fn skip_clean_enabled(setting: Option<&str>) -> bool {
+    match setting {
+        Some("0") => false,
+        Some("1") => true,
+        _ => true,
+    }
+}
+
+/// [`Shadow::clean`]'s answer, from what it reads: a copy placed in the
+/// title's memory has nothing to copy, memory last found not write-watched
+/// is copied whole, a copy with no whole copy of its pages yet has them to
+/// fill, and a range the journal cannot answer for is copied.
+/// `[from, to)` cut to a copy of `len` bytes at `start`: what of the ask
+/// lies in the copy, as title addresses.
+fn cut_to_copy(start: usize, len: usize, from: usize, to: usize) -> (usize, usize) {
+    let end = start.saturating_add(len);
+    (from.clamp(start, end), to.clamp(start, end))
+}
+
+fn clean_decided(placed: bool, watched: u8, all_copied: u64, in_range: bool, written: Option<bool>) -> bool {
+    !placed && watched == 1 && all_copied != 0 && in_range && written == Some(false)
+}
+
+#[cfg(test)]
+mod clean_tests {
+    use super::{clean_decided, cut_to_copy, skip_clean_enabled};
+
+    /// A copy nothing wrote since it was last brought up to date is clean;
+    /// one with pages never copied whole, not known to be write-watched,
+    /// placed in the title's memory, or written since is not.
+    #[test]
+    fn a_copy_is_clean_only_where_nothing_wrote_since_its_last_whole_copy() {
+        assert!(clean_decided(false, 1, 7, true, Some(false)));
+        // Never copied whole: its pages are to fill.
+        assert!(!clean_decided(false, 1, 0, true, Some(false)));
+        // Not (yet) known to be write-watched: copied whole.
+        assert!(!clean_decided(false, 0, 7, true, Some(false)));
+        assert!(!clean_decided(false, 2, 7, true, Some(false)));
+        // Placed in the title's memory: nothing to copy either way.
+        assert!(!clean_decided(true, 1, 7, true, Some(false)));
+        // A page written since, or a range the journal cannot answer for.
+        assert!(!clean_decided(false, 1, 7, true, Some(true)));
+        assert!(!clean_decided(false, 1, 7, true, None));
+        // A range outside the copy.
+        assert!(!clean_decided(false, 1, 7, false, Some(false)));
+    }
+
+    /// An ask is cut to the copy: one reaching past its end answers for the
+    /// bytes inside it only (a nested copy's tail is no part of it), and one
+    /// wholly outside asks nothing.
+    #[test]
+    fn a_clean_check_is_cut_to_the_copy() {
+        // A 0x4000-byte copy at 0x1000, and asks around it.
+        assert_eq!(cut_to_copy(0x1000, 0x4000, 0x2000, 0x3000), (0x2000, 0x3000), "inside");
+        assert_eq!(cut_to_copy(0x1000, 0x4000, 0x1000, 0x5000), (0x1000, 0x5000), "whole");
+        assert_eq!(cut_to_copy(0x1000, 0x4000, 0xf00, 0x6000), (0x1000, 0x5000), "past both ends");
+        assert_eq!(cut_to_copy(0x1000, 0x4000, 0x4000, 0x6000), (0x4000, 0x5000), "the tail only");
+        assert_eq!(cut_to_copy(0x1000, 0x4000, 0x6000, 0x7000), (0x5000, 0x5000), "outside: empty");
+        assert_eq!(cut_to_copy(0x1000, 0x4000, 0x9000, 0x9100), (0x5000, 0x5000), "past it: empty");
+    }
+
+    /// Skipping clean copies is on unless the switch is set to 0.
+    #[test]
+    fn skipping_clean_copies_can_be_turned_off() {
+        assert!(skip_clean_enabled(None));
+        assert!(skip_clean_enabled(Some("1")));
+        assert!(!skip_clean_enabled(Some("0")));
+        assert!(skip_clean_enabled(Some("yes")), "anything else keeps the default");
+    }
+}
+
 type Job = Box<dyn FnOnce() + Send>;
 
 /// Threads kept for [`wide`]: what they are to do, and the word that there
@@ -1917,6 +2013,7 @@ impl Shadow {
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
+            all_copied: AtomicU64::new(0),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -2681,6 +2778,29 @@ impl Shadow {
         self.update_free(from, to)
     }
 
+    /// Whether a refresh of `[from, to)` (title addresses, cut to the copy)
+    /// would copy nothing:
+    /// every page of the copy was copied whole at some asking, and the
+    /// journal holds no page of the range written after it. The copy keeps
+    /// one number, so the check walks no pages and takes no lock of the
+    /// pages'.
+    ///
+    /// `false` where the answer is not known: memory never found to be
+    /// write-watched, a copy placed in the title's memory (nothing to copy
+    /// either way), and a range no asking of this submission covers
+    /// ([`crate::watch::written_since`]).
+    pub(crate) fn clean(&self, from: usize, to: usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = cut_to_copy(start, end - start, from, to);
+        let since = self.all_copied.load(Ordering::Relaxed);
+        let written = if since != 0 && from < to {
+            crate::watch::written_since(from, to, since)
+        } else {
+            None
+        };
+        clean_decided(self.place.is_some(), self.watched.load(Ordering::Relaxed), since, from < to, written)
+    }
+
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
@@ -2688,6 +2808,13 @@ impl Shadow {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
+                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                // Every page copied, so nothing in the copy is stale as of
+                // this asking: a later refresh of any range is left out
+                // until the journal has a page of it written after.
+                if from <= start && to >= end {
+                    self.all_copied.store(now, Ordering::Relaxed);
+                }
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};

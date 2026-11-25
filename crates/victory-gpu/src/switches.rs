@@ -25,6 +25,9 @@
 //!   ([`crate::texture`]) decide how the next refresh reads: in place under
 //!   the remap lock, and up to what size. Both are asked per refresh.
 //! - `VICTORY_LATE_WAITS` ([`crate::frame`]) picks how a wait sleeps.
+//! - `VICTORY_SKIP_CLEAN` ([`crate::shadow::skip_clean`]) picks whether a
+//!   copy nothing wrote since it was last brought up to date is left out of
+//!   the submission's refreshes; asked per copy at each flush.
 //! - `VICTORY_RELAY`, `VICTORY_LATE_WAIT`, `VICTORY_ASYNC_WRITEBACK`,
 //!   `VICTORY_QUEUE_WAIT` and `VICTORY_SPLIT_WAITS` change how submissions
 //!   are held and landed, so they are only taken when nothing is in the air
@@ -60,6 +63,7 @@ const NAMES: [&str; 18] = [
     "VICTORY_LATE_WAITS",
     "VICTORY_QUEUE_WAIT",
     "VICTORY_SPLIT_WAITS",
+    "VICTORY_SKIP_CLEAN",
 ];
 
 const N: usize = NAMES.len();
