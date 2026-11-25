@@ -88,6 +88,14 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   `crates/victory-gpu/src/descriptor/host.rs` `view_layout`, `VICTORY_HEAP_BOUNDS=0` off). Taken whole on
   this tree; the frame line counts the indices bound.
 
+- **fxceless/victory-fork [PR #1033](https://github.com/fxceless/victory-fork/pull/1033)** (UwUCammie),
+  GPL-3.0: a title-slot view of a host resource allocated while an earlier submission is still on the card
+  waits for that submission to finish before the live slot points at it (on RADV/amdgpu a new BO's page tables
+  are only mapped by a later submission, so the view faulted the GPU); `crates/victory-gpu/src/descriptor/host.rs`
+  (`DeferredViews`, `must_defer`, `VICTORY_DEFER_NEW_VIEWS=0` off), counted on the frame line. Reimplemented on
+  this tree's counters: its born-after stamps on both twins and on placed buffers are kept, its `sync_line`
+  place is ours.
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is

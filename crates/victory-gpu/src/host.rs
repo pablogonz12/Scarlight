@@ -206,6 +206,16 @@ fn sweep() {
     crate::resource::let_go_idle();
 }
 
+/// Submissions started so far (counted right before each one runs).
+pub(crate) fn started() -> u64 {
+    STARTED.load(Ordering::Acquire)
+}
+
+/// Submissions finished on the card so far.
+pub(crate) fn finished() -> u64 {
+    FINISHED.load(Ordering::Acquire)
+}
+
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
@@ -4153,6 +4163,15 @@ impl Host {
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
+        // Title-slot views held back for host resources allocated while an
+        // earlier submission was on the card: settle first if a draw's table
+        // needs one now, then publish every view whose earlier submissions
+        // have finished (RADV maps a new BO's page tables on a later
+        // submission, `VICTORY_DEFER_NEW_VIEWS=0`: at once).
+        if behind && crate::descriptor::has_required_deferred_views() {
+            self.settle(&mut submitted, WHY_SYNC);
+        }
+        crate::descriptor::flush_deferred_views();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
@@ -6341,13 +6360,15 @@ impl Meter {
                 du2 = crate::resource::DEPTH_UNORDERED[2].load(Ordering::Relaxed),
                 du3 = crate::resource::DEPTH_UNORDERED[3].load(Ordering::Relaxed),
                 refused = format!(
-                    "{}; view indices a translated shader bounds to the title's slots before it reads a view (VICTORY_HEAP_BOUNDS=0: none): {}; depth twins: {} alive, {} depth textures left without one; twin copies per frame: {twin_to_depth:.1} into depth textures, {twin_to_colour:.1} into twins; depth planes: {planes:.1} drawn from their twins per frame, {} times not given back to a twin, {} times used before the pass",
+                    "{}; view indices a translated shader bounds to the title's slots before it reads a view (VICTORY_HEAP_BOUNDS=0: none): {}; depth twins: {} alive, {} depth textures left without one; twin copies per frame: {twin_to_depth:.1} into depth textures, {twin_to_colour:.1} into twins; depth planes: {planes:.1} drawn from their twins per frame, {} times not given back to a twin, {} times used before the pass; new-resource views of our own (VICTORY_DEFER_NEW_VIEWS=0: at once): {} held back for their resource to finish, {} published",
                     crate::descriptor::host::REFUSED_VIEWS.load(Ordering::Relaxed),
                     victory_shader::emit::BOUNDED_INDICES.load(Ordering::Relaxed),
                     crate::resource::TWINS[0].load(Ordering::Relaxed),
                     crate::resource::TWINS[1].load(Ordering::Relaxed),
                     crate::resource::PLANES[1].load(Ordering::Relaxed),
-                    crate::resource::PLANES[2].load(Ordering::Relaxed)
+                    crate::resource::PLANES[2].load(Ordering::Relaxed),
+                    crate::descriptor::host::DEFERRED_VIEWS[0].load(Ordering::Relaxed),
+                    crate::descriptor::host::DEFERRED_VIEWS[1].load(Ordering::Relaxed)
                 ),
                 making = crate::pipeline::making(),
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
