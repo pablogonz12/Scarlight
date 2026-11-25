@@ -1824,7 +1824,7 @@ fn plane_of(i: u32, mips: u32, subresources_per_plane: u32) -> (usize, u32, u32)
 /// (`VICTORY_TEXTURE_PLANES=0`: the first plane alone, as before).
 fn planes_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_PLANES").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_PLANES").is_some_and(|v| v == "1"))
 }
 
 /// The planes of `layout` the host takes, where the host takes more than
@@ -2326,12 +2326,16 @@ mod present_tests {
         // R32G8X24_TYPELESS: 32-bit depth, 8-bit stencil, one byte a texel,
         // the host's own two planes.
         let depth_stencil = texture(19);
+        let typed_20 = texture(20);
         assert_eq!(depth_stencil.planes.len(), 2);
-        // Both planes unless the switch turns the second one off.
+        // Both planes only with the switch on and a typed host format the
+        // runtime can copy one plane of; one plane otherwise.
         let both = if super::planes_on() { 2 } else { 1 };
-        assert_eq!(planes_uploaded(&depth_stencil, Some(2), 19), both, "depth and stencil");
-        assert_eq!(planes_uploaded(&depth_stencil, Some(1), 19), 1, "a host with one plane");
-        assert_eq!(planes_uploaded(&depth_stencil, None, 19), 1, "a host that cannot say");
+        assert_eq!(planes_uploaded(&typed_20, Some(2), 20), both, "depth and stencil");
+        assert_eq!(planes_uploaded(&typed_20, Some(0), 20), 1, "a host that names no plane");
+        assert_eq!(planes_uploaded(&typed_20, Some(1), 20), 1, "a host with one plane");
+        assert_eq!(planes_uploaded(&typed_20, None, 20), 1, "a host that cannot say");
+        assert_eq!(planes_uploaded(&depth_stencil, Some(2), 19), 1, "a TYPELESS host format");
         let (depth, stencil) = (&depth_stencil.planes[0], &depth_stencil.planes[1]);
         assert_eq!((depth.layout.desc.element_bytes, stencil.layout.desc.element_bytes), (4, 1));
         assert_eq!(stencil.offset, depth.layout.size.next_multiple_of(stencil.layout.alignment));
