@@ -777,10 +777,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_copy_of_title_memory_the_layer_has_seen_goes_at_the_bytes() {
+        use windows_sys::Win32::System::Memory::*;
+        const N: usize = 2 << 16;
+        // SAFETY: a private region committed whole, accessed directly.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), N, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            for i in 0..N {
+                base.add(i).write((i * 7) as u8);
+            }
+            let bytes: Vec<u8> = (0..N).map(|i| (i * 7) as u8).collect();
+            let mut first = vec![0u8; N];
+            super::copy_mapped(first.as_mut_ptr(), base, N, false);
+            assert_eq!(first, bytes);
+            // The kernel read the whole range: it is there, so the next copy
+            // goes at the bytes.
+            assert!(super::plain(base as usize, N));
+            let mut second = vec![0u8; N];
+            super::copy_mapped(second.as_mut_ptr(), base, N, false);
+            assert_eq!(second, bytes);
+            // Into title memory the same: the kernel first, then the bytes.
+            let dst = VirtualAlloc(std::ptr::null(), N, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!dst.is_null());
+            super::write_mapped(dst, first.as_ptr(), N);
+            assert_eq!(std::slice::from_raw_parts(dst, N), &first[..]);
+            assert!(super::plain(dst as usize, N));
+            super::write_mapped(dst, second.as_ptr(), N);
+            assert_eq!(std::slice::from_raw_parts(dst, N), &second[..]);
+            // A range with a page that is not there: the kernel's path, and
+            // zeros for the hole, as before.
+            let part = VirtualAlloc(std::ptr::null(), 128 << 10, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert_eq!(VirtualAlloc(part.cast(), 4096, MEM_COMMIT, PAGE_READWRITE), part.cast());
+            part.write_bytes(0x5a, 4096);
+            let mut sparse = vec![0xccu8; 128 << 10];
+            super::copy_mapped(sparse.as_mut_ptr(), part, 128 << 10, false);
+            assert!(sparse[..4096].iter().all(|&b| b == 0x5a));
+            assert!(sparse[4096..].iter().all(|&b| b == 0));
+            // The layer hears of memory that goes, as it does from the runtime
+            // (`title_memory_remapped`): a freed range's blocks are not
+            // "there" for a later copy at an address the kernel hands out again.
+            crate::watch::title_memory_remapped(part as usize, 128 << 10);
+            assert_ne!(VirtualFree(part.cast(), 0, MEM_RELEASE), 0);
+            crate::watch::title_memory_remapped(dst as usize, N);
+            assert_ne!(VirtualFree(dst.cast(), 0, MEM_RELEASE), 0);
+            crate::watch::title_memory_remapped(base as usize, N);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
     use super::*;
 
     #[test]
     fn warp_adapter_accepts_only_software() {
+        let _once = crate::warptest::lock();
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
         let raw = unsafe {
@@ -5700,7 +5751,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
             unsafe { to.write_bytes(0, n) };
-        } else if !read(at, to, n) {
+        } else if !read_piece(at, to, n) {
             // A mapping may change between query and read.
             read_pieces(at, to, n);
         }
@@ -5713,10 +5764,10 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
     // that fails), zeros for what cannot be read.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
+        if !read_piece(at as *const u8, to, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
                 let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
+                if !read_piece(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
                     // SAFETY: inside the destination, which is mapped.
@@ -5736,12 +5787,90 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    read_mark(src, dst, len, true)
+}
+
+/// [`read`] for a piece of a range: a piece that reads marks nothing, so a
+/// block the title only has pages of is never taken for one it has whole
+/// (see [`crate::watch::copied`]).
+fn read_piece(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    read_mark(src, dst, len, false)
+}
+
+fn read_mark(src: *const u8, dst: *mut u8, len: usize, mark: bool) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if plain(src as usize, len) && !overlaps(src as usize, dst as usize, len) {
+        // SAFETY: the layer has copied this whole range before and its first
+        // and last pages read just now; the destination is mapped writable
+        // memory of `len` bytes and does not overlap the source.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::Plain, 1);
+            crate::copystat::add(crate::copystat::C::PlainBytes, len as u64);
+        }
+        return true;
+    }
     let mut done = 0;
+    // The kernel read must not run across a remap, and a mark it makes must
+    // not outlive one: both are held under the runtime's remapping guard.
+    // The guard is taken only if it is free (a caller that holds it keeps
+    // it), and a read without it still reads, just without marking.
+    let reading = crate::watch::title_memory_reading_now();
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    let whole = unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 };
+    if whole && mark && reading.is_some() {
+        // The kernel read all of it: it is there.
+        crate::watch::copied(src as usize, len);
+    }
+    whole
+}
+
+/// Whether title memory is copied as bytes (`ptr::copy_nonoverlapping`) where
+/// the layer knows the range is there, instead of through the kernel: under
+/// Wine the kernel's own call costs a wineserver roundtrip for every write
+/// (`NtWriteVirtualMemory` has no self path, Wine 11 dlls/ntdll/unix/virtual.c)
+/// and a guarded `memmove` for every read, and the title's copies cost
+/// 2.4 s + 0.5-2.1 s a frame. `VICTORY_PLAIN_COPIES=0` copies through the
+/// kernel as before.
+fn plain_copies() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLAIN_COPIES").is_none_or(|v| v != "0"))
+}
+
+/// Whether `[at, at + len)` may be copied as bytes: every 64 KiB block of it
+/// is memory the layer has already copied whole or guarded
+/// ([`crate::watch::mapped`]), and its first and last pages read (a page the
+/// title has since unmapped fails here, not while the copy runs).
+fn plain(at: usize, len: usize) -> bool {
+    if len == 0 || !plain_copies() || !crate::watch::mapped(at, len) {
+        return false;
+    }
+    let last = at + len - 1;
+    probe(at) && (last == at || probe(last))
+}
+
+/// Whether `[a, a + len)` and `[b, b + len)` share a byte: the plain copy
+/// needs them apart, and a title may hand us copies that overlap (D3D12
+/// leaves intersecting copies undefined; the layer contains them).
+fn overlaps(a: usize, b: usize, len: usize) -> bool {
+    a.abs_diff(b) < len
+}
+
+/// Whether the page of `at` can be read: one byte through the kernel, which
+/// fails on memory that is not committed instead of faulting.
+fn probe(at: usize) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut byte = 0u8;
+    let mut done = 0;
+    // SAFETY: one byte of this process read into a local; the kernel checks
+    // the address.
+    unsafe {
+        ReadProcessMemory(GetCurrentProcess(), at as *const _, (&raw mut byte).cast(), 1, &mut done) != 0
+    }
 }
 
 #[link(name = "ntdll", kind = "raw-dylib")]
@@ -5775,28 +5904,47 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();
-    let write = |at: usize, n: usize| {
+    let write = |at: usize, n: usize, mark: bool| {
         let from = src.wrapping_add(at - dst as usize);
+        if plain(at, n) {
+            // SAFETY: the layer knows the whole range is mapped (its first and
+            // last pages read just now) and its guards are open for this
+            // write (`crate::watch::writing`): a plain write is the title's
+            // own, which the watch sees as one.
+            unsafe { std::ptr::copy_nonoverlapping(from, at as *mut u8, n) };
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::Plain, 1);
+                crate::copystat::add(crate::copystat::C::PlainBytes, n as u64);
+            }
+            return true;
+        }
         let mut done = 0;
-        if direct {
+        let written = if direct {
             // SAFETY: as below; the kernel checks the destination and
             // writes nothing it cannot (the caller opened its guards:
             // `crate::watch::writing`).
-            return unsafe {
+            unsafe {
                 NtWriteVirtualMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) >= 0
-            };
+            }
+        } else {
+            // SAFETY: the source is our mapped host copy; the kernel checks
+            // the destination.
+            unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
+        };
+        if written && mark {
+            // The kernel wrote all of it: it is there.
+            crate::watch::copied(at, n);
         }
-        // SAFETY: the source is our mapped host copy; the kernel checks the
-        // destination.
-        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
+        written
     };
-    if len == 0 || write(dst as usize, len) {
+    if len == 0 || write(dst as usize, len, true) {
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
+        if !write(at, n, false) {
             for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
+                write(at, n, false);
             });
         }
     });
@@ -5951,6 +6099,19 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// When the last frame was counted, and the submission counters as they
+    /// were then, for the frame budget (`crate::frame_budget`): what of a
+    /// frame is ours and its card's, taken off the sums the line above uses.
+    shown: std::time::Instant,
+    counters: [u64; 5],
+    /// What a delta could not take at the last sample, carried to the next
+    /// one (see `budget`): positive when the one-second line's `swap(0)`
+    /// consumed it first, negative when a worker's provisional addition was
+    /// taken back (`PREPARING[0]`), so every increment is in exactly one
+    /// frame's report and the sums of the deltas are the counters' own.
+    carry: [i64; 5],
+    /// When the frame budget last said a line (a present holds the meter).
+    said: Option<std::time::Instant>,
 }
 
 impl Meter {
@@ -5964,6 +6125,57 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            shown: now,
+            counters: [0; 5],
+            carry: [0; 5],
+            said: None,
+        }
+    }
+
+    /// Says what a frame past the budget was bound by
+    /// ([`crate::frame_budget`]): its parts, the largest named.
+    fn budget(&mut self) {
+        // With the report off nothing is measured: not the clock, not the
+        // counters (`VICTORY_FRAME_BUDGET=0`).
+        if !crate::frame_budget::enabled() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let frame = now.saturating_duration_since(self.shown);
+        self.shown = now;
+        let counters = [
+            SUBMISSION_US[0].load(Ordering::Relaxed),
+            SUBMISSION_US[1].load(Ordering::Relaxed),
+            COPY_BACK[0].load(Ordering::Relaxed),
+            PREPARING[0].load(Ordering::Relaxed),
+            PREPARING[2].load(Ordering::Relaxed),
+        ];
+        // A delta is what the counter holds now less what the last sample
+        // took, plus what that sample could not take: signed, because a
+        // worker adds its time before `Batch::flush` takes back the part
+        // over the wall time, so a counter can go down between two samples.
+        let mut parts = [std::time::Duration::ZERO; 5];
+        let mut carry = [0_i64; 5];
+        for i in 0..5 {
+            let delta = counters[i] as i64 - self.counters[i] as i64;
+            let total = self.carry[i].saturating_add(delta);
+            if total < 0 {
+                carry[i] = total;
+            } else {
+                parts[i] = std::time::Duration::from_micros(total as u64);
+            }
+        }
+        let phases = crate::frame_budget::Phases {
+            preparing: parts[0],
+            gpu: parts[1],
+            back: parts[2],
+            copies: parts[3],
+            textures: parts[4],
+        };
+        self.counters = counters;
+        self.carry = carry;
+        if let Some(text) = crate::frame_budget::say(frame, &phases, &mut self.said) {
+            tracing::warn!("{text}");
         }
     }
 
@@ -5973,6 +6185,7 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
+        self.budget();
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
@@ -5989,17 +6202,32 @@ impl Meter {
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
-        let [cpu, gpu] = [0, 1].map(|i| {
-            SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
-        });
-        let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
-            let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
-            PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
-        });
-        let [back_ms, back_mb] = [0, 1].map(|i| {
-            COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
-        });
+        let cpu_gpu = [0, 1].map(|i| SUBMISSION_US[i].swap(0, Ordering::Relaxed));
+        let preparing = [0, 1, 2, 3].map(|i| PREPARING[i].swap(0, Ordering::Relaxed));
+        let back = [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed));
+        let [cpu, gpu] = cpu_gpu.map(|us| us as f64 / 1000.0 / frames);
+        let [copy_ms, copy_mb, texture_ms, texture_mb] = [
+            preparing[0] as f64 / 1e3 / frames,
+            preparing[1] as f64 / 1e6 / frames,
+            preparing[2] as f64 / 1e3 / frames,
+            preparing[3] as f64 / 1e6 / frames,
+        ];
+        let [back_ms, back_mb] = [back[0] as f64 / 1e3 / frames, back[1] as f64 / 1e6 / frames];
+        // The sums above are from zero again. What landed between the frame
+        // budget's last sample and these swaps was taken here and not there,
+        // so the next frame's delta starts with it: every increment is in
+        // exactly one of the two.
+        let swapped = [cpu_gpu[0], cpu_gpu[1], back[0], preparing[0], preparing[2]];
+        for i in 0..5 {
+            let landed = swapped[i] as i64 - self.counters[i] as i64;
+            self.carry[i] = self.carry[i].saturating_add(landed);
+        }
+        self.counters = [0; 5];
         let dropped = crate::draw::take_dropped() as f64 / frames;
+        // Of those, the ones whose pipeline was refused (lost every frame)
+        // and those still being made (lost this one).
+        let [refused_per_frame, waiting_per_frame] =
+            crate::pipeline::take_dropped_split().map(|count| count as f64 / frames);
         let indirect = crate::list::take_indirect() as f64 / frames;
         // What a shot's stats file says about this second of frames.
         #[cfg(feature = "diagnostics")]
@@ -6007,7 +6235,9 @@ impl Meter {
             "{fps:.1} fps {ms:.1} ms/frame (preparing {cpu:.1} ms: copies {copy_ms:.1} ms \
              {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} ms on \
              the GPU; copying back {back_ms:.1} ms {back_mb:.1} MB), {draws:.0} draws/frame, \
-             dropped {dropped:.0} without a host pipeline ({} being made), {indirect:.0} indirect",
+             dropped {dropped:.0} without a host pipeline ({refused_per_frame:.0} refused, \
+             {waiting_per_frame:.0} waiting for one, {} being made), \
+             {indirect:.0} indirect",
             crate::pipeline::making()
         ));
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
@@ -6132,8 +6362,8 @@ impl Meter {
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
-                 dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
+                 dropped {dropped:.0} without a host pipeline ({refused_per_frame:.0} refused, \
+                 {waiting_per_frame:.0} waiting for one, {making} being made) and {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                  {picked_waiting} waiting, {picked_away} passed over unmapped ({picked_kept} kept what they showed); depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
