@@ -1806,6 +1806,14 @@ impl ValueWait {
         met
     }
 
+    /// Off Windows there is no title memory to read (this crate is built
+    /// there for the unit tests and rustdoc only): the wait counts as met.
+    #[cfg(not(windows))]
+    fn holds(&self) -> bool {
+        true
+    }
+
+    #[cfg(windows)]
     fn holds(&self) -> bool {
         let bytes = if self.wide { 8 } else { 4 };
         if self.address == 0 {
