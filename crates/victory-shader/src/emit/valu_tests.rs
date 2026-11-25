@@ -1758,7 +1758,7 @@ fn write_f_omod_flushes_neg_zero() {
             // -0 + -0 = -0; the omod must yield +0, not IEEE -0.
             ([nz, nz, 0, 0], pz),
             ([f(1.0), f(1.0), 0, 0], f(2.0 * scale)),
-            ([f(-1.0), f(0.0), 0, 0], f(-1.0 * scale)),
+            ([f(-1.0), f(0.0), 0, 0], f(-scale)),
         ];
         let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
         run_cases(&shader, &inputs, |backend, i, inp, got| {
