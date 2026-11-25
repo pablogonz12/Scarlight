@@ -43,6 +43,10 @@ pub(crate) struct Staging {
     layout: victory_formats::texture::Layout,
     /// Mips per array slice.
     mips: u32,
+    /// The title's top mip levels the host copy lacks (memory pressure,
+    /// [`crate::resource::dropped_mips`]): subresource `i` holds the title's
+    /// mip `i + skipped` of its slice.
+    skipped: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     memory: *const u8,
@@ -1351,7 +1355,10 @@ impl Staging {
             );
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let (mip, slice) = (
+                i as u32 % self.mips + self.skipped,
+                i as u32 / self.mips,
+            );
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
@@ -1863,6 +1870,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        skipped: crate::resource::dropped_mips(resource),
         bytes: total,
         memory,
         resource,

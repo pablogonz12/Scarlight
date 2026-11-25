@@ -827,6 +827,24 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
+/// Whether a title texture's host copy lacks its top mip levels (the host
+/// could not give them, [`crate::resource::dropped_mips`]). A copy or a
+/// resolve names the title's subresources and sizes, so it is skipped on
+/// such a copy.
+#[cfg(windows)]
+fn mip_dropped(texture: This) -> bool {
+    let dropped = crate::resource::dropped_mips(texture);
+    if dropped > 0 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                "a copy or resolve skipped: a host texture lost mips to memory pressure"
+            );
+        });
+    }
+    dropped > 0
+}
+
 /// Buffer to buffer: both are host memory, copied at submission.
 extern "system" fn copy_buffer_region(
     this: This,
@@ -872,7 +890,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            if unlike(dst, src) {
+            if unlike(dst, src) || mip_dropped(dst) || mip_dropped(src) {
                 return;
             }
             // A source the title fills itself is uploaded first (upstream
@@ -974,7 +992,10 @@ extern "system" fn copy_texture_region(
             }
             return;
         };
-        if unlike(dst.resource, src.resource) {
+        if unlike(dst.resource, src.resource)
+            || mip_dropped(dst.resource)
+            || (src.kind != FOOTPRINT && mip_dropped(src.resource))
+        {
             return;
         }
         let mut from = src;
@@ -1163,7 +1184,7 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
-        if unlike(dst, src) {
+        if unlike(dst, src) || mip_dropped(dst) || mip_dropped(src) {
             return;
         }
         // Depth textures shaders also write: what they wrote, first.
