@@ -699,6 +699,12 @@ fn create() -> windows::core::Result<Host> {
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
         tracing::info!("host D3D12 device ready");
+        // Before any title memory is asked for: a host heap on pages of our
+        // own really is those pages, or the driver fell back without a word
+        // (`inplace::check`, one line either way).
+        if crate::inplace::level() > 0 {
+            crate::inplace::check_at_startup(&device);
+        }
         Ok(Host {
             device,
             queue,
