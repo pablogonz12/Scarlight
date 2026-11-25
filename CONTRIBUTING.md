@@ -32,14 +32,13 @@ Most of the repository needs nothing from the title, and none of the following r
 * Packaging and installing: `tools/steam-compat/package.sh` builds the release tarball,
   `tools/steam-compat/install.sh` installs from a source checkout, and a scratch
   `compatibilitytools.d` plus a Steam restart shows whether the entry appears.
-* A **dry run** of an installed tool: `SCARLIGHT_DRY_RUN=1` in a title's Launch Options resolves its
-  imports, binds them and stops, without touching the GPU. It needs a title's `.exe` and nothing else
-  of it ([docs/steam.md](docs/steam.md)).
 * Documentation, the entry script, and reading Mesa or vkd3d-proton with us.
 
 Scarlight is written with AI assistance (Claude, DeepSeek); every change goes through CI and review.
 
-A run, a frame rate and a test report do need your own copy of a title: the
+A dry run (`SCARLIGHT_DRY_RUN=1` in a title's Launch Options: imports resolved and bound, no GPU;
+[docs/steam.md](docs/steam.md)) needs a title's `.exe`. A run, a frame rate and a test report need your
+own copy of a title: the
 [test report form](https://github.com/pablogonz12/Scarlight/issues/new?template=test-report.yml) says
 what to send. The [`help wanted`](https://github.com/pablogonz12/Scarlight/labels/help%20wanted)
 issues each say which part of their work can be done without one.
