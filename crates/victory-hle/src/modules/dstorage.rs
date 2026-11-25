@@ -134,7 +134,10 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         FILE_SHARE_READ,
         std::ptr::null(),
         OPEN_EXISTING,
-        FILE_FLAG_OVERLAPPED,
+        // Only the overlapping read needs its own offsets; without it the
+        // handle is the one the layer opened before, so `files` can drop
+        // `FILE_FLAG_NO_BUFFERING` and the host file cache keeps the packs.
+        if overlap() { FILE_FLAG_OVERLAPPED } else { 0 },
         std::ptr::null_mut(),
     );
     // SAFETY: the title passes a NUL-terminated path.
@@ -263,9 +266,24 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 // Files.
 
 struct File {
-    /// Opened with `FILE_FLAG_OVERLAPPED`: reads carry their own offset and
-    /// do not move its file pointer.
+    /// Opened with `FILE_FLAG_OVERLAPPED` when reads overlap: they carry
+    /// their own offset and do not move its file pointer.
     file: OwnedHandle,
+}
+
+impl File {
+    /// Reads at `offset` through the file object's own position, which the
+    /// kernel moves under its lock: reads of one file take turns, as the
+    /// layer's did before the overlapping read.
+    fn seek_read(&self, out: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        use std::os::windows::fs::FileExt;
+        // SAFETY: a handle we own; `ManuallyDrop` keeps the borrow from
+        // closing it.
+        let file = std::mem::ManuallyDrop::new(unsafe {
+            std::fs::File::from_raw_handle(self.file.as_raw_handle())
+        });
+        file.seek_read(out, offset)
+    }
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -342,6 +360,18 @@ struct Scheduler {
 const COST: [u64; 3] = [100, 10, 1];
 /// The console's default staging buffer.
 const STAGING: u64 = 32 << 20;
+
+/// Whether reads of one file run at once on overlapped handles, each worker
+/// with an event of its own: `VICTORY_DSTORAGE_OVERLAP=1` (a start-up
+/// switch, off by default). Off, a read seeks and reads through the file
+/// object's own position, as the layer did before, which is measurably
+/// cheaper per request when the file's pages are in the page cache; on, the
+/// reads of a file no longer wait for one another, which is what a cold file
+/// on a spinning disk needs.
+fn overlap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DSTORAGE_OVERLAP").is_ok_and(|v| v != "0"))
+}
 
 /// Whether a queue that submits itself leaves its reads into physical pages
 /// for the title's Submit: `VICTORY_DSTORAGE_HELD=0` submits them at once, as
@@ -1288,6 +1318,8 @@ fn read_into(request: &Request, event: &mut Event, out: &mut [u8]) -> Result<(),
     let mark = Mark::begin();
     let started = std::time::Instant::now();
     let mut done = 0;
+    // SAFETY: a file object we created; the title keeps it open.
+    let object = unsafe { &*request.source.cast::<Instance<File>>() };
     let result = loop {
         if done == out.len() {
             break Ok(());
@@ -1298,7 +1330,15 @@ fn read_into(request: &Request, event: &mut Event, out: &mut [u8]) -> Result<(),
         else {
             break Err(E_INVALIDARG);
         };
-        match read_at(file, event, offset, &mut out[done..]) {
+        let read = if overlap() {
+            read_at(file, event, offset, &mut out[done..])
+        } else {
+            match object.state.seek_read(&mut out[done..], offset) {
+                Ok(n) => Ok(n),
+                Err(error) => Err(from_win32(&error)),
+            }
+        };
+        match read {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
             Err(hr) => break Err(hr),
@@ -2071,6 +2111,9 @@ mod tests {
 
     #[test]
     fn a_read_leaves_the_handles_file_pointer_where_it_was() {
+        if !overlap() {
+            return; // the sequential read takes the handle's position, by design
+        }
         use windows_sys::Win32::Storage::FileSystem::{FILE_CURRENT, SetFilePointerEx};
         let (_dir, file) = file_with(&pattern(4096));
         let mut worker = Worker::new().unwrap();
