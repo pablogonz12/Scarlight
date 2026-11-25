@@ -80,6 +80,10 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   `VICTORY_FRAME_BUDGET=0`). Reimplemented on this tree's counters and its own 50 ms budget: its
   per-command timestamps, memory-trait breakdown and slow-pipeline guard are not taken.
 
+- **Marvisak/VIctory [#2163](https://github.com/Marvisak/VIctory/pull/2163)** (0xkn0wh3r3), GPL-3.0: the
+  built-in BCPack table's first BC7 dictionary entry has its 32 indices right after its width bytes, where
+  every other entry repeats them first and holds 31 (`crates/victory-formats/src/bcpack.rs`).
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
