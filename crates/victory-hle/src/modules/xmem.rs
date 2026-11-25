@@ -1137,6 +1137,99 @@ mod tests {
         info
     }
 
+    /// The placeholder machinery the runtime needs to show physical pages,
+    /// end to end: a 64 KiB-granular reservation (`VirtualAlloc2` with
+    /// `MEM_RESERVE_PLACEHOLDER`), a section mapped into one part of it
+    /// (`MapViewOfFile3` with `MEM_REPLACE_PLACEHOLDER`), a second view of the
+    /// same section showing the bytes written through the first, and the way
+    /// back to a placeholder (`UnmapViewOfFile2` with
+    /// `MEM_PRESERVE_PLACEHOLDER`). Under Wine this says whether the host has
+    /// the calls at all; without them no physical page can be shown in place.
+    #[test]
+    fn sections_map_into_placeholder_parts() {
+        let base = 0x7_5acc_0000 as *mut c_void;
+        let len = 4 * PAGE;
+        // SAFETY: a fresh range at an address of our choice; a placeholder
+        // reservation, as the runtime makes for 64 KiB pages.
+        let at = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                base,
+                len,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(at, base, "VirtualAlloc2 with MEM_RESERVE_PLACEHOLDER failed: {:?}", std::io::Error::last_os_error());
+        // SAFETY: a pagefile-backed section of two 64 KiB pages.
+        let section = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * PAGE) as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null(), "a pagefile section failed: {:?}", std::io::Error::last_os_error());
+        let second = base.cast::<u8>().wrapping_add(2 * PAGE) as *mut c_void;
+
+        let map = |at: *mut c_void, offset: usize| {
+            // SAFETY: `at` is a part of the placeholder, split off first; the
+            // section outlives both views.
+            unsafe {
+                VirtualFree(at, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                MapViewOfFile3(
+                    section,
+                    GetCurrentProcess(),
+                    at,
+                    offset as u64,
+                    PAGE,
+                    MEM_REPLACE_PLACEHOLDER,
+                    PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            }
+        };
+        let first_view = map(base, 0);
+        assert_eq!(
+            first_view.Value,
+            base,
+            "MapViewOfFile3 into a placeholder part failed (Wine has no placeholders?): {:?}",
+            std::io::Error::last_os_error()
+        );
+        // The same section page shown a second time, at another address.
+        let second_view = map(second, 0);
+        assert_eq!(second_view.Value, second, "the second view failed: {:?}", std::io::Error::last_os_error());
+
+        // Writes through one view show through the other: one page, two views.
+        // SAFETY: both views are a page of read-write section.
+        unsafe {
+            (base as *mut u8).write_bytes(0x5a, 64);
+            assert_eq!(*(second as *const u8), 0x5a);
+            (second as *mut u8).write_bytes(0xa5, 64);
+            assert_eq!(*(base as *const u8), 0xa5);
+        }
+
+        // Both parts are placeholders again once their views are gone.
+        for view in [first_view, second_view] {
+            // SAFETY: views we just mapped.
+            assert_ne!(unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) }, 0, "UnmapViewOfFile2 failed: {:?}", std::io::Error::last_os_error());
+        }
+        for at in [base, base.cast::<u8>().wrapping_add(PAGE) as *mut c_void] {
+            assert_eq!(query(at).host.State, MEM_RESERVE, "the parts are placeholders again at {at:p}");
+        }
+        // SAFETY: the placeholder and the section handle we made.
+        unsafe {
+            assert_ne!(VirtualFree(base, 0, MEM_RELEASE), 0);
+            CloseHandle(section);
+        }
+    }
+
     #[test]
     fn alloc_honours_alignment_and_frees() {
         for (field, align) in [(0, 16), (4, 16), (0xc, 4096), (0x10, 64 * 1024)] {
