@@ -738,13 +738,15 @@ pub(crate) fn back_open_for_write(at: usize, len: usize) {
             if let Some((done, _)) = held.remove(&block) {
                 given.entry(block).or_default().push(done);
                 opened.push(block);
+                // Access back before the block leaves `BACK`: a title read of
+                // it meanwhile finds no job to wait for, and must not fault.
+                let mut old = 0;
+                // SAFETY: a block a write-back job made inaccessible.
+                unsafe {
+                    VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old)
+                };
             }
         }
-    }
-    for &block in &opened {
-        let mut old = 0;
-        // SAFETY: a block a write-back job made inaccessible.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
     if !opened.is_empty() {
         let mut g = guards();
