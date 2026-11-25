@@ -1934,6 +1934,16 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
+    // The buffer covers every footprint's whole rows: `GetCopyableFootprints`
+    // leaves the last row of the last footprint unpadded, and a placed copy
+    // names RowPitch × Height bytes.
+    let total = footprints
+        .iter()
+        .zip(&rows)
+        .map(|(f, &r)| {
+            f.Offset + u64::from(f.Footprint.RowPitch) * u64::from(r) * u64::from(f.Footprint.Depth)
+        })
+        .fold(total, u64::max);
     let (buffer, data) = host.upload_buffer(total)?;
     crate::host::name(&buffer, || {
         format!(
