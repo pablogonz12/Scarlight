@@ -777,7 +777,34 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
         let v = views_read();
         beside_in(&v.views, at, section, offset, len)
     };
+    if !beside.is_empty() {
+        ALIASED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     crate::watch::opened_beside(&beside);
+}
+
+/// Whether any two of the title's views show bytes of one section (a page
+/// mapped twice) anywhere: `false` until one does, which is the answer that
+/// lets the guards take their fast path.
+static ALIASED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the bytes at `at` are also shown at another address: the view
+/// that holds `at` has another view of the same section over its bytes.
+/// A block of such a page may not be made read-only (a write through the
+/// other view would go unseen), so the guards ask this before protecting.
+/// One atomic load while nothing is mapped twice.
+pub(crate) fn aliased(at: usize) -> bool {
+    if !ALIASED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let v = views_read();
+    let Some((&base, &(bytes, section, offset))) =
+        v.views.range(..=at).next_back().filter(|(base, view)| **base + view.0 > at)
+    else {
+        return false;
+    };
+    // The bytes of the view that `at` lies in, of the section's offsets.
+    !beside_in(&v.views, base, section, offset, bytes).is_empty()
 }
 
 /// The views of `section` that show any of the bytes a view at `at` shows
@@ -1618,11 +1645,9 @@ mod tests {
     /// ones whose guards are opened together (a page mapped twice).
     #[test]
     fn views_beside_a_new_one_show_the_same_bytes_of_the_section() {
+        // Only the local map: `title_memory_view` writes the process-wide
+        // one, which other tests read.
         let at = 0x7_8000_0000usize;
-        title_memory_view(at, 4 * K64, 78, 0);
-        title_memory_view(at + 8 * K64, 2 * K64, 78, 2 * K64 as u64);
-        // Another section, the same offsets: not an alias.
-        title_memory_view(at + 12 * K64, K64, 79, 0);
         let views = BTreeMap::from([
             (at, (4 * K64, 78, 0u64)),
             (at + 8 * K64, (2 * K64, 78, 2 * K64 as u64)),

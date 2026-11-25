@@ -639,6 +639,13 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut g = guards();
     let mut written = Vec::new();
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // A block whose bytes another view of the same section shows too is
+    // never made read-only: a write through that view would go unseen, and
+    // the block would stay `clean` for good. One atomic load while the title
+    // has mapped nothing twice (`inplace::aliased`).
+    let aliased = |at: usize| aliases() && crate::inplace::aliased(at);
+    // (`open` is a block's name below, so the giving back goes through this.)
+    let give_back = |g: &mut Guards, at: usize, to: usize| open(g, at, to);
     // Large heaps are usually clean. Walk only gaps between clean runs.
     let mut uncommitted_until = first;
     for (from, to) in g.clean.uncovered(first, last) {
@@ -656,7 +663,12 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                     g.absent.remove(&block);
                 }
             }
-            if open {
+            if open && aliased(block * BLOCK) {
+                // Given back if an earlier pass guarded it; never guarded
+                // again, and never clean.
+                give_back(&mut g, block * BLOCK, (block + 1) * BLOCK);
+                written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+            } else if open {
                 written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
                 if g.protected.contains(&block) {
                     // Written through the runtime, still read-only.
