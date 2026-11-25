@@ -516,8 +516,10 @@ fn uav_barrier(texture: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
             UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                // SAFETY: a borrowed reference; the barrier never releases it.
-                pResource: std::mem::ManuallyDrop::new(Some(texture.clone())),
+                // SAFETY: a borrowed pointer, as `host::transition` takes it:
+                // the barrier never releases it, and the list keeps the host
+                // copy alive until it has run.
+                pResource: unsafe { std::mem::transmute_copy(&texture) },
             }),
         },
     }
@@ -2053,16 +2055,18 @@ impl State {
             }
             return None;
         };
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COPY_DEST as COPY_DEST;
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_PREDICATION as PREDICATION;
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
         const COMMON: u32 = 0;
         // SAFETY: an open list; a count read where the execution reads it,
-        // into the low half of our own word (zero elsewhere).
+        // into the low half of our own word (zero elsewhere). The copy
+        // promotes the word to `COPY_DEST`, where the barrier finds it.
         unsafe {
             list.list.CopyBufferRegion(word, 0, &count, offset, 4);
             list.list.ResourceBarrier(&[crate::host::transition(
                 word,
-                State(COMMON as i32),
+                COPY_DEST,
                 PREDICATION,
             )]);
             list.list.SetPredication(word, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
@@ -2138,6 +2142,13 @@ impl State {
             if crate::resource::buffer_bytes(resource).is_some() {
                 if first {
                     tracing::warn!(program, view = %rule.view(), "ambient stand-in: a view of a buffer, which a clear of a view does not take");
+                }
+                crate::ambient::note(false);
+                continue;
+            }
+            if own.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 {
+                if first {
+                    tracing::warn!(program, view = %rule.view(), "ambient stand-in: a depth texture, whose views go to a colour twin and take no clear of this kind");
                 }
                 crate::ambient::note(false);
                 continue;
