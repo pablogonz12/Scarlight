@@ -85,6 +85,13 @@ impl<'a> Lower<'a> {
             // src0/src1; src2 is a full 32-bit addend. Clamp stays refused
             // (`write_i`).
             "v_mad_u32_u16" | "v_mad_i32_i16" => {
+                // op_sel[2]/[3] pick the half the result reads: this emits
+                // the whole dword, so the console's value would differ.
+                // Refused the way clamp is (`write_i`).
+                let Fields::Valu(v) = &inst.fields else { unreachable!() };
+                if v.opsel & 0b1100 != 0 {
+                    return Err("a result-half select on a 16-bit multiply-add");
+                }
                 let (mut a, mut b, d) = (
                     self.half_src(inst, 0)?,
                     self.half_src(inst, 1)?,
