@@ -609,6 +609,10 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     };
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
+        // Before the write, never after: the guards are on the title's views
+        // of the same pages, and told afterwards they save what we wrote
+        // (Marvisak/VIctory #2503).
+        mark_written(slice, *n, within, (data.len() - done).min(n * PAGE - within));
         let Some(mut view) = View::map(slice, *n) else {
             return false;
         };
@@ -619,19 +623,124 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     true
 }
 
+/// Tells the GPU side's write watch that bytes
+/// `[within, within + len)` of a run of `n` pages from `slice` are about to
+/// change through a view of our own: it saves an armed page's bytes before
+/// they change (`watch::writing`), so this has to come before the write.
+/// Called afterwards, it saves the bytes just written, and
+/// `copy_back_marked` then puts its stale copy back over them (streamed
+/// textures lost after a DirectStorage burst; Marvisak/VIctory #2503).
+fn mark_written(slice: &Slice, n: usize, within: usize, len: usize) {
+    for (at, bytes) in title_ranges(slice, n, within, len) {
+        victory_gpu::kernel_will_write(at, bytes);
+    }
+}
+
+/// The title's own views over bytes `[within, within + len)` of a run of `n`
+/// pages from `slice`, as addresses and lengths: the guards a write through
+/// our own view must open first.
+fn title_ranges(slice: &Slice, n: usize, within: usize, len: usize) -> Vec<(usize, usize)> {
+    let end = within.saturating_add(len);
+    let physical = physical();
+    let mut out = Vec::new();
+    for (at, (view_len, view)) in &physical.views {
+        if !Arc::ptr_eq(&view.section, &slice.section) {
+            continue;
+        }
+        // Where this view sits in the run's own bytes, which may start
+        // before the run (a view holding several pages of one section).
+        // Signed and saturating: a section's page indexes are large
+        // numbers, and a view may start before the run.
+        let head = (view.index as i64 - slice.index as i64).saturating_mul(PAGE as i64);
+        let lo = head.max(within as i64);
+        let hi = head
+            .saturating_add(*view_len as i64)
+            .min(end as i64)
+            .min((n as i64).saturating_mul(PAGE as i64));
+        if hi <= lo {
+            continue;
+        }
+        out.push((*at + (lo - head) as usize, (hi - lo) as usize));
+    }
+    out
+}
+
+/// Views a worker keeps for its next page destination: a load sends
+/// thousands of tiny requests, and each new view costs a map, a commit and
+/// an unmap (which flushes every core's TLB, and under Wine is a wineserver
+/// request): 0.2 ms a request when measured, more than the read itself
+/// (perf-ledger.md). A few per thread, since a tile is asked for again.
+struct Cached {
+    /// (section, index of the run's first page, byte in the first page, len).
+    key: (usize, usize, usize, usize),
+    view: View,
+}
+
+const CACHE_SLOTS: usize = 16;
+/// The most bytes one thread keeps mapped between requests.
+const CACHE_BYTES: usize = 4 << 20;
+
+thread_local! {
+    static CACHED: std::cell::RefCell<Vec<Option<Cached>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static NEXT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether a worker keeps its views mapped between requests
+/// (`VICTORY_DSTORAGE_VIEW_CACHE_MB`, 0 for off: the bench's before).
+fn cache_bytes() -> usize {
+    static BYTES: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("VICTORY_DSTORAGE_VIEW_CACHE_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(CACHE_BYTES, |mb| mb << 20)
+    });
+    *BYTES
+}
+
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
 /// until dropped: DirectStorage decodes into it instead of a buffer it
-/// would then copy.
+/// would then copy. The view of a cached window goes back to its worker's
+/// cache instead of being unmapped, so the next request in the same pages
+/// costs no map at all.
 pub(crate) struct PageWindow {
-    view: View,
+    view: Option<View>,
+    key: (usize, usize, usize, usize),
+    /// The cache slot the view goes back to, and whose old view it replaces.
+    slot: usize,
     within: usize,
     len: usize,
+    /// Mapped for this window alone: unmapped when it drops.
+    own: bool,
 }
 
 impl PageWindow {
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
         let (within, len) = (self.within, self.len);
-        &mut self.view.bytes()[within..within + len]
+        let view = self.view.as_mut().expect("a window's view until it drops");
+        &mut view.bytes()[within..within + len]
+    }
+}
+
+impl Drop for PageWindow {
+    fn drop(&mut self) {
+        let Some(view) = self.view.take() else {
+            return;
+        };
+        let (key, slot) = (self.key, self.slot);
+        if self.own {
+            drop(view);
+            return;
+        }
+        CACHED.with(|cached| {
+            let mut cached = cached.borrow_mut();
+            if slot >= cached.len() {
+                cached.resize_with(slot + 1, || None);
+            }
+            if let Some(old) = cached[slot].replace(Cached { key, view }) {
+                drop(old);
+            }
+        });
     }
 }
 
@@ -645,10 +754,72 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
-    Some(PageWindow {
-        view: View::map(slice, *n)?,
-        within: offset % PAGE,
+    let within = offset % PAGE;
+    let key = (
+        Arc::as_ptr(&slice.section) as usize,
+        slice.index,
+        within,
         len,
+    );
+    // Before the write, as in `write_physical` (Marvisak/VIctory #2503).
+    mark_written(slice, *n, within, len);
+    let budget = cache_bytes();
+    let hit = CACHED.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        if cached.len() < CACHE_SLOTS {
+            cached.resize_with(CACHE_SLOTS, || None);
+        }
+        let slot = cached
+            .iter()
+            .position(|c| c.as_ref().is_some_and(|c| c.key == key))?;
+        let taken = cached[slot].take()?;
+        Some((slot, taken.view))
+    });
+    if let Some((slot, view)) = hit {
+        return Some(PageWindow {
+            view: Some(view),
+            key,
+            slot,
+            within,
+            len,
+            own: false,
+        });
+    }
+    let view = View::map(slice, *n)?;
+    // A window longer than the budget (a big tile) is this request's alone:
+    // keeping it would hold that much of the title's memory.
+    if budget == 0 || len > budget {
+        return Some(PageWindow {
+            view: Some(view),
+            key,
+            slot: 0,
+            within,
+            len,
+            own: true,
+        });
+    }
+    let slot = CACHED.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        if cached.len() < CACHE_SLOTS {
+            cached.resize_with(CACHE_SLOTS, || None);
+        }
+        let held: usize = cached.iter().flatten().map(|c| c.view.len).sum();
+        match cached.iter().position(Option::is_none) {
+            Some(slot) if held + view.len <= budget => slot,
+            _ => NEXT.with(|next| {
+                let slot = next.get() % cached.len().max(1);
+                next.set(slot + 1);
+                slot
+            }),
+        }
+    });
+    Some(PageWindow {
+        view: Some(view),
+        key,
+        slot,
+        within,
+        len,
+        own: false,
     })
 }
 
