@@ -35,6 +35,12 @@ struct Clock {
 static CLOCK: Mutex<Option<Clock>> = Mutex::new(None);
 static FRAME: AtomicU64 = AtomicU64::new(0);
 
+/// One test at a time touches the clock above: `cargo test` runs a crate's
+/// tests in parallel, and a test that sets an interval or an event's offset
+/// while another waits on the clock moves that wait's ticks under it.
+#[cfg(test)]
+pub(crate) static TEST_FRAME_LOCK: Mutex<()> = Mutex::new(());
+
 fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -274,6 +280,8 @@ mod tests {
 
     #[test]
     fn scheduling_stores_the_offset_for_a_kind() {
+        // The clock's waits read these offsets: not while one of them runs.
+        let _clock = TEST_FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let null = std::ptr::null();
         let list = std::ptr::null::<u8>();
         assert_eq!(schedule(null, 2, 700, list, 0), S_OK);
@@ -286,6 +294,7 @@ mod tests {
 
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
+        let _clock = TEST_FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let null = std::ptr::null();
         assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
         let mut first = 0;
