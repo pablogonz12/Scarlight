@@ -1836,3 +1836,27 @@ fn v_mov_b32_modifiers_are_bitwise() {
         );
     });
 }
+fn check_half_fma_nearest_even(body: [u32; 2]) {
+    let cases = [
+        ([0x6600, 0x3956, 0x0400, 0], 0x6401), // 1024.5 plus 2^-14
+        ([0x6600, 0x3956, 0, 0], 0x6400), // exact tie, even
+        ([0xe600, 0x3956, 0x8400, 0], 0xe401), // negative midpoint plus a negative tail
+        ([0x6700, 0x3894, 0x8400, 0], 0x6401), // 1025.5 minus 2^-14
+        ([0x6700, 0x3894, 0, 0], 0x6402), // exact tie, even
+    ];
+    let inputs = cases.map(|(input, _)| input);
+    run_cases(&build_valu_cs(&body), &inputs, |backend, i, _, got| {
+        assert_eq!(got & 0xffff, cases[i].1, "{backend}: case {i}");
+    });
+}
+
+#[test]
+fn half_fma_rounds_once_to_nearest_even() {
+    check_half_fma_nearest_even(vop3(0x34b, 0, vgpr(1), vgpr(2), vgpr(3)));
+}
+
+#[test]
+fn half_fmac_rounds_once_to_nearest_even() {
+    let fmac = (0x036 << 25) | (2 << 9) | u32::from(vgpr(1));
+    check_half_fma_nearest_even([vop1(0x001, 0, vgpr(3)), fmac]);
+}
