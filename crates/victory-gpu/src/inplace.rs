@@ -1241,13 +1241,26 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         big >> 20
     ));
     for &(_, bytes, committed) in &v.sections {
-        lines.push(format!(
-            "census, a section of {} MB, {}",
-            bytes >> 20,
-            if committed { "committed: it can be opened as one heap" } else { "reserved: refused as a heap until it is made with SEC_COMMIT" }
-        ));
+        lines.push(format!("census, a section of {} MB, {}", bytes >> 20, section_verdict(committed)));
     }
     lines
+}
+
+/// What the census says of a section's memory, by whether it was made with
+/// `SEC_COMMIT`. Not "it can be opened as one heap": measured on this machine
+/// (`xcl-bin/notes/zero-copy.md` 6), a committed section cannot be. Its handle
+/// and its view both open, and the import under them fails (RADV refuses a
+/// file-backed host pointer, `VkAllocateMemory` giving `hr 0x8007000e`), after
+/// which vkd3d-proton quietly hands the buffers memory of its own: the API
+/// says yes, the GPU reads and writes somewhere else, and 267,386,880 of
+/// 268,435,456 bytes read back at the title's own address are wrong. Only
+/// private memory committed whole is placed, which is what [`From`] has.
+fn section_verdict(committed: bool) -> &'static str {
+    if committed {
+        "committed: not openable under Wine (the import of a section's pages is refused; measured, notes/zero-copy.md 6)"
+    } else {
+        "reserved: refused as a heap until it is made with SEC_COMMIT, and to no use then (the same refusal)"
+    }
 }
 
 /// With [`probe_level`] 2: one part of the title's own private memory
@@ -1424,6 +1437,18 @@ mod tests {
     /// The self-check decides the whole run: only "the bytes arrived both
     /// ways" keeps title memory in place; a refusal, a silent fallback and a
     /// check that could not be made leave every copy a copy.
+    #[test]
+    fn the_census_does_not_promise_a_section_heap() {
+        // #1117 places buffers over committed sections; under Wine the import
+        // is refused and vkd3d silently substitutes its own memory, so the
+        // census must never read as an invitation to place over one.
+        for committed in [true, false] {
+            let said = section_verdict(committed);
+            assert!(!said.contains("can be opened"), "{said}");
+            assert!(said.contains("not openable") || said.contains("no use"), "{said}");
+        }
+    }
+
     #[test]
     fn only_a_host_that_reads_our_pages_keeps_memory_in_place() {
         assert!(in_place(Health::Sound));
