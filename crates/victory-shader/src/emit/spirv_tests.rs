@@ -795,7 +795,6 @@ mod dpp {
     pub const QUAD_SWAP: u16 = 366;
     pub const SELECT: u16 = 169;
     pub const LESS_THAN: u16 = 176;
-    pub const GREATER_THAN_EQUAL: u16 = 174;
     /// `GLSL.std.450` `UMin`, the ext instruction `row_share` counts with.
     pub const EXT_INST: u16 = 12;
     pub const U_MIN: u32 = 38;
@@ -851,7 +850,7 @@ fn an_identity_quad_permutation_reads_the_lane_itself() {
     assert_eq!(ops_count(&m, dpp::QUAD_SWAP), 0);
     // The lane id is an input the module declares either way; the value
     // written is the source's own.
-    assert_eq!(capabilities(&m).contains(&dpp::CAP_QUAD), false);
+    assert!(!capabilities(&m).contains(&dpp::CAP_QUAD), "no quad swap here");
 }
 
 /// The three permutations that swap all four lanes of a quad are
