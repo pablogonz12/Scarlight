@@ -1,9 +1,9 @@
 //! Console primitive types the host lacks. A rectangle list gives three
-//! corners per rectangle, the second the one between the other two, and
-//! the hardware adds the fourth at `v0 + v2 - v1` (the title's
-//! full-screen rectangles come as top left, bottom left, bottom right); on
-//! the host each rectangle becomes two triangles, with the fourth vertex
-//! made from the other three on the CPU.
+//! corners per rectangle, in any order, and the hardware adds the fourth
+//! opposite the right angle (the title's full-screen rectangles come as
+//! top left, bottom left, bottom right, other lists give the right angle
+//! elsewhere); on the host each rectangle becomes two triangles, with the
+//! fourth vertex made from the other three on the CPU.
 //!
 //! shortcut: the fourth vertex is computed from vertex inputs, not from
 //! vertex shader outputs as the hardware does; that is the same for vertex
@@ -19,19 +19,41 @@
 //! left for a pipeline that could not get that stage.
 
 /// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
-/// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
-/// triangles turn the same way. `elements` are (byte offset, format).
+/// vertices each in `dst`: `(v0, v1, v2)` and `(va, vb, v3)`, so both
+/// triangles turn the same way, with the right angle `vc` picked from the
+/// first float element of two or more components (taken as the position;
+/// none: at `v1`), `va` before it, `vb` after it and `v3 = va + vb - vc`.
+/// `elements` are (byte offset, format).
 pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
+    if stride == 0 {
+        return;
+    }
     for (rect, out) in src
         .chunks_exact(3 * stride)
         .zip(dst.chunks_exact_mut(6 * stride))
     {
         let v = |i: usize| &rect[i * stride..(i + 1) * stride];
-        for (slot, i) in [0, 1, 2, 0, 2].into_iter().enumerate() {
+        let right = if any_corner() {
+            elements
+                .iter()
+                .find_map(|&(offset, format)| {
+                    let at = offset as usize;
+                    let (n, kind) = components(format)?;
+                    let float = matches!(kind, Kind::F32 | Kind::F16);
+                    (float && n >= 2 && stride.saturating_sub(at) / kind.bytes() >= 2).then(|| {
+                        right_angle([0, 1, 2].map(|i| [0, 1].map(|k| kind.read(&v(i)[at..], k))))
+                    })
+                })
+                .unwrap_or(1)
+        } else {
+            1
+        };
+        let (a, b) = ((right + 2) % 3, (right + 1) % 3);
+        for (slot, i) in [0, 1, 2, a, b].into_iter().enumerate() {
             out[slot * stride..(slot + 1) * stride].copy_from_slice(v(i));
         }
         let fourth = &mut out[5 * stride..];
-        fourth.copy_from_slice(v(0));
+        fourth.copy_from_slice(v(a));
         for &(offset, format) in elements {
             let at = offset as usize;
             let Some((n, kind)) = components(format) else {
@@ -42,11 +64,38 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
             let inside = stride.saturating_sub(at) / kind.bytes();
             for c in 0..n.min(inside) {
                 let get = |i: usize| kind.read(&v(i)[at..], c);
-                let value = get(0) + get(2) - get(1);
+                let value = get(a) + get(b) - get(right);
                 kind.write(&mut fourth[at..], c, value);
             }
         }
     }
+}
+
+/// Whether the right angle is picked in any order of the corners: on by
+/// default, `VICTORY_RECT_ANY_CORNER=0` keeps the old rule (the second
+/// corner), as every list the blits make gives it.
+fn any_corner() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECT_ANY_CORNER").is_none_or(|v| v != "0"))
+}
+
+/// Which of three corners holds a rectangle's right angle: the one opposite
+/// the longest side, in squared distance (ties, short sides and NaN keep
+/// `1`, the corner the blits put it at).
+fn right_angle(p: [[f32; 2]; 3]) -> usize {
+    let side = |a: usize, b: usize| {
+        let (x, y) = (p[a][0] - p[b][0], p[a][1] - p[b][1]);
+        x * x + y * y
+    };
+    // The side opposite each corner: the one between the other two.
+    let opposite = [side(1, 2), side(0, 2), side(0, 1)];
+    let mut right = 1;
+    for corner in [0, 2] {
+        if opposite[corner] > opposite[right] {
+            right = corner;
+        }
+    }
+    right
 }
 
 #[derive(Clone, Copy)]
@@ -216,6 +265,54 @@ mod tests {
         expand_rects(&src, &mut dst, 8, &[(0, 16), (4, 2), (8, 28)]);
         assert_eq!(dst[..40], [&src[..], &src[..8], &src[16..]].concat()[..]);
         assert_eq!(dst[40..], vertex(4.0, 6.0)[..]);
+    }
+
+    /// The corners can come in any order: a list whose right angle is the
+    /// first (top left, bottom left, top right, as a tiled lighting shader
+    /// gives them) completes at the bottom right, the second triangle
+    /// (v2, v1, v3), and a triangle that is no rectangle's keeps its
+    /// winding in both halves.
+    #[test]
+    fn rectangles_complete_opposite_their_right_angle() {
+        let vertex = |x: f32, y: f32| [x.to_le_bytes(), y.to_le_bytes()].concat();
+        let src = [vertex(0.0, 0.0), vertex(0.0, 1.0), vertex(1.0, 0.0)].concat();
+        let mut dst = vec![0u8; 6 * 8];
+        expand_rects(&src, &mut dst, 8, &[(0, 16)]);
+        assert_eq!(
+            dst[24..],
+            [&src[16..24], &src[8..16], &vertex(1.0, 1.0)[..]].concat()[..]
+        );
+        let read = |d: &[u8], i: usize| {
+            let f = |k: usize| {
+                f32::from_le_bytes(d[i * 8 + k * 4..i * 8 + k * 4 + 4].try_into().unwrap())
+            };
+            [f(0), f(1)]
+        };
+        let turn = |d: &[u8], i: usize| {
+            let [a, b, c] = [i, i + 1, i + 2].map(|k| read(d, k));
+            (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+        };
+        // No rectangle at all: both halves keep the source's winding.
+        let src = [vertex(0.0, 0.0), vertex(3.0, 1.0), vertex(1.0, 0.0)].concat();
+        expand_rects(&src, &mut dst, 8, &[(0, 16)]);
+        assert!(turn(&dst, 0) * turn(&dst, 3) > 0.0, "same winding");
+    }
+
+    /// The right angle is the corner opposite the longest side, in every
+    /// order; ties and NaN keep vertex 1.
+    #[test]
+    fn right_angles_are_found_in_any_order() {
+        let square = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]];
+        for (order, right) in [
+            ([0, 1, 2], 0), // top left, bottom left, top right
+            ([1, 2, 0], 2), // bottom left, top right, top left
+            ([2, 0, 1], 1), // top right, bottom left, top left
+        ] {
+            let p = order.map(|i| square[i]);
+            assert_eq!(right_angle(p), right, "{order:?}");
+        }
+        assert_eq!(right_angle([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]), 1, "a line");
+        assert_eq!(right_angle([[0.0, 0.0], [f32::NAN, 0.0], [1.0, 1.0]]), 1, "NaN");
     }
 
     /// `half_to_f32` reads subnormals, so an f16 rectangle output must be

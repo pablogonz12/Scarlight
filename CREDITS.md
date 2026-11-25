@@ -79,6 +79,10 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   the copy-back and the rest, the largest named (`crates/victory-gpu/src/frame_budget.rs`,
   `VICTORY_FRAME_BUDGET=0`). Reimplemented on this tree's counters and its own 50 ms budget: its
   per-command timestamps, memory-trait breakdown and slow-pipeline guard are not taken.
+- **Marvisak/VIctory [`8ff791351`](https://github.com/Marvisak/VIctory/commit/8ff791351)** (Marvis),
+  GPL-3.0: a rectangle list's fourth corner is completed opposite the right angle, wherever the three
+  corners put it (the rule is taken for the CPU expansion in `crates/victory-gpu/src/primitive.rs`,
+  `right_angle`; the geometry shader that also does it upstream is not on this tree).
 
 ## Tools
 
