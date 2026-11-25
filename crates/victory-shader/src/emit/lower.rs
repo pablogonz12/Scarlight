@@ -11504,6 +11504,7 @@ mod tests {
     // A POPS pixel shader's rasterizer ordered views: likewise.
     mod pops_rov;
     mod mad_u16_lerp;
+    mod mul24_hi;
 
     /// Tables of 2D textures at s0 and samplers at s1.
     fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
