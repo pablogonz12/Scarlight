@@ -34,6 +34,17 @@
 //!   decommit, release or protect the pages in it (`VirtualFree` and
 //!   `VirtualProtect` fail with error 87), nor unmap a view in it. Pages
 //!   outside the opened part are free to change.
+//! - `OpenExistingHeapFromAddress` takes one shape and no other: the
+//!   allocation's own base, one committed region, one protection
+//!   (vkd3d-proton `device.c:7603-7627`). A `MapViewOfFile` view of a section
+//!   is not that shape, and `OpenExistingHeapFromFileMapping` (`device.c:7637`)
+//!   maps the section again and unmaps it before the GPU uses the heap, so
+//!   neither is a way in for the page pool; memory we make ourselves is
+//!   `VirtualAlloc`ed as one region, and the title's own pages go through
+//!   `OpenExistingHeapFromAddress1`, which does take a part
+//!   (`xcl-bin/notes/linux-stack-fixes.md` 2.1). Needs vkd3d-proton master at
+//!   `563eb6c` (2026-11-04, "Do not force a failure in OpenHeapFromAddress"),
+//!   which 3.1.0 predates; our bundled `ec20719` has it.
 //! - A heap that opened is not a promise that the GPU uses those pages:
 //!   when the import is refused vkd3d-proton allocates memory of its own
 //!   and says nothing to the app (`xcl-bin/notes/zero-copy.md` §2). So
@@ -269,19 +280,19 @@ fn in_place(health: Health) -> bool {
 /// The one line the self-check leaves in the log, whatever it found, so
 /// that a run's log says whether title memory is in place or copied, and
 /// why, before a single frame is drawn.
-fn say_health(found: Health, error: &str) {
+fn say_health(found: Health, detail: &str) {
     match found {
         Health::Sound => tracing::info!(
-            "title memory in place: the host reads and writes our own pages (the self-check moved a page both ways, no flush and no map): title memory is used in place"
+            "title memory in place: the host reads and writes our own pages (the self-check moved a page both ways, no flush and no map; {detail}): title memory is used in place"
         ),
         Health::Refused => tracing::warn!(
-            "title memory in place: the host refused the import of a page of our own memory ({error}): every copy stays a copy, and this is counted"
+            "title memory in place: the host refused the import of a page of our own memory ({detail}): every copy stays a copy, and this is counted"
         ),
         Health::Fallback => tracing::warn!(
             "title memory in place: the host took the heap and the GPU used memory of its own (the self-check's bytes never arrived at our address): the import was refused and the driver fell back silently - every copy stays a copy, and this is counted"
         ),
         Health::Unchecked => tracing::warn!(
-            "title memory in place: the self-check could not be made ({error}): every copy stays a copy, and this is counted"
+            "title memory in place: the self-check could not be made ({detail}): every copy stays a copy, and this is counted"
         ),
         Health::Unknown => {}
     }
@@ -302,9 +313,9 @@ fn check(device: &ID3D12Device) -> Health {
     if known != Health::Unknown {
         return known;
     }
-    let (found, error) = ask(device);
+    let (found, detail) = ask(device);
     HEALTH.store(found as u8, Ordering::Relaxed);
-    say_health(found, &error);
+    say_health(found, &detail);
     found
 }
 
@@ -331,12 +342,19 @@ fn ask(device: &ID3D12Device) -> (Health, String) {
         if base.is_null() {
             return (Health::Unchecked, "no private memory to make it in".to_owned());
         }
-        let (found, error) = ask_page(&mut rig, device, base);
+        // The check's own pages are made the way an import needs them: one
+        // `VirtualAlloc`, 64 KiB aligned, one committed region of one
+        // protection (`whole_allocation`). The title's pages are not always
+        // that shape, which is why they go through `From::Part` instead.
+        if !whole_allocation(base as usize, 4 * K64) {
+            return (Health::Unchecked, "the check's own pages are not one allocation region".to_owned());
+        }
+        let (found, detail) = ask_page(&mut rig, device, base);
         let freed = mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE) != 0;
         if !freed && found == Health::Sound {
             return (Health::Unchecked, "the check's own page could not be released".to_owned());
         }
-        (found, error)
+        (found, detail)
     }
 }
 
@@ -364,14 +382,25 @@ fn ask_page(rig: &mut Rig, device: &ID3D12Device, base: *mut u8) -> (Health, Str
     fill(sent.as_mut_ptr(), sent.len(), 200);
     let writes = rig.store(&buffer, 0, &sent).is_ok() && same(base, &sent);
     let found = arrived(reads, writes);
-    let error = if found == Health::Sound {
-        String::new()
-    } else if reads {
-        "the GPU read our page but its write never reached our address".to_owned()
-    } else {
-        "the GPU never read our address".to_owned()
+    if found != Health::Sound {
+        return (
+            found,
+            if reads {
+                "the GPU read our page but its write never reached our address"
+            } else {
+                "the GPU never read our address"
+            }
+            .to_owned(),
+        );
+    }
+    // The strict opening (an allocation's own base, one region) beside the
+    // part the title's buffers use: both are ours to make here, and a host
+    // that refuses the first but takes the second is worth a word in the line.
+    let strict = match open(device, From::Region(base as usize, 4 * K64)) {
+        Ok(_) => "the whole-allocation opening takes these pages too",
+        Err(_) => "but the whole-allocation opening refuses them",
     };
-    (found, error)
+    (Health::Sound, strict.to_owned())
 }
 
 /// Title memory `[at, at + len)` is about to show something else, or the
@@ -426,9 +455,20 @@ fn say() {
 
 /// What a heap is opened on.
 pub(crate) enum From {
-    /// A whole `VirtualAlloc` allocation, by its base address.
-    Region(usize),
-    /// A committed part of one: address and bytes.
+    /// A whole `VirtualAlloc` allocation: its base address and its bytes. It
+    /// is the strict opening, and it takes nothing else - vkd3d-proton
+    /// refuses (`device.c:7603-7627`) unless `VirtualQuery` says the address
+    /// *is* the allocation's base, the range begins at that base and every
+    /// page of it has one protection, i.e. one region. A view of a section
+    /// from `MapViewOfFile` is not such a base, which is why the section path
+    /// ([`From::Section`], `OpenExistingHeapFromFileMapping`, `device.c:7637`,
+    /// which maps again and unmaps before the GPU uses the heap) always fails;
+    /// it is [`From::Part`] or memory of our own that can be imported
+    /// (`xcl-bin/notes/linux-stack-fixes.md` 2.1).
+    Region(usize, usize),
+    /// A committed part of one: address and bytes. `ID3D12Device13` takes a
+    /// part, so the title's own pages do not have to be the allocation's base
+    /// (or one region) for this.
     Part(usize, usize),
     /// A section made with `SEC_COMMIT`, by its handle.
     Section(usize),
@@ -440,7 +480,15 @@ pub(crate) fn open(device: &ID3D12Device, from: From) -> windows::core::Result<I
     // themselves; a refusal is an error code.
     unsafe {
         match from {
-            From::Region(at) => device.cast::<ID3D12Device3>()?.OpenExistingHeapFromAddress(at as *const c_void),
+            From::Region(at, bytes) => {
+                // The host's own rule, checked here so a refusal is ours and
+                // not a silent `E_INVALIDARG`: an allocation's base, one
+                // region, one protection.
+                if !whole_allocation(at, bytes) {
+                    return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG));
+                }
+                device.cast::<ID3D12Device3>()?.OpenExistingHeapFromAddress(at as *const c_void)
+            }
             From::Part(at, bytes) => device.cast::<ID3D12Device13>()?.OpenExistingHeapFromAddress1(at as *const c_void, bytes),
             From::Section(handle) => device.cast::<ID3D12Device3>()?.OpenExistingHeapFromFileMapping(HANDLE(handle as *mut c_void)),
         }
@@ -566,6 +614,27 @@ pub(crate) fn private_whole(at: usize, len: usize) -> bool {
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
     n != 0
+        && info.State == mem::MEM_COMMIT
+        && info.Type == mem::MEM_PRIVATE
+        && info.Protect == mem::PAGE_READWRITE
+        && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= at.saturating_add(len)
+}
+
+/// Whether `[at, at + len)` is a whole allocation as `OpenExistingHeapFromAddress`
+/// takes it (vkd3d-proton `device.c:7603-7627`: the address must be the
+/// allocation's own base, the range must begin there, and every page must have
+/// one protection, i.e. be one region). Memory we make ourselves is
+/// `VirtualAlloc`ed this way, one region per import, which is the fix
+/// `xcl-bin/notes/linux-stack-fixes.md` 2.1 asks for; a view of a section is
+/// not, and is never handed to this opening.
+fn whole_allocation(at: usize, len: usize) -> bool {
+    // SAFETY: plain data filled in by the query.
+    let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
+    n != 0
+        && info.AllocationBase as usize == at
+        && info.BaseAddress as usize == at
         && info.State == mem::MEM_COMMIT
         && info.Type == mem::MEM_PRIVATE
         && info.Protect == mem::PAGE_READWRITE
@@ -831,7 +900,7 @@ unsafe fn private(p: &mut Probe, rig: &mut Rig) {
         }
         // The part: 16 pages from the 16th on.
         let (at, bytes) = (base.add(16 * K64), 16 * K64);
-        let whole = open(&rig.device, From::Region(base as usize));
+        let whole = open(&rig.device, From::Region(base as usize, SIZE));
         p.lines.push(format!("private memory, the whole allocation (OpenExistingHeapFromAddress): {}", hr(&whole)));
         drop(whole);
         let opened = open(&rig.device, From::Part(at as usize, bytes));
@@ -1306,6 +1375,27 @@ mod tests {
         assert_eq!(health_of(9), Health::Unknown, "a number nobody wrote is not asked yet");
     }
 
+    /// The strict opening takes one shape only (vkd3d-proton
+    /// `device.c:7603-7627`): the allocation's own base, one committed region
+    /// of one protection. Our own pages are made that way; a part of them, or
+    /// a range that spans a second protection, is not.
+    #[test]
+    fn only_an_allocations_own_base_is_a_whole_allocation() {
+        // SAFETY: an allocation of the test's own.
+        unsafe {
+            let base = mem::VirtualAlloc(std::ptr::null(), 4 * K64, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            assert!(whole_allocation(base as usize, 4 * K64), "a VirtualAlloc's own base, one region");
+            assert!(!whole_allocation(base as usize + K64, 2 * K64), "an offset inside it is a part, not its base");
+            let mut old = 0;
+            assert_ne!(mem::VirtualProtect(base.add(K64).cast(), K64, mem::PAGE_READONLY, &mut old), 0);
+            assert!(!whole_allocation(base as usize, 4 * K64), "a page with a protection of its own makes a second region");
+            mem::VirtualProtect(base.add(K64).cast(), K64, mem::PAGE_READWRITE, &mut old);
+            assert!(whole_allocation(base as usize, 4 * K64));
+            mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
+    }
+
     /// Only private memory committed whole, read-write, is taken for a part.
     #[test]
     fn only_private_memory_committed_whole_is_a_part() {
@@ -1406,8 +1496,8 @@ mod tests {
             eprintln!("no ID3D12Device13 here: a part of an allocation cannot be opened");
             return;
         }
-        let (found, error) = ask(&device);
-        assert_eq!(found, Health::Sound, "the software adapter reads and writes a page we hand it: {error}");
+        let (found, detail) = ask(&device);
+        assert_eq!(found, Health::Sound, "the software adapter reads and writes a page we hand it: {detail}");
     }
 
     /// The census names each kind of memory.
