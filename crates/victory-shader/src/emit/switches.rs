@@ -19,3 +19,10 @@ pub fn mask_scc_wave() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| enabled("VICTORY_MASK_SCC_LANES"))
 }
+
+/// A `LaneExit::Branch` with both arms on one block lowers as a jump;
+/// `VICTORY_BRANCH_SAME_ARMS=0` keeps the two-way branch.
+pub fn branch_same_arms() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| enabled("VICTORY_BRANCH_SAME_ARMS"))
+}

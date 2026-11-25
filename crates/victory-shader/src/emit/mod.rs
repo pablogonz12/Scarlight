@@ -81,6 +81,8 @@
 //!   It binds nothing.
 
 mod bitcode;
+#[cfg(test)]
+mod branch_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;

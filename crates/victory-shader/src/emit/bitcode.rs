@@ -386,6 +386,12 @@ impl Module {
         }
     }
 
+    /// How many blocks the module has (a test of what lowering made).
+    #[cfg(test)]
+    pub fn blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
     pub fn new_block(&mut self) -> usize {
         self.blocks.push(Block::default());
         self.blocks.len() - 1

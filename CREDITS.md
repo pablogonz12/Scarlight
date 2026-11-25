@@ -48,6 +48,10 @@ BlueKaiman, kais7654, pushkarreddyy, shh.
   differs), not a per-lane XNOR/XOR, so it is left out of the per-lane SCC map and the branch is
   the uniform compare of the two masks (`crates/victory-shader/src/structure.rs`,
   `crates/victory-shader/src/emit/switches.rs`).
+- **JMAN730/victory** ([project-flamingo#685](https://github.com/JMAN730/project-flamingo/pull/685)),
+  GPL-3.0: a `LaneExit::Branch` whose two arms name one block is lowered as the jump it is, so the
+  edge map's `(from, to)` key is not written twice and that successor's PHIs keep their predecessor
+  (`crates/victory-shader/src/emit/lower.rs`, `crates/victory-shader/src/emit/branch_tests.rs`).
 
 ## Tools
 

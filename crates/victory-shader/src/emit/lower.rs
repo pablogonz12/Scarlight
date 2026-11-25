@@ -65,6 +65,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// The blocks of the module (a test of which edge blocks lowering made).
+    #[cfg(test)]
+    pub blocks: usize,
 }
 
 pub(crate) struct Parts<'a> {
@@ -2284,6 +2287,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            blocks: self.s.m.blocks(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -11070,6 +11075,23 @@ impl<'a> Lower<'a> {
             LaneExit::Jump(t) => {
                 self.enter_loop(b, t, self.cur);
                 Term::Br(self.block[t].expect("reachable"))
+            }
+            // Both arms go to one block: a CondBr would make the same
+            // critical edge twice, and the edge map (keyed by `(from, to)`)
+            // would drop the first block, leaving the PHIs of that successor
+            // one predecessor short (VIC-BT-007). A jump instead
+            // (`VICTORY_BRANCH_SAME_ARMS=0` keeps the CondBr).
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } if taken == not_taken && crate::emit::switches::branch_same_arms() => {
+                if self.counters.contains_key(&taken) && self.rpo[taken] <= self.rpo[b] {
+                    let ok = self.count_iteration(taken, pred::IULT);
+                    let abort = self.abort_block();
+                    Term::CondBr(ok, self.block[taken].expect("reachable"), abort)
+                } else {
+                    self.enter_loop(b, taken, self.cur);
+                    Term::Br(self.block[taken].expect("reachable"))
+                }
             }
             LaneExit::Branch {
                 when,
