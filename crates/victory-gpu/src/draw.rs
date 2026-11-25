@@ -2479,11 +2479,11 @@ impl State {
         };
         let rects = u64::from(count / 3);
         for slot in 0..32 {
-            let elements: Vec<(u32, u32)> = p
+            let elements: Vec<(u32, u32, bool)> = p
                 .inputs
                 .iter()
                 .filter(|e| e.slot == slot && !e.per_instance)
-                .map(|e| (e.offset, e.format))
+                .map(|e| (e.offset, e.format, e.position))
                 .collect();
             if elements.is_empty() {
                 continue;

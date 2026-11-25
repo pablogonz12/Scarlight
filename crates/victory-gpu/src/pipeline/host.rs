@@ -381,24 +381,31 @@ impl GraphicsState {
                 };
                 let bytes = crate::resource::element(format).map_or(0, |(b, _)| b as u32);
                 next[slot] = offset + bytes;
+                // SAFETY: the layout's semantic names are NUL-terminated.
+                let semantic = unsafe { CStr::from_ptr(e.SemanticName.0.cast()) };
                 Input {
                     slot: slot as u32,
                     offset,
                     format,
                     per_instance: e.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
+                    position: semantic.to_bytes().eq_ignore_ascii_case(b"POSITION"),
                 }
             })
             .collect()
     }
 }
 
-/// One input element: vertex buffer slot, byte offset, format.
+/// One input element: vertex buffer slot, byte offset, format, and whether
+/// it is the position the host reads a triangle's plane from.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Input {
     pub(crate) slot: u32,
     pub(crate) offset: u32,
     pub(crate) format: u32,
     pub(crate) per_instance: bool,
+    /// Its semantic is `POSITION`: the console completes a rectangle's
+    /// fourth corner from it, whatever its offset in the vertex.
+    pub(crate) position: bool,
 }
 
 /// The console's own primitive topology types.

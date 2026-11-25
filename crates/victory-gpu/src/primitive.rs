@@ -21,10 +21,16 @@
 /// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
 /// vertices each in `dst`: `(v0, v1, v2)` and `(va, vb, v3)`, so both
 /// triangles turn the same way, with the right angle `vc` picked from the
-/// first float element of two or more components (taken as the position;
-/// none: at `v1`), `va` before it, `vb` after it and `v3 = va + vb - vc`.
-/// `elements` are (byte offset, format).
-pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
+/// `POSITION` element's first two components (taken as x and y; no such
+/// element, or not a float pair: at `v1`), `va` before it, `vb` after it and
+/// `v3 = va + vb - vc`. `elements` are (byte offset, format, whether the
+/// element is `POSITION`).
+pub(crate) fn expand_rects(
+    src: &[u8],
+    dst: &mut [u8],
+    stride: usize,
+    elements: &[(u32, u32, bool)],
+) {
     if stride == 0 {
         return;
     }
@@ -36,13 +42,14 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
         let right = if any_corner() {
             elements
                 .iter()
-                .find_map(|&(offset, format)| {
+                .find_map(|&(offset, format, position)| {
                     let at = offset as usize;
                     let (n, kind) = components(format)?;
                     let float = matches!(kind, Kind::F32 | Kind::F16);
-                    (float && n >= 2 && stride.saturating_sub(at) / kind.bytes() >= 2).then(|| {
-                        right_angle([0, 1, 2].map(|i| [0, 1].map(|k| kind.read(&v(i)[at..], k))))
-                    })
+                    (position && float && n >= 2 && stride.saturating_sub(at) / kind.bytes() >= 2)
+                        .then(|| {
+                            right_angle([0, 1, 2].map(|i| [0, 1].map(|k| kind.read(&v(i)[at..], k))))
+                        })
                 })
                 .unwrap_or(1)
         } else {
@@ -54,7 +61,7 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
         }
         let fourth = &mut out[5 * stride..];
         fourth.copy_from_slice(v(a));
-        for &(offset, format) in elements {
+        for &(offset, format, _) in elements {
             let at = offset as usize;
             let Some((n, kind)) = components(format) else {
                 continue;
@@ -225,7 +232,7 @@ mod tests {
         ]
         .concat();
         let mut dst = vec![0u8; 6 * 12];
-        expand_rects(&src, &mut dst, 12, &[(0, 16), (8, 28)]);
+        expand_rects(&src, &mut dst, 12, &[(0, 16, true), (8, 28, false)]);
         assert_eq!(dst[..36], src[..]);
         assert_eq!(dst[36..48], src[..12]);
         assert_eq!(dst[48..60], src[24..36]);
@@ -249,7 +256,7 @@ mod tests {
             .flat_map(|h| h.to_le_bytes())
             .collect();
         let mut dst = vec![0u8; 6 * 2];
-        expand_rects(&src, &mut dst, 2, &[(0, 54)]);
+        expand_rects(&src, &mut dst, 2, &[(0, 54, false)]);
         assert_eq!(dst[10..], 0x4000_u16.to_le_bytes());
     }
 
@@ -262,7 +269,7 @@ mod tests {
         let vertex = |x: f32, y: f32| [x.to_le_bytes(), y.to_le_bytes()].concat();
         let src = [vertex(0.0, 2.0), vertex(1.0, 3.0), vertex(5.0, 7.0)].concat();
         let mut dst = vec![0u8; 6 * 8];
-        expand_rects(&src, &mut dst, 8, &[(0, 16), (4, 2), (8, 28)]);
+        expand_rects(&src, &mut dst, 8, &[(0, 16, true), (4, 2, false), (8, 28, false)]);
         assert_eq!(dst[..40], [&src[..], &src[..8], &src[16..]].concat()[..]);
         assert_eq!(dst[40..], vertex(4.0, 6.0)[..]);
     }
@@ -277,7 +284,7 @@ mod tests {
         let vertex = |x: f32, y: f32| [x.to_le_bytes(), y.to_le_bytes()].concat();
         let src = [vertex(0.0, 0.0), vertex(0.0, 1.0), vertex(1.0, 0.0)].concat();
         let mut dst = vec![0u8; 6 * 8];
-        expand_rects(&src, &mut dst, 8, &[(0, 16)]);
+        expand_rects(&src, &mut dst, 8, &[(0, 16, true)]);
         assert_eq!(
             dst[24..],
             [&src[16..24], &src[8..16], &vertex(1.0, 1.0)[..]].concat()[..]
@@ -294,8 +301,38 @@ mod tests {
         };
         // No rectangle at all: both halves keep the source's winding.
         let src = [vertex(0.0, 0.0), vertex(3.0, 1.0), vertex(1.0, 0.0)].concat();
-        expand_rects(&src, &mut dst, 8, &[(0, 16)]);
+        expand_rects(&src, &mut dst, 8, &[(0, 16, true)]);
         assert!(turn(&dst, 0) * turn(&dst, 3) > 0.0, "same winding");
+    }
+
+    /// The right angle is read from the `POSITION` element, wherever it sits
+    /// in the vertex: a float pair before it (texture coordinates, say) is no
+    /// position and does not pick the corner.
+    #[test]
+    fn the_right_angle_comes_from_the_position_element() {
+        let vertex = |u: f32, v: f32, x: f32, y: f32| {
+            [
+                u.to_le_bytes(),
+                v.to_le_bytes(),
+                x.to_le_bytes(),
+                y.to_le_bytes(),
+            ]
+            .concat()
+        };
+        // The texture coordinates (0,0), (0,1), (1,0) put the right angle
+        // first; the positions (0,0), (0,1), (1,1) put it second, so the
+        // fourth corner is (1, 0) and not (1, 2).
+        let src = [
+            vertex(0.0, 0.0, 0.0, 0.0),
+            vertex(0.0, 1.0, 0.0, 1.0),
+            vertex(1.0, 0.0, 1.0, 1.0),
+        ]
+        .concat();
+        let mut dst = vec![0u8; 6 * 16];
+        expand_rects(&src, &mut dst, 16, &[(0, 16, false), (8, 16, true)]);
+        let fourth = &dst[5 * 16 + 8..];
+        assert_eq!(fourth[..4], 1.0f32.to_le_bytes(), "x");
+        assert_eq!(fourth[4..], 0.0f32.to_le_bytes(), "y");
     }
 
     /// The right angle is the corner opposite the longest side, in every
