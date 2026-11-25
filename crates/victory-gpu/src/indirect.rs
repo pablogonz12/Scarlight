@@ -508,7 +508,10 @@ impl HoistedClamps {
             return Some((self.chunks[self.used - 1].clone(), at));
         }
         if self.used == self.chunks.len() {
-            let (buffer, _) = host()?.shared_buffer(HOIST_CHUNK)?;
+            // Device-local: the chunks are written as unordered access and read
+            // as indirect arguments by the card (a host-visible shared heap is
+            // neither, on a real D3D12 driver).
+            let buffer = host()?.uav_buffer(HOIST_CHUNK)?;
             crate::host::name(&buffer, || "hoisted indirect arguments".into());
             self.chunks.push(buffer);
         }
@@ -1739,11 +1742,32 @@ void main() {
 
     /// Reads `words` 32-bit words from `buf` at byte offset `at` after execution.
     fn read_words(buf: &super::ID3D12Resource, at: u64, words: usize) -> Vec<u32> {
-        let mut p = std::ptr::null_mut();
-        // SAFETY: mapped host-visible shared scratch buffer after GPU completion.
+        let Some(host) = super::host() else {
+            return Vec::new();
+        };
+        let bytes = (words * 4) as u64;
+        let (read, ptr) = host.shared_buffer(bytes).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: open list; the chunk is in `INDIRECT_ARGUMENT` (hoisted, or
+        // `done` left it there); the readback is a mapped shared buffer.
         unsafe {
-            buf.Map(0, None, Some(&mut p)).unwrap();
-            let base = p.cast::<u8>().add(at as usize).cast::<u32>();
+            list.list.ResourceBarrier(&[super::transition(
+                buf,
+                super::D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                super::D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list.CopyBufferRegion(&read, 0, buf, at, bytes);
+            list.list.ResourceBarrier(&[super::transition(
+                buf,
+                super::D3D12_RESOURCE_STATE_COPY_SOURCE,
+                super::D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            )]);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: GPU completed; mapped shared buffer.
+        unsafe {
+            let base = ptr.cast::<u32>();
             (0..words).map(|i| base.add(i).read_volatile()).collect()
         }
     }
@@ -1753,7 +1777,6 @@ void main() {
     /// record (>64) draw, and mid-wave `BUDGET` exhaustion — while leaving the
     /// title's source buffer completely unmodified.
     #[test]
-    #[ignore = "GPU output comparison: passes on RADV under Wine, access-violates in CI's D3D12 run"]
     fn hoisted_clamps_match_inline_bounds_and_budget_order() {
         let Some(host) = super::host() else {
             return;
