@@ -434,8 +434,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     ))
 }
 
-/// Guarded blocks of view memory.
-const BLOCK: usize = PAGE;
+/// The unit a write-back job holds and a copy guards: one page.
+pub(crate) const BLOCK: usize = PAGE;
 
 struct Guards {
     /// Blocks we made read-only.
@@ -966,6 +966,7 @@ pub fn title_memory_reading_within(limit: std::time::Duration) -> Option<Reading
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::texback::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
