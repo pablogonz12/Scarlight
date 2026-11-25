@@ -352,6 +352,11 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        // A null handle is the non-owning placeholder the tests build (and
+        // `CloseHandle(NULL)` raises under a debugger, so it must not run).
+        if self.0.is_null() {
+            return;
+        }
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
@@ -379,8 +384,31 @@ struct Physical {
 /// Whether freed page numbers are handed out again (`VICTORY_PAGE_RECYCLE=0`
 /// keeps the old ever-growing counter).
 fn page_recycle() -> bool {
+    #[cfg(test)]
+    if let Some(on) = forced_recycle() {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_PAGE_RECYCLE").as_deref() != Ok("0"))
+}
+
+// Tests set the policy they exercise on their own thread, so a run with
+// `VICTORY_PAGE_RECYCLE=0` still tests the reuse (see `force_recycle`).
+#[cfg(test)]
+thread_local! {
+    static FORCED_RECYCLE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// The policy a test asked for on this thread, if any.
+#[cfg(test)]
+fn forced_recycle() -> Option<bool> {
+    FORCED_RECYCLE.with(std::cell::Cell::get)
+}
+
+/// Tests: whether this thread's allocator reuses freed page numbers.
+#[cfg(test)]
+fn force_recycle(value: Option<bool>) {
+    FORCED_RECYCLE.with(|c| c.set(value));
 }
 
 impl Physical {
@@ -1658,6 +1686,8 @@ mod tests {
     /// the title's 21-bit `number >> 4` field, after which allocation fails.
     #[test]
     fn freed_page_numbers_are_handed_out_again() {
+        // The policy is the test's, not the environment's.
+        force_recycle(Some(true));
         let section = empty_section();
         let mut physical = owned_physical(FIRST_PAGE_NUMBER);
         let mut numbers = [MaybeUninit::<usize>::uninit(); 2];
@@ -1680,6 +1710,27 @@ mod tests {
                 physical.free(n);
             }
         }
+        force_recycle(None);
+    }
+
+    /// `VICTORY_PAGE_RECYCLE=0` is the old ever-growing counter, which the
+    /// switch keeps testable without the environment.
+    #[test]
+    fn the_page_recycle_switch_keeps_the_counter_growing() {
+        force_recycle(Some(false));
+        let section = empty_section();
+        let mut physical = owned_physical(FIRST_PAGE_NUMBER);
+        let mut numbers = [MaybeUninit::<usize>::uninit(); 2];
+        assert!(physical.allocate(&section, &mut numbers));
+        for &n in &take(&numbers) {
+            physical.free(n);
+        }
+        let ceiling = physical.next_page;
+        assert!(physical.allocate(&section, &mut numbers));
+        let grown = physical.next_page;
+        force_recycle(None);
+        assert!(grown > ceiling, "VICTORY_PAGE_RECYCLE=0 must not reuse");
+        assert_eq!(take(&numbers), vec![ceiling, ceiling + FRAMES]);
     }
 
     /// A page number at the top of the title's 21-bit field still allocates;
