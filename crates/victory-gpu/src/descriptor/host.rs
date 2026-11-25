@@ -2708,74 +2708,67 @@ mod tests {
         resource[0] = 1; // D3D12_RESOURCE_DIMENSION_BUFFER
         let view = |desc: [u32; 16]| View::Placed(false, resource, desc);
 
-        // A structured buffer view at a bogus first element: refused.
-        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_UNKNOWN,
-            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: 1u64 << 60,
-                    NumElements: 4,
-                    StructureByteStride: 16,
-                    Flags: D3D12_BUFFER_SRV_FLAG_NONE,
-                },
-            },
+        // The host's 40-byte descriptor words: format, dimension, component
+        // mapping, then the union at word 4 (a `u64` `FirstElement` there,
+        // `NumElements`, stride and flags after it).
+        let words = |format: u32, dimension: u32, first: u64, count: u32, stride: u32, flags: u32| {
+            let mut words = [0u32; 10];
+            words[0] = format;
+            words[1] = dimension;
+            words[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            (words[4], words[5]) = (first as u32, (first >> 32) as u32);
+            (words[6], words[7], words[8]) = (count, stride, flags);
+            words
         };
-        // SAFETY: the host's 40-byte descriptor words.
-        let words: [u32; 10] = unsafe { std::mem::transmute_copy(&srv) };
-        let mut desc = [0u32; 16];
-        desc[..10].copy_from_slice(&words);
-        desc[10] = 0x1000; // the view's address
-        assert_eq!(buffer_range(&view(desc)), None);
-        // The same view with a first element that fits is a view of it.
-        let mut fits = words;
-        fits[4] = 2; // FirstElement low half
-        fits[5] = 0; // FirstElement high half
-        let mut desc = [0u32; 16];
-        desc[..10].copy_from_slice(&fits);
-        desc[10] = 0x1000;
-        assert_eq!(buffer_range(&view(desc)), Some((0x1020, 64)));
+        let placed = |words: [u32; 10]| {
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&words);
+            desc[10] = 0x1000; // the view's address
+            view(desc)
+        };
+        let buffer = |first: u64| {
+            words(
+                DXGI_FORMAT_UNKNOWN.0 as u32,
+                D3D12_SRV_DIMENSION_BUFFER.0 as u32,
+                first,
+                4,
+                16,
+                D3D12_BUFFER_SRV_FLAG_NONE.0 as u32,
+            )
+        };
 
-        // A texture view of buffer memory is no buffer view at all.
-        let texture = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                Texture2D: D3D12_TEX2D_SRV {
-                    MostDetailedMip: 0,
-                    MipLevels: u32::MAX,
-                    PlaneSlice: 0,
-                    ResourceMinLODClamp: 0.0,
-                },
-            },
-        };
-        // SAFETY: the host's 40-byte descriptor words.
-        let words: [u32; 10] = unsafe { std::mem::transmute_copy(&texture) };
-        let mut desc = [0u32; 16];
-        desc[..10].copy_from_slice(&words);
-        desc[10] = 0x1000;
-        assert_eq!(buffer_range(&view(desc)), None);
-        // A texture view of buffer memory through a table's unordered slot too.
-        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
-            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                Texture2D: D3D12_TEX2D_UAV {
-                    MipSlice: 0,
-                    PlaneSlice: 0,
-                },
-            },
-        };
-        // SAFETY: the host's 40-byte descriptor words.
-        let words: [u32; 10] = unsafe { std::mem::transmute_copy(&uav) };
-        let mut desc = [0u32; 16];
-        desc[..10].copy_from_slice(&words);
-        desc[10] = 0x1000;
-        let mut unordered = resource;
-        unordered[0] = 1;
-        assert_eq!(buffer_range(&View::Placed(true, unordered, desc)), None);
+        // A structured buffer view at a bogus first element: refused.
+        assert_eq!(buffer_range(&placed(buffer(1u64 << 60))), None);
+        assert_eq!(buffer_range(&placed(buffer(u64::MAX))), None);
+        // The same view with a first element that fits is a view of it.
+        assert_eq!(buffer_range(&placed(buffer(2))), Some((0x1020, 64)));
+
+        // A texture view of buffer memory is no buffer view at all: its words
+        // are a texture's, and reading them as a buffer's is a bogus address.
+        let texture = words(
+            DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(buffer_range(&placed(texture)), None);
+        // Through a table's unordered slot too (its dimension word is its own).
+        let unordered_texture = words(
+            DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(buffer_range(&View::Placed(true, resource, {
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&unordered_texture);
+            desc[10] = 0x1000;
+            desc
+        })), None);
     }
 
     /// A view written over memory that older views describe otherwise
