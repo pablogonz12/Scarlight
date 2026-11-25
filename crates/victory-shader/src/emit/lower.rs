@@ -127,6 +127,12 @@ enum Numeric {
     Float,
 }
 
+/// The dword a byte or half at a constant byte `off` sits in, and the shift
+/// from its low end to the field (loads are dword-aligned).
+const fn field_in_dword(off: u32) -> (u32, u32) {
+    (off & !3, (off & 3) * 8)
+}
+
 /// A GFX10 buffer format (the unified format of typed buffer loads): the
 /// channel widths from the lowest bits up, and how the channels convert.
 /// Formats are numbered in families (`8`, `16`, `8_8`, ...: AMD names
@@ -6197,12 +6203,24 @@ impl<'a> Lower<'a> {
                 .collect()
         };
         let words = if total < 32 {
-            // A byte or half inside the dword that holds it.
-            let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
-            let at = self.s.m.bin(c, Bin::And, off, not3);
+            // A byte or half inside the dword that holds it. A constant offset
+            // is aligned here, and the load takes the same access as the
+            // buffer's others: vkd3d-proton reads a load at a computed offset
+            // through a per-component raw access, which on NVIDIA misses a
+            // dword the same invocation has just stored.
+            let (at, sh) = match self.s.m.int_value(off) {
+                Some(o) => {
+                    let (at, sh) = field_in_dword(o as u32);
+                    (self.s.m.i32(at), self.s.m.i32(sh))
+                }
+                None => {
+                    let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
+                    let at = self.s.m.bin(c, Bin::And, off, not3);
+                    let byte = self.s.m.bin(c, Bin::And, off, three);
+                    (at, self.s.m.bin(c, Bin::Shl, byte, three))
+                }
+            };
             let w = load(self, at, 1)[0];
-            let byte = self.s.m.bin(c, Bin::And, off, three);
-            let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             vec![self.s.m.bin(c, Bin::LShr, w, sh)]
         } else {
             load(self, off, total / 32)

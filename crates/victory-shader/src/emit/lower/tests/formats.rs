@@ -95,3 +95,26 @@ fn small_floats_widen_as_halves() {
     // A 16-bit float is a half already, sign included.
     assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
 }
+
+/// A byte or half load at a constant offset is the aligned dword of that
+/// field, with a constant shift: vkd3d-proton then takes the buffer's own
+/// access for it (see `format_load`).
+#[test]
+fn a_constant_field_offset_is_the_aligned_dword() {
+    use super::super::field_in_dword;
+    let cases = [
+        (0u32, (0u32, 0u32)),
+        (1, (0, 8)),
+        (2, (0, 16)),
+        (3, (0, 24)),
+        (4, (4, 0)),
+        (5, (4, 8)),
+        (7, (4, 24)),
+        (8, (8, 0)),
+        (0x11, (0x10, 8)),
+        (0xFFFE, (0xFFFC, 16)),
+    ];
+    for (off, want) in cases {
+        assert_eq!(field_in_dword(off), want, "offset {off}");
+    }
+}
