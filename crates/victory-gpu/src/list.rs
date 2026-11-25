@@ -1780,11 +1780,31 @@ pub(crate) struct ValueWait {
     wide: bool,
 }
 
+/// The comparison code that asks nothing of the value: a wait with it is met
+/// whatever the memory holds, mapped or not.
+const ALWAYS: u32 = 8;
+
+/// Whether a wait on memory that cannot be read yet holds its queue until it
+/// reads, rather than running on at once (`VICTORY_WAIT_UNREAD=0`, as before).
+/// Memory that is not mapped is taken as not holding what is waited for
+/// unless the comparison does not look at the value (`ALWAYS`).
+fn unread_holds() -> bool {
+    static HOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HOLD.get_or_init(|| std::env::var("VICTORY_WAIT_UNREAD").as_deref() != Ok("0"))
+}
+
 impl ValueWait {
     /// Whether the memory holds what is waited for now.
     /// shortcut: the comparison codes are taken to be the comparison
     /// functions' (1 never .. 8 always, value against reference); one not
-    /// known counts as met, and so does memory that is not mapped.
+    /// known counts as met.
+    ///
+    /// Memory that cannot be read yet (a page not mapped, say) is taken as
+    /// not holding, and the queue waits until it reads: running on at once
+    /// sent the work after the wait to the card before the work that writes
+    /// the value, and the wait was reported as an unknown comparison in the
+    /// frame's summary. `ALWAYS` asks nothing of the value, so it is met.
+    /// `VICTORY_WAIT_UNREAD=0` reads unreadable memory as met, as before.
     ///
     /// The value is read through the kernel, which reports memory that is
     /// not there instead of faulting (as the copies of title memory are
@@ -1825,7 +1845,7 @@ impl ValueWait {
         // The low `bytes` bytes; the rest stays zero.
         let mut raw = [0u8; 8];
         if !crate::host::read_into(self.address as *const u8, &mut raw[..bytes]) {
-            return true;
+            return !unread_holds() || self.comparison >= ALWAYS;
         }
         self.holds_for(u64::from_le_bytes(raw))
     }
@@ -2230,6 +2250,65 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// A wait on memory that cannot be read yet is not met: its queue waits
+    /// for the value instead of sending the work after it to the card first
+    /// (#2604). On the old code the wait was met at once. Bounded, so a look
+    /// that never returns fails the test instead of hanging the run.
+    #[cfg(windows)]
+    #[test]
+    fn a_wait_on_memory_not_mapped_yet_is_not_met() {
+        use windows_sys::Win32::System::Memory::*;
+        // EQUAL 5 holds once the page reads.
+        let wait = |address: u64, comparison: u32| ValueWait {
+            address,
+            comparison,
+            reference: 5,
+            wide: false,
+        };
+        // SAFETY: a private page, committed, protected and freed here only.
+        let page = unsafe {
+            let at = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+                .cast::<u32>();
+            assert!(!at.is_null());
+            at.write(5);
+            at
+        };
+        let mut old = 0;
+        // SAFETY: the page is ours and is read through the kernel, which
+        // reports an unreadable page instead of faulting.
+        assert_ne!(
+            unsafe { VirtualProtect(page.cast(), 4096, PAGE_NOACCESS, &mut old) },
+            0
+        );
+        // The look is a kernel call that does not block; the deadline only
+        // bounds a look that would not return at all.
+        let look = |w: ValueWait| {
+            let (send, got) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = send.send(w.met());
+            });
+            got.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("a wait's look returns")
+        };
+        let equal = wait(page as u64, 3);
+        assert!(
+            !look(equal),
+            "memory that cannot be read yet does not hold: the queue waits"
+        );
+        assert!(
+            look(wait(page as u64, ALWAYS)),
+            "ALWAYS asks nothing of the value"
+        );
+        // SAFETY: readable again, and ours.
+        assert_ne!(
+            unsafe { VirtualProtect(page.cast(), 4096, PAGE_READWRITE, &mut old) },
+            0
+        );
+        assert!(look(equal), "met once the value reads");
+        // SAFETY: ours, freed once.
+        assert_eq!(unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) }, 1);
     }
 
     #[cfg(windows)]
