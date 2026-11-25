@@ -61,6 +61,7 @@ pub(crate) struct Heap {
     pending: std::sync::Mutex<Vec<u32>>,
 }
 
+#[cfg(windows)]
 pub(crate) use host::fallback_samplers;
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
