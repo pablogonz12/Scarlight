@@ -16,6 +16,7 @@
 //! program's VGPR count, all read (and all written, for a destination).
 
 use crate::ShaderError;
+use crate::emit::lower::switches;
 use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
 
 /// One register dword. Scalar codes as in [`Operand::Scalar`]: 0-105 SGPRs,
@@ -214,7 +215,9 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             });
         }
     }
-    prune_unreachable(&mut blocks);
+    if switches::cfg_prune() {
+        prune_unreachable(&mut blocks);
+    }
     link(&mut blocks);
     if !blocks[0].preds.is_empty() {
         return Err(ShaderError::Unsupported {
@@ -533,12 +536,12 @@ fn rename(mut blocks: Vec<Block>, wave64: bool, vgprs: u16) -> Program {
     // reached from entry. Renaming and liveness only visit the reachable
     // set (`order`), so unreachable preds leave empty `outs` and would
     // insert `NONE` into phi.args (and panic `remove_trivial_phis`).
-    if order.len() != blocks.len() {
+    if switches::cfg_prune() && order.len() != blocks.len() {
         prune_unreachable(&mut blocks);
         link(&mut blocks);
         order = reverse_postorder(&blocks);
     }
-    debug_assert_eq!(order.len(), blocks.len());
+    debug_assert!(order.len() <= blocks.len());
     let (live_in, live_out) = liveness(&blocks, &order);
     let mut values = 0u32;
     let mut new_value = || {
@@ -632,7 +635,9 @@ pub(crate) fn thread_edges(
         }
         blocks.push(copy);
     }
-    prune_unreachable(&mut blocks);
+    if switches::cfg_prune() {
+        prune_unreachable(&mut blocks);
+    }
     link(&mut blocks);
     split_irreducible(&mut blocks)?;
     Ok(rename(blocks, p.wave64, p.vgprs))
@@ -1716,6 +1721,37 @@ mod tests {
             p.blocks[1].insts[0].read(Reg::S(0)),
             p.blocks[0].insts[0].write(Reg::S(0))
         );
+    }
+
+    /// `VICTORY_SHADER_CFG_PRUNE=0` keeps the blocks no path from entry
+    /// reaches, as before flamingo #679.
+    #[test]
+    fn the_cfg_prune_switch_keeps_unreachable_blocks() {
+        // Block 1 has no path from entry and no phi depends on it, so the
+        // graph lowers either way (the test above has the phi case).
+        let graph = || {
+            let mut blocks = vec![
+                synth_block(
+                    0,
+                    vec![synth_inst(0, vec![], vec![Reg::S(0)])],
+                    Exit::Jump(2),
+                ),
+                synth_block(4, vec![synth_inst(4, vec![], vec![Reg::S(1)])], Exit::End),
+                synth_block(8, vec![synth_inst(8, vec![Reg::S(0)], vec![])], Exit::End),
+            ];
+            link(&mut blocks);
+            blocks
+        };
+
+        switches::force(switches::CFG_PRUNE, Some(true));
+        let on = rename(graph(), false, 256);
+        switches::force(switches::CFG_PRUNE, None);
+        assert_eq!(on.blocks.len(), 2, "the prune drops the unreachable block");
+
+        switches::force(switches::CFG_PRUNE, Some(false));
+        let off = rename(graph(), false, 256);
+        switches::force(switches::CFG_PRUNE, None);
+        assert_eq!(off.blocks.len(), 3, "VICTORY_SHADER_CFG_PRUNE=0 keeps it");
     }
 
     #[test]

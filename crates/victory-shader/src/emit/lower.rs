@@ -93,14 +93,6 @@ enum Stop {
     Fail(ShaderError),
 }
 
-/// Whether the RDNA2 arithmetic fidelity fixes are on: an `omod` flushes
-/// -0.0 to +0.0 after the scale, and each `s_buffer_load` address term is
-/// truncated to a dword before the terms are summed.
-/// `VICTORY_SHADER_RDNA2=0` turns both off.
-fn rdna2_fixes() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_SHADER_RDNA2").as_deref() != Ok("0"))
-}
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
@@ -4088,7 +4080,7 @@ impl<'a> Lower<'a> {
                 f = self.s.m.bin(c, Bin::Mul, f, scale);
                 // RDNA2 omod (mul:2/mul:4/div:2) flushes -0.0 to +0.0;
                 // IEEE FMul keeps the sign of zero.
-                if rdna2_fixes() {
+                if switches::omod_zero() {
                     let zero = self.s.m.f32(0);
                     let is_zero = self.s.m.cmp(c, pred::OEQ, f, zero);
                     f = self.s.m.select(c, is_zero, zero, f);
@@ -5701,7 +5693,7 @@ impl<'a> Lower<'a> {
             (Some(x), Some(y)) => l.s.m.i32((x as u32).wrapping_add(y as u32)),
             _ => l.s.m.bin(c, Bin::Add, a, b),
         };
-        let mut addr = if rdna2_fixes() {
+        let mut addr = if switches::sbuffer_term() {
             let mut built = self.s.m.i32(base);
             if let Some(x) = extra {
                 built = add(self, built, x);
@@ -5722,7 +5714,11 @@ impl<'a> Lower<'a> {
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
             let so = self.operand(inst, soffset)?;
             // Without the fix the soffset is used as it is.
-            let so = if rdna2_fixes() { align(self, so) } else { so };
+            let so = if switches::sbuffer_term() {
+            align(self, so)
+        } else {
+            so
+        };
             addr = add(self, addr, so);
         }
         #[cfg(test)]
@@ -11157,6 +11153,9 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 
 // The VALU integer operations, in their own file (this one is at the 512 KiB cap).
 mod valu_int;
+
+// The off switches of the three flamingo fixes, read once each.
+pub(crate) mod switches;
 
 #[cfg(test)]
 #[path = "lower_tests.rs"]

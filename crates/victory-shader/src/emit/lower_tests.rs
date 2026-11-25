@@ -1,3 +1,4 @@
+    use super::switches::{OMOD_ZERO, SBUFFER_TERM, force as force_switch};
     use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -196,6 +197,14 @@
                 "v_add_f32 omod={omod} must emit fcmp oeq to flush -0.0"
             );
         }
+        // `VICTORY_SHADER_OMOD_ZERO=0` takes the flush away again.
+        force_switch(OMOD_ZERO, Some(false));
+        let off = lower_with(&v_add_f32_omod(1), vec![], vec![]).unwrap();
+        force_switch(OMOD_ZERO, None);
+        assert!(
+            !off.has_fcmp_oeq,
+            "VICTORY_SHADER_OMOD_ZERO=0 must drop the fcmp oeq"
+        );
     }
 
     /// Lowers a compute program with the root parameters `layout` (in user
@@ -421,6 +430,13 @@
         assert_eq!(bytes(4, 0), vec![4]);
         assert_eq!(bytes(0, 4), vec![4]);
         assert_eq!(bytes(5, 7), vec![8], "(5&~3)+(7&~3) = 8");
+        // `VICTORY_SHADER_SBUFFER_TERM=0` sums the terms untruncated.
+        force_switch(SBUFFER_TERM, Some(false));
+        let off = bytes(3, 3);
+        let also = bytes(5, 7);
+        force_switch(SBUFFER_TERM, None);
+        assert_eq!(off, vec![6], "3+3 untruncated");
+        assert_eq!(also, vec![12], "5+7 untruncated");
     }
 
     #[test]
