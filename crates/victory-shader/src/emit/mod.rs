@@ -95,6 +95,8 @@ mod own_bits;
 mod rect;
 mod sampler;
 mod shader;
+#[cfg(test)]
+mod key_tests;
 mod threading;
 #[cfg(windows)]
 pub mod validator;
@@ -244,6 +246,101 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
     parse_count(value).unwrap_or(lower::LOOP_LIMIT)
+}
+
+/// Every `VICTORY_*` variable [`translate`] reads whose value changes the
+/// DXIL it writes. A translation cached with one set of these must never be
+/// served to a run with another, so `victory-gpu`'s shader cache hashes
+/// [`settings_bytes`] into its entry key; a switch added here is covered
+/// from then on, and the test in `key_tests` fails if the sources read one
+/// that is in none of the three lists.
+pub const SWITCHES: &[&str] = &[
+    "VICTORY_F16_NEAREST",
+    "VICTORY_F16_SUM_WIDE",
+    "VICTORY_FIRSTLANE_OWN",
+    "VICTORY_FIRST_HALF",
+    "VICTORY_GROUP_SYNC",
+    "VICTORY_MESH_OUTPUT_STRICT",
+    "VICTORY_SHADER_LOOP_LIMIT",
+    "VICTORY_SHADER_LOOP_LIMIT_CS",
+    "VICTORY_SHADER_OPT",
+    "VICTORY_STRICT_JOINS",
+    "VICTORY_WAVE_DEEP_SKIPS",
+    "VICTORY_WAVE_LOCAL",
+    "VICTORY_WAVE_OWN_BITS",
+    "VICTORY_WAVE_WIDE",
+];
+
+/// Switches the translation reads that only change what it reports (traces,
+/// counters, the device a program is checked on): left out of
+/// [`settings_bytes`], so a run with one of them on still finds the
+/// translations an earlier run cached.
+pub const DIAGNOSTIC_SWITCHES: &[&str] = &[
+    "VICTORY_D3D12_DEBUG",
+    "VICTORY_DESC_WHY",
+    "VICTORY_SHADER_CENSUS",
+    "VICTORY_WARP",
+    "VICTORY_WAVE_WHY",
+];
+
+/// Variables read only by tests and the dump harnesses: never part of a
+/// shipped translation, so never part of its key.
+pub const TEST_SWITCHES: &[&str] = &[
+    "VICTORY_CONSOLE_DXC",
+    "VICTORY_DIFF_ONLY",
+    "VICTORY_DUMP_ALL",
+    "VICTORY_DXIL",
+    "VICTORY_EMIT_DUMP",
+    "VICTORY_PC_DXC",
+    "VICTORY_REF_PS",
+    "VICTORY_REF_VS",
+];
+
+/// What a translation depends on besides the container: every switch in
+/// [`SWITCHES`] with its value, the effective loop limits, the group-barrier
+/// mode and the clean-up passes. `victory-gpu`'s shader cache hashes this
+/// into the key of every entry, so a run that changes any of them translates
+/// again instead of serving the form an earlier run cached (`VICTORY_WAVE_LOCAL`
+/// and `VICTORY_F16_SUM_WIDE` among them: neither was in the key, and a warm
+/// cache kept the form it was warmed with).
+pub fn settings_bytes() -> Vec<u8> {
+    settings_bytes_of(|name| std::env::var_os(name))
+}
+
+/// As [`settings_bytes`], with `lookup` in place of the environment: pure,
+/// so a test can ask what a switch set would key, without touching the
+/// process's environment.
+pub fn settings_bytes_of(lookup: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<u8> {
+    let mut out = b"victory-shader settings 1".to_vec();
+    out.push(u8::from(cfg!(feature = "diagnostics")));
+    for value in [loop_limit(), compute_loop_limit(), shader_opt(), u32::from(group_sync())] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    let mut names = SWITCHES.to_vec();
+    names.sort_unstable();
+    for name in names {
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'=');
+        match lookup(name) {
+            Some(value) => out.extend_from_slice(value.as_encoded_bytes()),
+            None => out.extend_from_slice(b"unset"),
+        }
+        out.push(0);
+    }
+    out
+}
+
+/// What a translation takes from the host GPU rather than from the container
+/// or a switch: the null slot view indices are clamped to
+/// ([`set_view_heap_limit`], probed on the device) and the widest wave it
+/// runs ([`set_host_max_wave`], from `WaveLaneCountMax`). Both are known only
+/// once the device exists, so a cache must read this when it translates, not
+/// once at start: its key takes this too.
+pub fn device_bytes() -> Vec<u8> {
+    let mut out = b"victory-shader host 1".to_vec();
+    out.extend_from_slice(&view_heap_limit().to_le_bytes());
+    out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
+    out
 }
 
 /// A translated shader and what the host binds for it.
@@ -494,17 +591,45 @@ pub fn emit(
         }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
-    // trace programs): right once the wave takes that skip together ([`widen`]; the
-    // lowering has named the skipped blocks).
+    // trace programs) or cross-lane code in a shader that could not run with local waves alone:
+    // retry `widen` allowing loop-adjacent branches cleanly now that `local_waves` was tried.
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
             if native.stage == HwStage::Cs
-                && what == lower::LANE_MASK
+                && (what == lower::LANE_MASK || lower::needs_every_lane(what))
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+            let deep = native.wave64
+                && lower::host_max_wave() == 32
+                && std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+            let base = if deep {
+                ir::without_skips(p, true)
+                    .or_else(|| ir::without_skips(p, false))
+                    .or_else(|| ir::without_early_outs(p))
+            } else {
+                None
+            };
+            let log = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
+                if why {
+                    match r {
+                        Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
+                        Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
+                    }
+                }
+            };
+            let again = widen(c, native, base.as_ref().unwrap_or(p), why);
+            log("wave-wide branches (retry)", &again);
             match again {
                 Ok(_) => again,
+                Err(_) if base.is_some() => {
+                    let fallback = widen(c, native, p, why);
+                    log("wave-wide branches (fallback)", &fallback);
+                    match fallback {
+                        Ok(_) => fallback,
+                        Err(_) => emit_program(c, native, p, st, io, res),
+                    }
+                }
                 Err(_) => emit_program(c, native, p, st, io, res),
             }
         }
@@ -547,7 +672,11 @@ fn widen(
     match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
-        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        crate::native::StageIo::Cs(cs)
+            if {
+                let g = cs.threads.iter().product::<u32>();
+                g > 0 && g <= 1024 && (g <= 32 || g.is_multiple_of(64))
+            } => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);

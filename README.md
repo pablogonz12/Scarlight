@@ -80,6 +80,10 @@ on, name yours in `compatibilitytools.d/Scarlight-<version>/scarlight.conf` (`PR
 DXC's `dxil.dll` and `dxcompiler.dll` in `Scarlight-<version>/files/` (Microsoft's binaries are not redistributed
 by a Linux release). [docs/steam.md](docs/steam.md) has both.
 
+Running the game from a script instead of Steam, and the Mesa shader cache that cuts pipeline creation
+from 37,672 ms to 148 ms for the 751 programs of the test set, are in
+**[docs/linux.md](docs/linux.md#mesa-shader-cache)**.
+
 ## Releases
 
 Releases are on the [Releases page](https://github.com/pablogonz12/Scarlight/releases): a versioned
@@ -107,6 +111,10 @@ Measured 25 Nov 2026 on one machine: **AMD RX 9070 XT**, Mesa 26.3.1 (RADV), Cac
 No other card and no other game have been tried, so nothing here promises anything about yours.
 
 <!-- progress:start -->
+[![Shader instruction coverage](https://pablogonz12.github.io/Scarlight/progress/shaders.svg)](https://pablogonz12.github.io/Scarlight/progress/)
+
+Counted from the source on every change: which GPU instructions Scarlight can read and translate.
+Live page with history: [pablogonz12.github.io/Scarlight/progress](https://pablogonz12.github.io/Scarlight/progress/).
 Progress in detail — what is measured, how, and where each number comes from: [docs/PROGRESS.md](docs/PROGRESS.md).
 <!-- progress:end -->
 
