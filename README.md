@@ -122,36 +122,49 @@ anything that has changed since.</sub>
 ## How it works
 
 ```mermaid
-flowchart LR
-    A["Xbox Series game<br/>x86-64 code + GPU work"] --> B["Scarlight<br/>console APIs · GPU command streams · RDNA2 shader recompiler"]
-    B --> C["Direct3D 12"] --> D["vkd3d-proton"] --> E["Vulkan"] --> F["Mesa<br/>RADV · ANV · NVK"] --> G["Linux kernel<br/>amdgpu · i915 / xe"]
-    W["Proton = Wine<br/>(the OS side)"] -.-> A
+flowchart TB
+    S["Steam: you press Play"] --> T["Scarlight compatibility tool<br/>picks your Proton, sets up the prefix"]
+    T --> P
+    subgraph P["Proton (Wine): the operating-system side"]
+        direction TB
+        G["The game's own x86-64 code"] <-->|"console API calls"| R["Scarlight runtime<br/>console APIs · GPU command decoder · RDNA2 shader recompiler"]
+    end
+    R -->|"Direct3D 12 + DXIL"| V["vkd3d-proton"]
+    V -->|"Vulkan + SPIR-V"| M["Mesa: RADV · ANV · NVK"]
+    M --> K["Linux kernel GPU driver<br/>amdgpu · xe / i915 · nouveau"]
 ```
 
 [![Mesa: built for it](https://img.shields.io/badge/Mesa-built%20for%20it-ff2e63?style=flat-square&labelColor=14072c)](https://docs.mesa3d.org/)
-[![Drivers: RADV · ANV](https://img.shields.io/badge/drivers-RADV%20%C2%B7%20ANV-ff7a3d?style=flat-square&labelColor=14072c)](docs/hardware.md)
+[![Drivers: RADV · ANV · NVK](https://img.shields.io/badge/drivers-RADV%20%C2%B7%20ANV%20%C2%B7%20NVK-ff7a3d?style=flat-square&labelColor=14072c)](docs/hardware.md)
 [![Vulkan 1.3](https://img.shields.io/badge/Vulkan-1.3%2B-19d8ff?style=flat-square&labelColor=14072c)](https://www.vulkan.org/)
 
+- **Steam starts it.** The game's `.exe` is a Non-Steam Game whose compatibility tool is Scarlight.
+  The tool finds your Proton, prepares the game's prefix and shader cache, and asks Steam for the same
+  runtime container Proton gets.
 - **Proton does the operating-system side.** The game's file, thread, memory and window calls are
-  Wine's job, through the Proton you installed. Scarlight asks Steam for the same runtime container
-  Proton gets, so the game sees a normal, working Linux desktop.
-- **Scarlight does the console side.** It answers the console system APIs the game calls, decodes its
-  GPU command streams, and recompiles its RDNA2 shaders and pipelines for your card.
-- **vkd3d-proton and Mesa draw it.** The re-emitted Direct3D 12 goes through vkd3d-proton into
-  Vulkan, and Mesa's RADV (AMD), ANV (Intel) or NVK (NVIDIA) submits it to the kernel. Mesa is open
-  source, so the driver is ours to read, tune and fix — that is why the project is built around it.
+  Wine's job, through the Proton you installed.
+- **Scarlight does the console side.** It runs inside that Wine process next to the game: it answers
+  the console system APIs the game calls, decodes its GPU command streams, and recompiles its RDNA2
+  shaders and pipelines for your card.
+- **vkd3d-proton and Mesa draw it.** Scarlight hands Direct3D 12 and DXIL to vkd3d-proton, which turns
+  them into Vulkan and SPIR-V for Mesa's RADV (AMD), ANV (Intel) or NVK (NVIDIA). Mesa is open source,
+  so the driver is ours to read, tune and fix — that is why the project is built around it. RADV on
+  RDNA4 is the only one tested so far.
 
 Design notes: [docs/architecture.md](docs/architecture.md).
 
 ## Roadmap
 
-| Stage | Goal |
-|---|---|
-| **Now** | A complete picture in the fixed scene: dark areas lit, faces and walls drawn |
-| **Next** | Speed: remove the per-frame copies and stalls, caches that survive a rebuild |
-| **Later** | Talk to Vulkan directly — the game's memory without copies, then SPIR-V straight from its shaders |
+| Stage | Goal | Where it stands |
+|---|---|---|
+| **Now** | One core, every shader | The best translator and GPU code of the related projects merged into one core: 751 of 751 world shaders and 2,907 of 2,912 recorded shaders translate offline |
+| **Now** | Speed: stop copying the game's memory every frame | Most of a slow frame is copies of the game's memory. In progress: copies on the graphics card, the game's private memory shared with the card instead of copied, and copies that avoid a slow path in Wine |
+| **Now** | Loading and pop-in | Files are read at a small fraction of what the disk can do; the reader is being measured stage by stage |
+| **Next** | Dark areas lit | The game traces rays in its own compute shaders, and that part is switched off today; turning it on (or using the card's ray tracing on RADV) is the way to light shadowed areas |
+| **Next** | Faces and missing geometry | Specific shaders and copies that are dropped; each has a named cause |
+| **Later** | Talk to Vulkan directly | Shaders straight from the console's instructions to SPIR-V, with no DXIL in between: an experimental translator already covers about half of the compute shaders |
 
-No dates; these are goals, not results.
+No dates; these are goals, not results. Every number above is from offline checks on one machine.
 
 ## Help wanted
 
