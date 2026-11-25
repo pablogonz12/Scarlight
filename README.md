@@ -107,6 +107,10 @@ Measured 25 Nov 2026 on one machine: **AMD RX 9070 XT**, Mesa 26.3.1 (RADV), Cac
 No other card and no other game have been tried, so nothing here promises anything about yours.
 
 <!-- progress:start -->
+[![Shader instruction coverage](https://pablogonz12.github.io/Scarlight/progress/shaders.svg)](https://pablogonz12.github.io/Scarlight/progress/)
+
+Counted from the source on every change: which GPU instructions Scarlight can read and translate.
+Live page with history: [pablogonz12.github.io/Scarlight/progress](https://pablogonz12.github.io/Scarlight/progress/).
 Progress in detail — what is measured, how, and where each number comes from: [docs/PROGRESS.md](docs/PROGRESS.md).
 <!-- progress:end -->
 

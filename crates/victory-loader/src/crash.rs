@@ -155,18 +155,19 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
             Some([0x0f, 0x01, 0xfb]) => std::thread::yield_now(),
             _ => {
                 if let Some(pass) = clwb_loop(bytes) {
-                    // A whole write-back loop in one exception (see `clwb_loop`).
+                    // A whole write-back loop in one exception (see `clwb_loop`),
+                    // unless its last pass would leave the address space: then
+                    // only the `clwb` is skipped and the loop runs at the
+                    // CPU's own pace, so `base` never wraps.
                     let limit = *gpr(context, pass.limit);
                     let base = gpr(context, pass.base);
-                    *base = if *base <= limit {
-                        base.wrapping_add(((limit - *base) / 64 + 1) * 64)
-                    } else {
-                        base.wrapping_add(64)
-                    };
-                    let flags = cmp_flags(*base, limit);
-                    context.EFlags = context.EFlags & !CMP_FLAGS | flags;
-                    context.Rip += pass.len as u64;
-                    return true;
+                    if let Some(end) = loop_exit(*base, limit) {
+                        *base = end;
+                        let flags = cmp_flags(*base, limit);
+                        context.EFlags = context.EFlags & !CMP_FLAGS | flags;
+                        context.Rip += pass.len as u64;
+                        return true;
+                    }
                 }
                 if let Some(len) = clwb_len(bytes) {
                     // A write-back hint: the PC's memory is coherent, so it has nothing to do.
@@ -307,6 +308,19 @@ fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
         return None;
     }
     (limit != base).then_some(ClwbLoop { base, limit, len })
+}
+
+/// Where an emulated write-back loop's last pass leaves `base`: past `limit`
+/// by one line. `None` when that would leave the address space (a `base` or
+/// `limit` within a line of `u64::MAX`), so the loop is left to the CPU
+/// rather than finished with a wrapped `base`.
+fn loop_exit(base: u64, limit: u64) -> Option<u64> {
+    let passes = if base <= limit {
+        (limit - base) / 64 + 1
+    } else {
+        1
+    };
+    base.checked_add(passes.checked_mul(64)?)
 }
 
 /// The general register numbered `n` as instructions encode it.
@@ -792,6 +806,46 @@ mod tests {
         // The flags the last cmp leaves: base just past limit.
         assert_eq!(cmp_flags(0x1040, 0x1000) & 0x41, 0); // CF and ZF clear: the loop ends
         assert_eq!(cmp_flags(0x1000, 0x1000) & 0x40, 0x40);
+    }
+
+    /// A `clwb` loop whose last pass would run past `u64::MAX`: `base` is not
+    /// moved, only the `clwb` is emulated, and the loop then runs one
+    /// instruction at a time (#2555).
+    #[test]
+    fn a_write_back_loop_at_the_top_of_the_address_space_is_left_to_the_cpu() {
+        assert_eq!(loop_exit(0x1000, 0x1000), Some(0x1040));
+        assert_eq!(loop_exit(0x1040, 0x1000), Some(0x1080));
+        // One pass or many, the end is past `u64::MAX`: no fast path.
+        assert_eq!(loop_exit(u64::MAX - 0x3f, u64::MAX), None);
+        assert_eq!(loop_exit(u64::MAX, 0), None);
+
+        // clwb [rcx]; add rcx, 0x40; cmp rcx, rax; jbe top, with `rax` at the
+        // top of the address space.
+        let code = [
+            0x66, 0x0f, 0xae, 0x31, 0x48, 0x83, 0xc1, 0x40, 0x48, 0x39, 0xc1, 0x76, 0xf3,
+        ];
+        let mut bytes = [0xcc_u8; 32];
+        bytes[..code.len()].copy_from_slice(&code);
+        assert!(clwb_loop(&bytes).is_some());
+        // SAFETY: a zeroed record and context are valid; the emulation reads
+        // only `bytes` and writes only `context` (the loop's `clwb` touches
+        // no memory).
+        unsafe {
+            let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+            record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rip = bytes.as_ptr() as u64;
+            context.Rax = u64::MAX;
+            context.Rcx = 0x1000;
+            let mut pointers = EXCEPTION_POINTERS {
+                ExceptionRecord: &mut record,
+                ContextRecord: &mut context,
+            };
+            assert!(emulate_amd_only(&mut pointers));
+            // Past the `clwb` only, and `rcx` as it was.
+            assert_eq!(context.Rip - bytes.as_ptr() as u64, 4);
+            assert_eq!(context.Rcx, 0x1000);
+        }
     }
 
     /// Gives the bytes at `rip` to the emulation as an illegal instruction
