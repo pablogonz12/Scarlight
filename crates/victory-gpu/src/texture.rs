@@ -1809,6 +1809,10 @@ pub(crate) fn narrowed(asked: (u32, u32), resident: (u32, u32), mips: u32) -> (u
 
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
+    // Read (and make) the host copy first: `hosted` takes the texture's own
+    // lock, which `let_go_idle` holds while it calls `unstage` and so takes
+    // this one.
+    let skipped = crate::resource::dropped_mips(resource);
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize)) {
@@ -1870,7 +1874,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
-        skipped: crate::resource::dropped_mips(resource),
+        skipped,
         bytes: total,
         memory,
         resource,

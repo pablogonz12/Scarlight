@@ -1669,6 +1669,15 @@ fn narrow_to_resident(
     }
     // SAFETY: a live resource.
     let mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+    // A copy that lost the title's top mips names its own levels (the view
+    // was rebased before this): the window resident in title memory shifts
+    // and shortens with them.
+    let dropped = crate::resource::dropped_mips(resource);
+    let (first, count) = (
+        resident.0.saturating_sub(dropped),
+        resident.1.saturating_sub(dropped).max(1),
+    );
+    let resident = (first, count.min(mips.saturating_sub(first)).max(1));
     let asked = match desc.ViewDimension {
         D3D12_SRV_DIMENSION_TEXTURE2D => {
             // SAFETY: the union member of a 2D view.

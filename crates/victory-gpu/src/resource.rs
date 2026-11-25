@@ -734,8 +734,17 @@ fn create_with_fewer_mips<T, E>(
         match create(&attempt) {
             Ok(made) => return Ok((made, attempt, dropped)),
             Err(e) => {
-                let fewer = kept / 2;
-                if !retry || fewer == 0 || droppable_mips(desc, mips - fewer) == 0 {
+                if !retry {
+                    return Err(e);
+                }
+                let mut fewer = kept / 2;
+                // A drop that block compression makes illegal (36×36 BC1
+                // cannot lose two levels) gives way to the largest one
+                // below it, which keeps whole blocks.
+                while fewer > 0 && droppable_mips(desc, mips - fewer) == 0 {
+                    fewer -= 1;
+                }
+                if fewer == 0 {
                     return Err(e);
                 }
                 kept = fewer;
@@ -1943,6 +1952,11 @@ fn hand_out_resource(
 ) -> HRESULT {
     #[cfg(not(windows))]
     let _ = (state, clear);
+    // A placed texture (and a texture made for a view the title placed in
+    // its own memory) may alias a full-mip target or unordered access view:
+    // it is known as one before its host copy can be made, lazy or not.
+    #[cfg(windows)]
+    let placed = matches!(&backing, Backing::Placed { .. } | Backing::Address(_));
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -1959,7 +1973,7 @@ fn hand_out_resource(
             used: std::sync::atomic::AtomicU64::new(0),
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
-            placed: std::sync::atomic::AtomicBool::new(false),
+            placed: std::sync::atomic::AtomicBool::new(placed),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
@@ -2295,10 +2309,6 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     }
     map.insert((address, *desc), out as usize);
     crate::texture::placed_in_host_written(address, desc);
-    resource(out)
-        .host
-        .placed
-        .store(true, std::sync::atomic::Ordering::Relaxed);
     Some(out)
 }
 
@@ -2574,6 +2584,22 @@ mod tests {
             .is_err()
         );
         assert_eq!(asked, 1);
+    }
+
+    #[test]
+    fn an_illegal_retry_candidate_gives_way_to_a_smaller_one() {
+        // 36×36 BC1 with four levels: halving asks for two levels gone, which
+        // leaves 9×9 (not a whole block). The three-level drop (4×4) is tried.
+        let desc = texture(36, 36, 71, 4);
+        let mut asked = Vec::new();
+        let made = create_with_fewer_mips(&desc, true, |trial| {
+            asked.push(mip_count(trial));
+            (mip_count(trial) <= 1)
+                .then_some(trial.width)
+                .ok_or("no memory")
+        });
+        assert_eq!(asked, [4, 1]);
+        assert_eq!(made.map(|(width, _, dropped)| (width, dropped)), Ok((4, 3)));
     }
 
     #[test]

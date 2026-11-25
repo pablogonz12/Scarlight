@@ -966,6 +966,9 @@ extern "system" fn copy_texture_region(
             // and 1x1 RGBA32F, 80 and 16 bytes: run 90), and read a buffer
             // nobody wrote. `VICTORY_READ_BACK=0` leaves them unmade, as
             // before.
+            if src.kind != FOOTPRINT && mip_dropped(src.resource) {
+                return;
+            }
             static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             let made = read_back(list, dst, x, y, z, src, source_box);
