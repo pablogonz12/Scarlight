@@ -997,6 +997,13 @@ pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
 /// the last place of a result that is not exact is then one lower than the console's).
 /// Off by default: it is exact but untried in a game run, and adds instructions to every
 /// such operation. The wave sum of 16-bit floats ([`Lower::half_sum`]) is always exact.
+/// `VICTORY_SHADER_DIV_FIXUP_F16=0` keeps `v_div_fixup_f16` refused, as it
+/// was before it was lowered (the program is dropped, not mistranslated).
+fn div_fixup_f16_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHADER_DIV_FIXUP_F16").is_none_or(|v| v != "0"))
+}
+
 fn f16_nearest_on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_F16_NEAREST.get() {
@@ -6902,6 +6909,60 @@ impl<'a> Lower<'a> {
         Ok((r, enable))
     }
 
+    /// `v_div_fixup`'s special cases on f32 values (an f16's are exact in
+    /// f32): `q` is the quotient a division computed, `den` and `num` its
+    /// denominator and numerator. A NaN numerator or denominator comes back
+    /// quieted (numerator first); 0/0 and inf/inf give a negative quiet NaN;
+    /// x/0 and inf/x give a signed infinity; 0/x and x/inf a signed zero; a
+    /// NaN quotient gives a signed infinity; anything else is `|q|` with the
+    /// sign of `num ^ den` (the ISA's order of checks).
+    fn div_fixup(&mut self, q: V, den: V, num: V) -> V {
+        let c = self.cur;
+        let (qi, di, ni) = (self.as_int(q), self.as_int(den), self.as_int(num));
+        let (ksign, kabs, kinf) = (
+            self.s.m.i32(0x8000_0000),
+            self.s.m.i32(0x7FFF_FFFF),
+            self.s.m.i32(0x7F80_0000),
+        );
+        let (kqnan_bit, kneg_qnan, zero) = (
+            self.s.m.i32(0x0040_0000),
+            self.s.m.i32(0xFFC0_0000),
+            self.s.m.i32(0),
+        );
+        let sign = {
+            let x = self.s.m.bin(c, Bin::Xor, ni, di);
+            self.s.m.bin(c, Bin::And, x, ksign)
+        };
+        let q_abs = self.s.m.bin(c, Bin::And, qi, kabs);
+        let d_abs = self.s.m.bin(c, Bin::And, di, kabs);
+        let n_abs = self.s.m.bin(c, Bin::And, ni, kabs);
+        let q_nan = self.s.m.cmp(c, pred::IUGT, q_abs, kinf);
+        let d_nan = self.s.m.cmp(c, pred::IUGT, d_abs, kinf);
+        let n_nan = self.s.m.cmp(c, pred::IUGT, n_abs, kinf);
+        let d_inf = self.s.m.cmp(c, pred::EQ, d_abs, kinf);
+        let n_inf = self.s.m.cmp(c, pred::EQ, n_abs, kinf);
+        let d_zero = self.s.m.cmp(c, pred::EQ, d_abs, zero);
+        let n_zero = self.s.m.cmp(c, pred::EQ, n_abs, zero);
+        let both_inf = self.s.m.bin(c, Bin::And, n_inf, d_inf);
+        let both_zero = self.s.m.bin(c, Bin::And, n_zero, d_zero);
+        let invalid = self.s.m.bin(c, Bin::Or, both_inf, both_zero);
+        let make_inf = {
+            let t = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
+            self.s.m.bin(c, Bin::Or, t, q_nan)
+        };
+        let make_zero = self.s.m.bin(c, Bin::Or, d_inf, n_zero);
+        let signed_q = self.s.m.bin(c, Bin::Or, sign, q_abs);
+        let signed_inf = self.s.m.bin(c, Bin::Or, sign, kinf);
+        let n_qnan = self.s.m.bin(c, Bin::Or, ni, kqnan_bit);
+        let d_qnan = self.s.m.bin(c, Bin::Or, di, kqnan_bit);
+        let r = self.s.m.select(c, make_zero, sign, signed_q);
+        let r = self.s.m.select(c, make_inf, signed_inf, r);
+        let r = self.s.m.select(c, invalid, kneg_qnan, r);
+        let r = self.s.m.select(c, d_nan, d_qnan, r);
+        let r = self.s.m.select(c, n_nan, n_qnan, r);
+        self.as_float(r)
+    }
+
     fn valu_op(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -7226,52 +7287,12 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.select(c, vcc, scaled, tmp);
                 float(self, r)
             }
+
+
             "v_div_fixup_f32" => {
-                let (q, den, num) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
-                let (qi, di, ni) = (self.as_int(q), self.as_int(den), self.as_int(num));
-                let (ksign, kabs, kinf) = (
-                    self.s.m.i32(0x8000_0000),
-                    self.s.m.i32(0x7FFF_FFFF),
-                    self.s.m.i32(0x7F80_0000),
-                );
-                let (kqnan_bit, kneg_qnan, zero) = (
-                    self.s.m.i32(0x0040_0000),
-                    self.s.m.i32(0xFFC0_0000),
-                    self.s.m.i32(0),
-                );
-                let sign = {
-                    let x = self.s.m.bin(c, Bin::Xor, ni, di);
-                    self.s.m.bin(c, Bin::And, x, ksign)
-                };
-                let q_abs = self.s.m.bin(c, Bin::And, qi, kabs);
-                let d_abs = self.s.m.bin(c, Bin::And, di, kabs);
-                let n_abs = self.s.m.bin(c, Bin::And, ni, kabs);
-                let q_nan = self.s.m.cmp(c, pred::IUGT, q_abs, kinf);
-                let d_nan = self.s.m.cmp(c, pred::IUGT, d_abs, kinf);
-                let n_nan = self.s.m.cmp(c, pred::IUGT, n_abs, kinf);
-                let d_inf = self.s.m.cmp(c, pred::EQ, d_abs, kinf);
-                let n_inf = self.s.m.cmp(c, pred::EQ, n_abs, kinf);
-                let d_zero = self.s.m.cmp(c, pred::EQ, d_abs, zero);
-                let n_zero = self.s.m.cmp(c, pred::EQ, n_abs, zero);
-                let both_inf = self.s.m.bin(c, Bin::And, n_inf, d_inf);
-                let both_zero = self.s.m.bin(c, Bin::And, n_zero, d_zero);
-                let invalid = self.s.m.bin(c, Bin::Or, both_inf, both_zero);
-                let make_inf = {
-                    let t = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
-                    self.s.m.bin(c, Bin::Or, t, q_nan)
-                };
-                let make_zero = self.s.m.bin(c, Bin::Or, d_inf, n_zero);
-                let signed_q = self.s.m.bin(c, Bin::Or, sign, q_abs);
-                let signed_inf = self.s.m.bin(c, Bin::Or, sign, kinf);
-                let n_qnan = self.s.m.bin(c, Bin::Or, ni, kqnan_bit);
-                let d_qnan = self.s.m.bin(c, Bin::Or, di, kqnan_bit);
-                let r = self.s.m.select(c, make_zero, sign, signed_q);
-                let r = self.s.m.select(c, make_inf, signed_inf, r);
-                let r = self.s.m.select(c, invalid, kneg_qnan, r);
-                let r = self.s.m.select(c, d_nan, d_qnan, r);
-                let r = self.s.m.select(c, n_nan, n_qnan, r);
-                let rf = self.as_float(r);
-                float(self, rf)
+                let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                let r = self.div_fixup(a, bb, cc);
+                float(self, r)
             }
             "v_fmac_f32" | "v_mac_f32" | "v_mac_legacy_f32" => {
                 let (a, bb) = (f(self, 0)?, f(self, 1)?);
@@ -8164,6 +8185,7 @@ impl<'a> Lower<'a> {
             "v_max3_f16",
             "v_min3_f16",
             "v_med3_f16",
+            "v_div_fixup_f16",
         ];
         const FLOAT1: &[&str] = &[
             "v_rcp_f16",
@@ -8198,6 +8220,9 @@ impl<'a> Lower<'a> {
             "v_cvt_norm_i16_f16",
             "v_cvt_norm_u16_f16",
         ];
+        if name == "v_div_fixup_f16" && !div_fixup_f16_on() {
+            return None;
+        }
         let all = [FLOAT1, FLOAT2, FLOAT3, INT];
         if !all.iter().any(|l| l.contains(&name))
             && !matches!(name, "v_cvt_f16_f32" | "v_cvt_f32_f16")
@@ -8299,6 +8324,9 @@ impl<'a> Lower<'a> {
                     let t = self.max_min(false, a, b);
                     self.max_min(false, t, acc)
                 }
+                // Every f16 is exact in f32, so the f32 special cases hold
+                // for the f16 operands; the result rounds once on the way back.
+                "v_div_fixup_f16" => self.div_fixup(a, b, acc),
                 _ => self.med3(a, b, acc),
             };
             return float_result(self, r);
