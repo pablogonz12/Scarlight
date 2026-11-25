@@ -30,6 +30,8 @@ mod drvwatch;
 mod spread;
 #[cfg(windows)]
 mod draw;
+#[cfg(windows)]
+mod dxc;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
