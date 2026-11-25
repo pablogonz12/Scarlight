@@ -72,17 +72,26 @@ Three steps. Full detail — every option, logs, uninstall, troubleshooting — 
 3. **Choose it for the game.** If the game is not in your library yet, add it first: *Steam → Games →
    Add a Non-Steam Game to My Library → Browse…* and pick its `.exe`. Then *Library → right-click the
    game → Properties → Compatibility →* tick
-   **Force the use of a specific Steam Play compatibility tool** and pick **Scarlight (Xbox Series)**.
+   **Force the use of a specific Steam Play compatibility tool** and pick **Scarlight 11.14.1** (the release you installed).
    Press Play.
 
 Two things a release leaves to you, both one step: if Steam cannot find the Proton Scarlight should run
-on, name yours in `compatibilitytools.d/Scarlight/scarlight.conf` (`PROTON=`); and put your own copy of
-DXC's `dxil.dll` and `dxcompiler.dll` in `Scarlight/files/` (Microsoft's binaries are not redistributed
+on, name yours in `compatibilitytools.d/Scarlight-<version>/scarlight.conf` (`PROTON=`); and put your own copy of
+DXC's `dxil.dll` and `dxcompiler.dll` in `Scarlight-<version>/files/` (Microsoft's binaries are not redistributed
 by a Linux release). [docs/steam.md](docs/steam.md) has both.
 
+<<<<<<< HEAD
 Running the game from a script instead of Steam, and the Mesa shader cache that cuts pipeline creation
 from 37,672 ms to 148 ms for the 751 programs of the test set, are in
 **[docs/linux.md](docs/linux.md#mesa-shader-cache)**.
+=======
+## Releases
+
+Releases are on the [Releases page](https://github.com/pablogonz12/Scarlight/releases): a versioned
+tarball named after the Proton it runs on — **Scarlight 11.14.1** runs on GE-Proton11-14.
+[docs/RELEASES.md](docs/RELEASES.md) says what a version number means, how to install one, and how
+often a new one comes.
+>>>>>>> hub/main
 
 ## Status
 

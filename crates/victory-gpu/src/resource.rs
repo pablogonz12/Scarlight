@@ -621,6 +621,7 @@ pub(crate) const SRGB: [(u32, u32); 7] = [
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
+#[cfg(windows)]
 pub(crate) fn view_format(this: This) -> Option<u32> {
     // First: a view of no resource (a typed null view) has none.
     let host = host_resource(this)?;
@@ -1579,7 +1580,10 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
 
 #[cfg(windows)]
 impl HostTexture {
-    fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
+    pub(crate) fn new(
+        texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        state: u32,
+    ) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
@@ -1614,8 +1618,10 @@ pub(crate) fn placed_textures() -> u64 {
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
-/// resource and the state it leaves, if that is a change.
-#[cfg(windows)]
+/// resource and the state it leaves, if that is a change. Test only: a
+/// list's moves are recorded in it and swapped in at submission
+/// (`crate::host::HostList::settle`), where the submission lock is held.
+#[cfg(all(windows, test))]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
     let (host, _) = hosted(this, true)?;

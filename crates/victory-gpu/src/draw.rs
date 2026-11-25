@@ -44,6 +44,59 @@ pub(crate) struct VertexView {
     stride: u32,
 }
 
+/// Whether an overflowing rectangle vertex range drops the draw
+/// (`VICTORY_RECTANGLE_GUARD=0` keeps the old arithmetic, which wrapped).
+fn rectangle_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_RECTANGLE_GUARD").map_or(true, |v| v != "0"))
+}
+
+fn rectangle_vertex_range(v: VertexView, count: u32, first: u32) -> Option<(u64, u64, u32)> {
+    rectangle_vertex_range_guarded(v, count, first, rectangle_guard())
+}
+
+fn rectangle_vertex_range_guarded(
+    v: VertexView,
+    count: u32,
+    first: u32,
+    guarded: bool,
+) -> Option<(u64, u64, u32)> {
+    if v.address == 0 || v.stride == 0 {
+        return None;
+    }
+    if !guarded {
+        // The old arithmetic: the title's range wraps instead of being refused.
+        let stride = u64::from(v.stride);
+        let from = v.address.wrapping_add(u64::from(first).wrapping_mul(stride));
+        let rects = u64::from(count / 3);
+        let src = rects.wrapping_mul(3).wrapping_mul(stride);
+        let dst = rects.wrapping_mul(6).wrapping_mul(stride) as u32;
+        return Some((from, src, dst));
+    }
+    let stride = u64::from(v.stride);
+    let end_bytes = (u64::from(first) + u64::from(count)).checked_mul(stride)?;
+    if end_bytes > u64::from(v.size) {
+        return None;
+    }
+    let from = v.address.checked_add(u64::from(first) * stride)?;
+    let rects = u64::from(count / 3);
+    let src_bytes = rects.checked_mul(3)?.checked_mul(stride)?;
+    from.checked_add(src_bytes)?;
+    let dst_bytes = u32::try_from(rects.checked_mul(6)?.checked_mul(stride)?).ok()?;
+    Some((from, src_bytes, dst_bytes))
+}
+
+fn expanded_rectangle_vertices(vertices: u32) -> Option<u32> {
+    expanded_rectangle_vertices_guarded(vertices, rectangle_guard())
+}
+
+fn expanded_rectangle_vertices_guarded(vertices: u32, guarded: bool) -> Option<u32> {
+    if !guarded {
+        return Some((vertices / 3).wrapping_mul(6));
+    }
+    (vertices / 3).checked_mul(6)
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct IndexView {
@@ -324,6 +377,14 @@ fn mesh_test() -> u8 {
     })
 }
 
+/// `VICTORY_MESH_GRID=0`: the older mesh dispatch call, one group across
+/// `y` and `z` (off means the caller's whole grid is forwarded; on by
+/// default).
+fn mesh_grid() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_MESH_GRID").as_deref() != Ok("0"))
+}
+
 /// `VICTORY_MESH_TEST=keep:<hex digits>[:<hex digits>]`: only the mesh
 /// draws whose mesh shader's hash ends in one of the first digits (and
 /// whose digit before it is one of the second, if given) are issued: a
@@ -443,10 +504,12 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Marks the last traced draw as not run on the host.
-#[cfg(feature = "diagnostics")]
+/// Marks a draw of pipeline `pipeline` as not run on the host: counted by
+/// whether its host pipeline can still arrive, and, with the diagnostics
+/// feature, marked in the trace and counted with its reason.
 fn dropped(pipeline: usize) {
     crate::pipeline::note_drop(pipeline as This);
+    #[cfg(feature = "diagnostics")]
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
     }
@@ -1031,8 +1094,15 @@ impl State {
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
-            // Title memory by address: what the shader finds it by.
+            // Title memory by address: what the shader finds it by. A builder
+            // stage's writes through it stay in the copies
+            // ([`crate::pipeline::builder_map_host`]): #1198's rule for the
+            // map, and the writes run 98 killed the title with. The root UAVs
+            // below still copy back: that is a diff against the submission's
+            // snapshot (`shadow::gpu_writes`), and a page only the map's copies
+            // hold is unchanged there, so nothing is written over it.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
+                let writes = writes && !crate::pipeline::builder_map_host(self.pipeline as This);
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
@@ -1963,11 +2033,9 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            dropped(self.pipeline);
             #[cfg(feature = "diagnostics")]
-            {
-                crate::pipeline::note_drop(self.pipeline as This);
-                self.list_dropped_roots([x, y, z]);
-            }
+            self.list_dropped_roots([x, y, z]);
             return;
         };
         if !p.compute {
@@ -2070,22 +2138,23 @@ impl State {
         }
     }
 
-    /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
-    /// programs are one-dimensional).
-    pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+    /// Runs a mesh dispatch with the caller's three-dimensional group grid.
+    pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         self.window = None;
+        // The older call took one group across `y` and `z`.
+        let (x, y, z) = if mesh_grid() { (x, y, z) } else { (x, 1, 1) };
         #[cfg(feature = "diagnostics")]
-        self.trace("mesh", x, 0);
+        self.trace("mesh", x * y * z, 0);
         let ran = mesh_test() != 1
             && mesh_kept(self.pipeline)
             && self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
-                    list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    list.note_op(|| self.op_text(format!("mesh {x}x{y}x{z}"), false));
                     self.mesh_scissor(list, true);
                     // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, 1, 1) };
+                    unsafe { l6.DispatchMesh(x, y, z) };
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -2094,7 +2163,6 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
     }
@@ -2427,14 +2495,17 @@ impl State {
         // A pipeline with the rectangle geometry stage draws the title's
         // vertices as they are; any other gets its rectangles expanded.
         let rects = self.topology == RECTANGLES && !self.completes_rects();
-        let ran = ready && (!rects || self.rectangles(list, vertices, first));
-        if ran {
+        // Rectangles are expanded into six vertices each, a count that can
+        // overflow as the title's vertex count is not checked beforehand.
+        let count = if rects {
+            expanded_rectangle_vertices(vertices)
+        } else {
+            Some(vertices)
+        };
+        let ran = ready && (!rects || (count.is_some() && self.rectangles(list, vertices, first)));
+        if let Some(count) = count.filter(|_| ran) {
             // Rectangles were expanded into their own vertex buffers.
-            let (count, from) = if rects {
-                (vertices / 3 * 6, 0)
-            } else {
-                (vertices, first)
-            };
+            let from = if rects { 0 } else { first };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             // SAFETY: an open list with everything set.
@@ -2446,7 +2517,6 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
     }
@@ -2463,7 +2533,6 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
-        let rects = u64::from(count / 3);
         for slot in 0..32 {
             let elements: Vec<(u32, u32)> = p
                 .inputs
@@ -2475,21 +2544,16 @@ impl State {
                 continue;
             }
             let v = self.vertex[slot as usize];
-            let stride = u64::from(v.stride);
-            let from = v.address + u64::from(first) * stride;
-            if v.address == 0
-                || stride == 0
-                || u64::from(first + count) * stride > u64::from(v.size)
-                || crate::shadow::find(from, rects * 3 * stride).is_none()
-            {
+            let Some((from, src_bytes, dst_bytes)) = rectangle_vertex_range(v, count, first)
+                .filter(|&(from, src_bytes, _)| crate::shadow::find(from, src_bytes).is_some())
+            else {
                 once!(slot, "rectangle vertices outside their buffer");
                 return false;
-            }
-            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
+            };
+            let Some((gpu, to)) = list.scratch(u64::from(dst_bytes)) else {
                 return false;
             };
-            let (from, to, stride) = (from as usize, to as usize, stride as usize);
-            let n = rects as usize;
+            let (from, to, stride) = (from as usize, to as usize, v.stride as usize);
             list.defer_host(move || {
                 // The vertices are read in place, at submission: no change
                 // of mapping under the read (see
@@ -2499,15 +2563,15 @@ impl State {
                 // recorded) and the scratch memory is the list's.
                 let (src, dst) = unsafe {
                     (
-                        std::slice::from_raw_parts(from as *const u8, n * 3 * stride),
-                        std::slice::from_raw_parts_mut(to as *mut u8, n * 6 * stride),
+                        std::slice::from_raw_parts(from as *const u8, src_bytes as usize),
+                        std::slice::from_raw_parts_mut(to as *mut u8, dst_bytes as usize),
                     )
                 };
                 crate::primitive::expand_rects(src, dst, stride, &elements);
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
-                SizeInBytes: (rects * 6 * stride as u64) as u32,
+                SizeInBytes: dst_bytes,
                 StrideInBytes: v.stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
@@ -2547,7 +2611,6 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
     }
@@ -3017,7 +3080,103 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::staging_budget_per_frame;
+    use super::{
+        VertexView, expanded_rectangle_vertices_guarded, rectangle_vertex_range_guarded,
+        staging_budget_per_frame,
+    };
+
+    /// What a rectangle draw asks of the tile's vertex buffer with the guard
+    /// on, which is what the environment gives unless `VICTORY_RECTANGLE_GUARD`
+    /// is `0`; the tests do not read the switch.
+    fn range(v: VertexView, count: u32, first: u32) -> Option<(u64, u64, u32)> {
+        rectangle_vertex_range_guarded(v, count, first, true)
+    }
+
+    fn expanded(vertices: u32) -> Option<u32> {
+        expanded_rectangle_vertices_guarded(vertices, true)
+    }
+
+    const RECTANGLE_VIEW: VertexView = VertexView {
+        address: 0x1000_0000,
+        size: 96,
+        stride: 16,
+    };
+
+    #[test]
+    fn rectangle_vertex_range_valid() {
+        assert_eq!(range(RECTANGLE_VIEW, 3, 1), Some((0x1000_0010, 48, 96)));
+    }
+
+    #[test]
+    fn rectangle_vertex_range_rejects_vertex_index_overflow() {
+        assert_eq!(range(RECTANGLE_VIEW, 3, u32::MAX - 2), None);
+        assert_eq!(range(RECTANGLE_VIEW, u32::MAX, 1), None);
+    }
+
+    #[test]
+    fn rectangle_vertex_range_rejects_address_overflow() {
+        let view = VertexView {
+            address: u64::MAX - 15,
+            ..RECTANGLE_VIEW
+        };
+        assert_eq!(range(view, 3, 1), None);
+        assert_eq!(range(view, 3, 0), None);
+    }
+
+    #[test]
+    fn rectangle_vertex_range_rejects_byte_offset_overflow() {
+        let view = VertexView {
+            size: u32::MAX,
+            stride: u32::MAX,
+            ..RECTANGLE_VIEW
+        };
+        assert_eq!(range(view, u32::MAX, u32::MAX), None);
+    }
+
+    #[test]
+    fn rectangle_vertex_range_rejects_oversized_buffers() {
+        for stride in [0x8000_0000, 0x4000_0000] {
+            let view = VertexView {
+                size: u32::MAX,
+                stride,
+                ..RECTANGLE_VIEW
+            };
+            assert_eq!(range(view, 3, 0), None);
+        }
+    }
+
+    /// `VICTORY_RECTANGLE_GUARD=0`: the old arithmetic, whose range wraps.
+    #[test]
+    fn the_guard_switched_off_keeps_the_old_wrapping() {
+        assert_eq!(
+            rectangle_vertex_range_guarded(RECTANGLE_VIEW, 3, u32::MAX - 2, false),
+            Some((
+                0x1000_0000u64.wrapping_add(u64::from(u32::MAX - 2) * 16),
+                48,
+                96
+            ))
+        );
+        let view = VertexView {
+            address: u64::MAX - 15,
+            ..RECTANGLE_VIEW
+        };
+        assert_eq!(
+            rectangle_vertex_range_guarded(view, 3, 1, false).map(|r| r.0),
+            Some(0u64)
+        );
+        assert_eq!(
+            expanded_rectangle_vertices_guarded(u32::MAX, false),
+            Some((u32::MAX / 3).wrapping_mul(6))
+        );
+    }
+
+    #[test]
+    fn expanded_rectangle_vertices_rejects_overflow() {
+        let max_rects = u32::MAX / 6;
+        assert_eq!(expanded(max_rects * 3), Some(max_rects * 6));
+        assert_eq!(expanded((max_rects + 1) * 3), None);
+        assert_eq!(expanded(u32::MAX), None);
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {
