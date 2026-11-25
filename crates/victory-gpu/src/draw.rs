@@ -508,6 +508,21 @@ fn names_view(used: &[UsedResource], rule: &crate::ambient::Rule) -> bool {
     })
 }
 
+/// A barrier over every unordered access: what a dispatch wrote before a
+/// stand-in's clear reads, and the clear before what comes after it.
+fn uav_barrier(texture: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                // SAFETY: a borrowed reference; the barrier never releases it.
+                pResource: std::mem::ManuallyDrop::new(Some(texture.clone())),
+            }),
+        },
+    }
+}
+
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
     if roots.len() <= slot {
@@ -2038,9 +2053,9 @@ impl State {
             }
             return None;
         };
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_PREDICATION as PREDICATION;
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
         const COMMON: u32 = 0;
-        const PREDICATION: u32 = 0x1000;
         // SAFETY: an open list; a count read where the execution reads it,
         // into the low half of our own word (zero elsewhere).
         unsafe {
@@ -2048,7 +2063,7 @@ impl State {
             list.list.ResourceBarrier(&[crate::host::transition(
                 word,
                 State(COMMON as i32),
-                State(PREDICATION as i32),
+                PREDICATION,
             )]);
             list.list.SetPredication(word, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
         }
@@ -2062,7 +2077,7 @@ impl State {
             );
             list.list.ResourceBarrier(&[crate::host::transition(
                 word,
-                State(PREDICATION as i32),
+                PREDICATION,
                 State(COMMON as i32),
             )]);
         }
@@ -2128,8 +2143,10 @@ impl State {
                 continue;
             }
             let (width, height, own) = (own.Width, own.Height, own.Format.0 as u32);
-            let view = words.map_or(0, |words| words[0]);
-            let format = if view == 0 { own } else { view };
+            // The title's own description of the view, unless it leaves the
+            // format to the resource: then the resource's, whole.
+            let words = words.filter(|words| words[0] != 0);
+            let format = words.map_or(own, |words| words[0]);
             let fill = crate::ambient::fill(rule.value, format, own);
             if first {
                 tracing::info!(
@@ -2146,10 +2163,10 @@ impl State {
             }
             let recorded = match fill {
                 Ok(crate::ambient::Fill::Float(rgba)) => {
-                    self.clear_uav(list, resource, view, rgba.map(f32::to_bits), true)
+                    self.clear_uav(list, resource, words, rgba.map(f32::to_bits), true)
                 }
-                Ok(crate::ambient::Fill::Uint(words)) => {
-                    self.clear_uav(list, resource, view, words, false)
+                Ok(crate::ambient::Fill::Uint(fill)) => {
+                    self.clear_uav(list, resource, words, fill, false)
                 }
                 Err(why) => {
                     if first {
@@ -2164,38 +2181,52 @@ impl State {
         filled
     }
 
-    /// Clears the whole of the texture `resource`, seen as its view's
-    /// `format` (0: its own), to `values` (a float clear's bits when
-    /// `floats`): [`Host::uav`]'s two views, the texture left in the state
-    /// it was found in. False if the clear could not be recorded.
+    /// Clears the whole of the texture `resource`, seen as the view the
+    /// title described (`words`, as [`Host::uav`] takes them; `None`: its
+    /// own format, whole), to `values` (a float clear's bits when `floats`):
+    /// our heap set for the clear and the title's again after it, the
+    /// texture in the state it was found in. False if the clear could not be
+    /// recorded.
     fn clear_uav(
-        &self,
+        &mut self,
         list: &HostList,
         resource: This,
-        format: u32,
+        words: Option<[u32; 10]>,
         values: [u32; 4],
         floats: bool,
     ) -> bool {
-        const UNORDERED: u32 = 0x8;
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS as UNORDERED;
         let Some(host) = crate::host::host() else {
             return false;
         };
-        let Some((cpu, gpu)) = host.uav(resource, format) else {
+        let (Some(heap), Some((cpu, gpu))) = (host.uav_heap(), host.uav(resource, words)) else {
             return false;
         };
-        // The clear is a write: the texture is the unordered state a clear
-        // takes, in a barrier of its own, and left in the state it was found.
-        let Some((texture, before)) = list.transition(resource, UNORDERED) else {
+        let Some(texture) = crate::resource::host_resource(resource) else {
             return false;
         };
-        // SAFETY: an open list, a live texture, our own descriptors.
+        // The state the list saw it in, also when that is the unordered one
+        // already (a dispatch reads and writes it): the clear is still owed
+        // a barrier of its own then.
+        let Some(before) = list.state_of(resource) else {
+            return false;
+        };
+        let unordered = before == UNORDERED.0 as u32;
+        // SAFETY: an open list, a live texture, our own descriptors and the
+        // heap they are in (the title's heaps are set again by the next
+        // bind, which this drops from the cache).
         unsafe {
-            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-            list.list.ResourceBarrier(&[crate::host::transition(
-                texture,
-                State(before as i32),
-                State(UNORDERED as i32),
-            )]);
+            list.list.SetDescriptorHeaps(&[Some(heap)]);
+            if !unordered {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    texture,
+                    D3D12_RESOURCE_STATES(before as i32),
+                    UNORDERED,
+                )]);
+            }
+            // What the dispatch wrote is ordered before the clear, and the
+            // clear before what reads the view next.
+            list.list.ResourceBarrier(&[uav_barrier(texture)]);
             if floats {
                 list.list.ClearUnorderedAccessViewFloat(
                     gpu,
@@ -2208,18 +2239,26 @@ impl State {
                 list.list
                     .ClearUnorderedAccessViewUint(gpu, cpu, texture, &values, &[]);
             }
-            list.list.ResourceBarrier(&[crate::host::transition(
-                texture,
-                State(UNORDERED as i32),
-                State(before as i32),
-            )]);
+            list.list.ResourceBarrier(&[uav_barrier(texture)]);
+            if !unordered {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    texture,
+                    UNORDERED,
+                    D3D12_RESOURCE_STATES(before as i32),
+                )]);
+            }
         }
-        // The tracked state follows the barriers above: back to `before`.
-        let _ = list.transition(resource, before);
+        if !unordered {
+            // The tracked state follows the barriers above: back to `before`.
+            let _ = list.transition(resource, before);
+        }
+        // The title's own heaps are not those of the clear: the next bind
+        // sets them again.
+        self.host_heaps = [0; 2];
         true
     }
 
-    /// What a draw or dispatch runs, for the device-removed report
+    /// What a draw or dispatch runs, for the device-removed report    /// What a draw or dispatch runs, for the device-removed report
     /// (diagnostics): the pipeline, then per stage the user data it gets
     /// (with the view at that heap index, if one is), the host addresses
     /// of its root views and the views its tables name.
