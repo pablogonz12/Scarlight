@@ -1,0 +1,2663 @@
+//! SPIR-V emitter (native-path spike, branch `spike/spirv-emit`): GFX10 ISA
+//! -> SPIR-V, no DXIL and no dxil-spirv.
+//!
+//! This is deliberately *not* a port of [`super::lower`]: it walks the same
+//! decoded IR ([`crate::ir`]) one machine instruction at a time, but each
+//! register dword is a function-local SPIR-V variable and every instruction
+//! is load/op/store. That drops SSA plumbing (phis, dominance) so the whole
+//! CFG can be emitted as one dispatcher loop with an `OpSwitch`: valid
+//! structured SPIR-V for any program, at the cost of code quality. The spike
+//! measures coverage and validation, not speed; mem2reg and real structuring
+//! are the next step (`xcl-bin/notes/spirv-spike.md`).
+//!
+//! Memory is the console's own address space: every `s_load_*`,
+//! `s_buffer_load_*`, `buffer_*`, `global_*` and `flat_*` becomes an
+//! `OpLoad`/`OpStore` through a 64-bit address the program itself computes,
+//! i.e. `physical_storage_buffer` + buffer device address. The module has no
+//! descriptors at all; the root arguments arrive as push constants, as the
+//! console's user SGPRs do.
+//!
+//! What this does not model yet: EXEC is a scalar all-ones/all-zeros mask
+//! rather than a per-lane one (as `lower`'s per-lane form is), so programs
+//! whose lanes diverge inside a wave compute the wrong values while still
+//! emitting valid modules; images, DPP/SDWA source modifiers, typed buffer
+//! formats and wave/ballot operations are reported as gaps.
+
+use std::collections::HashMap;
+
+use crate::ShaderError;
+use crate::gfx10::{Fields, Operand};
+use crate::io::{Input, Io};
+use crate::ir::{Exit, Inst, Program, Reg};
+use crate::native::{HwStage, NativeProgram, StageIo};
+
+// ---- SPIR-V constants -------------------------------------------------------
+mod op {
+    pub const NAME: u16 = 5;
+    pub const EXTENSION: u16 = 10;
+    pub const EXT_INST_IMPORT: u16 = 11;
+    pub const EXT_INST: u16 = 12;
+    pub const MEMORY_MODEL: u16 = 14;
+    pub const ENTRY_POINT: u16 = 15;
+    pub const EXECUTION_MODE: u16 = 16;
+    pub const CAPABILITY: u16 = 17;
+    pub const TYPE_VOID: u16 = 19;
+    pub const TYPE_BOOL: u16 = 20;
+    pub const TYPE_INT: u16 = 21;
+    pub const TYPE_FLOAT: u16 = 22;
+    pub const TYPE_VECTOR: u16 = 23;
+    pub const TYPE_ARRAY: u16 = 28;
+    pub const TYPE_STRUCT: u16 = 30;
+    pub const TYPE_POINTER: u16 = 32;
+    pub const TYPE_FUNCTION: u16 = 33;
+    pub const CONSTANT: u16 = 43;
+    pub const FUNCTION: u16 = 54;
+    pub const FUNCTION_END: u16 = 56;
+    pub const VARIABLE: u16 = 59;
+    pub const LOAD: u16 = 61;
+    pub const STORE: u16 = 62;
+    pub const ACCESS_CHAIN: u16 = 65;
+    pub const DECORATE: u16 = 71;
+    pub const MEMBER_DECORATE: u16 = 72;
+    pub const COMPOSITE_EXTRACT: u16 = 81;
+    pub const CONVERT_F_TO_S: u16 = 109;
+    pub const CONVERT_F_TO_U: u16 = 110;
+    pub const CONVERT_S_TO_F: u16 = 111;
+    pub const CONVERT_U_TO_F: u16 = 112;
+    pub const U_CONVERT: u16 = 113;
+    pub const S_CONVERT: u16 = 114;
+    pub const F_CONVERT: u16 = 115;
+    pub const CONVERT_U_TO_PTR: u16 = 120;
+    pub const BITCAST: u16 = 124;
+    pub const F_NEGATE: u16 = 127;
+    pub const I_ADD: u16 = 128;
+    pub const F_ADD: u16 = 129;
+    pub const I_SUB: u16 = 130;
+    pub const F_SUB: u16 = 131;
+    pub const I_MUL: u16 = 132;
+    pub const F_MUL: u16 = 133;
+    pub const U_DIV: u16 = 134;
+    pub const S_DIV: u16 = 135;
+    pub const F_DIV: u16 = 136;
+    pub const U_MOD: u16 = 137;
+    pub const S_REM: u16 = 139;
+    pub const F_REM: u16 = 140;
+    pub const F_MOD: u16 = 141;
+    pub const LOGICAL_AND: u16 = 167;
+    pub const LOGICAL_NOT: u16 = 168;
+    pub const SELECT: u16 = 169;
+    pub const I_EQUAL: u16 = 170;
+    pub const I_NOT_EQUAL: u16 = 171;
+    pub const U_GREATER_THAN: u16 = 172;
+    pub const S_GREATER_THAN: u16 = 173;
+    pub const U_GREATER_THAN_EQUAL: u16 = 174;
+    pub const S_GREATER_THAN_EQUAL: u16 = 175;
+    pub const U_LESS_THAN: u16 = 176;
+    pub const S_LESS_THAN: u16 = 177;
+    pub const U_LESS_THAN_EQUAL: u16 = 178;
+    pub const S_LESS_THAN_EQUAL: u16 = 179;
+    pub const F_ORD_EQUAL: u16 = 180;
+    pub const F_UNORD_EQUAL: u16 = 181;
+    pub const F_ORD_NOT_EQUAL: u16 = 182;
+    pub const F_UNORD_NOT_EQUAL: u16 = 183;
+    pub const F_ORD_LESS_THAN: u16 = 184;
+    pub const F_UNORD_LESS_THAN: u16 = 185;
+    pub const F_ORD_GREATER_THAN: u16 = 186;
+    pub const F_UNORD_GREATER_THAN: u16 = 187;
+    pub const F_ORD_LESS_THAN_EQUAL: u16 = 188;
+    pub const F_UNORD_LESS_THAN_EQUAL: u16 = 189;
+    pub const F_ORD_GREATER_THAN_EQUAL: u16 = 190;
+    pub const F_UNORD_GREATER_THAN_EQUAL: u16 = 191;
+    pub const SHIFT_RIGHT_LOGICAL: u16 = 194;
+    pub const SHIFT_RIGHT_ARITHMETIC: u16 = 195;
+    pub const SHIFT_LEFT_LOGICAL: u16 = 196;
+    pub const BITWISE_OR: u16 = 197;
+    pub const BITWISE_XOR: u16 = 198;
+    pub const BITWISE_AND: u16 = 199;
+    pub const BITWISE_NOT: u16 = 200;
+    pub const BIT_FIELD_INSERT: u16 = 201;
+    pub const BIT_FIELD_S_EXTRACT: u16 = 202;
+    pub const BIT_FIELD_U_EXTRACT: u16 = 203;
+    pub const BIT_REVERSE: u16 = 204;
+    pub const BIT_COUNT: u16 = 205;
+    pub const CONTROL_BARRIER: u16 = 224;
+    pub const ATOMIC_I_ADD: u16 = 234;
+    pub const ATOMIC_I_SUB: u16 = 235;
+    pub const ATOMIC_S_MIN: u16 = 236;
+    pub const ATOMIC_U_MIN: u16 = 237;
+    pub const ATOMIC_S_MAX: u16 = 238;
+    pub const ATOMIC_U_MAX: u16 = 239;
+    pub const ATOMIC_AND: u16 = 240;
+    pub const ATOMIC_OR: u16 = 241;
+    pub const ATOMIC_XOR: u16 = 242;
+    pub const ATOMIC_EXCHANGE: u16 = 243;
+    pub const LOOP_MERGE: u16 = 246;
+    pub const SELECTION_MERGE: u16 = 247;
+    pub const LABEL: u16 = 248;
+    pub const BRANCH: u16 = 249;
+    pub const BRANCH_CONDITIONAL: u16 = 250;
+    pub const SWITCH: u16 = 251;
+    pub const RETURN: u16 = 253;
+}
+
+mod decoration {
+    pub const BLOCK: u32 = 2;
+    pub const ARRAY_STRIDE: u32 = 6;
+    pub const BUILT_IN: u32 = 11;
+    pub const OFFSET: u32 = 35;
+}
+
+mod storage {
+    pub const INPUT: u32 = 1;
+    pub const FUNCTION: u32 = 7;
+    pub const PUSH_CONSTANT: u32 = 9;
+    pub const WORKGROUP: u32 = 4;
+    pub const PHYSICAL_STORAGE_BUFFER: u32 = 5349;
+}
+
+mod builtin {
+    pub const WORKGROUP_ID: u32 = 26;
+    pub const LOCAL_INVOCATION_ID: u32 = 27;
+}
+
+/// GLSL.std.450 instruction numbers used here.
+mod glsl {
+    pub const ROUND_EVEN: u32 = 2;
+    pub const TRUNC: u32 = 3;
+    pub const FABS: u32 = 4;
+    pub const FLOOR: u32 = 8;
+    pub const CEIL: u32 = 9;
+    pub const FRACT: u32 = 10;
+    pub const SIN: u32 = 13;
+    pub const COS: u32 = 14;
+    pub const POW: u32 = 26;
+    pub const EXP2: u32 = 29;
+    pub const LOG2: u32 = 30;
+    pub const SQRT: u32 = 31;
+    pub const INVERSE_SQRT: u32 = 32;
+    pub const FMIN: u32 = 37;
+    pub const UMIN: u32 = 38;
+    pub const SMIN: u32 = 39;
+    pub const FMAX: u32 = 40;
+    pub const UMAX: u32 = 41;
+    pub const SMAX: u32 = 42;
+    pub const FCLAMP: u32 = 43;
+}
+
+/// The register dwords the machine can name, mapped into one space.
+const SCC_SLOT: u32 = 390;
+const VGPR_BASE: u32 = 128;
+const SLOTS: u32 = 391;
+
+fn slot(reg: Reg) -> u32 {
+    match reg {
+        Reg::S(code) => u32::from(code),
+        Reg::V(reg) => VGPR_BASE + u32::from(reg),
+        Reg::Scc => SCC_SLOT,
+        Reg::Spill(r) => 301 + u32::from(r) - 16,
+    }
+}
+
+// ---- binary writer ----------------------------------------------------------
+
+struct M {
+    words: Vec<u32>,
+    next: u32,
+}
+
+impl M {
+    fn new() -> M {
+        M {
+            words: vec![0x0723_0203, 0x0001_0500, 0, 0, 0],
+            next: 1,
+        }
+    }
+
+    fn id(&mut self) -> u32 {
+        let i = self.next;
+        self.next += 1;
+        i
+    }
+
+    fn ins(&mut self, opcode: u16, ty: u32, result: u32, ops: &[u32]) {
+        let n = 1 + u32::from(ty != 0) + u32::from(result != 0) + ops.len() as u32;
+        self.words.push((n << 16) | u32::from(opcode));
+        if ty != 0 {
+            self.words.push(ty);
+        }
+        if result != 0 {
+            self.words.push(result);
+        }
+        self.words.extend_from_slice(ops);
+    }
+
+    /// An instruction whose operands end in a literal string.
+    fn ins_str(&mut self, opcode: u16, ty: u32, result: u32, ops: &[u32], s: &str) {
+        let mut tail = Vec::new();
+        let bytes = s.as_bytes();
+        for chunk in bytes.chunks(4) {
+            let mut w = 0u32;
+            for (i, b) in chunk.iter().enumerate() {
+                w |= u32::from(*b) << (8 * i);
+            }
+            tail.push(w);
+        }
+        if bytes.len() % 4 == 0 {
+            tail.push(0);
+        }
+        let n =
+            1 + u32::from(ty != 0) + u32::from(result != 0) + ops.len() as u32 + tail.len() as u32;
+        self.words.push((n << 16) | u32::from(opcode));
+        if ty != 0 {
+            self.words.push(ty);
+        }
+        if result != 0 {
+            self.words.push(result);
+        }
+        self.words.extend_from_slice(ops);
+        self.words.extend_from_slice(&tail);
+    }
+
+    /// An instruction whose string sits between two operand lists: what
+    /// `OpEntryPoint` needs (execution model, entry id, name, interface).
+    fn ins_str_at(&mut self, opcode: u16, pre: &[u32], s_: &str, post: &[u32]) {
+        let mut tail = Vec::new();
+        let bytes = s_.as_bytes();
+        for chunk in bytes.chunks(4) {
+            let mut w = 0u32;
+            for (i, b) in chunk.iter().enumerate() {
+                w |= u32::from(*b) << (8 * i);
+            }
+            tail.push(w);
+        }
+        if bytes.len() % 4 == 0 {
+            tail.push(0);
+        }
+        let n = 1 + pre.len() as u32 + tail.len() as u32 + post.len() as u32;
+        self.words.push((n << 16) | u32::from(opcode));
+        self.words.extend_from_slice(pre);
+        self.words.extend_from_slice(&tail);
+        self.words.extend_from_slice(post);
+    }
+
+    fn finish(mut self) -> Vec<u32> {
+        self.words[3] = self.next;
+        self.words
+    }
+}
+
+type Why = &'static str;
+type R<T> = Result<T, Gap>;
+
+/// What the spike does not emit yet, with a reason a report can group.
+#[derive(Debug, Clone, Copy)]
+pub struct Gap(pub Why);
+
+impl From<Gap> for ShaderError {
+    fn from(g: Gap) -> Self {
+        ShaderError::Unsupported {
+            offset: 0,
+            what: g.0,
+        }
+    }
+}
+
+fn gap<T>(why: Why) -> R<T> {
+    Err(Gap(why))
+}
+
+// ---- emitter ----------------------------------------------------------------
+
+pub struct Emitter<'a> {
+    m: M,
+    native: &'a NativeProgram,
+    p: &'a Program,
+    io: &'a Io,
+    t_void: u32,
+    t_bool: u32,
+    t_i32: u32,
+    t_i64: u32,
+    t_f32: u32,
+    t_f16: u32,
+    t_i16: u32,
+    t_u16: u32,
+    t_u32: u32,
+    t_u64: u32,
+    t_v3u32: u32,
+    pf_i32: u32,
+    pf_i64: u32,
+    pf_f32: u32,
+    pf_bool: u32,
+    ps32: u32,
+    ps64: u32,
+    psf32: u32,
+    pw32: u32,
+    p_pc: u32,
+    p_pc_i32: u32,
+    p_arr: u32,
+    t_lds: u32,
+    t_arr: u32,
+    t_struct: u32,
+    pfn: u32,
+    p_in_v3: u32,
+    pc: u32,
+    lds: u32,
+    ext: u32,
+    /// The entry point function.
+    main: u32,
+    /// The vec3 thread-group id and local invocation id inputs, if read.
+    tid_var: Option<u32>,
+    gid_var: Option<u32>,
+    regs: Vec<u32>,
+    scc: u32,
+    zero: u32,
+    one: u32,
+    minus_one: u32,
+    ci: HashMap<u32, u32>,
+    ci64: HashMap<u64, u32>,
+    /// Constant instructions, spliced in before the functions (a constant
+    /// may be created while the body is emitted, and the module's layout
+    /// wants every constant before the first function).
+    consts: Vec<u32>,
+    pc_var: u32,
+    loop_head: u32,
+    dispatch: u32,
+    cont: u32,
+    /// The dispatch select's merge block, inside the loop.
+    sel_merge: u32,
+    exit: u32,
+    labels: Vec<u32>,
+    lds_words: u32,
+    scope_device: u32,
+    scope_workgroup: u32,
+    sem_acq_rel_workgroup: u32,
+}
+
+/// Emits the SPIR-V module of a compute program.
+pub fn emit(native: &NativeProgram, p: &Program, io: &Io) -> Result<Vec<u32>, ShaderError> {
+    if native.stage != HwStage::Cs {
+        return Err(Gap("a non-compute stage").into());
+    }
+    let StageIo::Cs(cs) = native.io else {
+        return Err(Gap("compute code without compute stage data").into());
+    };
+    let mut e = Emitter::new(native, p, io, cs.lds_bytes() / 4);
+    e.build()?;
+    let mut pre = std::mem::take(&mut e.m.words);
+    let mut consts = std::mem::take(&mut e.consts);
+    e.function()?;
+    consts.extend(std::mem::take(&mut e.consts));
+    pre.extend_from_slice(&consts);
+    pre.extend_from_slice(&e.m.words);
+    e.m.words = pre;
+    Ok(e.m.finish())
+}
+
+impl<'a> Emitter<'a> {
+    fn new(native: &'a NativeProgram, p: &'a Program, io: &'a Io, lds_words: u32) -> Emitter<'a> {
+        let mut m = M::new();
+        let mut ids = Vec::new();
+        for _ in 0..23 {
+            ids.push(m.id());
+        }
+        let [
+            t_void,
+            t_bool,
+            t_i32,
+            t_i64,
+            t_f32,
+            t_f16,
+            t_v3u32,
+            pf_i32,
+            pf_i64,
+            pf_f32,
+            ps32,
+            ps64,
+            psf32,
+            pw32,
+            p_pc,
+            t_arr,
+            t_struct,
+            pfn,
+            t_i16,
+            pf_bool,
+            t_u16,
+            t_u32,
+            t_u64,
+        ] = ids[..23]
+        else {
+            unreachable!()
+        };
+        let p_in_v3 = m.id();
+        let pc = m.id();
+        let lds = m.id();
+        let ext = m.id();
+        let zero = m.id();
+        let one = m.id();
+        let minus_one = m.id();
+        let scope_device = m.id();
+        let scope_workgroup = m.id();
+        let sem = m.id();
+        let pc_var = m.id();
+        let loop_head = m.id();
+        let dispatch = m.id();
+        let cont = m.id();
+        let sel_merge = m.id();
+        let exit = m.id();
+        let arr_len = m.id();
+        let tid_var = m.id();
+        let gid_var = m.id();
+        let main = m.id();
+        let p_pc_i32 = m.id();
+        let p_arr = m.id();
+        let t_lds = m.id();
+        Emitter {
+            m,
+            native,
+            p,
+            io,
+            t_void,
+            t_bool,
+            t_i32,
+            t_i64,
+            t_f32,
+            t_f16,
+            t_v3u32,
+            pf_i32,
+            pf_i64,
+            pf_f32,
+            ps32,
+            ps64,
+            psf32,
+            pw32,
+            p_pc,
+            p_pc_i32,
+            p_arr,
+            t_lds,
+            t_arr,
+            t_struct,
+            t_i16,
+            t_u16,
+            t_u32,
+            t_u64,
+            pf_bool,
+            pfn,
+            p_in_v3,
+            pc,
+            lds,
+            ext,
+            main,
+            tid_var: Some(tid_var),
+            gid_var: Some(gid_var),
+            regs: Vec::new(),
+            scc: 0,
+            zero,
+            one,
+            minus_one,
+            ci: HashMap::new(),
+            ci64: HashMap::new(),
+            consts: Vec::new(),
+            pc_var,
+            loop_head,
+            dispatch,
+            cont,
+            sel_merge,
+            exit,
+            labels: Vec::new(),
+            lds_words,
+            scope_device,
+            scope_workgroup,
+            sem_acq_rel_workgroup: sem,
+        }
+    }
+
+    // ---- small helpers ------------------------------------------------------
+
+    fn ins(&mut self, opcode: u16, ty: u32, result: u32, ops: &[u32]) {
+        self.m.ins(opcode, ty, result, ops);
+    }
+
+    fn c32(&mut self, v: u32) -> u32 {
+        if v == 0 {
+            return self.zero;
+        }
+        if v == 1 {
+            return self.one;
+        }
+        if v == 0xffff_ffff {
+            return self.minus_one;
+        }
+        if let Some(&id) = self.ci.get(&v) {
+            return id;
+        }
+        let id = self.m.id();
+        let at = self.m.words.len();
+        self.m.ins(op::CONSTANT, self.t_i32, id, &[v]);
+        let new = self.m.words.split_off(at);
+        self.consts.extend_from_slice(&new);
+        self.ci.insert(v, id);
+        id
+    }
+
+    fn c64(&mut self, v: u64) -> u32 {
+        if let Some(&id) = self.ci64.get(&v) {
+            return id;
+        }
+        let id = self.m.id();
+        let at = self.m.words.len();
+        self.m
+            .ins(op::CONSTANT, self.t_i64, id, &[v as u32, (v >> 32) as u32]);
+        let new = self.m.words.split_off(at);
+        self.consts.extend_from_slice(&new);
+        self.ci64.insert(v, id);
+        id
+    }
+
+    fn cf32(&mut self, v: f32) -> u32 {
+        let bits = self.c32(v.to_bits());
+        self.bitcast_f32(bits)
+    }
+
+    fn bitcast_f32(&mut self, i: u32) -> u32 {
+        let id = self.m.id();
+        self.ins(op::BITCAST, self.t_f32, id, &[i]);
+        id
+    }
+
+    fn bitcast_i32(&mut self, f: u32) -> u32 {
+        let id = self.m.id();
+        self.ins(op::BITCAST, self.t_i32, id, &[f]);
+        id
+    }
+
+    fn un(&mut self, opcode: u16, ty: u32, a: u32) -> u32 {
+        let id = self.m.id();
+        self.ins(opcode, ty, id, &[a]);
+        id
+    }
+
+    fn bin(&mut self, opcode: u16, ty: u32, a: u32, b: u32) -> u32 {
+        let id = self.m.id();
+        self.ins(opcode, ty, id, &[a, b]);
+        id
+    }
+
+    fn tern(&mut self, opcode: u16, ty: u32, a: u32, b: u32, c: u32) -> u32 {
+        let id = self.m.id();
+        self.ins(opcode, ty, id, &[a, b, c]);
+        id
+    }
+
+    fn ext1(&mut self, inst: u32, a: u32) -> u32 {
+        let id = self.m.id();
+        self.ins(op::EXT_INST, self.t_f32, id, &[self.ext, inst, a]);
+        id
+    }
+
+    fn ext2(&mut self, inst: u32, ty: u32, a: u32, b: u32) -> u32 {
+        let id = self.m.id();
+        self.ins(op::EXT_INST, ty, id, &[self.ext, inst, a, b]);
+        id
+    }
+
+    fn select(&mut self, cond: u32, a: u32, b: u32) -> u32 {
+        self.tern(op::SELECT, self.t_i32, cond, a, b)
+    }
+
+    fn load(&mut self, slot: u32) -> u32 {
+        let id = self.m.id();
+        self.ins(op::LOAD, self.t_i32, id, &[self.regs[slot as usize]]);
+        id
+    }
+
+    fn store(&mut self, slot: u32, v: u32) {
+        self.ins(op::STORE, 0, 0, &[self.regs[slot as usize], v]);
+    }
+
+    /// The dword `v` at a byte address, through a physical-storage pointer.
+    fn load_bda(&mut self, addr: u32) -> u32 {
+        let p = self.un(op::CONVERT_U_TO_PTR, self.ps32, addr);
+        let id = self.m.id();
+        // Physical storage buffer accesses carry their alignment.
+        self.ins(op::LOAD, self.t_i32, id, &[p, 2, 4]);
+        id
+    }
+
+    fn store_bda(&mut self, addr: u32, v: u32) {
+        let p = self.un(op::CONVERT_U_TO_PTR, self.ps32, addr);
+        self.ins(op::STORE, 0, 0, &[p, v, 2, 4]);
+    }
+
+    /// Zero-extends a 32-bit value to the module's i64 currency.
+    fn u32_to_u64(&mut self, v: u32) -> u32 {
+        let u = self.un(op::BITCAST, self.t_u32, v);
+        let w = self.un(op::U_CONVERT, self.t_u64, u);
+        self.un(op::BITCAST, self.t_i64, w)
+    }
+
+    /// Truncates the i64 currency to 32 bits.
+    fn u64_to_u32(&mut self, v: u32) -> u32 {
+        let u = self.un(op::BITCAST, self.t_u64, v);
+        let w = self.un(op::U_CONVERT, self.t_u32, u);
+        self.un(op::BITCAST, self.t_i32, w)
+    }
+
+    /// Truncates a 32-bit value to 16 bits (an unsigned half).
+    fn u32_to_u16(&mut self, v: u32) -> u32 {
+        let u = self.un(op::BITCAST, self.t_u32, v);
+        self.un(op::U_CONVERT, self.t_u16, u)
+    }
+
+    /// Zero-extends a 16-bit value to the i32 currency.
+    fn u16_to_u32(&mut self, v: u32) -> u32 {
+        let w = self.un(op::U_CONVERT, self.t_u32, v);
+        self.un(op::BITCAST, self.t_i32, w)
+    }
+
+    fn sext64(&mut self, v: u32) -> u32 {
+        self.un(op::S_CONVERT, self.t_i64, v)
+    }
+
+    fn add64(&mut self, a: u32, b: u32) -> u32 {
+        self.bin(op::I_ADD, self.t_i64, a, b)
+    }
+
+    /// The i32 sum of some values, wrapping.
+    fn sum32(&mut self, parts: &[u32]) -> u32 {
+        match parts {
+            [] => self.zero,
+            [a] => *a,
+            [a, rest @ ..] => {
+                let b = self.sum32(rest);
+                self.bin(op::I_ADD, self.t_i32, *a, b)
+            }
+        }
+    }
+
+    /// The i64 value of the register pair at `start`.
+    fn pair64(&mut self, start: u32) -> u32 {
+        let (lo, hi) = (self.load(start), self.load(start + 1));
+        let lo = self.u32_to_u64(lo);
+        let hi = self.u32_to_u64(hi);
+        let shift = self.c64(32);
+        let hi = self.bin(op::SHIFT_LEFT_LOGICAL, self.t_i64, hi, shift);
+        self.bin(op::BITWISE_OR, self.t_i64, lo, hi)
+    }
+
+    fn write_pair64(&mut self, start: u32, v: u32) {
+        let lo = self.u64_to_u32(v);
+        let shift = self.c64(32);
+        let hi = self.bin(op::SHIFT_RIGHT_LOGICAL, self.t_i64, v, shift);
+        let hi = self.u64_to_u32(hi);
+        self.store(start, lo);
+        self.store(start + 1, hi);
+    }
+
+    /// The value as an unsigned 32-bit integer (same width).
+    fn as_u32(&mut self, v: u32) -> u32 {
+        self.un(op::BITCAST, self.t_u32, v)
+    }
+
+    /// The value as a signed 32-bit integer (same width).
+    fn as_s32(&mut self, v: u32) -> u32 {
+        self.un(op::BITCAST, self.t_i32, v)
+    }
+
+    fn is_zero32(&mut self, v: u32) -> u32 {
+        self.bin(op::I_EQUAL, self.t_bool, v, self.zero)
+    }
+
+    fn logical_not(&mut self, v: u32) -> u32 {
+        self.un(op::LOGICAL_NOT, self.t_bool, v)
+    }
+
+    fn logical_and(&mut self, a: u32, b: u32) -> u32 {
+        self.bin(op::LOGICAL_AND, self.t_bool, a, b)
+    }
+
+    /// Where a source operand's first dword lives, and how many dwords it has.
+    fn op_regs(&self, o: &Operand) -> R<(u32, u8)> {
+        match *o {
+            Operand::Scalar { code, dwords } if code == 125 => gap("a null register read"),
+            Operand::Scalar { code, dwords } => Ok((u32::from(code), dwords)),
+            Operand::Vector { reg, dwords } => Ok((VGPR_BASE + u32::from(reg), dwords)),
+            _ => gap("a source that is not a register"),
+        }
+    }
+
+    /// A 32-bit source as an i32 value.
+    fn src32(&mut self, o: &Operand) -> R<u32> {
+        match *o {
+            Operand::Scalar { code, dwords } if code == 125 => Ok(self.zero),
+            Operand::Scalar { code, .. } => Ok(self.load(u32::from(code))),
+            Operand::Vector { reg, .. } => Ok(self.load(VGPR_BASE + u32::from(reg))),
+            Operand::Const(code) => self.const_operand(code),
+            Operand::Literal(v) => Ok(self.c32(v)),
+            _ => gap("a source that is not a scalar or vector register"),
+        }
+    }
+
+    /// A 32-bit source as an f32 value.
+    fn srcf32(&mut self, o: &Operand, neg: bool, abs: bool) -> R<u32> {
+        let bits = self.src32(o)?;
+        let mut f = self.bitcast_f32(bits);
+        if abs {
+            f = self.ext1(glsl::FABS, f);
+        }
+        if neg {
+            f = self.un(op::F_NEGATE, self.t_f32, f);
+        }
+        Ok(f)
+    }
+
+    fn const_operand(&mut self, code: u8) -> R<u32> {
+        match code {
+            128..=192 => Ok(self.c32(u32::from(code - 128))),
+            193..=208 => Ok(self.c32(0u32.wrapping_sub(u32::from(code - 192)))),
+            240 => Ok(self.c32(0.5f32.to_bits())),
+            241 => Ok(self.c32((-0.5f32).to_bits())),
+            242 => Ok(self.c32(1.0f32.to_bits())),
+            243 => Ok(self.c32((-1.0f32).to_bits())),
+            244 => Ok(self.c32(2.0f32.to_bits())),
+            245 => Ok(self.c32((-2.0f32).to_bits())),
+            246 => Ok(self.c32(4.0f32.to_bits())),
+            247 => Ok(self.c32((-4.0f32).to_bits())),
+            248 => Ok(self.c32(std::f32::consts::FRAC_1_PI.to_bits())),
+            249 => Ok(self.c32(std::f32::consts::FRAC_1_PI.to_bits())),
+            251 | 252 | 253 => {
+                // vccz / execz / scc as a number.
+                let id = self.condition_id(code)?;
+                let one = self.one;
+                let zero = self.zero;
+                Ok(self.tern(op::SELECT, self.t_i32, id, one, zero))
+            }
+            254 => Ok(self.zero),
+            _ => gap("a source constant this emitter does not know"),
+        }
+    }
+
+    fn condition_id(&mut self, code: u8) -> R<u32> {
+        match code {
+            251 => {
+                let lo = self.load(106);
+                let hi = self.load(107);
+                let o = self.bin(op::BITWISE_OR, self.t_i32, lo, hi);
+                Ok(self.is_zero32(o))
+            }
+            252 => {
+                let lo = self.load(126);
+                let hi = self.load(127);
+                let o = self.bin(op::BITWISE_OR, self.t_i32, lo, hi);
+                Ok(self.is_zero32(o))
+            }
+            253 => Ok(self.load_scc()),
+            _ => gap("a condition this emitter does not know"),
+        }
+    }
+
+    fn load_scc(&mut self) -> u32 {
+        let id = self.m.id();
+        self.ins(op::LOAD, self.t_bool, id, &[self.scc]);
+        id
+    }
+
+    fn store_scc(&mut self, v: u32) {
+        self.ins(op::STORE, 0, 0, &[self.scc, v]);
+    }
+
+    /// Compares two values with `pred`, giving an i1.
+    fn cmp(&mut self, pred: u16, ty: u32, a: u32, b: u32) -> u32 {
+        self.bin(pred, self.t_bool, a, b)
+    }
+
+    /// Writes an i32 value into an integer destination.
+    fn wdst(&mut self, dst: &Operand, v: u32) -> R<()> {
+        if is_null(dst) {
+            return Ok(());
+        }
+        let (start, _) = self.op_regs(dst)?;
+        self.store(start, v);
+        Ok(())
+    }
+
+    /// Writes an f32 value into a destination, bitcast to its dwords.
+    fn wdst_f32(&mut self, dst: &Operand, f: u32) -> R<()> {
+        let i = self.bitcast_i32(f);
+        self.wdst(dst, i)
+    }
+
+    /// Writes a 64-bit value into a pair destination.
+    fn wdst64(&mut self, dst: &Operand, v: u32) -> R<()> {
+        if is_null(dst) {
+            return Ok(());
+        }
+        let (start, _) = self.op_regs(dst)?;
+        self.write_pair64(start, v);
+        Ok(())
+    }
+
+    /// Reads the i64 pair a 64-bit source operand names.
+    fn src64(&mut self, o: &Operand) -> R<u32> {
+        match *o {
+            Operand::Scalar { code, .. } if code == 125 => Ok(self.c64(0)),
+            Operand::Scalar { code, .. } => Ok(self.pair64(u32::from(code))),
+            Operand::Vector { reg, .. } => Ok(self.pair64(VGPR_BASE + u32::from(reg))),
+            Operand::Const(code) => {
+                let v = u64::from(self.const_operand(code)?);
+                Ok(self.c64(v))
+            }
+            Operand::Literal(v) => Ok(self.c64(u64::from(v))),
+            _ => gap("a 64-bit source that is not a register"),
+        }
+    }
+
+    fn valu(i: &Inst) -> R<&super::super::gfx10::Valu> {
+        match &i.fields {
+            Fields::Valu(v) => Ok(v),
+            _ => gap("a vector instruction without vector fields"),
+        }
+    }
+
+    fn valu_mods(v: &crate::gfx10::Valu) -> R<()> {
+        if v.sdwa.is_some() {
+            return gap("an SDWA source modifier");
+        }
+        if v.dpp.is_some() {
+            return gap("a DPP source modifier");
+        }
+        if v.opsel != 0 || v.opsel_hi != 0 {
+            return gap("an operand-select modifier");
+        }
+        Ok(())
+    }
+
+    // ---- the module --------------------------------------------------------
+
+    fn build(&mut self) -> R<()> {
+        let (ls_x, ls_y, ls_z) = match self.native.io {
+            StageIo::Cs(cs) => (
+                cs.threads[0].max(1),
+                cs.threads[1].max(1),
+                cs.threads[2].max(1),
+            ),
+            _ => (1, 1, 1),
+        };
+        // Header.
+        self.m.ins(op::CAPABILITY, 0, 0, &[1]); // Shader
+        self.m.ins(op::CAPABILITY, 0, 0, &[5347]); // PhysicalStorageBufferAddresses
+        self.m.ins(op::CAPABILITY, 0, 0, &[11]); // Int64
+        self.m.ins(op::CAPABILITY, 0, 0, &[22]); // Int16
+        self.m.ins(op::CAPABILITY, 0, 0, &[9]); // Float16
+        self.m
+            .ins_str(op::EXTENSION, 0, 0, &[], "SPV_KHR_physical_storage_buffer");
+        self.m
+            .ins_str(op::EXT_INST_IMPORT, 0, self.ext, &[], "GLSL.std.450");
+        // Addressing model, then memory model: PhysicalStorageBuffer64, GLSL450.
+        self.m.ins(op::MEMORY_MODEL, 0, 0, &[5348, 1]);
+        self.m.ins_str_at(
+            op::ENTRY_POINT,
+            &[5, self.main],
+            "main",
+            &[
+                self.pc,
+                self.lds,
+                self.tid_var.unwrap(),
+                self.gid_var.unwrap(),
+            ],
+        );
+        self.m
+            .ins(op::EXECUTION_MODE, 0, 0, &[self.main, 17, ls_x, ls_y, ls_z]);
+        // Decorations.
+        self.m
+            .ins(op::DECORATE, 0, 0, &[self.t_struct, decoration::BLOCK]);
+        self.m.ins(
+            op::MEMBER_DECORATE,
+            0,
+            0,
+            &[self.t_struct, 0, decoration::OFFSET, 0],
+        );
+        self.m.ins(
+            op::DECORATE,
+            0,
+            0,
+            &[self.t_arr, decoration::ARRAY_STRIDE, 4],
+        );
+        self.m.ins(
+            op::DECORATE,
+            0,
+            0,
+            &[
+                self.tid_var.unwrap(),
+                decoration::BUILT_IN,
+                builtin::LOCAL_INVOCATION_ID,
+            ],
+        );
+        self.m.ins(
+            op::DECORATE,
+            0,
+            0,
+            &[
+                self.gid_var.unwrap(),
+                decoration::BUILT_IN,
+                builtin::WORKGROUP_ID,
+            ],
+        );
+        // Types.
+        self.m.ins(op::TYPE_VOID, 0, self.t_void, &[]);
+        self.m.ins(op::TYPE_BOOL, 0, self.t_bool, &[]);
+        self.m.ins(op::TYPE_INT, 0, self.t_i32, &[32, 1]);
+        self.m.ins(op::TYPE_INT, 0, self.t_i64, &[64, 1]);
+        self.m.ins(op::TYPE_FLOAT, 0, self.t_f32, &[32]);
+        self.m.ins(op::TYPE_FLOAT, 0, self.t_f16, &[16]);
+        self.m.ins(op::TYPE_INT, 0, self.t_i16, &[16, 1]);
+        self.m.ins(op::TYPE_INT, 0, self.t_u16, &[16, 0]);
+        self.m.ins(op::TYPE_INT, 0, self.t_u32, &[32, 0]);
+        self.m.ins(op::TYPE_INT, 0, self.t_u64, &[64, 0]);
+        self.m
+            .ins(op::TYPE_VECTOR, 0, self.t_v3u32, &[self.t_i32, 3]);
+        self.m.ins(
+            op::TYPE_POINTER,
+            0,
+            self.pf_i32,
+            &[storage::FUNCTION, self.t_i32],
+        );
+        self.m.ins(
+            op::TYPE_POINTER,
+            0,
+            self.pf_i64,
+            &[storage::FUNCTION, self.t_i64],
+        );
+        self.m.ins(
+            op::TYPE_POINTER,
+            0,
+            self.pf_f32,
+            &[storage::FUNCTION, self.t_f32],
+        );
+        self.m.ins(
+            op::TYPE_POINTER,
+            0,
+            self.pf_bool,
+            &[storage::FUNCTION, self.t_bool],
+        );
+        self.m.ins(
+            op::TYPE_POINTER,
+            0,
+            self.ps32,
+            &[storage::PHYSICAL_STORAGE_BUFFER, self.t_i32],
+        );
+        self.m.ins(
+            op::TYPE_POINTER,
+            0,
+            self.ps64,
+            &[storage::PHYSICAL_STORAGE_BUFFER, self.t_i64],
+        );
+        self.m.ins(
+            op::TYPE_POINTER,
+            0,
+            self.psf32,
+            &[storage::PHYSICAL_STORAGE_BUFFER, self.t_f32],
+        );
+        self.m.ins(
+            op::TYPE_POINTER,
+            0,
+            self.pw32,
+            &[storage::WORKGROUP, self.t_i32],
+        );
+        self.m.ins(
+            op::TYPE_POINTER,
+            0,
+            self.p_in_v3,
+            &[storage::INPUT, self.t_v3u32],
+        );
+        let alen = self.arr_len();
+        self.m
+            .ins(op::TYPE_ARRAY, 0, self.t_arr, &[self.t_i32, alen]);
+        self.m.ins(op::TYPE_STRUCT, 0, self.t_struct, &[self.t_arr]);
+        self.m.ins(
+            op::TYPE_POINTER,
+            0,
+            self.p_pc,
+            &[storage::PUSH_CONSTANT, self.t_struct],
+        );
+        self.m.ins(
+            op::TYPE_POINTER,
+            0,
+            self.p_pc_i32,
+            &[storage::PUSH_CONSTANT, self.t_i32],
+        );
+        // A constant the array type refers to must precede it, so it cannot
+        // come from the deferred constant section.
+        let lds_len = self.m.id();
+        let words = self.lds_words.max(1);
+        self.m.ins(op::CONSTANT, self.t_i32, lds_len, &[words]);
+        self.m
+            .ins(op::TYPE_ARRAY, 0, self.t_lds, &[self.t_i32, lds_len]);
+        self.m.ins(
+            op::TYPE_POINTER,
+            0,
+            self.p_arr,
+            &[storage::WORKGROUP, self.t_lds],
+        );
+        self.m.ins(op::TYPE_FUNCTION, 0, self.pfn, &[self.t_void]);
+        self.m.ins(op::CONSTANT, self.t_i32, self.zero, &[0]);
+        self.m.ins(op::CONSTANT, self.t_i32, self.one, &[1]);
+        self.m
+            .ins(op::CONSTANT, self.t_i32, self.minus_one, &[0xffff_ffff]);
+        self.m
+            .ins(op::CONSTANT, self.t_i32, self.scope_device, &[1]);
+        self.m
+            .ins(op::CONSTANT, self.t_i32, self.scope_workgroup, &[2]);
+        self.m.ins(
+            op::CONSTANT,
+            self.t_i32,
+            self.sem_acq_rel_workgroup,
+            &[0x108],
+        );
+        // Global variables.
+        self.m
+            .ins(op::VARIABLE, self.p_pc, self.pc, &[storage::PUSH_CONSTANT]);
+        self.m
+            .ins(op::VARIABLE, self.p_arr, self.lds, &[storage::WORKGROUP]);
+        self.m.ins(
+            op::VARIABLE,
+            self.p_in_v3,
+            self.tid_var.unwrap(),
+            &[storage::INPUT],
+        );
+        self.m.ins(
+            op::VARIABLE,
+            self.p_in_v3,
+            self.gid_var.unwrap(),
+            &[storage::INPUT],
+        );
+        // One function-local variable per register dword, the pc, and SCC.
+        let mut regs = Vec::with_capacity(SLOTS as usize);
+        for _ in 0..SLOTS {
+            regs.push(self.m.id());
+        }
+        self.scc = self.m.id();
+        let pc_var = self.pc_var;
+        self.regs = regs;
+        self.pc_var = pc_var;
+        Ok(())
+    }
+
+    fn arr_len(&mut self) -> u32 {
+        let n = self.m.id();
+        self.m.ins(op::CONSTANT, self.t_i32, n, &[32]);
+        n
+    }
+
+    /// The function body: variables, input registers, the dispatcher loop and
+    /// one block per IR block.
+    fn function(&mut self) -> R<()> {
+        let main = self.main;
+        self.labels = (0..self.p.blocks.len()).map(|_| self.m.id()).collect();
+        self.ins(op::FUNCTION, self.t_void, main, &[0, self.pfn]);
+        let entry = self.m.id();
+        self.ins(op::LABEL, 0, entry, &[]);
+        for i in 0..SLOTS {
+            let v = self.regs[i as usize];
+            self.ins(op::VARIABLE, self.pf_i32, v, &[storage::FUNCTION]);
+        }
+        let scc = self.scc;
+        let pf_bool = self.pf_bool;
+        self.ins(op::VARIABLE, pf_bool, scc, &[storage::FUNCTION]);
+        let pc_var = self.pc_var;
+        self.ins(op::VARIABLE, self.pf_i32, pc_var, &[storage::FUNCTION]);
+        // EXEC starts all ones, as it does on the machine.
+        let m1 = self.minus_one;
+        self.store(126, m1);
+        self.store(127, m1);
+        self.store(self.pc_var, self.zero);
+        self.init_user_data()?;
+        self.init_inputs()?;
+        self.ins(op::BRANCH, 0, 0, &[self.loop_head]);
+        // The dispatcher loop.
+        self.ins(op::LABEL, 0, self.loop_head, &[]);
+        self.ins(op::LOOP_MERGE, 0, 0, &[self.exit, self.cont, 0]);
+        self.ins(op::BRANCH, 0, 0, &[self.dispatch]);
+        self.ins(op::LABEL, 0, self.dispatch, &[]);
+        let pcv = self.m.id();
+        self.ins(op::LOAD, self.t_i32, pcv, &[self.pc_var]);
+        self.ins(op::SELECTION_MERGE, 0, 0, &[self.sel_merge, 0]);
+        // Default: the select's merge (an unreachable pc), not the loop exit:
+        // a case target must live inside the switch's construct.
+        let mut sw = vec![pcv, self.sel_merge];
+        for (b, label) in self.labels.clone().iter().enumerate() {
+            sw.push(b as u32);
+            sw.push(*label);
+        }
+        self.ins(op::SWITCH, 0, 0, &sw);
+        // One block per IR block.
+        for b in 0..self.p.blocks.len() {
+            let label = self.labels[b];
+            self.ins(op::LABEL, 0, label, &[]);
+            let n = self.p.blocks[b].insts.len();
+            for i in 0..n {
+                let inst = self.p.blocks[b].insts[i].clone();
+                self.inst(&inst)?;
+            }
+            let exit = self.p.blocks[b].exit;
+            self.exit_branch(b, exit)?;
+        }
+        self.ins(op::LABEL, 0, self.sel_merge, &[]);
+        self.ins(op::BRANCH, 0, 0, &[self.cont]);
+        self.ins(op::LABEL, 0, self.cont, &[]);
+        self.ins(op::BRANCH, 0, 0, &[self.loop_head]);
+        self.ins(op::LABEL, 0, self.exit, &[]);
+        self.ins(op::RETURN, 0, 0, &[]);
+        self.ins(op::FUNCTION_END, 0, 0, &[]);
+        Ok(())
+    }
+
+    // ---- memory -------------------------------------------------------------
+
+    fn load_dwords(&mut self, start: u32, n: u32, addr: u32) {
+        for k in 0..n {
+            let a = if k == 0 {
+                addr
+            } else {
+                let d = self.c64(4 * u64::from(k));
+                self.add64(addr, d)
+            };
+            let v = self.load_bda(a);
+            self.store(start + k, v);
+        }
+    }
+
+    fn store_dwords(&mut self, start: u32, n: u32, addr: u32) {
+        for k in 0..n {
+            let a = if k == 0 {
+                addr
+            } else {
+                let d = self.c64(4 * u64::from(k));
+                self.add64(addr, d)
+            };
+            let v = self.load(start + k);
+            self.store_bda(a, v);
+        }
+    }
+
+    /// A byte address: a 64-bit base plus a 32-bit signed offset.
+    fn mem_addr(&mut self, base: u32, parts: &[u32]) -> u32 {
+        let off = self.sum32(parts);
+        let off = self.sext64(off);
+        self.add64(base, off)
+    }
+
+    fn smem(&mut self, i: &Inst) -> R<()> {
+        let Fields::Smem {
+            data,
+            base,
+            offset,
+            soffset,
+            ..
+        } = &i.fields
+        else {
+            return gap("a scalar memory instruction without its fields");
+        };
+        let (data, base, offset, soffset) = (*data, *base, *offset, *soffset);
+        let base = self.src64(&base)?;
+        let mut parts = vec![self.c32(offset as u32)];
+        if !is_null(&soffset) {
+            let s = self.src32(&soffset)?;
+            parts.push(s);
+        }
+        let addr = self.mem_addr(base, &parts);
+        let data = data.ok_or(Gap("a scalar memory instruction without data"))?;
+        let (start, n) = self.op_regs(&data)?;
+        if i.name().contains("store") {
+            self.store_dwords(start, u32::from(n), addr);
+        } else {
+            self.load_dwords(start, u32::from(n), addr);
+        }
+        Ok(())
+    }
+
+    fn mubuf(&mut self, i: &Inst) -> R<()> {
+        let Fields::Buffer {
+            data,
+            addr,
+            rsrc,
+            soffset,
+            offset,
+            offen,
+            idxen,
+            format,
+            lds,
+            tfe,
+            ..
+        } = &i.fields
+        else {
+            return gap("a buffer instruction without its fields");
+        };
+        if format.is_some() {
+            return gap("a typed buffer access");
+        }
+        if *lds {
+            return gap("a buffer access through LDS");
+        }
+        if *tfe {
+            return gap("a buffer access with a fetch index");
+        }
+        let base = self.src64(rsrc)?;
+        let mut parts = vec![self.c32(u32::from(*offset))];
+        if *idxen {
+            let eight = self.c64(8);
+            let at = self.add64(base, eight);
+            let stride = self.load_bda(at);
+            let idx = self.src32(addr)?;
+            let step = self.bin(op::I_MUL, self.t_i32, idx, stride);
+            parts.push(step);
+        }
+        if *offen {
+            let v = self.src32(addr)?;
+            parts.push(v);
+        }
+        if !is_null(soffset) {
+            let s = self.src32(soffset)?;
+            parts.push(s);
+        }
+        let addr64 = self.mem_addr(base, &parts);
+        let data = (*data).ok_or(Gap("a buffer access without data"))?;
+        let (start, n) = self.op_regs(&data)?;
+        let name = i.name();
+        if name.contains("atomic") {
+            self.buffer_atomic(name, start, n, addr64)
+        } else if name.contains("store") {
+            self.store_dwords(start, u32::from(n), addr64);
+            Ok(())
+        } else {
+            self.load_dwords(start, u32::from(n), addr64);
+            Ok(())
+        }
+    }
+
+    fn buffer_atomic(&mut self, name: &str, start: u32, n: u8, addr: u32) -> R<()> {
+        let code = match name {
+            "buffer_atomic_add" | "buffer_atomic_add_x2" => op::ATOMIC_I_ADD,
+            "buffer_atomic_sub" | "buffer_atomic_sub_x2" => op::ATOMIC_I_SUB,
+            "buffer_atomic_smin" => op::ATOMIC_S_MIN,
+            "buffer_atomic_umin" => op::ATOMIC_U_MIN,
+            "buffer_atomic_smax" => op::ATOMIC_S_MAX,
+            "buffer_atomic_umax" => op::ATOMIC_U_MAX,
+            "buffer_atomic_and" => op::ATOMIC_AND,
+            "buffer_atomic_or" => op::ATOMIC_OR,
+            "buffer_atomic_xor" => op::ATOMIC_XOR,
+            "buffer_atomic_swap" => op::ATOMIC_EXCHANGE,
+            _ => return gap("a buffer atomic this emitter does not implement"),
+        };
+        let scope = self.scope_device;
+        let sem = self.zero;
+        for k in 0..u32::from(n) {
+            let a = if k == 0 {
+                addr
+            } else {
+                let d = self.c64(4 * u64::from(k));
+                self.add64(addr, d)
+            };
+            let p = self.un(op::CONVERT_U_TO_PTR, self.ps32, a);
+            let v = self.load(start + k);
+            let id = self.m.id();
+            self.ins(code, self.t_i32, id, &[p, scope, sem, v]);
+            self.store(start + k, id);
+        }
+        Ok(())
+    }
+
+    fn flat(&mut self, i: &Inst) -> R<()> {
+        let Fields::Flat {
+            dst,
+            addr,
+            data,
+            saddr,
+            offset,
+            lds,
+            ..
+        } = &i.fields
+        else {
+            return gap("a flat instruction without its fields");
+        };
+        if *lds {
+            return gap("a scratch access");
+        }
+        let a = (*addr).ok_or(Gap("a flat access without an address"))?;
+        let base = self.src64(&a)?;
+        let mut parts = vec![self.c32(i32::from(*offset) as u32)];
+        if let Some(s) = *saddr {
+            if !is_null(&s) {
+                let v = self.src32(&s)?;
+                parts.push(v);
+            }
+        }
+        let addr64 = self.mem_addr(base, &parts);
+        let name = i.name();
+        if name.contains("atomic") {
+            let d = (*data).ok_or(Gap("an atomic without data"))?;
+            let (start, n) = self.op_regs(&d)?;
+            self.buffer_atomic(name, start, n, addr64)
+        } else if name.contains("store") {
+            let d = (*data).ok_or(Gap("a store without data"))?;
+            let (start, n) = self.op_regs(&d)?;
+            self.store_dwords(start, u32::from(n), addr64);
+            Ok(())
+        } else {
+            let d = (*dst).ok_or(Gap("a load without a destination"))?;
+            let (start, n) = self.op_regs(&d)?;
+            self.load_dwords(start, u32::from(n), addr64);
+            Ok(())
+        }
+    }
+
+    fn lds_ptr(&mut self, byte: u32) -> u32 {
+        let two = self.c32(2);
+        let idx = self.bin(op::SHIFT_RIGHT_LOGICAL, self.t_i32, byte, two);
+        let id = self.m.id();
+        self.ins(op::ACCESS_CHAIN, self.pw32, id, &[self.lds, idx]);
+        id
+    }
+
+    fn ds(&mut self, i: &Inst) -> R<()> {
+        let Fields::Ds {
+            dst,
+            addr,
+            data,
+            offset0,
+            offset1,
+            gds,
+            ..
+        } = &i.fields
+        else {
+            return gap("an LDS instruction without its fields");
+        };
+        if *gds {
+            return gap("an LDS access with GDS");
+        }
+        let name = i.name();
+        let base = match addr {
+            Some(a) => self.src32(a)?,
+            None => self.zero,
+        };
+        let at = |this: &mut Self, off: u8, scale: u32| {
+            let k = this.c32(u32::from(off) * scale);
+            this.bin(op::I_ADD, this.t_i32, base, k)
+        };
+        let (o0, o1) = (*offset0, *offset1);
+        match name {
+            "ds_read_b32" | "ds_read_u8" | "ds_read_i8" | "ds_read_u16" | "ds_read_i16" => {
+                let d = (*dst).ok_or(Gap("an LDS read without a destination"))?;
+                let (start, _) = self.op_regs(&d)?;
+                let a = at(self, o0, 1);
+                let p = self.lds_ptr(a);
+                let v = self.m.id();
+                self.ins(op::LOAD, self.t_i32, v, &[p]);
+                self.store(start, v);
+                Ok(())
+            }
+            "ds_read_b64" | "ds_read_b96" | "ds_read_b128" => {
+                let d = (*dst).ok_or(Gap("an LDS read without a destination"))?;
+                let (start, n) = self.op_regs(&d)?;
+                for k in 0..u32::from(n) {
+                    let a = at(self, o0, 1);
+                    let four_k = self.c32(4 * k);
+                    let a = self.bin(op::I_ADD, self.t_i32, a, four_k);
+                    let p = self.lds_ptr(a);
+                    let v = self.m.id();
+                    self.ins(op::LOAD, self.t_i32, v, &[p]);
+                    self.store(start + k, v);
+                }
+                Ok(())
+            }
+            "ds_read2_b32" | "ds_read2st64_b32" => {
+                let scale = if name.contains("st64") { 64 } else { 1 };
+                let d = (*dst).ok_or(Gap("an LDS read without a destination"))?;
+                let (start, _) = self.op_regs(&d)?;
+                for (k, off) in [o0, o1].into_iter().enumerate() {
+                    let a = at(self, off, scale);
+                    let p = self.lds_ptr(a);
+                    let v = self.m.id();
+                    self.ins(op::LOAD, self.t_i32, v, &[p]);
+                    self.store(start + k as u32, v);
+                }
+                Ok(())
+            }
+            "ds_write_b8" | "ds_write_b16" | "ds_write_b32" => {
+                let d = data.first().ok_or(Gap("an LDS write without data"))?;
+                let (start, _) = self.op_regs(d)?;
+                let a = at(self, o0, 1);
+                let p = self.lds_ptr(a);
+                let v = self.load(start);
+                self.ins(op::STORE, 0, 0, &[p, v]);
+                Ok(())
+            }
+            "ds_write_b64" | "ds_write_b96" | "ds_write_b128" => {
+                let d = data.first().ok_or(Gap("an LDS write without data"))?;
+                let (start, n) = self.op_regs(d)?;
+                for k in 0..u32::from(n) {
+                    let a = at(self, o0, 1);
+                    let four_k = self.c32(4 * k);
+                    let a = self.bin(op::I_ADD, self.t_i32, a, four_k);
+                    let p = self.lds_ptr(a);
+                    let v = self.load(start + k);
+                    self.ins(op::STORE, 0, 0, &[p, v]);
+                }
+                Ok(())
+            }
+            "ds_write2_b32" | "ds_write2st64_b32" => {
+                let scale = if name.contains("st64") { 64 } else { 1 };
+                let d = data.first().ok_or(Gap("an LDS write without data"))?;
+                let (start, n) = self.op_regs(d)?;
+                for (k, off) in [o0, o1].into_iter().enumerate().take(u32::from(n) as usize) {
+                    let a = at(self, off, scale);
+                    let p = self.lds_ptr(a);
+                    let v = self.load(start + k as u32);
+                    self.ins(op::STORE, 0, 0, &[p, v]);
+                }
+                Ok(())
+            }
+            "ds_add_u32" | "ds_sub_u32" | "ds_min_u32" | "ds_max_u32" | "ds_min_i32"
+            | "ds_max_i32" | "ds_and_b32" | "ds_or_b32" | "ds_xor_b32" => {
+                let code = match name {
+                    "ds_add_u32" => op::ATOMIC_I_ADD,
+                    "ds_sub_u32" => op::ATOMIC_I_SUB,
+                    "ds_min_u32" => op::ATOMIC_U_MIN,
+                    "ds_max_u32" => op::ATOMIC_U_MAX,
+                    "ds_min_i32" => op::ATOMIC_S_MIN,
+                    "ds_max_i32" => op::ATOMIC_S_MAX,
+                    "ds_and_b32" => op::ATOMIC_AND,
+                    "ds_or_b32" => op::ATOMIC_OR,
+                    _ => op::ATOMIC_XOR,
+                };
+                let d = data.first().ok_or(Gap("an LDS atomic without data"))?;
+                let (start, _) = self.op_regs(d)?;
+                let a = at(self, o0, 1);
+                let p = self.lds_ptr(a);
+                let (scope, sem) = (self.scope_workgroup, self.zero);
+                let v = self.load(start);
+                let id = self.m.id();
+                self.ins(code, self.t_i32, id, &[p, scope, sem, v]);
+                self.store(start, id);
+                Ok(())
+            }
+            _ => gap("an LDS instruction this emitter does not implement"),
+        }
+    }
+    /// The root arguments: user SGPRs are push-constant dwords.
+    fn init_user_data(&mut self) -> R<()> {
+        let n = self.io.initialized_sgprs.unwrap_or(0).min(16);
+        for k in 0..n {
+            let k = self.c32(u32::from(k));
+            let p = self.tern(op::ACCESS_CHAIN, self.p_pc_i32, self.pc, self.zero, k);
+            let v = self.m.id();
+            self.ins(op::LOAD, self.t_i32, v, &[p]);
+            self.store(u32::from(k % 16), v);
+        }
+        Ok(())
+    }
+
+    /// Hardware-loaded inputs: thread and group ids become SPIR-V builtins.
+    fn init_inputs(&mut self) -> R<()> {
+        let inputs = self.io.inputs.clone();
+        let regs = self.p.inputs.clone();
+        for (reg, value) in regs {
+            let Some((_, input)) = inputs.iter().find(|(v, _)| *v == value) else {
+                continue;
+            };
+            match *input {
+                Input::ThreadIdInGroup(c) => {
+                    let v = self.builtin_component(true, c)?;
+                    self.store(slot(reg), v);
+                }
+                Input::GroupId(c) => {
+                    let v = self.builtin_component(false, c)?;
+                    self.store(slot(reg), v);
+                }
+                Input::GroupInfo => self.store(slot(reg), self.zero),
+                _ => return gap("a compute input that is not a thread or group id"),
+            }
+        }
+        Ok(())
+    }
+
+    fn builtin_component(&mut self, local: bool, c: u8) -> R<u32> {
+        let var = if local {
+            self.tid_var.unwrap()
+        } else {
+            self.gid_var.unwrap()
+        };
+        let vec = self.m.id();
+        self.ins(op::LOAD, self.t_v3u32, vec, &[var]);
+        let id = self.m.id();
+        // A composite index is a literal, not a constant id.
+        self.ins(op::COMPOSITE_EXTRACT, self.t_i32, id, &[vec, u32::from(c)]);
+        Ok(id)
+    }
+
+    fn exit_branch(&mut self, _b: usize, exit: Exit) -> R<()> {
+        match exit {
+            Exit::Jump(t) => {
+                self.set_pc(t);
+                self.ins(op::BRANCH, 0, 0, &[self.sel_merge]);
+                Ok(())
+            }
+            Exit::Branch { taken, not_taken } => {
+                let name = self.branch_name(_b);
+                let cond = self.branch_cond(name)?;
+                let (taken, not_taken) = (taken, not_taken);
+                let c = self.c32(taken as u32);
+                self.store(self.pc_var, c);
+                let then = self.m.id();
+                let els = self.m.id();
+                // Each header needs its own merge block.
+                let merge = self.m.id();
+                self.ins(op::SELECTION_MERGE, 0, 0, &[merge, 0]);
+                self.ins(op::BRANCH_CONDITIONAL, 0, 0, &[cond, then, els]);
+                self.ins(op::LABEL, 0, then, &[]);
+                self.ins(op::BRANCH, 0, 0, &[merge]);
+                self.ins(op::LABEL, 0, els, &[]);
+                let c = self.c32(not_taken as u32);
+                self.store(self.pc_var, c);
+                self.ins(op::BRANCH, 0, 0, &[merge]);
+                self.ins(op::LABEL, 0, merge, &[]);
+                self.ins(op::BRANCH, 0, 0, &[self.sel_merge]);
+                Ok(())
+            }
+            Exit::End => {
+                self.ins(op::BRANCH, 0, 0, &[self.exit]);
+                Ok(())
+            }
+            Exit::Indirect => gap("an indirect branch"),
+        }
+    }
+
+    fn set_pc(&mut self, b: usize) {
+        let c = self.c32(b as u32);
+        self.store(self.pc_var, c);
+    }
+
+    fn branch_name(&self, b: usize) -> &'static str {
+        self.p.blocks[b]
+            .insts
+            .last()
+            .map(|i| i.name())
+            .unwrap_or("")
+    }
+
+    fn branch_cond(&mut self, name: &str) -> R<u32> {
+        match name {
+            "s_cbranch_scc0" => {
+                let s = self.load_scc();
+                Ok(self.logical_not(s))
+            }
+            "s_cbranch_scc1" => Ok(self.load_scc()),
+            "s_cbranch_execz" => {
+                let e = self.condition_id(252)?;
+                Ok(e)
+            }
+            "s_cbranch_execnz" => {
+                let e = self.condition_id(252)?;
+                Ok(self.logical_not(e))
+            }
+            "s_cbranch_vccz" => self.condition_id(251),
+            "s_cbranch_vccnz" => {
+                let v = self.condition_id(251)?;
+                Ok(self.logical_not(v))
+            }
+            _ => gap("a branch condition this emitter does not know"),
+        }
+    }
+
+    // ---- instructions -------------------------------------------------------
+
+    fn inst(&mut self, i: &Inst) -> R<()> {
+        let name = i.name();
+        match &i.fields {
+            Fields::Smem { .. } => return self.smem(i),
+            Fields::Buffer { .. } => return self.mubuf(i),
+            Fields::Flat { .. } => return self.flat(i),
+            Fields::Ds { .. } => return self.ds(i),
+            Fields::Image { .. } => return gap("an image instruction"),
+            Fields::Exp { .. } => return gap("an export"),
+            Fields::Vintrp { .. } => return gap("an interpolation"),
+            _ => {}
+        }
+        match name {
+            // No-ops for this emitter: scheduling, branches (the block exit
+            // carries the control flow), and hardware state with no value.
+            "s_branch" | "s_cbranch_scc0" | "s_cbranch_scc1" | "s_cbranch_execz"
+            | "s_cbranch_execnz" | "s_cbranch_vccz" | "s_cbranch_vccnz" | "s_endpgm" | "s_nop"
+            | "s_waitcnt" | "s_waitcnt_vscnt" | "s_waitcnt_depctr" | "s_setreg_imm32_b32"
+            | "s_icache_inv" | "s_sleep" | "s_inst_prefetch" | "s_clause" | "s_delay_alu"
+            | "s_ttracedata" => Ok(()),
+            "s_barrier" => {
+                let (dg, wg, sem) = (
+                    self.scope_device,
+                    self.scope_workgroup,
+                    self.sem_acq_rel_workgroup,
+                );
+                self.ins(op::CONTROL_BARRIER, 0, 0, &[wg, wg, sem]);
+                Ok(())
+            }
+            // ---- scalar moves and arithmetic ----
+            "s_mov_b32" => {
+                let sop = self.sop(i)?;
+                let v = self.src32(&sop.src[0])?;
+                let dst = sop.dst.ok_or(Gap("a move without a destination"))?;
+                self.wdst(&dst, v)
+            }
+            "s_mov_b64" => {
+                let sop = self.sop(i)?;
+                let v = self.src64(&sop.src[0])?;
+                let dst = sop.dst.ok_or(Gap("a move without a destination"))?;
+                self.wdst64(&dst, v)
+            }
+            "s_movk_i32" => {
+                let sop = self.sop(i)?;
+                let imm = i32::from(sop.imm.ok_or(Gap("s_movk_i32 without an immediate"))? as i16);
+                let v = self.c32(imm as u32);
+                self.wdst(&sop.dst.ok_or(Gap("a move without a destination"))?, v)
+            }
+            "s_cmov_b32" => {
+                let sop = self.sop(i)?;
+                let v = self.src32(&sop.src[0])?;
+                let scc = self.load_scc();
+                let zero = self.zero;
+                let v = self.select(scc, v, zero);
+                self.wdst(&sop.dst.ok_or(Gap("a move without a destination"))?, v)
+            }
+            "s_not_b32" => self.sop1(i, op::BITWISE_NOT, false),
+            "s_brev_b32" => self.sop1(i, op::BIT_REVERSE, false),
+            "s_abs_i32" => {
+                let sop = self.sop(i)?;
+                let v = self.src32(&sop.src[0])?;
+                let r = self.un(op::BITWISE_NOT, self.t_i32, v);
+                let r = self.bin(op::I_ADD, self.t_i32, r, self.one);
+                let (sv, z) = (self.as_s32(v), self.as_s32(self.zero));
+                let neg = self.bin(op::S_LESS_THAN, self.t_bool, sv, z);
+                let r = self.select(neg, r, v);
+                self.wdst(&sop.dst.ok_or(Gap("an abs without a destination"))?, r)
+            }
+            // Binary scalar ops.
+            "s_add_i32" => self.sop2(i, op::I_ADD),
+            "s_sub_i32" => self.sop2(i, op::I_SUB),
+            "s_mul_i32" => self.sop2(i, op::I_MUL),
+            "s_and_b32" => self.sop2(i, op::BITWISE_AND),
+            "s_or_b32" => self.sop2(i, op::BITWISE_OR),
+            "s_xor_b32" => self.sop2(i, op::BITWISE_XOR),
+            "s_andn2_b32" => self.sop_not2(i, op::BITWISE_AND),
+            "s_orn2_b32" => self.sop_not2(i, op::BITWISE_OR),
+            "s_nand_b32" => self.sop_notres(i, op::BITWISE_AND),
+            "s_nor_b32" => self.sop_notres(i, op::BITWISE_OR),
+            "s_xnor_b32" => self.sop_notres(i, op::BITWISE_XOR),
+            "s_lshl_b32" => self.sop2(i, op::SHIFT_LEFT_LOGICAL),
+            "s_lshr_b32" => self.sop2(i, op::SHIFT_RIGHT_LOGICAL),
+            "s_ashr_i32" => self.sop2(i, op::SHIFT_RIGHT_ARITHMETIC),
+            "s_mul_hi_u32" => self.sop_mul_hi(i, false),
+            "s_mul_hi_i32" => self.sop_mul_hi(i, true),
+            "s_bfe_u32" => self.sop_bfe(i, false),
+            "s_bfe_i32" => self.sop_bfe(i, true),
+            "s_bfm_b32" => self.sop_bfm(i),
+            "s_min_i32" => self.sop_minmax(i, glsl::SMIN),
+            "s_max_i32" => self.sop_minmax(i, glsl::SMAX),
+            "s_min_u32" => self.sop_minmax(i, glsl::UMIN),
+            "s_max_u32" => self.sop_minmax(i, glsl::UMAX),
+            "s_cselect_b32" => {
+                let sop = self.sop(i)?;
+                let a = self.src32(&sop.src[0])?;
+                let b = self.src32(&sop.src[1])?;
+                let scc = self.load_scc();
+                let v = self.select(scc, a, b);
+                self.wdst(&sop.dst.ok_or(Gap("a select without a destination"))?, v)
+            }
+            "s_cselect_b64" => {
+                let sop = self.sop(i)?;
+                let a = self.src64(&sop.src[0])?;
+                let b = self.src64(&sop.src[1])?;
+                let scc = self.load_scc();
+                let id = self.m.id();
+                self.ins(op::SELECT, self.t_i64, id, &[scc, a, b]);
+                self.wdst64(&sop.dst.ok_or(Gap("a select without a destination"))?, id)
+            }
+            // ---- 64-bit scalar bit operations on lane masks ----
+            "s_and_b64" | "s_or_b64" | "s_xor_b64" => {
+                let code = match name {
+                    "s_and_b64" => op::BITWISE_AND,
+                    "s_or_b64" => op::BITWISE_OR,
+                    _ => op::BITWISE_XOR,
+                };
+                self.sop2_64(i, code)
+            }
+            "s_andn2_b64" => self.sop2_64_not2(i, op::BITWISE_AND),
+            "s_orn2_b64" => self.sop2_64_not2(i, op::BITWISE_OR),
+            "s_not_b64" => {
+                let sop = self.sop(i)?;
+                let v = self.src64(&sop.src[0])?;
+                let r = self.un(op::BITWISE_NOT, self.t_i64, v);
+                self.wdst64(&sop.dst.ok_or(Gap("a not without a destination"))?, r)
+            }
+            // Save-exec forms: the old EXEC goes to the destination.
+            "s_and_saveexec_b64" | "s_or_saveexec_b64" | "s_xor_saveexec_b64" => {
+                let code = match name {
+                    "s_and_saveexec_b64" => op::BITWISE_AND,
+                    "s_or_saveexec_b64" => op::BITWISE_OR,
+                    _ => op::BITWISE_XOR,
+                };
+                let sop = self.sop(i)?;
+                let exec = self.pair64(126);
+                let src = self.src64(&sop.src[0])?;
+                let new = self.bin(code, self.t_i64, exec, src);
+                self.write_pair64(126, new);
+                self.wdst64(
+                    &sop.dst.ok_or(Gap("a save-exec without a destination"))?,
+                    exec,
+                )
+            }
+            "s_bcnt1_i32_b32" => {
+                let sop = self.sop(i)?;
+                let v = self.src32(&sop.src[0])?;
+                let r = self.un(op::BIT_COUNT, self.t_i32, v);
+                self.wdst(&sop.dst.ok_or(Gap("a count without a destination"))?, r)
+            }
+            // Scalar compares write SCC.
+            "s_cmp_eq_u32" | "s_cmp_lg_u32" | "s_cmp_lt_u32" | "s_cmp_le_u32" | "s_cmp_gt_u32"
+            | "s_cmp_ge_u32" | "s_cmp_eq_i32" | "s_cmp_lg_i32" | "s_cmp_lt_i32"
+            | "s_cmp_le_i32" | "s_cmp_gt_i32" | "s_cmp_ge_i32" => {
+                let sop = self.sop(i)?;
+                let a = self.src32(&sop.src[0])?;
+                let b = self.src32(&sop.src[1])?;
+                let (kind, int) = name
+                    .strip_prefix("s_cmp_")
+                    .and_then(|s| s.split_once('_'))
+                    .ok_or(Gap("a compare name this emitter does not know"))?;
+                let pred = int_pred(kind, int == "i32")
+                    .ok_or(Gap("a compare kind this emitter does not know"))?;
+                let unsigned = matches!(
+                    pred,
+                    op::U_GREATER_THAN
+                        | op::U_GREATER_THAN_EQUAL
+                        | op::U_LESS_THAN
+                        | op::U_LESS_THAN_EQUAL
+                );
+                let (a, b) = if unsigned {
+                    (self.as_u32(a), self.as_u32(b))
+                } else if kind != "eq" && kind != "ne" && kind != "lg" && int == "i32" {
+                    (self.as_s32(a), self.as_s32(b))
+                } else {
+                    (a, b)
+                };
+                let c = self.cmp(pred, self.t_i32, a, b);
+                self.store_scc(c);
+                Ok(())
+            }
+            "s_addk_i32" | "s_mulk_i32" => {
+                let sop = self.sop(i)?;
+                let imm = sop
+                    .imm
+                    .ok_or(Gap("a scalar immediate operation without one"))?;
+                let mut k = u32::from(imm);
+                if name == "s_addk_i32" {
+                    k = (i32::from(imm as i16)) as u32;
+                }
+                let dst = sop.dst.ok_or(Gap("an operation without a destination"))?;
+                // SOPK reads and writes the same SGPR.
+                let a = self.src32(&dst)?;
+                let k = self.c32(k);
+                let code = if name == "s_addk_i32" {
+                    op::I_ADD
+                } else {
+                    op::I_MUL
+                };
+                let r = self.bin(code, self.t_i32, a, k);
+                self.wdst(&dst, r)
+            }
+            "s_bitset0_b32" | "s_bitset1_b32" => {
+                let sop = self.sop(i)?;
+                let dst = sop.dst.ok_or(Gap("a bitset without a destination"))?;
+                // SOP1's destination is its other source.
+                let a = self.src32(&dst)?;
+                let bit = self.src32(&sop.src[0])?;
+                let one = self.one;
+                let m = self.bin(op::SHIFT_LEFT_LOGICAL, self.t_i32, one, bit);
+                let r = if name == "s_bitset1_b32" {
+                    self.bin(op::BITWISE_OR, self.t_i32, a, m)
+                } else {
+                    let nm = self.un(op::BITWISE_NOT, self.t_i32, m);
+                    self.bin(op::BITWISE_AND, self.t_i32, a, nm)
+                };
+                self.wdst(&dst, r)
+            }
+            "s_and_saveexec_b32" | "s_or_saveexec_b32" | "s_xor_saveexec_b32" => {
+                let code = match name {
+                    "s_and_saveexec_b32" => op::BITWISE_AND,
+                    "s_or_saveexec_b32" => op::BITWISE_OR,
+                    _ => op::BITWISE_XOR,
+                };
+                let sop = self.sop(i)?;
+                let exec = self.load(126);
+                let src = self.src32(&sop.src[0])?;
+                let new = self.bin(code, self.t_i32, exec, src);
+                self.store(126, new);
+                self.store(127, new);
+                self.wdst(
+                    &sop.dst.ok_or(Gap("a save-exec without a destination"))?,
+                    exec,
+                )
+            }
+            "s_wqm_b64" | "s_wqm_b32" => {
+                // shortcut: the whole quad mask a lane's EXEC bit stands for
+                // is taken to be the mask itself (right when EXEC is full).
+                let sop = self.sop(i)?;
+                let v = if name == "s_wqm_b64" {
+                    self.src64(&sop.src[0])?
+                } else {
+                    let a = self.src32(&sop.src[0])?;
+                    self.u32_to_u64(a)
+                };
+                let dst = sop.dst.ok_or(Gap("a wqm without a destination"))?;
+                if name == "s_wqm_b64" {
+                    self.wdst64(&dst, v)
+                } else {
+                    let lo = self.u64_to_u32(v);
+                    self.wdst(&dst, lo)
+                }
+            }
+            // ---- vector instructions ----
+            _ => {
+                if matches!(i.fields, Fields::Valu(_)) {
+                    self.valu_inst(i, name)
+                } else {
+                    Err(Gap(name))
+                }
+            }
+        }
+    }
+
+    fn sop(&self, i: &Inst) -> R<Sop> {
+        match &i.fields {
+            Fields::Sop { dst, src, imm } => Ok(Sop {
+                dst: *dst,
+                src: src.clone(),
+                imm: *imm,
+            }),
+            _ => gap("a scalar instruction without scalar fields"),
+        }
+    }
+
+    fn sop1(&mut self, i: &Inst, opcode: u16, _f: bool) -> R<()> {
+        let s = self.sop(i)?;
+        let v = self.src32(&s.src[0])?;
+        let r = self.un(opcode, self.t_i32, v);
+        self.wdst(&s.dst.ok_or(Gap("an operation without a destination"))?, r)
+    }
+
+    fn sop2(&mut self, i: &Inst, opcode: u16) -> R<()> {
+        let s = self.sop(i)?;
+        let a = self.src32(&s.src[0])?;
+        let b = self.src32(&s.src[1])?;
+        let r = self.bin(opcode, self.t_i32, a, b);
+        self.wdst(&s.dst.ok_or(Gap("an operation without a destination"))?, r)
+    }
+
+    fn sop_not2(&mut self, i: &Inst, opcode: u16) -> R<()> {
+        let s = self.sop(i)?;
+        let a = self.src32(&s.src[0])?;
+        let b = self.src32(&s.src[1])?;
+        let nb = self.un(op::BITWISE_NOT, self.t_i32, b);
+        let r = self.bin(opcode, self.t_i32, a, nb);
+        self.wdst(&s.dst.ok_or(Gap("an operation without a destination"))?, r)
+    }
+
+    fn sop_notres(&mut self, i: &Inst, opcode: u16) -> R<()> {
+        let s = self.sop(i)?;
+        let a = self.src32(&s.src[0])?;
+        let b = self.src32(&s.src[1])?;
+        let r = self.bin(opcode, self.t_i32, a, b);
+        let r = self.un(op::BITWISE_NOT, self.t_i32, r);
+        self.wdst(&s.dst.ok_or(Gap("an operation without a destination"))?, r)
+    }
+
+    fn sop2_64(&mut self, i: &Inst, opcode: u16) -> R<()> {
+        let s = self.sop(i)?;
+        let a = self.src64(&s.src[0])?;
+        let b = self.src64(&s.src[1])?;
+        let r = self.bin(opcode, self.t_i64, a, b);
+        self.wdst64(&s.dst.ok_or(Gap("an operation without a destination"))?, r)
+    }
+
+    fn sop2_64_not2(&mut self, i: &Inst, opcode: u16) -> R<()> {
+        let s = self.sop(i)?;
+        let a = self.src64(&s.src[0])?;
+        let b = self.src64(&s.src[1])?;
+        let nb = self.un(op::BITWISE_NOT, self.t_i64, b);
+        let r = self.bin(opcode, self.t_i64, a, nb);
+        self.wdst64(&s.dst.ok_or(Gap("an operation without a destination"))?, r)
+    }
+
+    fn sop_mul_hi(&mut self, i: &Inst, signed: bool) -> R<()> {
+        let s = self.sop(i)?;
+        let a = self.src32(&s.src[0])?;
+        let b = self.src32(&s.src[1])?;
+        let (a, b) = if signed {
+            (self.sext64(a), self.sext64(b))
+        } else {
+            (self.u32_to_u64(a), self.u32_to_u64(b))
+        };
+        let p = self.bin(op::I_MUL, self.t_i64, a, b);
+        let shift = self.c64(32);
+        let hi = self.bin(op::SHIFT_RIGHT_LOGICAL, self.t_i64, p, shift);
+        let hi = self.u64_to_u32(hi);
+        self.wdst(&s.dst.ok_or(Gap("a multiply without a destination"))?, hi)
+    }
+
+    fn sop_bfe(&mut self, i: &Inst, signed: bool) -> R<()> {
+        let s = self.sop(i)?;
+        let v = self.src32(&s.src[0])?;
+        let field = self.src32(&s.src[1])?;
+        let sixteen = self.c32(16);
+        let sh = self.bin(op::SHIFT_RIGHT_LOGICAL, self.t_i32, field, sixteen);
+        let low = self.c32(0x1f);
+        let _mask = self.bin(op::BITWISE_AND, self.t_i32, field, low);
+        let max = self.c32(32);
+        let (uf, umax) = (self.as_u32(field), self.as_u32(max));
+        let width = self.bin(op::U_MOD, self.t_u32, uf, umax);
+        let width = self.as_s32(width);
+        // `width == 0` selects 32 bits on the machine; the host clamps it.
+        let zero_w = self.is_zero32(width);
+        let width = self.select(zero_w, max, width);
+        let count = self.bin(op::I_ADD, self.t_i32, width, self.one);
+        let pred = if signed {
+            op::BIT_FIELD_S_EXTRACT
+        } else {
+            op::BIT_FIELD_U_EXTRACT
+        };
+        let r = self.tern(pred, self.t_i32, v, sh, count);
+        self.wdst(&s.dst.ok_or(Gap("a bitfield without a destination"))?, r)
+    }
+
+    fn sop_bfm(&mut self, i: &Inst) -> R<()> {
+        let s = self.sop(i)?;
+        let (w, off) = (self.src32(&s.src[0])?, self.src32(&s.src[1])?);
+        let k32 = self.c32(32);
+        let n = self.bin(op::I_SUB, self.t_i32, k32, w);
+        let low = self.bin(op::SHIFT_RIGHT_LOGICAL, self.t_i32, self.minus_one, n);
+        let r = self.bin(op::SHIFT_LEFT_LOGICAL, self.t_i32, low, off);
+        self.wdst(&s.dst.ok_or(Gap("a mask without a destination"))?, r)
+    }
+
+    fn sop_minmax(&mut self, i: &Inst, ext: u32) -> R<()> {
+        let s = self.sop(i)?;
+        let a = self.src32(&s.src[0])?;
+        let b = self.src32(&s.src[1])?;
+        let r = self.minmax(ext, a, b);
+        self.wdst(&s.dst.ok_or(Gap("a min or max without a destination"))?, r)
+    }
+
+    /// A min or max in the type the GLSL instruction class wants.
+    fn minmax(&mut self, ext: u32, a: u32, b: u32) -> u32 {
+        if matches!(ext, glsl::UMIN | glsl::UMAX | glsl::SMIN | glsl::SMAX) {
+            let (ty, uv) = if matches!(ext, glsl::UMIN | glsl::UMAX) {
+                (self.t_u32, true)
+            } else {
+                (self.t_i32, false)
+            };
+            let (a, b) = if uv {
+                (self.as_u32(a), self.as_u32(b))
+            } else {
+                (self.as_s32(a), self.as_s32(b))
+            };
+            let r = self.ext2(ext, ty, a, b);
+            self.as_s32(r)
+        } else {
+            self.ext2(ext, self.t_i32, a, b)
+        }
+    }
+
+    // ---- vector instructions ------------------------------------------------
+
+    fn valu_inst(&mut self, i: &Inst, name: &'static str) -> R<()> {
+        let v = match &i.fields {
+            Fields::Valu(v) => v.clone(),
+            _ => return gap("an instruction this emitter does not implement"),
+        };
+        Self::valu_mods(&v)?;
+        if let Some(rest) = name.strip_prefix("v_cmpx_") {
+            return self.valu_compare(&v, rest, true);
+        }
+        if let Some(rest) = name.strip_prefix("v_cmp_") {
+            return self.valu_compare(&v, rest, false);
+        }
+        match name {
+            "v_mov_b32" => {
+                let r = self.src32(&v.src[0])?;
+                self.wdst(&v.dst.ok_or(Gap("a move without a destination"))?, r)
+            }
+            "v_mov_b64" => {
+                let r = self.src64(&v.src[0])?;
+                self.wdst64(&v.dst.ok_or(Gap("a move without a destination"))?, r)
+            }
+            "v_swap_b32" => {
+                let a = self.src32(&v.src[0])?;
+                let b = self.src32(&v.src[1])?;
+                let (sa, _) = self.op_regs(&v.src[0])?;
+                let (sb, _) = self.op_regs(&v.src[1])?;
+                self.store(sa, b);
+                self.store(sb, a);
+                Ok(())
+            }
+            "v_readfirstlane_b32" | "v_readlane_b32" | "v_writelane_b32" => {
+                // shortcut: one lane per SPIR-V invocation, so a read of any
+                // lane's value is this lane's (right for the uniform values
+                // the title reads this way).
+                let r = self.src32(&v.src[0])?;
+                self.wdst(&v.dst.ok_or(Gap("a lane move without a destination"))?, r)
+            }
+            "v_cndmask_b32" => {
+                let a = self.src32(&v.src[0])?;
+                let b = self.src32(&v.src[1])?;
+                let mask = self.src32(&v.src[2])?;
+                let cond = self.bin(op::I_NOT_EQUAL, self.t_bool, mask, self.zero);
+                let r = self.select(cond, a, b);
+                self.wdst(&v.dst.ok_or(Gap("a select without a destination"))?, r)
+            }
+            // Floating-point binary.
+            "v_add_f32" | "v_add_f16" => self.fv_bin(&v, op::F_ADD),
+            "v_sub_f32" => self.fv_bin(&v, op::F_SUB),
+            "v_subrev_f32" => self.fv_bin_rev(&v, op::F_SUB),
+            "v_mul_f32" | "v_mul_legacy_f32" | "v_mul_dx9_zero_f32" => self.fv_bin(&v, op::F_MUL),
+            "v_min_f32" => self.fv_ext2(&v, glsl::FMIN),
+            "v_max_f32" => self.fv_ext2(&v, glsl::FMAX),
+            "v_fma_f32" | "v_mad_f32" | "v_fma_f32_f16" => {
+                let a = self.srcf32(&v.src[0], v.neg & 1 != 0, v.abs & 1 != 0)?;
+                let b = self.srcf32(&v.src[1], v.neg & 2 != 0, v.abs & 2 != 0)?;
+                let c = self.srcf32(&v.src[2], v.neg & 4 != 0, v.abs & 4 != 0)?;
+                let p = self.bin(op::F_MUL, self.t_f32, a, b);
+                let r = self.bin(op::F_ADD, self.t_f32, p, c);
+                self.fv_out(&v, r)
+            }
+            "v_fmac_f32" | "v_mac_f32" | "v_mad_legacy_f32" => {
+                let a = self.srcf32(&v.src[0], v.neg & 1 != 0, v.abs & 1 != 0)?;
+                let b = self.srcf32(&v.src[1], v.neg & 2 != 0, v.abs & 2 != 0)?;
+                let dst = v.dst.ok_or(Gap("a multiply-add without a destination"))?;
+                let c = self.srcf32(&dst, false, false)?;
+                let p = self.bin(op::F_MUL, self.t_f32, a, b);
+                let r = self.bin(op::F_ADD, self.t_f32, p, c);
+                self.fv_out(&v, r)
+            }
+            "v_madmk_f32" | "v_madak_f32" => {
+                let a = self.srcf32(&v.src[0], v.neg & 1 != 0, v.abs & 1 != 0)?;
+                let b = self.srcf32(&v.src[1], false, false)?;
+                let dst = v.dst.ok_or(Gap("a multiply-add without a destination"))?;
+                let c = self.srcf32(&dst, false, false)?;
+                let p = self.bin(op::F_MUL, self.t_f32, a, b);
+                let r = self.bin(op::F_ADD, self.t_f32, p, c);
+                self.fv_out(&v, r)
+            }
+            "v_min3_f32" => {
+                let a = self.srcf32(&v.src[0], v.neg & 1 != 0, v.abs & 1 != 0)?;
+                let b = self.srcf32(&v.src[1], v.neg & 2 != 0, v.abs & 2 != 0)?;
+                let c = self.srcf32(&v.src[2], v.neg & 4 != 0, v.abs & 4 != 0)?;
+                let t = self.ext2(glsl::FMIN, self.t_f32, a, b);
+                let r = self.ext2(glsl::FMIN, self.t_f32, t, c);
+                self.fv_out(&v, r)
+            }
+            "v_max3_f32" => {
+                let a = self.srcf32(&v.src[0], v.neg & 1 != 0, v.abs & 1 != 0)?;
+                let b = self.srcf32(&v.src[1], v.neg & 2 != 0, v.abs & 2 != 0)?;
+                let c = self.srcf32(&v.src[2], v.neg & 4 != 0, v.abs & 4 != 0)?;
+                let t = self.ext2(glsl::FMAX, self.t_f32, a, b);
+                let r = self.ext2(glsl::FMAX, self.t_f32, t, c);
+                self.fv_out(&v, r)
+            }
+            "v_med3_f32" => {
+                let a = self.srcf32(&v.src[0], v.neg & 1 != 0, v.abs & 1 != 0)?;
+                let b = self.srcf32(&v.src[1], v.neg & 2 != 0, v.abs & 2 != 0)?;
+                let c = self.srcf32(&v.src[2], v.neg & 4 != 0, v.abs & 4 != 0)?;
+                let lo = self.ext2(glsl::FMIN, self.t_f32, a, b);
+                let hi = self.ext2(glsl::FMAX, self.t_f32, a, b);
+                let t = self.ext2(glsl::FMIN, self.t_f32, hi, c);
+                let r = self.ext2(glsl::FMAX, self.t_f32, lo, t);
+                self.fv_out(&v, r)
+            }
+            // Floating-point unary.
+            "v_rcp_f32" | "v_rcp_iflag_f32" => {
+                let a = self.srcf32(&v.src[0], v.neg & 1 != 0, v.abs & 1 != 0)?;
+                let one = self.cf32(1.0);
+                let r = self.bin(op::F_DIV, self.t_f32, one, a);
+                self.fv_out(&v, r)
+            }
+            "v_sqrt_f32" => self.fv_ext1(&v, glsl::SQRT),
+            "v_rsq_f32" => self.fv_ext1(&v, glsl::INVERSE_SQRT),
+            "v_exp_f32" => self.fv_ext1(&v, glsl::EXP2),
+            "v_log_f32" => self.fv_ext1(&v, glsl::LOG2),
+            "v_sin_f32" => self.fv_ext1(&v, glsl::SIN),
+            "v_cos_f32" => self.fv_ext1(&v, glsl::COS),
+            "v_trunc_f32" => self.fv_ext1(&v, glsl::TRUNC),
+            "v_floor_f32" => self.fv_ext1(&v, glsl::FLOOR),
+            "v_ceil_f32" => self.fv_ext1(&v, glsl::CEIL),
+            "v_fract_f32" => self.fv_ext1(&v, glsl::FRACT),
+            "v_rndne_f32" => self.fv_ext1(&v, glsl::ROUND_EVEN),
+            // Integer arithmetic.
+            "v_add_u32" | "v_add_i32" | "v_add_nc_u32" => self.iv_bin(&v, op::I_ADD),
+            "v_sub_u32" | "v_sub_i32" | "v_sub_nc_u32" => self.iv_bin(&v, op::I_SUB),
+            "v_subrev_u32" | "v_subrev_nc_u32" => self.iv_bin_rev(&v, op::I_SUB),
+            "v_mul_lo_u32" => self.iv_bin(&v, op::I_MUL),
+            "v_add_co_u32" | "v_addc_co_u32" | "v_add_co_ci_u32" => self.add_carry(&v, false),
+            "v_sub_co_u32" | "v_subb_co_u32" | "v_sub_co_ci_u32" => self.add_carry(&v, true),
+            "v_mul_hi_u32" => self.mul_hi(&v, false),
+            "v_mul_hi_i32" => self.mul_hi(&v, true),
+            "v_mul_u32_u24" => self.mul_u24(&v),
+            "v_mad_u32_u24" => self.mad_u24(&v),
+            "v_mad_i32_i24" => self.mad_i24(&v),
+            "v_and_b32" => self.iv_bin(&v, op::BITWISE_AND),
+            "v_or_b32" => self.iv_bin(&v, op::BITWISE_OR),
+            "v_xor_b32" => self.iv_bin(&v, op::BITWISE_XOR),
+            "v_not_b32" => {
+                let a = self.src32(&v.src[0])?;
+                let r = self.un(op::BITWISE_NOT, self.t_i32, a);
+                self.wdst(&v.dst.ok_or(Gap("a not without a destination"))?, r)
+            }
+            "v_andn2_b32" => {
+                let a = self.src32(&v.src[0])?;
+                let b = self.src32(&v.src[1])?;
+                let nb = self.un(op::BITWISE_NOT, self.t_i32, b);
+                let r = self.bin(op::BITWISE_AND, self.t_i32, a, nb);
+                self.wdst(&v.dst.ok_or(Gap("an and not without a destination"))?, r)
+            }
+            "v_orn2_b32" => {
+                let a = self.src32(&v.src[0])?;
+                let b = self.src32(&v.src[1])?;
+                let nb = self.un(op::BITWISE_NOT, self.t_i32, b);
+                let r = self.bin(op::BITWISE_OR, self.t_i32, a, nb);
+                self.wdst(&v.dst.ok_or(Gap("an or not without a destination"))?, r)
+            }
+            "v_and_or_b32" => {
+                let (a, b, c) = self.src3(&v)?;
+                let p = self.bin(op::BITWISE_AND, self.t_i32, a, b);
+                let r = self.bin(op::BITWISE_OR, self.t_i32, p, c);
+                self.wdst(&v.dst.ok_or(Gap("an and-or without a destination"))?, r)
+            }
+            "v_or3_b32" => {
+                let (a, b, c) = self.src3(&v)?;
+                let p = self.bin(op::BITWISE_OR, self.t_i32, a, b);
+                let r = self.bin(op::BITWISE_OR, self.t_i32, p, c);
+                self.wdst(&v.dst.ok_or(Gap("an or3 without a destination"))?, r)
+            }
+            "v_lshlrev_b32" => self.iv_bin_rev(&v, op::SHIFT_LEFT_LOGICAL),
+            "v_lshrrev_b32" => self.iv_bin_rev(&v, op::SHIFT_RIGHT_LOGICAL),
+            "v_ashrrev_i32" => self.iv_bin_rev(&v, op::SHIFT_RIGHT_ARITHMETIC),
+            "v_lshl_add_u32" => {
+                let (a, b, c) = self.src3(&v)?;
+                let s = self.bin(op::SHIFT_LEFT_LOGICAL, self.t_i32, a, b);
+                let r = self.bin(op::I_ADD, self.t_i32, s, c);
+                self.wdst(&v.dst.ok_or(Gap("a shift-add without a destination"))?, r)
+            }
+            "v_add_lshl_u32" => {
+                let (a, b, c) = self.src3(&v)?;
+                let s = self.bin(op::I_ADD, self.t_i32, a, b);
+                let r = self.bin(op::SHIFT_LEFT_LOGICAL, self.t_i32, s, c);
+                self.wdst(&v.dst.ok_or(Gap("an add-shift without a destination"))?, r)
+            }
+            "v_lshl_or_b32" => {
+                let (a, b, c) = self.src3(&v)?;
+                let s = self.bin(op::SHIFT_LEFT_LOGICAL, self.t_i32, a, b);
+                let r = self.bin(op::BITWISE_OR, self.t_i32, s, c);
+                self.wdst(&v.dst.ok_or(Gap("a shift-or without a destination"))?, r)
+            }
+            "v_add3_u32" => {
+                let (a, b, c) = self.src3(&v)?;
+                let s = self.bin(op::I_ADD, self.t_i32, a, b);
+                let r = self.bin(op::I_ADD, self.t_i32, s, c);
+                self.wdst(&v.dst.ok_or(Gap("an add3 without a destination"))?, r)
+            }
+            "v_xad_u32" => {
+                let (a, b, c) = self.src3(&v)?;
+                let s = self.bin(op::BITWISE_XOR, self.t_i32, a, b);
+                let r = self.bin(op::I_ADD, self.t_i32, s, c);
+                self.wdst(&v.dst.ok_or(Gap("an xor-add without a destination"))?, r)
+            }
+            "v_bfe_u32" => self.vbfe(&v, false),
+            "v_bfe_i32" => self.vbfe(&v, true),
+            "v_bfi_b32" => {
+                let (b, base, mask) = self.src3(&v)?;
+                let ins = self.bin(op::BITWISE_AND, self.t_i32, b, mask);
+                let nm = self.un(op::BITWISE_NOT, self.t_i32, mask);
+                let keep = self.bin(op::BITWISE_AND, self.t_i32, base, nm);
+                let r = self.bin(op::BITWISE_OR, self.t_i32, ins, keep);
+                self.wdst(
+                    &v.dst
+                        .ok_or(Gap("a bitfield insert without a destination"))?,
+                    r,
+                )
+            }
+            "v_bfm_b32" => {
+                let (w, off) = (self.src32(&v.src[0])?, self.src32(&v.src[1])?);
+                let k32 = self.c32(32);
+                let n = self.bin(op::I_SUB, self.t_i32, k32, w);
+                let low = self.bin(op::SHIFT_RIGHT_LOGICAL, self.t_i32, self.minus_one, n);
+                let r = self.bin(op::SHIFT_LEFT_LOGICAL, self.t_i32, low, off);
+                self.wdst(&v.dst.ok_or(Gap("a mask without a destination"))?, r)
+            }
+            "v_bcnt_u32_b32" => {
+                let (a, b, _) = {
+                    let a = self.src32(&v.src[0])?;
+                    let b = self.src32(&v.src[1])?;
+                    (a, b, 0)
+                };
+                let n = self.un(op::BIT_COUNT, self.t_i32, a);
+                let r = self.bin(op::I_ADD, self.t_i32, n, b);
+                self.wdst(&v.dst.ok_or(Gap("a bit count without a destination"))?, r)
+            }
+            "v_pack_b32_f16" => {
+                let a = self.srcf32(&v.src[0], v.neg & 1 != 0, v.abs & 1 != 0)?;
+                let b = self.srcf32(&v.src[1], v.neg & 2 != 0, v.abs & 2 != 0)?;
+                let (ha, hb) = (
+                    self.un(op::F_CONVERT, self.t_f16, a),
+                    self.un(op::F_CONVERT, self.t_f16, b),
+                );
+                let (ia, ib) = (
+                    self.un(op::BITCAST, self.t_u16, ha),
+                    self.un(op::BITCAST, self.t_u16, hb),
+                );
+                let (la, lb) = (self.u16_to_u32(ia), self.u16_to_u32(ib));
+                let sixteen = self.c32(16);
+                let hi = self.bin(op::SHIFT_LEFT_LOGICAL, self.t_i32, lb, sixteen);
+                let not16 = self.c32(0xffff);
+                let lo = self.bin(op::BITWISE_AND, self.t_i32, la, not16);
+                let r = self.bin(op::BITWISE_OR, self.t_i32, hi, lo);
+                self.wdst(&v.dst.ok_or(Gap("a pack without a destination"))?, r)
+            }
+            "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" => {
+                // shortcut: no lane ids in the scalar model; the title uses
+                // the count only to index by wave position.
+                let b = self.src32(&v.src[1])?;
+                self.wdst(&v.dst.ok_or(Gap("a lane count without a destination"))?, b)
+            }
+            "v_subrev_co_u32" | "v_subrev_co_ci_u32" => {
+                let a = self.src32(&v.src[0])?;
+                let b = self.src32(&v.src[1])?;
+                let mut r = self.bin(op::I_SUB, self.t_i32, b, a);
+                if v.src.len() > 2 {
+                    let cin = self.src32(&v.src[2])?;
+                    let bit = self.bin(op::BITWISE_AND, self.t_i32, cin, self.one);
+                    r = self.bin(op::I_SUB, self.t_i32, r, bit);
+                }
+                let carry = self.bin(op::U_LESS_THAN, self.t_bool, b, a);
+                let mask = self.tern(op::SELECT, self.t_i32, carry, self.minus_one, self.zero);
+                if let Some(c) = v.carry {
+                    self.wdst(&c, mask)?;
+                }
+                self.wdst(&v.dst.ok_or(Gap("a subtract without a destination"))?, r)
+            }
+            "v_bfrev_b32" => {
+                let a = self.src32(&v.src[0])?;
+                let r = self.un(op::BIT_REVERSE, self.t_i32, a);
+                self.wdst(&v.dst.ok_or(Gap("a reverse without a destination"))?, r)
+            }
+            "v_alignbit_b32" => {
+                let (a, b, c) = self.src3(&v)?;
+                let k32 = self.c32(32);
+                let n = self.bin(op::I_SUB, self.t_i32, k32, c);
+                let hi = self.bin(op::SHIFT_LEFT_LOGICAL, self.t_i32, b, n);
+                let lo = self.bin(op::SHIFT_RIGHT_LOGICAL, self.t_i32, a, c);
+                let r = self.bin(op::BITWISE_OR, self.t_i32, hi, lo);
+                self.wdst(&v.dst.ok_or(Gap("an align without a destination"))?, r)
+            }
+            "v_sad_u32" => {
+                let (a, b, c) = self.src3(&v)?;
+                let gt = self.bin(op::U_GREATER_THAN, self.t_bool, a, b);
+                let d1 = self.bin(op::I_SUB, self.t_i32, a, b);
+                let d2 = self.bin(op::I_SUB, self.t_i32, b, a);
+                let d = self.select(gt, d1, d2);
+                let r = self.bin(op::I_ADD, self.t_i32, d, c);
+                self.wdst(&v.dst.ok_or(Gap("a sad without a destination"))?, r)
+            }
+            "v_min_u32" => self.iv_ext2(&v, glsl::UMIN),
+            "v_max_u32" => self.iv_ext2(&v, glsl::UMAX),
+            "v_min_i32" => self.iv_ext2(&v, glsl::SMIN),
+            "v_max_i32" => self.iv_ext2(&v, glsl::SMAX),
+            // Conversions.
+            "v_cvt_f32_u32" => self.conv(&v, op::CONVERT_U_TO_F),
+            "v_cvt_f32_i32" => self.conv(&v, op::CONVERT_S_TO_F),
+            "v_cvt_u32_f32" => self.conv(&v, op::CONVERT_F_TO_U),
+            "v_cvt_i32_f32" => self.conv(&v, op::CONVERT_F_TO_S),
+            "v_cvt_f32_ubyte0" => self.cvt_ubyte(&v, 0),
+            "v_cvt_f32_ubyte1" => self.cvt_ubyte(&v, 1),
+            "v_cvt_f32_ubyte2" => self.cvt_ubyte(&v, 2),
+            "v_cvt_f32_ubyte3" => self.cvt_ubyte(&v, 3),
+            "v_cvt_f32_f16" => {
+                let a = self.src32(&v.src[0])?;
+                let h = self.u32_to_u16(a);
+                let f = self.un(op::BITCAST, self.t_f16, h);
+                let r = self.un(op::F_CONVERT, self.t_f32, f);
+                self.fv_out(&v, r)
+            }
+            "v_cvt_f16_f32" => {
+                let a = self.srcf32(&v.src[0], v.neg & 1 != 0, v.abs & 1 != 0)?;
+                let h = self.un(op::F_CONVERT, self.t_f16, a);
+                let i = self.un(op::BITCAST, self.t_u16, h);
+                let r = self.u16_to_u32(i);
+                self.wdst(&v.dst.ok_or(Gap("a convert without a destination"))?, r)
+            }
+            _ => Err(Gap(name)),
+        }
+    }
+
+    fn src3(&mut self, v: &crate::gfx10::Valu) -> R<(u32, u32, u32)> {
+        if v.src.len() < 3 {
+            return gap("a three-source operation with fewer sources");
+        }
+        let a = self.src32(&v.src[0])?;
+        let b = self.src32(&v.src[1])?;
+        let c = self.src32(&v.src[2])?;
+        Ok((a, b, c))
+    }
+
+    fn fv_bin(&mut self, v: &crate::gfx10::Valu, code: u16) -> R<()> {
+        let a = self.srcf32(&v.src[0], v.neg & 1 != 0, v.abs & 1 != 0)?;
+        let b = self.srcf32(&v.src[1], v.neg & 2 != 0, v.abs & 2 != 0)?;
+        let r = self.bin(code, self.t_f32, a, b);
+        self.fv_out(v, r)
+    }
+
+    fn fv_bin_rev(&mut self, v: &crate::gfx10::Valu, code: u16) -> R<()> {
+        let a = self.srcf32(&v.src[0], v.neg & 1 != 0, v.abs & 1 != 0)?;
+        let b = self.srcf32(&v.src[1], v.neg & 2 != 0, v.abs & 2 != 0)?;
+        let r = self.bin(code, self.t_f32, b, a);
+        self.fv_out(v, r)
+    }
+
+    fn fv_ext1(&mut self, v: &crate::gfx10::Valu, ext: u32) -> R<()> {
+        let a = self.srcf32(&v.src[0], v.neg & 1 != 0, v.abs & 1 != 0)?;
+        let r = self.ext1(ext, a);
+        self.fv_out(v, r)
+    }
+
+    fn fv_ext2(&mut self, v: &crate::gfx10::Valu, ext: u32) -> R<()> {
+        let a = self.srcf32(&v.src[0], v.neg & 1 != 0, v.abs & 1 != 0)?;
+        let b = self.srcf32(&v.src[1], v.neg & 2 != 0, v.abs & 2 != 0)?;
+        let r = self.ext2(ext, self.t_f32, a, b);
+        self.fv_out(v, r)
+    }
+
+    /// The destination-modifier (clamp, ×2/×4/÷2) and the write.
+    fn fv_out(&mut self, v: &crate::gfx10::Valu, mut f: u32) -> R<()> {
+        if v.clamp {
+            let zero = self.cf32(0.0);
+            let one = self.cf32(1.0);
+            let id = self.m.id();
+            self.ins(
+                op::EXT_INST,
+                self.t_f32,
+                id,
+                &[self.ext, glsl::FCLAMP, f, zero, one],
+            );
+            f = id;
+        }
+        f = match v.omod {
+            0 => f,
+            1 => {
+                let two = self.cf32(2.0);
+                self.bin(op::F_MUL, self.t_f32, f, two)
+            }
+            2 => {
+                let four = self.cf32(4.0);
+                self.bin(op::F_MUL, self.t_f32, f, four)
+            }
+            3 => {
+                let two = self.cf32(2.0);
+                self.bin(op::F_DIV, self.t_f32, f, two)
+            }
+            _ => return gap("an output modifier this emitter does not know"),
+        };
+        self.wdst_f32(&v.dst.ok_or(Gap("an operation without a destination"))?, f)
+    }
+
+    fn iv_bin(&mut self, v: &crate::gfx10::Valu, code: u16) -> R<()> {
+        let a = self.src32(&v.src[0])?;
+        let b = self.src32(&v.src[1])?;
+        let r = self.bin(code, self.t_i32, a, b);
+        self.wdst(&v.dst.ok_or(Gap("an operation without a destination"))?, r)
+    }
+
+    fn iv_bin_rev(&mut self, v: &crate::gfx10::Valu, code: u16) -> R<()> {
+        let a = self.src32(&v.src[0])?;
+        let b = self.src32(&v.src[1])?;
+        let r = self.bin(code, self.t_i32, b, a);
+        self.wdst(&v.dst.ok_or(Gap("an operation without a destination"))?, r)
+    }
+
+    fn iv_ext2(&mut self, v: &crate::gfx10::Valu, ext: u32) -> R<()> {
+        let a = self.src32(&v.src[0])?;
+        let b = self.src32(&v.src[1])?;
+        let r = self.minmax(ext, a, b);
+        self.wdst(&v.dst.ok_or(Gap("a min or max without a destination"))?, r)
+    }
+
+    fn conv(&mut self, v: &crate::gfx10::Valu, code: u16) -> R<()> {
+        if v.clamp {
+            return gap("a clamped conversion");
+        }
+        let a = self.src32(&v.src[0])?;
+        let r = match code {
+            op::CONVERT_U_TO_F => {
+                let u = self.un(op::BITCAST, self.t_u32, a);
+                self.un(op::CONVERT_U_TO_F, self.t_f32, u)
+            }
+            op::CONVERT_F_TO_U => {
+                let fa = self.bitcast_f32(a);
+                let f = self.un(op::CONVERT_F_TO_U, self.t_u32, fa);
+                self.un(op::BITCAST, self.t_i32, f)
+            }
+            op::CONVERT_S_TO_F => {
+                let sv = self.as_s32(a);
+                self.un(op::CONVERT_S_TO_F, self.t_f32, sv)
+            }
+            op::CONVERT_F_TO_S => {
+                let fa = self.bitcast_f32(a);
+                self.un(op::CONVERT_F_TO_S, self.t_i32, fa)
+            }
+            _ => self.un(code, self.t_f32, a),
+        };
+        let r = self.bitcast_i32(r);
+        self.wdst(&v.dst.ok_or(Gap("a convert without a destination"))?, r)
+    }
+
+    fn cvt_ubyte(&mut self, v: &crate::gfx10::Valu, byte: u32) -> R<()> {
+        let a = self.src32(&v.src[0])?;
+        let sh = self.c32(8 * byte);
+        let b = self.bin(op::SHIFT_RIGHT_LOGICAL, self.t_i32, a, sh);
+        let ff = self.c32(0xff);
+        let b = self.bin(op::BITWISE_AND, self.t_i32, b, ff);
+        let ub = self.un(op::BITCAST, self.t_u32, b);
+        let f = self.un(op::CONVERT_U_TO_F, self.t_f32, ub);
+        self.fv_out(v, f)
+    }
+
+    fn add_carry(&mut self, v: &crate::gfx10::Valu, sub: bool) -> R<()> {
+        let a = self.src32(&v.src[0])?;
+        let b = self.src32(&v.src[1])?;
+        let mut r = self.bin(if sub { op::I_SUB } else { op::I_ADD }, self.t_i32, a, b);
+        // Carry/borrow in, when the VOP3 form has a third source.
+        if v.src.len() > 2 {
+            let cin = self.src32(&v.src[2])?;
+            let bit = self.bin(op::BITWISE_AND, self.t_i32, cin, self.one);
+            r = self.bin(if sub { op::I_SUB } else { op::I_ADD }, self.t_i32, r, bit);
+        }
+        let (ua, ub) = (self.as_u32(a), self.as_u32(b));
+        let carry = if sub {
+            self.bin(op::U_LESS_THAN, self.t_bool, ua, ub)
+        } else {
+            let ur = self.as_u32(r);
+            self.bin(op::U_LESS_THAN, self.t_bool, ur, ua)
+        };
+        let mask = self.tern(op::SELECT, self.t_i32, carry, self.minus_one, self.zero);
+        if let Some(c) = v.carry {
+            self.wdst(&c, mask)?;
+        }
+        self.wdst(
+            &v.dst
+                .ok_or(Gap("a carry operation without a destination"))?,
+            r,
+        )
+    }
+
+    fn mul_hi(&mut self, v: &crate::gfx10::Valu, signed: bool) -> R<()> {
+        let a = self.src32(&v.src[0])?;
+        let b = self.src32(&v.src[1])?;
+        let (a, b) = if signed {
+            (self.sext64(a), self.sext64(b))
+        } else {
+            (self.u32_to_u64(a), self.u32_to_u64(b))
+        };
+        let p = self.bin(op::I_MUL, self.t_i64, a, b);
+        let shift = self.c64(32);
+        let hi = self.bin(op::SHIFT_RIGHT_LOGICAL, self.t_i64, p, shift);
+        let hi = if signed {
+            let u = self.un(op::BITCAST, self.t_u64, hi);
+            let l = self.un(op::U_CONVERT, self.t_u32, u);
+            self.un(op::BITCAST, self.t_i32, l)
+        } else {
+            self.u64_to_u32(hi)
+        };
+        self.wdst(&v.dst.ok_or(Gap("a multiply without a destination"))?, hi)
+    }
+
+    fn mul_u24(&mut self, v: &crate::gfx10::Valu) -> R<()> {
+        let mask = self.c32(0x00ff_ffff);
+        let a = self.src32(&v.src[0])?;
+        let b = self.src32(&v.src[1])?;
+        let a = self.bin(op::BITWISE_AND, self.t_i32, a, mask);
+        let b = self.bin(op::BITWISE_AND, self.t_i32, b, mask);
+        let r = self.bin(op::I_MUL, self.t_i32, a, b);
+        self.wdst(&v.dst.ok_or(Gap("a multiply without a destination"))?, r)
+    }
+
+    fn mad_u24(&mut self, v: &crate::gfx10::Valu) -> R<()> {
+        let (a, b, c) = self.src3(v)?;
+        let mask = self.c32(0x00ff_ffff);
+        let a = self.bin(op::BITWISE_AND, self.t_i32, a, mask);
+        let b = self.bin(op::BITWISE_AND, self.t_i32, b, mask);
+        let p = self.bin(op::I_MUL, self.t_i32, a, b);
+        let r = self.bin(op::I_ADD, self.t_i32, p, c);
+        self.wdst(
+            &v.dst.ok_or(Gap("a multiply-add without a destination"))?,
+            r,
+        )
+    }
+
+    fn mad_i24(&mut self, v: &crate::gfx10::Valu) -> R<()> {
+        let (a, b, c) = self.src3(v)?;
+        let eight = self.c32(8);
+        let a = self.bin(op::SHIFT_LEFT_LOGICAL, self.t_i32, a, eight);
+        let a = self.bin(op::SHIFT_RIGHT_ARITHMETIC, self.t_i32, a, eight);
+        let b = self.bin(op::SHIFT_LEFT_LOGICAL, self.t_i32, b, eight);
+        let b = self.bin(op::SHIFT_RIGHT_ARITHMETIC, self.t_i32, b, eight);
+        let p = self.bin(op::I_MUL, self.t_i32, a, b);
+        let r = self.bin(op::I_ADD, self.t_i32, p, c);
+        self.wdst(
+            &v.dst.ok_or(Gap("a multiply-add without a destination"))?,
+            r,
+        )
+    }
+
+    fn vbfe(&mut self, v: &crate::gfx10::Valu, signed: bool) -> R<()> {
+        let (data, off, width) = self.src3(v)?;
+        let pred = if signed {
+            op::BIT_FIELD_S_EXTRACT
+        } else {
+            op::BIT_FIELD_U_EXTRACT
+        };
+        let r = self.tern(pred, self.t_i32, data, off, width);
+        self.wdst(&v.dst.ok_or(Gap("a bitfield without a destination"))?, r)
+    }
+
+    fn valu_compare(&mut self, v: &crate::gfx10::Valu, rest: &str, exec: bool) -> R<()> {
+        let (kind, ty) = rest
+            .split_once('_')
+            .ok_or(Gap("a compare name this emitter does not know"))?;
+        let (a_ty, int) = match ty {
+            "u32" | "i32" => ("i32", true),
+            "f32" => ("f32", false),
+            _ => return gap("a compare width this emitter does not implement"),
+        };
+        let pred = if int {
+            int_pred(kind, ty == "i32").ok_or(Gap("a compare kind this emitter does not know"))?
+        } else {
+            f_pred(kind).ok_or(Gap("a compare kind this emitter does not know"))?
+        };
+        let unsigned = matches!(
+            pred,
+            op::U_GREATER_THAN | op::U_GREATER_THAN_EQUAL | op::U_LESS_THAN | op::U_LESS_THAN_EQUAL
+        );
+        let (a, b) = if a_ty == "f32" {
+            (
+                self.srcf32(&v.src[0], v.neg & 1 != 0, v.abs & 1 != 0)?,
+                self.srcf32(&v.src[1], v.neg & 2 != 0, v.abs & 2 != 0)?,
+            )
+        } else {
+            let (a, b) = (self.src32(&v.src[0])?, self.src32(&v.src[1])?);
+            if unsigned {
+                (self.as_u32(a), self.as_u32(b))
+            } else if a_ty == "i32" {
+                (self.as_s32(a), self.as_s32(b))
+            } else {
+                (a, b)
+            }
+        };
+        let _ = a_ty;
+        let c = self.bin(pred, self.t_bool, a, b);
+        let mask = self.tern(op::SELECT, self.t_i32, c, self.minus_one, self.zero);
+        let dst = v.dst.ok_or(Gap("a compare without a destination"))?;
+        self.wdst(&dst, mask)?;
+        if exec {
+            self.store(126, mask);
+            self.store(127, mask);
+        }
+        Ok(())
+    }
+}
+
+fn is_null(o: &Operand) -> bool {
+    matches!(o, Operand::Const(125) | Operand::Scalar { code: 125, .. })
+}
+
+/// A scalar instruction's operands.
+struct Sop {
+    dst: Option<Operand>,
+    src: Vec<Operand>,
+    imm: Option<u16>,
+}
+
+fn int_pred(kind: &str, signed: bool) -> Option<u16> {
+    Some(match (kind, signed) {
+        ("eq", _) => op::I_EQUAL,
+        ("ne", _) | ("lg", _) => op::I_NOT_EQUAL,
+        ("lt", false) => op::U_LESS_THAN,
+        ("le", false) => op::U_LESS_THAN_EQUAL,
+        ("gt", false) => op::U_GREATER_THAN,
+        ("ge", false) => op::U_GREATER_THAN_EQUAL,
+        ("lt", true) => op::S_LESS_THAN,
+        ("le", true) => op::S_LESS_THAN_EQUAL,
+        ("gt", true) => op::S_GREATER_THAN,
+        ("ge", true) => op::S_GREATER_THAN_EQUAL,
+        _ => return None,
+    })
+}
+
+fn f_pred(kind: &str) -> Option<u16> {
+    Some(match kind {
+        "eq" => op::F_ORD_EQUAL,
+        "ne" => op::F_ORD_NOT_EQUAL,
+        "lg" => op::F_UNORD_NOT_EQUAL,
+        "lt" => op::F_ORD_LESS_THAN,
+        "le" => op::F_ORD_LESS_THAN_EQUAL,
+        "gt" => op::F_ORD_GREATER_THAN,
+        "ge" => op::F_ORD_GREATER_THAN_EQUAL,
+        "nge" => op::F_UNORD_LESS_THAN,
+        "nle" => op::F_UNORD_GREATER_THAN,
+        "nlt" => op::F_UNORD_GREATER_THAN_EQUAL,
+        "ngt" => op::F_UNORD_LESS_THAN_EQUAL,
+        _ => return None,
+    })
+}
