@@ -61,16 +61,30 @@ pub(crate) fn probe_level() -> u8 {
     *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE_PROBE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
-/// `VICTORY_INPLACE`: 0 (unset) off. 1: a window of title memory outside
-/// buffers that lies in private memory committed whole is not copied: a
-/// part of the title's allocation is opened as a host heap and the window
-/// is a buffer placed over it ([`place_for`]). 2: title buffers too,
-/// except the big ones in the card's memory.
+/// `VICTORY_INPLACE`: 2 (unset) on, the measured-safe class only; 1: a
+/// window of title memory outside buffers only; 0: off, every copy as
+/// before. At 2 a window or a title buffer that lies in private memory
+/// committed whole is not copied: a part of the title's allocation is
+/// opened as a host heap and the window is a buffer placed over it
+/// ([`place_for`]).
 ///
-/// What stage 1 covers is private memory (`XMemVirtualAlloc`'s). View
+/// What 1 and 2 cover is private memory (`XMemVirtualAlloc`'s). View
 /// memory (the page pool) is turned down here: its section is made
 /// reserved, which the host refuses, and what a view shows changes when
 /// the title maps pages.
+///
+/// On by default since the probe and the game runs of 24-25 Nov say this
+/// class is safe and the rest is not (`xcl-bin/notes/zero-copy.md`):
+/// private memory in place read true, the CPU read at its own address what
+/// the GPU wrote with no flush and no map true, and write watching saw the
+/// GPU's writes true; a committed section through a view read false and
+/// wrote false, whatever the views did. The same split in the game: with
+/// view memory in place (the fork's `4cbe9d76`) every presented frame was
+/// black from frame 1, and with only that class refused the menus and the
+/// intro were right. What it costs: opening 64 MB locked into the PC's
+/// memory takes 15.3 ms once (4 MB: 1.6 ms), and the card reads such a heap
+/// at 9.2 GB/s at 256 MB against 20.5 GB/s from a committed buffer of
+/// today's kind - the CPU copy it replaces costs more than that difference.
 ///
 /// What it assumes, for 2: nothing reads title memory that a submission
 /// not yet run writes through such a buffer. With every submission waited
@@ -85,7 +99,23 @@ pub(crate) fn probe_level() -> u8 {
 /// call before such a call once it takes them over.
 pub(crate) fn level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+    *LEVEL.get_or_init(|| {
+        let level = level_from(std::env::var("VICTORY_INPLACE").ok().as_deref());
+        if level > 1 && crate::host::late() {
+            tracing::info!("title buffers are not used in place: VICTORY_LATE_WAIT is on");
+            return 1;
+        }
+        level
+    })
+}
+
+/// [`level`] from the variable's text: unset (or empty, or not a number) is
+/// 2, the measured-safe class on; `0` off; `1` windows outside buffers only.
+fn level_from(text: Option<&str>) -> u8 {
+    match text.map(str::trim) {
+        None | Some("") => 2,
+        Some(text) => text.parse().unwrap_or(2),
+    }
 }
 
 /// The most title memory in place at once, in bytes
@@ -1050,6 +1080,19 @@ mod tests {
         assert_eq!(cover(at + 4 * K64, K64), Cover::Run(77, 4 * K64 as u64));
         views_gone(at + 4 * K64, K64);
         assert_eq!(cover(at + 4 * K64, K64), Cover::None);
+    }
+
+    /// The switch: unset is on (the measured-safe class only), `0` off,
+    /// `1` windows outside buffers only; a value that is not a number keeps
+    /// the default rather than silently turning it off.
+    #[test]
+    fn the_switch_is_on_by_default() {
+        assert_eq!(level_from(None), 2);
+        assert_eq!(level_from(Some("")), 2);
+        assert_eq!(level_from(Some("0")), 0);
+        assert_eq!(level_from(Some("1")), 1);
+        assert_eq!(level_from(Some(" 2 ")), 2);
+        assert_eq!(level_from(Some("on")), 2);
     }
 
     /// Only private memory committed whole, read-write, is taken for a part.
