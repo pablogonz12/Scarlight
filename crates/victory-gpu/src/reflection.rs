@@ -116,6 +116,16 @@ fn radiance_of(uavs: &[(u8, u32)]) -> Option<usize> {
         .or((uavs.len() == 1).then_some(0))
 }
 
+/// The place in `uavs` (root parameter, place in dwords, resource) of the
+/// image to clear: `CS_RayMiss`'s radiance image, if it names a live one.
+/// A null or unresolvable view there clears nothing, and another live UAV
+/// is never taken for it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn target_of(uavs: &[(u8, u32, usize)]) -> Option<usize> {
+    let places: Vec<(u8, u32)> = uavs.iter().map(|&(slot, at, _)| (slot, at)).collect();
+    radiance_of(&places).filter(|&i| uavs[i].2 != 0)
+}
+
 /// The colour a render target clear of `format` (DXGI) to `level` takes;
 /// none if the format is not one this clears (typeless, packed
 /// shared-exponent, depth), or an integer format asked for other than zero.
@@ -189,13 +199,16 @@ pub(crate) fn after(list: &HostList, mode: &Mode, hash: &str, uavs: &[Uav]) {
         });
         return;
     }
-    let places: Vec<(u8, u32)> = uavs.iter().map(|&(slot, at, ..)| (slot, at)).collect();
-    let Some(i) = radiance_of(&places) else {
+    let named: Vec<(u8, u32, usize)> = uavs
+        .iter()
+        .map(|&(slot, at, resource, _)| (slot, at, resource))
+        .collect();
+    let Some(i) = target_of(&named) else {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             tracing::warn!(
                 hash,
-                ?places,
+                ?named,
                 "no reflection clear: CS_RayMiss's tables are not as expected"
             )
         });
@@ -342,6 +355,18 @@ mod tests {
         // alone: this port clears the opaque pass's image only.
         let other = [(1, 96), (1, 112)];
         assert_eq!(radiance_of(&other), None);
+    }
+
+    /// A null radiance view clears nothing; another UAV is not taken for it.
+    #[test]
+    fn a_null_image_is_not_replaced() {
+        // s1+96 is live and s1+104 is null: nothing is cleared.
+        assert_eq!(target_of(&[(1, 96, 0x1000), (1, 104, 0)]), None);
+        assert_eq!(target_of(&[(1, 104, 0)]), None);
+        assert_eq!(target_of(&[(1, 96, 0x1000), (1, 104, 0x2000)]), Some(1));
+        // The only table UAV, when the program names one: cleared if live.
+        assert_eq!(target_of(&[(1, 96, 0x1000)]), Some(0));
+        assert_eq!(target_of(&[]), None);
     }
 
     /// Float images to any level, integer ones only to zero, others never.
