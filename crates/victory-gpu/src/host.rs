@@ -1818,6 +1818,18 @@ fn rehash_runs() -> bool {
     }
 }
 
+/// Maximum gap (in 64 KiB pieces) bridged when coalescing card rehash runs
+/// (`VICTORY_CARD_REHASH_GAP=<n>`, default 4; 0 joins only touching pieces).
+fn rehash_gap() -> u32 {
+    static GAP: OnceLock<u32> = OnceLock::new();
+    *GAP.get_or_init(|| {
+        std::env::var("VICTORY_CARD_REHASH_GAP")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(4)
+    })
+}
+
 /// Since the last frame-rate line, of our own passes over copies in the
 /// card's memory: hash passes after ranges were sent up, the pieces they
 /// hashed, and compare passes after the lists.
@@ -4213,8 +4225,12 @@ impl Host {
                         } else {
                             ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
                         };
-                        // The same pieces in fewer passes (`rehash_runs`).
-                        let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                        // The same pieces in fewer passes (`rehash_runs` + `rehash_gap`).
+                        let runs = if rehash_runs() {
+                            crate::shadow::joined_piece_runs_within(runs, rehash_gap())
+                        } else {
+                            runs
+                        };
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {

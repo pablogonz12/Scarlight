@@ -1529,7 +1529,15 @@ impl State {
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        static FULL_EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let full_every = (*FULL_EVERY.get_or_init(|| {
+            std::env::var("VICTORY_HEAP_FULL_EVERY")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(128)
+        }))
+        .clamp(1, 4096);
+        let slots = if *passes % full_every == 0 {
             ranges.clear();
             host.buffer_slots()
         } else {
