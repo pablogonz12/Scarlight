@@ -67,6 +67,9 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   pruned. Reimplemented against this tree's library, which has no `victory_shader::SOURCE_HASH`: the key is
   the executable's BLAKE3, the same bytes the shader cache keys its translations on
   (`crates/victory-gpu/src/shader_cache.rs`), and `VICTORY_LIBRARY_PRUNE=0` keeps every library.
+- **vitutu1** by **ZigZagBoi1** ([ZigZagBoi1/ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort),
+  GPL-3.0-or-later): the resolution and upscaler levers, which here are profile hooks and the
+  switches `VICTORY_RENDER_SCALE` / `VICTORY_OWN_UPSCALER` rather than code that names a title.
 
 ## Tools
 
