@@ -673,7 +673,8 @@ pub(crate) fn back_wait(from: usize, to: usize) {
 /// Before a kernel write into title memory `[at, at + len)`: the blocks are
 /// given back writable, as [`open`] does for the guarded ones (the write is
 /// the title's, or the job's own, so nothing waits for the job there).
-pub(crate) fn back_open(at: usize, len: usize) {
+/// Returns the blocks a job held, now the write's.
+pub(crate) fn back_open(at: usize, len: usize) -> Vec<usize> {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut opened = Vec::new();
@@ -694,11 +695,39 @@ pub(crate) fn back_open(at: usize, len: usize) {
     // kernel's write did not fault into `open`.
     if !opened.is_empty() {
         let mut g = guards();
-        for block in opened {
+        for &block in &opened {
             g.protected.remove(&block);
             g.clean.remove(&block);
         }
     }
+    opened
+}
+
+/// Blocks a write was given while a copy-back job held them
+/// ([`back_open_for_write`]): the job took the block before the write, so
+/// what the write put there is newer than the job's bytes and the merge
+/// leaves it ([`given_over`]).
+static GIVEN_OVER: Mutex<BTreeSet<usize>> = Mutex::new(BTreeSet::new());
+
+fn given() -> std::sync::MutexGuard<'static, BTreeSet<usize>> {
+    GIVEN_OVER.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// [`back_open`] for a write that is newer than a held job's bytes: the
+/// blocks it gave over are noted, so the job's merge does not put its own
+/// bytes over them. A physical-page write that a copy-back would otherwise
+/// undo (`kernel_will_write` from xmem's `write_physical`).
+pub(crate) fn back_open_for_write(at: usize, len: usize) {
+    let opened = back_open(at, len);
+    if !opened.is_empty() {
+        given().extend(opened);
+    }
+}
+
+/// Whether a write gave the block holding `at` over while a copy-back job
+/// held it: the job's merge leaves the bytes there.
+pub(crate) fn given_over(at: usize) -> bool {
+    given().contains(&(at / BLOCK))
 }
 
 /// The job is done with `blocks` (from [`back_begin`]): each still held by
@@ -721,6 +750,15 @@ pub(crate) fn back_release(blocks: &[usize], done: &std::sync::Arc<Done>) {
         // SAFETY: a block the job made inaccessible.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut was) };
     }
+    // The job is done with its blocks: a write that took one of them is no
+    // longer to be kept from a merge (unless a later job holds it).
+    let held = back();
+    let mut given = given();
+    for block in blocks {
+        if !held.contains_key(block) {
+            given.remove(block);
+        }
+    }
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -729,8 +767,9 @@ pub(crate) fn back_release(blocks: &[usize], done: &std::sync::Arc<Done>) {
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
-    // A block a write-back job holds is this write's now.
-    back_open(at, len);
+    // A block a write-back job holds is this write's now, and the job's
+    // merge must not put its older bytes back over it.
+    back_open_for_write(at, len);
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
@@ -1002,6 +1041,37 @@ mod tests {
         back_release(&blocks, &done);
         assert!(writable(at), "given back after the job");
         assert!(back_pending(at).is_none());
+        // SAFETY: the memory allocated above.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A write given a block a copy-back job holds is newer than the job's
+    /// bytes: the block is noted ([`given_over`]) so the merge leaves what
+    /// the write put there, until the job is done with it.
+    #[test]
+    fn a_write_given_a_held_block_is_not_merged_over() {
+        // SAFETY: one block of private memory, freed at the end.
+        let at = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                BLOCK,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(at, 0);
+        let done = std::sync::Arc::new(Done::default());
+        let blocks = back_begin(&done, at, at + BLOCK);
+        assert_eq!(blocks, [at / BLOCK]);
+        assert!(!given_over(at), "no write yet");
+        // A write through another view of the same pages, told first.
+        writing(at, BLOCK);
+        assert!(given_over(at), "the job's bytes must not land on top");
+        assert!(back_pending(at).is_none(), "the block is the write's now");
+        assert!(writable(at));
+        done.finish();
+        back_release(&blocks, &done);
+        assert!(!given_over(at), "the job is done with it");
         // SAFETY: the memory allocated above.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }

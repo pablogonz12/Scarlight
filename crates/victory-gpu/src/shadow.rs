@@ -2150,6 +2150,13 @@ impl Shadow {
                 // memory is read and written there only (a shader that sets
                 // a few words of a piece cost a read, a walk and a write of
                 // all 64 KiB of it).
+                // A write gave this block over after the job took it (a
+                // physical-page write through our own view, told to the watch
+                // first): the title's bytes are newer than the GPU's, so the
+                // merge leaves them and the write-back does not undo it.
+                if crate::watch::given_over(start + at) {
+                    continue;
+                }
                 let Some(first) = first_difference(host, old) else {
                     continue;
                 };
