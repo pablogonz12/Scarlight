@@ -16,7 +16,7 @@
 //! from several threads ("The pipeline library is thread-safe to use, and
 //! will internally synchronize as necessary", `CreatePipelineLibrary`,
 //! Thread Safety), with one exception kept here: two loads of the same
-//! pipeline are made one after the other ([`same_name`]). Under one lock of
+//! pipeline are made one after the other ([`Names`]). Under one lock of
 //! ours for every call, the eight workers made pipelines one at a time:
 //! 87 to 96 of 110 looks at each worker found it waiting for that lock
 //! (run 49), and an earlier run's 2,300 pipelines, all in the library, were
@@ -50,7 +50,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -409,20 +409,58 @@ struct Library {
 
 // SAFETY: D3D12 objects are free-threaded, and the library synchronises
 // its own calls (see the module's notes); what it does not, two loads of
-// one name, is serialised by `same_name`.
+// one name, is serialised by `NAMES`.
 unsafe impl Send for Library {}
 // SAFETY: as above; the other fields are an atomic and a lock.
 unsafe impl Sync for Library {}
 
-/// Held by a load of the pipeline named `name`: loads of the same name
-/// wait for each other (the host's one exception to the library's thread
-/// safety: such a load may change that pipeline's entry). Names share 64
-/// locks, so two different names seldom wait.
-fn same_name(name: &str) -> MutexGuard<'static, ()> {
-    static LOADING: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
-    let at = name.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(usize::from(b)));
-    LOADING[at % LOADING.len()].lock().unwrap_or_else(|e| e.into_inner())
+/// Names one thread at a time holds: a load or a making of the same name
+/// waits for the other (the host's one exception to the library's thread
+/// safety: such a load may change that pipeline's entry). Ported from
+/// Marvisak/VIctory #2401, whose `abandon` lets a lost thread's name go.
+struct Names {
+    held: Mutex<Option<HashSet<String>>>,
+    released: Condvar,
 }
+
+/// A name held until this is dropped.
+struct Held<'a> {
+    names: &'a Names,
+    name: &'a str,
+}
+
+impl Names {
+    const fn new() -> Names {
+        Names {
+            held: Mutex::new(None),
+            released: Condvar::new(),
+        }
+    }
+
+    /// Holds `name`, once no other thread does.
+    fn hold<'a>(&'a self, name: &'a str) -> Held<'a> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        while held.as_ref().is_some_and(|h| h.contains(name)) {
+            held = self.released.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+        held.get_or_insert_default().insert(name.to_owned());
+        Held { names: self, name }
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        let mut held = self.names.held.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = held.as_mut() {
+            h.remove(self.name);
+        }
+        drop(held);
+        self.names.released.notify_all();
+    }
+}
+
+/// The names held now.
+static NAMES: Names = Names::new();
 
 /// With `VICTORY_LIBRARY_LOCK=1`: held by every library call, as before.
 fn one_call() -> Option<MutexGuard<'static, ()>> {
@@ -526,10 +564,16 @@ pub(crate) fn pipeline(
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
+    let _held = NAMES.hold(name);
+    if abandoned(name) {
+        // E_FAIL: the driver's compiler crashed on it in this run.
+        let fail = windows::core::HRESULT(0x8000_4005_u32 as i32);
+        return Err(windows::core::Error::from_hresult(fail));
+    }
+    HOLDS.set(Some(name.to_owned()));
     let began = std::time::Instant::now();
     let loaded = {
         let _all = one_call();
-        let _one = same_name(name);
         let _call = call("load", name);
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
@@ -538,6 +582,7 @@ pub(crate) fn pipeline(
     TRIMMED.store(false, Ordering::Relaxed);
     let refused = match loaded {
         Ok(pso) => {
+            HOLDS.set(None);
             LOADED.fetch_add(1, Ordering::Relaxed);
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
@@ -550,8 +595,10 @@ pub(crate) fn pipeline(
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
-        create()?
+        create()
     };
+    HOLDS.set(None);
+    let pso = pso?;
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
@@ -569,6 +616,34 @@ pub(crate) fn pipeline(
         library.added.fetch_add(1, Ordering::Relaxed);
     }
     Ok(pso)
+}
+
+thread_local! {
+    /// The name this thread holds in [`NAMES`] while it loads or makes it.
+    static HOLDS: std::cell::Cell<Option<String>> = const { std::cell::Cell::new(None) };
+}
+
+/// Names whose making crashed the host driver's compiler in this run.
+static ABANDONED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+fn abandoned(name: &str) -> bool {
+    ABANDONED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|a| a.contains(name))
+}
+
+/// This thread will not return from the load or creation it is in (see
+/// `make::worker_lost`): the name it holds is let go, and refused to the
+/// threads waiting for it and to later ones.
+pub(super) fn abandon() {
+    let Ok(Some(name)) = HOLDS.try_with(std::cell::Cell::take) else { return };
+    let mut abandoned = ABANDONED.lock().unwrap_or_else(|e| e.into_inner());
+    abandoned.get_or_insert_default().insert(name.clone());
+    drop(abandoned);
+    let mut held = NAMES.held.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = held.as_mut() {
+        h.remove(&name);
+    }
+    drop(held);
+    NAMES.released.notify_all();
 }
 
 /// Writes the library and the early list if pipelines were added since the
