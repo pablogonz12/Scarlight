@@ -20,6 +20,11 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HRESULT, Interface, PCWSTR, w};
 
+use crate::present_compositor::PresentCompositor;
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod present_tests;
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -59,6 +64,9 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    /// Why the present compositor was not made, and when to try again:
+    /// one attempt per state, not one per frame.
+    present_compositor_retry: Mutex<Retry>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -66,6 +74,55 @@ pub(crate) struct Host {
 unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
+
+/// A presenter (or a present compositor) that could not be made, and when to
+/// try again. Without this, a run behind a locked screen or a sleeping
+/// display retried every frame: 1,654 `no swap chain` lines in 60 seconds,
+/// and one DXGI call per frame, which buries the log and costs a
+/// submission's worth of work each time.
+struct Retry {
+    attempts: u32,
+    /// The next attempt is due at (or after) this instant; `None` with
+    /// `attempts == 0` means nothing has failed.
+    next: Option<std::time::Instant>,
+}
+
+impl Retry {
+    const fn new() -> Self {
+        Retry {
+            attempts: 0,
+            next: None,
+        }
+    }
+
+    /// Whether an attempt is due at `now`.
+    fn due(&self, now: std::time::Instant) -> bool {
+        self.next.is_none_or(|at| now >= at)
+    }
+
+    /// Records a failed attempt at `now` and when the next one may run.
+    fn failed(&mut self, now: std::time::Instant) {
+        self.attempts = self.attempts.saturating_add(1);
+        self.next = Some(now + retry_delay(self.attempts));
+    }
+
+    /// Clears the failure state after an attempt worked, returning how many
+    /// attempts had failed before it.
+    fn reset(&mut self) -> u32 {
+        let attempts = self.attempts;
+        *self = Retry::new();
+        attempts
+    }
+}
+
+/// How long to wait before retry number `attempts`: 100 ms, doubling, up to
+/// one second, so a state that clears still recovers within a second.
+fn retry_delay(attempts: u32) -> std::time::Duration {
+    const FIRST_MS: u64 = 100;
+    const MOST_MS: u64 = 1_000;
+    let doubling = FIRST_MS << attempts.saturating_sub(1).min(4);
+    std::time::Duration::from_millis(doubling.min(MOST_MS))
+}
 
 /// Host objects the title let go of while a submission may still use them
 /// (a texture its descriptors name, a descriptor slot's old resource), by
@@ -681,6 +738,7 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
+            present_compositor_retry: Mutex::new(Retry::new()),
         })
     }
 }
@@ -6034,6 +6092,7 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     last_present_error: Option<HRESULT>,
+    compositor: Option<PresentCompositor>,
 }
 
 /// A successful DXGI status may still mean nothing was presented.
@@ -6328,14 +6387,100 @@ impl Host {
         frame: u64,
         fill: bool,
     ) -> Option<bool> {
+        self.present_planes(
+            texture,
+            state,
+            None,
+            frame,
+            fill.then_some(resource),
+            PresentCompositor::new,
+            #[cfg(all(test, feature = "diagnostics"))]
+            |_, _| {},
+        )
+    }
+
+    /// Shows `texture` as [`present`](Self::present) does, with `overlay`
+    /// composed over it (premultiplied) when
+    /// [`crate::present_compositor::extent`] takes the pair. The base alone
+    /// is shown when the compositor cannot start (it retries) or the planes
+    /// do not pair, so a run with one plane is unaffected.
+    pub(crate) fn present_overlay(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: &ID3D12Resource,
+        overlay_state: u32,
+        frame: u64,
+    ) -> Option<bool> {
+        self.present_planes(
+            texture,
+            state,
+            Some((overlay, overlay_state)),
+            frame,
+            None,
+            PresentCompositor::new,
+            #[cfg(all(test, feature = "diagnostics"))]
+            |_, _| {},
+        )
+    }
+
+    /// `fill`: the title resource whose newest content this present puts up
+    /// first ([`crate::texture::present_fill_pending`]), if any.
+    fn present_planes(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+        fill: Option<crate::object::This>,
+        create: impl Fn(&ID3D12Device, DXGI_FORMAT) -> windows::core::Result<PresentCompositor>,
+        #[cfg(all(test, feature = "diagnostics"))] inspect: impl FnOnce(
+            &ID3D12Resource,
+            &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+        ),
+    ) -> Option<bool> {
+        // The diagnostic render-target override takes precedence.
+        #[cfg(feature = "diagnostics")]
+        let overlay = overlay.filter(|_| crate::capture::show_spec().is_none());
+        let mut overlay = overlay.and_then(|(overlay, state)| {
+            let extent = crate::present_compositor::extent(texture, overlay)?;
+            Some((overlay, D3D12_RESOURCE_STATES(state as i32), extent))
+        });
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        // Initialize before choosing the swap-chain extent or opening a
+        // list. A failed attempt still presents the base and retries later.
+        let mut new_compositor = None;
+        if overlay.is_some() && presenter.as_ref().is_none_or(|p| p.compositor.is_none()) {
+            let mut retry = self
+                .present_compositor_retry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let now = std::time::Instant::now();
+            if retry.due(now) {
+                match create(&self.device, format) {
+                    Ok(compositor) => {
+                        new_compositor = Some(compositor);
+                        retry.reset();
+                    }
+                    Err(error) => {
+                        retry.failed(now);
+                        if retry.attempts == 1 {
+                            tracing::warn!(%error, "no present compositor; showing the base plane");
+                        }
+                    }
+                }
+            }
+            if new_compositor.is_none() {
+                overlay = None;
+            }
+        }
+        let (width, height) = overlay.map_or((desc.Width as u32, desc.Height), |(_, _, size)| size);
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
                 Ok(p) => Some(p),
@@ -6362,21 +6507,33 @@ impl Host {
                 }
             }
         }
+        if let Some(compositor) = new_compositor {
+            p.compositor = Some(compositor);
+            tracing::info!(width, height, "compositing two present planes");
+        }
+        // The compositor writes its descriptor heap as it records, so it
+        // goes in a list that is waited for: never one sent ahead.
+        let composition = overlay
+            .zip(p.compositor.as_ref())
+            .filter(|_| fill.is_none() && !late_free_present());
         let state = D3D12_RESOURCE_STATES(state as i32);
-        // SAFETY: our swap chain, list and a live source texture.
+        // SAFETY: our swap chain, list and live source textures. Lists are
+        // waited for before the presenter can reuse its descriptors.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
                 return None;
             };
             // Sent ahead ([`late_free_present`]) unless the frame is to be
-            // read back at once (a saved or listed frame): then a list of
-            // its own, one whose last flight has finished or a new one.
+            // read back at once (a saved or listed frame, or a test): then a
+            // list of its own, one whose last flight has finished or a new
+            // one.
             #[cfg(feature = "diagnostics")]
-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            let read_now =
+                cfg!(test) || crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
-            let read_now = false;
-            let slot = if late_free_present() && !read_now {
+            let read_now = cfg!(test);
+            let slot = if late_free_present() && !read_now && composition.is_none() {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
                     let list = self.new_list().ok()?;
@@ -6393,75 +6550,116 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            // The frame shown is the title's newest content of this texture:
-            // its staging buffer is refreshed and copied up in this present's
-            // own list, in order with the copy to the back buffer. Without
-            // it the present shows what the last list that sampled the
-            // texture uploaded -- one recorded before its refresh found the
-            // newest bytes holds a frame behind, and two textures taking
-            // turns then show their frames out of order (the intro's movie).
-            let filling = fill
-                && slot.is_none()
-                && crate::texture::title_written(texture)
-                && crate::texture::present_fill_pending(resource);
-            if filling {
-                list.ResourceBarrier(&[transition(texture, state, D3D12_RESOURCE_STATE_COPY_DEST)]);
-                crate::texture::present_fill(copy, resource, texture);
-            }
-            list.ResourceBarrier(&[
-                transition(
-                    texture,
-                    if filling {
-                        D3D12_RESOURCE_STATE_COPY_DEST
-                    } else {
-                        state
-                    },
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                ),
-                transition(
+            // What the readback below names: the composed frame on the back
+            // buffer, or the base the copy leaves there.
+            let capture_source = if let Some(((overlay, overlay_state, extent), compositor)) =
+                composition
+            {
+                compositor.record(
+                    &self.device,
+                    list,
                     &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
+                    [(texture, state), (overlay, overlay_state)],
+                    extent,
+                );
+                // The back buffer leaves RENDER_TARGET: as a copy source for
+                // the readback, else for PRESENT below.
+                #[cfg(feature = "diagnostics")]
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                &back
+            } else {
+                // The frame shown is the title's newest content of this
+                // texture: its staging buffer is refreshed and copied up in
+                // this present's own list, in order with the copy to the back
+                // buffer. Without it the present shows what the last list
+                // that sampled the texture uploaded -- one recorded before
+                // its refresh found the newest bytes holds a frame behind,
+                // and two textures taking turns then show their frames out of
+                // order (the intro's movie).
+                let filling = fill.is_some_and(|resource| {
+                    slot.is_none()
+                        && crate::texture::title_written(texture)
+                        && crate::texture::present_fill_pending(resource)
+                });
+                if filling {
+                    list.ResourceBarrier(&[transition(
+                        texture,
+                        state,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    if let Some(resource) = fill {
+                        crate::texture::present_fill(copy, resource, texture);
+                    }
+                }
+                list.ResourceBarrier(&[
+                    transition(
+                        texture,
+                        if filling {
+                            D3D12_RESOURCE_STATE_COPY_DEST
+                        } else {
+                            state
+                        },
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    ),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ),
+                ]);
+                list.CopyResource(&back, texture);
+                texture
+            };
             #[cfg(feature = "diagnostics")]
             let shot = crate::capture::take_request();
             #[cfg(feature = "diagnostics")]
-            let capture = (crate::capture::wanted(frame) || shot.is_some())
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+            let capture = (cfg!(test) || crate::capture::wanted(frame) || shot.is_some())
+                .then(|| crate::capture::read_back(&self.device, list, capture_source))
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            let probe = if slot.is_some() {
+                None
+            } else {
+                crate::capture::probe(&self.device, list, capture_source)
+            };
             #[cfg(not(feature = "diagnostics"))]
-            let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            let _ = (frame, capture_source);
+            // The base back in `state` and the back buffer in PRESENT; the
+            // compositor restored both of its sources itself.
+            if composition.is_none() {
+                list.ResourceBarrier(&[transition(
+                    texture,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    state,
+                )]);
+            }
+            let back_state = match (composition.is_some(), cfg!(feature = "diagnostics")) {
+                (true, true) => D3D12_RESOURCE_STATE_COPY_SOURCE,
+                (true, false) => D3D12_RESOURCE_STATE_RENDER_TARGET,
+                (false, _) => D3D12_RESOURCE_STATE_COPY_DEST,
+            };
+            list.ResourceBarrier(&[transition(
+                &back,
+                back_state,
+                D3D12_RESOURCE_STATE_PRESENT,
+            )]);
             copy.close();
             match slot {
                 Some(i) => {
                     let flown = self.execute_own(copy);
                     p.ahead[i].1 = flown;
                 }
-                None => self.execute(&[copy]),
+                None => self.execute(&[&p.copy]),
             }
             #[cfg(feature = "diagnostics")]
-            match (capture, shot) {
-                (Some((buffer, footprint)), Some(label)) => {
-                    crate::capture::save_shot(frame, label, &buffer, &footprint);
-                }
-                (Some((buffer, footprint)), None) => {
-                    crate::capture::save_read_back(frame, &buffer, &footprint);
-                }
-                // Not this frame: the next one reads the same request.
-                (None, Some(label)) => crate::capture::put_back(label),
-                (None, None) => {}
+            if let Some((buffer, footprint)) = capture {
+                #[cfg(test)]
+                inspect(&buffer, &footprint);
+                crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
             match present_result(status) {
@@ -6535,6 +6733,7 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 last_present_error: None,
+                compositor: None,
             })
         }
     }

@@ -61,6 +61,14 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   child that is not there is a miss whatever its box holds, and that an empty or inverted box and any NaN
   coordinate miss in both node widths, with the reference's own tests
   (`crates/victory-shader/src/bvh.rs`, `crates/victory-shader/src/emit/intersect.rs`).
+- **JMAN730/project-flamingo [#734](https://github.com/JMAN730/project-flamingo/pull/734)** (Yaekai, with swarm,
+  Blitz Studios and axknxla), GPL-3.0: the two-plane present compositor for the Series S menu -- the fullscreen
+  triangle, its premultiplied blend, the explicit root signature for Wine, the retry after an initialization that
+  failed, and the pair check that leaves every other present on the base-only path -- reimplemented for this
+  tree's presenter (`crates/victory-gpu/src/present_compositor.rs`, `Host::present_overlay`), whose present keeps
+  its own late-free lists and present fill. It supersedes the same idea in fxceless/victory-fork
+  [#188](https://github.com/fxceless/victory-fork/pull/188) (sagouindupm), GPL-3.0, which bundled it with an
+  `ffxDispatch` stand-in that our #162 now makes unnecessary.
 
 ## Tools
 

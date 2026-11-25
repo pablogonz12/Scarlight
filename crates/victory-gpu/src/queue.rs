@@ -758,8 +758,7 @@ pub(crate) fn presented() -> u64 {
 
 /// Shows the first plane's first resource in our window.
 ///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// shortcut: only the opt-in Series S two-plane layout adds an overlay.
 extern "system" fn present(
     _: This,
     planes: u32,
@@ -855,7 +854,28 @@ extern "system" fn present(
         // behind, and two textures taking turns then show frames out of
         // order.
         let fill = crate::texture::present_fill_pending(resource);
-        let shown = host.present(resource, texture, state, frame, fill);
+        // The Series S menu presents a second plane (the HUD over the
+        // picture). It is composed into the frame when its host copy is
+        // there already: one that is not yet must not be made just to be
+        // looked at, and the frame whose content must be filled in first
+        // shows the base alone.
+        let overlay = (!fill)
+            .then(|| series_s_overlay(planes, plane_parameters, resource))
+            .flatten()
+            .and_then(|overlay| crate::resource::existing_host_copy(overlay as usize));
+        let shown = match overlay {
+            Some(overlay) => {
+                let overlay_state = overlay.state.load(Ordering::Relaxed);
+                host.present_overlay(
+                    texture,
+                    state,
+                    &overlay.texture,
+                    overlay_state,
+                    frame,
+                )
+            }
+            None => host.present(resource, texture, state, frame, fill),
+        };
         #[cfg(feature = "diagnostics")]
         if let Some(o) = crate::texture::present_order(resource, fill) {
             use crate::copystat::{C, add};
@@ -889,12 +909,63 @@ extern "system" fn present(
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        let _ = (state, shown);
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     S_OK
 }
+
+/// `VICTORY_PRESENT_TWO_PLANES=1` (opt-in): compose a second present plane
+/// over the first, for the Series S menu. `=0` or unset leaves the base
+/// alone.
+#[cfg(windows)]
+fn two_planes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_TWO_PLANES").is_some_and(|v| v == "1"))
+}
+
+/// The second plane's first resource, for the two-plane present the Series S
+/// profile makes with the switch on: `None` for any other presentation.
+#[cfg(windows)]
+fn series_s_overlay(planes: u32, plane_parameters: *const Plane, primary: This) -> Option<This> {
+    if planes != 2
+        || crate::console::current() != crate::console::Console::SeriesS
+        || !two_planes()
+    {
+        return None;
+    }
+    second_plane_resource(plane_parameters, primary)
+}
+
+/// The second plane's first resource, when that plane holds exactly one and
+/// it is not the first plane's. Only the common prefix of [`Plane`] is
+/// documented, and the console's plane carries more after it, so the second
+/// one is read at its own stride.
+#[cfg(windows)]
+fn second_plane_resource(plane_parameters: *const Plane, primary: This) -> Option<This> {
+    const SERIES_S_PLANE_STRIDE: usize = 0x48;
+    let plane = (plane_parameters as usize).checked_add(SERIES_S_PLANE_STRIDE)?;
+    let count_at = plane.checked_add(std::mem::offset_of!(Plane, count))?;
+    let mut count = [0; size_of::<u32>()];
+    if !crate::host::read_into(count_at as *const u8, &mut count) || u32::from_ne_bytes(count) != 1
+    {
+        return None;
+    }
+    let resources_at = plane.checked_add(std::mem::offset_of!(Plane, resources))?;
+    let mut resources = [0; size_of::<usize>()];
+    if !crate::host::read_into(resources_at as *const u8, &mut resources) {
+        return None;
+    }
+    let resources = usize::from_ne_bytes(resources);
+    let mut overlay = [0; size_of::<usize>()];
+    if resources == 0 || !crate::host::read_into(resources as *const u8, &mut overlay) {
+        return None;
+    }
+    let overlay = usize::from_ne_bytes(overlay);
+    (overlay != primary as usize).then_some(overlay as This)
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -1100,6 +1171,54 @@ mod tests {
             7
         );
         assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+    }
+
+    /// The Series S present puts its second plane at its own stride, after
+    /// the prefix this tree documents, and refuses anything else.
+    #[cfg(windows)]
+    #[test]
+    fn series_s_overlay_reads_the_second_plane_at_its_stride() {
+        #[repr(C)]
+        struct FullPlane {
+            prefix: Plane,
+            reserved: [u64; 6],
+        }
+
+        let primary = 0x1_0000usize as This;
+        let first = [primary];
+        let second = [0x2_0000usize as This];
+        let mut planes = [
+            FullPlane {
+                prefix: Plane {
+                    token: 1,
+                    count: 1,
+                    resources: first.as_ptr(),
+                },
+                reserved: [0; 6],
+            },
+            FullPlane {
+                prefix: Plane {
+                    token: 1,
+                    count: 1,
+                    resources: second.as_ptr(),
+                },
+                reserved: [0; 6],
+            },
+        ];
+        let read = |planes: &[FullPlane; 2]| {
+            let parameters = std::hint::black_box(planes.as_ptr().cast::<Plane>());
+            second_plane_resource(parameters, primary)
+        };
+        assert_eq!(read(&planes), Some(0x2_0000usize as This));
+        planes[1].prefix.count = 2;
+        assert_eq!(read(&planes), None, "a plane of two is not composed");
+        planes[1].prefix.count = 1;
+        planes[1].prefix.resources = std::ptr::null();
+        assert_eq!(read(&planes), None);
+        planes[1].prefix.resources = first.as_ptr();
+        assert_eq!(read(&planes), None, "the same plane twice is not two");
+        planes[1].prefix.resources = second.as_ptr();
+        assert_eq!(read(&planes), Some(0x2_0000usize as This));
     }
 
     /// The title's compute queue: `{COMPUTE, 0, pipe 1, queue 0}`.

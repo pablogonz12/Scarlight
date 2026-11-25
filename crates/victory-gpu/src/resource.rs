@@ -2155,6 +2155,30 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     Some(out)
 }
 
+/// The host copy of the target at `address`, if the title texture table
+/// holds it and something already made one. A present plane that is not
+/// used must not make a host texture just by being looked at, so an absent
+/// copy answers `None` and the next frame finds the one the title's own
+/// work made.
+#[cfg(windows)]
+pub(crate) fn existing_host_copy(address: usize) -> Option<std::sync::Arc<HostTexture>> {
+    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    // Checked against the table before the object is touched: a plane
+    // parameter the title left behind must not name freed memory.
+    if !targets.values().any(|&target| target == address) {
+        return None;
+    }
+    // SAFETY: a resource in the table takes this same lock before its
+    // allocation goes, so the object outlives the read.
+    let made = resource(address as This)
+        .host
+        .made
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    Some(made.as_ref()?.0.clone())
+}
+
+#[cfg(windows)]
 pub(crate) extern "system" fn create_placed(
     _: This,
     heap: This,
@@ -2327,10 +2351,21 @@ static RESOURCE_FUNCTIONS: Table<32> = {
     Table(f)
 };
 
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// A present plane that is not used, and an address the table never
+    /// held, must not touch an object: the base alone is presented.
+    #[cfg(windows)]
+    #[test]
+    fn host_copy_is_not_made_for_an_unknown_target() {
+        assert!(super::existing_host_copy(0).is_none());
+        assert!(super::existing_host_copy(0xdead_0000).is_none());
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {
