@@ -135,7 +135,7 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    HEAP_DYNAMIC, HEAP_GUARDS, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS,
+    BOUNDED_INDICES, HEAP_DYNAMIC, HEAP_GUARDS, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS,
     SLOT_MEMORY, SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
     USER_VIEW_BIAS, set_view_heap_limit, view_bounds, view_bounds_of, view_heap_limit,
 };

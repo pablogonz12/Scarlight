@@ -6829,6 +6829,7 @@ impl<'a> Lower<'a> {
         let inside = self.s.m.cmp(c, pred::IULT, index, limit);
         let v = self.s.m.select(c, inside, index, target);
         self.s.bounded.insert(v);
+        super::shader::BOUNDED_INDICES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         v
     }
 

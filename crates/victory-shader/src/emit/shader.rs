@@ -106,7 +106,7 @@ pub fn view_bounds() -> Option<(u32, u32)> {
 /// (`victory-gpu`'s `descriptor::host::view_layout`), so the slots a
 /// shader holds as constants and the slots the host makes are one figure.
 pub fn view_bounds_of(null_slot: u32) -> Option<(u32, u32)> {
-    if null_slot == 0 {
+    if null_slot == 0 || !heap_bounds() {
         return None;
     }
     let slots = null_slot.checked_add(1)?;
@@ -115,6 +115,20 @@ pub fn view_bounds_of(null_slot: u32) -> Option<(u32, u32)> {
     }
     Some((slots - HEAP_DYNAMIC, slots - HEAP_GUARDS.len() as u32))
 }
+
+/// Whether a computed view index is bounded to the title's slots and reads
+/// a null view of its own kind past them ([`view_bounds`]):
+/// `VICTORY_HEAP_BOUNDS=0` leaves every index clamped to the heap's last slot
+/// as before (the host lays its heaps out by [`view_bounds_of`] too, so the
+/// two come back together). Read once.
+fn heap_bounds() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_BOUNDS").is_none_or(|v| v != "0"))
+}
+
+/// Heap indices bounded since the process started, for the frame line: a
+/// session whose translations bound none has no fix working.
+pub static BOUNDED_INDICES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The limit translations use: [`VIEW_LIMIT`], or in tests a limit set
 /// for this thread alone ([`with_view_limit`]), so that tests translating

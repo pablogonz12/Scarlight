@@ -80,6 +80,14 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   `VICTORY_FRAME_BUDGET=0`). Reimplemented on this tree's counters and its own 50 ms budget: its
   per-command timestamps, memory-trait breakdown and slow-pipeline guard are not taken.
 
+- **fxceless/victory-fork [PR #1095](https://github.com/fxceless/victory-fork/pull/1095)** (AimLogin),
+  GPL-3.0: view indices a translated shader computes are bounded at the title's slots (or at the first guard
+  when read through a table) and read a null view of their own kind past them, so a wrong or absent index
+  reads nothing instead of another draw's view or a device removal; the host lays its heaps out by the
+  translator's own figure (`crates/victory-shader/src/emit/shader.rs` `view_bounds_of`,
+  `crates/victory-gpu/src/descriptor/host.rs` `view_layout`, `VICTORY_HEAP_BOUNDS=0` off). Taken whole on
+  this tree; the frame line counts the indices bound.
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
