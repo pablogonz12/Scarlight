@@ -291,6 +291,117 @@ pub(crate) fn target_format(format: u32) -> u32 {
     format
 }
 
+/// The render target use of a resource (`uses_taken`).
+pub(crate) const TAKES_RENDER_TARGET: u32 = 1;
+/// The typed unordered access use of a resource (`uses_taken`).
+pub(crate) const TAKES_UNORDERED: u32 = 2;
+
+/// Whether `format` names no format itself: a typeless one, whose views
+/// name theirs, and which `CheckFeatureSupport` reports no use for. DXGI
+/// puts it first in its family.
+pub(crate) fn typeless(format: u32) -> bool {
+    family(format) == format && family(format.saturating_add(1)) == format
+}
+
+/// The uses the host takes of a resource in `format`, given `report`: what
+/// `CheckFeatureSupport` answered for the format (its render target and its
+/// typed unordered access use; `None` where it answered nothing for it).
+/// A use it does not take is left out of the resource: the host refuses a
+/// creation with a use its format cannot take, and such a creation removed
+/// the device (B5G5R5A1 takes no typed unordered access on NVIDIA,
+/// B4G4R4A4 neither use, #2725). Shaders still read the texture; a view of
+/// the use it lacks is held back ([`unordered_view_stored`],
+/// `descriptor::host::fits`). A typeless format names no format itself --
+/// its views do -- so it keeps the uses its description has, whatever the
+/// report says of it; the same where the query left it unknown, as the
+/// console makes such textures.
+pub(crate) fn uses_taken(format: u32, report: Option<(bool, bool)>) -> u32 {
+    let Some((render_target, unordered)) = report.filter(|_| !typeless(format)) else {
+        return TAKES_RENDER_TARGET | TAKES_UNORDERED;
+    };
+    (if render_target { TAKES_RENDER_TARGET } else { 0 })
+        | (if unordered { TAKES_UNORDERED } else { 0 })
+}
+
+/// The flags the host makes a resource of `format` with, from the title's
+/// `flags`: a use the host does not take of the format is left away
+/// (`uses_taken`), so the creation is not refused -- nor, on NVIDIA, the
+/// device removed (#2725).
+pub(crate) fn taken_flags(format: u32, flags: u32, report: Option<(bool, bool)>) -> u32 {
+    const TARGET: u32 = 1;
+    const UNORDERED: u32 = 4;
+    let taken = uses_taken(format, report);
+    let mut flags = flags;
+    if taken & TAKES_RENDER_TARGET == 0 {
+        flags &= !TARGET;
+    }
+    if taken & TAKES_UNORDERED == 0 {
+        flags &= !UNORDERED;
+    }
+    flags
+}
+
+/// Whether a typed unordered access view naming `view` of a resource in
+/// `own` (a view that names none: the resource's own format) names a
+/// format the host takes that use of. Making one in a format it does not
+/// (B5G5R5A1, B4G4R4A4 on NVIDIA) removed the device (#2725): such a view
+/// reads null, its writes are dropped.
+pub(crate) fn unordered_view_stored(
+    own: u32,
+    view: Option<u32>,
+    report: impl Fn(u32) -> Option<(bool, bool)>,
+) -> bool {
+    let named = view.filter(|&v| v != 0).unwrap_or(own);
+    uses_taken(named, report(named)) & TAKES_UNORDERED != 0
+}
+
+/// What the host answers for the uses of `format`, asked once per format:
+/// its render target and its typed unordered access use, `None` where it
+/// answered nothing (or no host is there).
+#[cfg(windows)]
+pub(crate) fn host_uses(format: u32) -> Option<(bool, bool)> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    static KNOWN: std::sync::Mutex<Vec<(u32, Option<(bool, bool)>)>> =
+        std::sync::Mutex::new(Vec::new());
+    let host = crate::host::host()?;
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, uses)) = known.iter().find(|&&(f, _)| f == format) {
+        return uses;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    // SAFETY: a plain query into our own structure.
+    let asked = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    };
+    let uses = asked.is_ok().then_some((
+        support.Support1.0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0,
+        support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0,
+    ));
+    known.push((format, uses));
+    uses
+}
+
+/// No host without Windows: every use is taken, as the console makes them.
+#[cfg(not(windows))]
+pub(crate) fn host_uses(_format: u32) -> Option<(bool, bool)> {
+    None
+}
+
+/// Whether the texture keeps the uses its format takes:
+/// `VICTORY_FORMAT_USES=0` keeps every use the title asks for, as before.
+pub(crate) fn format_uses_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FORMAT_USES").is_none_or(|v| v != "0"))
+}
+
 /// Whether the host copy of the title texture `this` is in a stand-in
 /// format ([`target_format`]): its texels are not laid out as the title's.
 #[cfg(windows)]
@@ -1689,6 +1800,14 @@ fn host_texture(
     if d.flags & (TARGET | UNORDERED) != 0 {
         d.format = target_format(d.format);
     }
+    // The host makes the resource with the uses its format takes: one it
+    // does not take is refused at creation, and that removed the device
+    // (B5G5R5A1 takes no typed unordered access on NVIDIA, B4G4R4A4
+    // neither use, #2725). Left away, shaders still read the texture and a
+    // view of the missing use is held back (`descriptor::host::fits`).
+    if d.flags & DEPTH == 0 && format_uses_on() {
+        d.flags = taken_flags(d.format, d.flags, host_uses(d.format));
+    }
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -2346,6 +2465,96 @@ mod tests {
         // Boundaries: 59 belongs to the preceding family, 66 is unmapped.
         assert_eq!(family(59), 53);
         assert_eq!(family(66), 66);
+    }
+
+    /// The uses of a resource a host takes, as its `CheckFeatureSupport`
+    /// answers them: a use it does not take is left out of the creation,
+    /// which it would refuse -- and which removed the device on NVIDIA
+    /// (#2725). A typeless format names no format itself and keeps every
+    /// use of its description; so does one the query left unknown. RADV
+    /// takes both uses of every format, so nothing is left out there.
+    #[test]
+    fn a_use_the_host_does_not_take_is_left_out_of_the_resource() {
+        const TARGET: u32 = 1;
+        const UNORDERED: u32 = 4;
+        let both = TARGET | UNORDERED;
+        // NVIDIA's answers: B4G4R4A4 (115) takes neither use of the two,
+        // B5G5R5A1 (86) the render target one only.
+        let nvidia = |format: u32| match format {
+            115 => Some((false, false)),
+            86 => Some((true, false)),
+            _ => Some((true, true)),
+        };
+        assert_eq!(
+            taken_flags(86, both, nvidia(86)),
+            TARGET,
+            "B5G5R5A1 keeps its render target use"
+        );
+        assert_eq!(
+            taken_flags(115, both, nvidia(115)),
+            0,
+            "B4G4R4A4 keeps neither use"
+        );
+        assert_eq!(
+            taken_flags(28, both, nvidia(28)),
+            both,
+            "R8G8B8A8_UNORM keeps both"
+        );
+        // RADV takes both uses of every format: no use is ever left out.
+        let radv = |_: u32| Some((true, true));
+        for format in [10, 28, 86, 87, 115] {
+            assert_eq!(
+                taken_flags(format, both, radv(format)),
+                both,
+                "format {format}: a host taking both uses keeps both"
+            );
+        }
+        // A typeless format names no format itself: its views do, and the
+        // device reports no use for it. It keeps the uses of its
+        // description (the game's own sRGB targets, 29 into 27).
+        for format in [27, 90, 92] {
+            assert!(typeless(format), "format {format} is typeless");
+            assert!(!typeless(format + 1), "format {} is typed", format + 1);
+            assert_eq!(
+                taken_flags(format, both, Some((false, false))),
+                both,
+                "format {format}: a typeless resource keeps its uses"
+            );
+        }
+        // A format the query left unknown is made as the console makes it.
+        assert_eq!(taken_flags(86, both, None), both);
+    }
+
+    /// A typed unordered access view names a format the host takes that
+    /// use of: the resource's own where the view names none, and a cast
+    /// alike. One in a format it does not is held back -- making it
+    /// removed the device (#2725).
+    #[test]
+    fn an_unordered_view_names_a_format_the_host_stores() {
+        let nvidia = |format: u32| match format {
+            86 | 115 => Some((true, false)),
+            _ => Some((true, true)),
+        };
+        assert!(
+            !unordered_view_stored(86, None, nvidia),
+            "a view of no format names the resource's own"
+        );
+        assert!(!unordered_view_stored(86, Some(86), nvidia));
+        assert!(
+            !unordered_view_stored(28, Some(115), nvidia),
+            "a cast to a format the host cannot store is held back too"
+        );
+        assert!(unordered_view_stored(28, None, nvidia));
+        assert!(unordered_view_stored(28, Some(28), nvidia));
+        let radv = |_: u32| Some((true, true));
+        for format in [28, 86, 115] {
+            assert!(
+                unordered_view_stored(28, Some(format), radv),
+                "format {format}: a host storing the view's format makes it"
+            );
+        }
+        // A typeless resource's view names its own typed format.
+        assert!(unordered_view_stored(27, Some(28), nvidia));
     }
 
     type Release = extern "system" fn(This) -> u32;

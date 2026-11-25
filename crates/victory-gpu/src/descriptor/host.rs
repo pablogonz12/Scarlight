@@ -2261,8 +2261,24 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    // A typed unordered access view names a format the host takes that use
+    // of: one it does not (B5G5R5A1, B4G4R4A4 on NVIDIA) removed the device
+    // where such a view was made (#2725). Held back, it reads null and its
+    // writes are dropped, where the resource itself is made without the
+    // use (`crate::resource::taken_flags`).
+    let stored = |named: u32| {
+        if !unordered || !crate::resource::format_uses_on() {
+            return true;
+        }
+        if crate::resource::unordered_view_stored(own, Some(named), crate::resource::host_uses) {
+            return true;
+        }
+        once!(named, own, "an unordered view in a format the host cannot store");
+        false
+    };
     if view == 0 {
-        return !typeless;
+        // A view without a description names the resource's own format.
+        return !typeless && stored(own);
     }
     // A view of a target whose format the host refuses, in the title's
     // format: in the stand-in the host copy has.
@@ -2270,7 +2286,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         if let Some(format) = format {
             *format = d.Format;
         }
-        return true;
+        return stored(own);
     }
     if family(view) != family(own) {
         once!(view, own, "view format of another family");
@@ -2279,13 +2295,13 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     let twin = crate::resource::SRGB
         .iter()
         .any(|&(s, l)| (s, l) == (view, own) || (l, s) == (view, own));
-    if let Some(format) = format
+    if let Some(format) = format.as_deref_mut()
         && !typeless
         && !(twin && casts_typed())
     {
         *format = d.Format;
     }
-    true
+    stored(format.as_ref().map_or(0, |f| f.0 as u32))
 }
 
 /// The title's unordered access view of a depth texture, as a view of the

@@ -79,6 +79,11 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   the copy-back and the rest, the largest named (`crates/victory-gpu/src/frame_budget.rs`,
   `VICTORY_FRAME_BUDGET=0`). Reimplemented on this tree's counters and its own 50 ms budget: its
   per-command timestamps, memory-trait breakdown and slow-pipeline guard are not taken.
+- **Marvisak/VIctory [#2773](https://github.com/Marvisak/VIctory/pull/2773)** (kais7654), GPL-3.0: the idea
+  that a format's uses come from the host's `CheckFeatureSupport` answer, the uses it does not take left out of
+  the resource and a typed unordered access view in a format it does not store held back, a typeless format
+  keeping the uses of its description (`crates/victory-gpu/src/resource.rs` `uses_taken`/`taken_flags`,
+  `descriptor/host.rs` `fits`, `VICTORY_FORMAT_USES=0`).
 
 ## Tools
 
