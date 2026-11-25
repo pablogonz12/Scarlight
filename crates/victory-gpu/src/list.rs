@@ -528,6 +528,14 @@ fn list_for_texture_copy<'a>(this: This, src: &CopyLocation) -> Option<&'a crate
     }
 }
 
+/// Whether a queue's entry (one submission) starts at a part: the part has
+/// waits of its own, or the part before it wrote title memory once it had
+/// run and so must be waited for first ([`cut_read_back`]).
+#[cfg(any(windows, test))]
+fn starts_entry(waits: bool, flush: bool) -> bool {
+    flush || waits
+}
+
 /// What a queue is given for submitted lists that were cut at their waits:
 /// the waits it stands at, the host lists it runs once they are met, and
 /// the order those run in.
@@ -550,6 +558,12 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
     // The lists taken: where its one host list is (entry, place), or none
     // for a list of several parts.
     let mut seen: Vec<(This, Option<(usize, usize)>)> = Vec::new();
+    // A part whose read-backs write title memory once it has run
+    // ([`cut_read_back`]) runs before what is prepared next: the part after
+    // it starts an entry of its own, so the queue gives it a submission of
+    // its own. Carried across the lists taken, a read-back that ends one
+    // list's last part ends its entry for the next list too.
+    let mut flush = false;
     for &this in lists {
         if this.is_null() {
             continue;
@@ -605,14 +619,9 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             },
         ));
         let mut last = None;
-        // A part whose read-backs write title memory once it has run
-        // ([`cut_read_back`]) runs before what follows is prepared: the next
-        // part starts an entry of its own, so the queue gives it a submission
-        // of its own.
-        let mut flush = false;
         for (waits, detached) in pieces {
             let read_backs = detached.host().has_read_backs();
-            if flush || !waits.is_empty() {
+            if starts_entry(!waits.is_empty(), flush) {
                 parts.push((waits, Vec::new(), Vec::new()));
             }
             let entry = parts.len() - 1;
@@ -2420,5 +2429,45 @@ mod tests {
         assert_eq!(idle_most(Some(31 * GIB), 16), (256, 512 * MIB));
         assert_eq!(idle_most(Some(32 * GIB), 16), (256, 512 * MIB));
         assert_eq!(idle_most(Some(64 * GIB), 32), (256, 512 * MIB));
+    }
+}
+
+/// The parts a submission of several lists is run in
+/// ([`detach_parts`], [`starts_entry`]): which part lands in which entry, as
+/// the queues run them one entry at a time.
+#[cfg(test)]
+mod part_entry_tests {
+    use super::starts_entry;
+
+    /// The entries the parts (`(waits, read-backs)`, lists one after
+    /// another) are given, as how many parts each holds.
+    fn entries(parts: &[(bool, bool)]) -> Vec<usize> {
+        let mut entries = vec![0];
+        let mut flush = false;
+        for &(waits, read_back) in parts {
+            if starts_entry(waits, flush) {
+                entries.push(0);
+            }
+            *entries.last_mut().expect("an entry") += 1;
+            flush = read_back;
+        }
+        entries.retain(|&held| held > 0);
+        entries
+    }
+
+    #[test]
+    fn a_read_back_that_ends_one_list_ends_its_entry_for_the_next() {
+        // List A ends with a read-back, list B (the same submission) copies
+        // what it wrote: B's copy must be prepared after A's read-back has
+        // run, so it starts an entry of its own.
+        let two = [(false, false), (false, true), (false, false)];
+        assert_eq!(entries(&two), [2, 1], "B's part waits for A's read-back");
+        // Without the read-back the lists share the entry, as before.
+        let one = [(false, false), (false, false), (false, false)];
+        assert_eq!(entries(&one), [3], "nothing to wait for: one submission");
+        // Waits still start an entry of their own, and a read-back before a
+        // wait does not add a second one.
+        assert_eq!(entries(&[(true, false)]), [1]);
+        assert_eq!(entries(&[(false, true), (true, false)]), [1, 1]);
     }
 }
