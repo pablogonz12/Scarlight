@@ -2178,7 +2178,6 @@ pub(crate) fn existing_host_copy(address: usize) -> Option<std::sync::Arc<HostTe
     Some(made.as_ref()?.0.clone())
 }
 
-#[cfg(windows)]
 pub(crate) extern "system" fn create_placed(
     _: This,
     heap: This,
