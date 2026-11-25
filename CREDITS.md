@@ -160,3 +160,7 @@ Missing or wrong name? Open an issue.
   enables blending on one, so those targets are made to write unblended, per target and with independent
   blending turned on only where it was needed (`crates/victory-gpu/src/pipeline/host.rs`,
   `VICTORY_HOST_BLEND=0`). Its host-pipeline device test used `D3DCompile`; ours checks the state itself.
+- **avatarmanz/VIctory-7900XTX [2be0515c](https://github.com/avatarmanz/VIctory-7900XTX/commit/2be0515cb)**, GPL-3.0:
+  a page the title maps at more than one address, where a guard at one address can be written through another: the
+  guarded blocks of the views beside it are given back to write together, under the one look
+  (`crates/victory-gpu/src/watch.rs`, `VICTORY_GUARD_ALIASES=0`).
