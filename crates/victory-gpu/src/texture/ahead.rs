@@ -34,7 +34,7 @@
 //! no list has used is, for the title's barriers and ours.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
@@ -163,6 +163,9 @@ static QUEUE: (Mutex<VecDeque<Arc<Job>>>, Condvar) = (Mutex::new(VecDeque::new()
 /// Those on their way, by staging buffer.
 static ON_THEIR_WAY: Mutex<Vec<Arc<Job>>> = Mutex::new(Vec::new());
 static BYTES: AtomicU64 = AtomicU64::new(0);
+/// Its worker has stopped (or never started): nothing is taken any more, and
+/// what a list asks for is the list's, as before.
+static STOPPED: AtomicBool = AtomicBool::new(false);
 
 /// Since the start: asked for, that ran, submissions that queued a wait for
 /// one, threads that waited for one, submissions that sampled one before it
@@ -359,8 +362,9 @@ impl Copy {
 }
 
 /// The copy queue and its worker, made on first use: `None` when the device
-/// has no copy queue or its worker thread could not be started, and then no
-/// upload is taken (a job nothing would run must not be admitted).
+/// has no copy queue, its worker thread could not be started, or the worker
+/// has stopped, and then no upload is taken (a job nothing would run must not
+/// be admitted).
 fn workers() -> Option<&'static Copy> {
     static STARTED: OnceLock<Option<()>> = OnceLock::new();
     // One worker: a fence moves forward once for the queue, so a second
@@ -379,6 +383,9 @@ fn workers() -> Option<&'static Copy> {
         Some(())
     });
     started.as_ref()?;
+    if STOPPED.load(Relaxed) {
+        return None;
+    }
     Copy::get()
 }
 
@@ -412,8 +419,26 @@ impl Drop for Worker {
     }
 }
 
-/// Takes jobs off [`QUEUE`] until the process ends.
+/// Takes jobs off [`QUEUE`] until the process ends, and, whatever ends it,
+/// finishes what is left as not run (a queue nothing would serve would
+/// otherwise leave its waiters waiting) and stops taking more ([`workers`]).
 fn work() -> windows::core::Result<()> {
+    let ran = serve();
+    STOPPED.store(true, Relaxed);
+    let left: Vec<Arc<Job>> = QUEUE
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain(..)
+        .collect();
+    if !left.is_empty() {
+        finish(&left, false);
+    }
+    ran
+}
+
+/// The worker's loop: one batch after another.
+fn serve() -> windows::core::Result<()> {
     let copy = Copy::get().ok_or_else(windows::core::Error::empty)?;
     let device = copy.host.device.clone();
     let worker = Worker::new(&device)?;
@@ -437,17 +462,29 @@ fn work() -> windows::core::Result<()> {
                 }
                 // SAFETY: the fence and the event are ours, and the jobs
                 // hold what the submission names until it has run.
-                unsafe {
-                    copy.fence.SetEventOnCompletion(value, worker.event)?;
-                    let waited = windows::Win32::System::Threading::WaitForSingleObject(
-                        worker.event,
-                        windows::Win32::System::Threading::INFINITE,
-                    );
-                    if waited != WAIT_OBJECT_0 {
-                        tracing::warn!(?waited, "uploads ahead not waited for");
+                match unsafe {
+                    copy.fence.SetEventOnCompletion(value, worker.event)
+                } {
+                    Ok(()) => {
+                        let waited = unsafe {
+                            windows::Win32::System::Threading::WaitForSingleObject(
+                                worker.event,
+                                windows::Win32::System::Threading::INFINITE,
+                            )
+                        };
+                        if waited != WAIT_OBJECT_0 {
+                            tracing::warn!(?waited, "uploads ahead not waited for");
+                        }
+                        true
+                    }
+                    Err(e) => {
+                        // Its completion cannot be waited for: its texture
+                        // keeps what it holds and asks again next time.
+                        STATS[FAILED].fetch_add(jobs.len() as u64, Relaxed);
+                        tracing::warn!(error = %e, jobs = jobs.len(), "uploads ahead could not be waited for");
+                        false
                     }
                 }
-                true
             }
         };
         finish(&jobs, ran);
