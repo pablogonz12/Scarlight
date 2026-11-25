@@ -1787,7 +1787,8 @@ const ALWAYS: u32 = 8;
 /// Whether a wait on memory that cannot be read yet holds its queue until it
 /// reads, rather than running on at once (`VICTORY_WAIT_UNREAD=0`, as before).
 /// Memory that is not mapped is taken as not holding what is waited for
-/// unless the comparison does not look at the value (`ALWAYS`).
+/// unless the comparison does not look at the value (1..=7 do,
+/// `ValueWait::holds_for`).
 fn unread_holds() -> bool {
     static HOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *HOLD.get_or_init(|| std::env::var("VICTORY_WAIT_UNREAD").as_deref() != Ok("0"))
@@ -1837,17 +1838,27 @@ impl ValueWait {
             return true;
         }
         static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // Asking first is the same question the read answers: memory that is
+        // not committed is not readable, and is held as below.
         if *ASK.get_or_init(|| std::env::var_os("VICTORY_WAIT_ASK").is_some_and(|v| v == "1"))
             && !crate::texture::committed(self.address as *const u8, bytes)
         {
-            return true;
+            return self.unread_met();
         }
         // The low `bytes` bytes; the rest stays zero.
         let mut raw = [0u8; 8];
         if !crate::host::read_into(self.address as *const u8, &mut raw[..bytes]) {
-            return !unread_holds() || self.comparison >= ALWAYS;
+            return self.unread_met();
         }
         self.holds_for(u64::from_le_bytes(raw))
+    }
+
+    /// Whether a wait is met while its memory cannot be read: only a
+    /// comparison that does not look at the value is (`holds_for` says what
+    /// the 1..=7 codes compare), or, with `VICTORY_WAIT_UNREAD=0`, every one,
+    /// as before.
+    fn unread_met(&self) -> bool {
+        !unread_holds() || !(1..ALWAYS).contains(&self.comparison)
     }
 
     /// Where the value waited for is: address and bytes.
@@ -2300,6 +2311,10 @@ mod tests {
         assert!(
             look(wait(page as u64, ALWAYS)),
             "ALWAYS asks nothing of the value"
+        );
+        assert!(
+            look(wait(page as u64, 0)),
+            "a comparison we do not know counts as met, readable or not"
         );
         // SAFETY: readable again, and ours.
         assert_ne!(
