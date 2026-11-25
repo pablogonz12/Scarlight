@@ -515,6 +515,19 @@ impl HostPipeline {
         }
         let host = host()?;
 
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        // Older runtimes may not recognize OPTIONS19; that means no support.
+        let aniso_point_mip_supported = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.AnisoFilterWithPointMipSupported.as_bool();
+
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
         // The ranges table parameters point at, alive until the root
@@ -622,7 +635,7 @@ impl HostPipeline {
             }
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(s.filter as i32),
+                    Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip_supported) as i32),
                     AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
                     AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
                     AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
@@ -673,6 +686,40 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        let t = stages[0].0.translated();
+                        let sfi0 = t.and_then(|t| {
+                            victory_shader::Container::parse(&t.host.dxil)
+                                .ok()?
+                                .part(victory_shader::FourCC::SFI0)?
+                                .data
+                                .get(..4)?
+                                .try_into()
+                                .ok()
+                                .map(u32::from_le_bytes)
+                        });
+                        tracing::warn!(
+                            error = %e,
+                            ?shaders,
+                            params = params.len(),
+                            ?samplers,
+                            ?sfi0,
+                            user_data = t.map(|t| t.host.user_data_dwords()),
+                            root_cbvs = ?t.map(|t| &t.host.root_cbvs),
+                            root_srvs = ?t.map(|t| &t.host.root_srvs),
+                            root_uavs = ?t.map(|t| &t.host.root_uavs),
+                            indexed = t.map(|t| t.host.root_indexed_views.len()),
+                            "host pipeline refused"
+                        );
+                        if let (Ok(dir), Some(t)) = (std::env::var("VICTORY_REFUSED_DIR"), t) {
+                            let _ = std::fs::write(
+                                std::path::Path::new(&dir).join(format!("{}.dxil", shaders[0].hash)),
+                                &t.host.dxil,
+                            );
+                        }
+                    }
+                    #[cfg(not(feature = "diagnostics"))]
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
                     return None;
@@ -726,6 +773,21 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        tracing::warn!(error = %e, ?shaders, ?state, params = params.len(), "host mesh pipeline refused");
+                        if let Ok(dir) = std::env::var("VICTORY_REFUSED_DIR") {
+                            for (idx, (st, _)) in stages.iter().enumerate() {
+                                if let (Some(t), Some(sh)) = (st.translated(), shaders.get(idx)) {
+                                    let _ = std::fs::write(
+                                        std::path::Path::new(&dir).join(format!("{}.{}.dxil", sh.hash, sh.stage)),
+                                        &t.host.dxil,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "diagnostics"))]
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
                     return None;
