@@ -2133,6 +2133,10 @@ void main() {
                 let (s, g) = if i % 2 == 0 { (&src_a, gpu_a) } else { (&src_b, gpu_b) };
                 probes.push(super::hoist(&list, s, g + 32, (1, 20, 1)).unwrap());
             }
+            {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "MARK2 probes hoisted, before spill");
+            }
             // Spill across 256 KiB chunk boundary (8,192 * 32B = 256 KiB).
             let mut spilled = false;
             let first_chunk = probes[0].0.as_raw();
@@ -2147,8 +2151,20 @@ void main() {
                 let (s, g) = if i % 2 == 0 { (&src_a, gpu_a) } else { (&src_b, gpu_b) };
                 probes.push(super::hoist(&list, s, g + 32, (1, 20, 1)).unwrap());
             }
+            {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "MARK2 spill hoisted, before close");
+            }
             list.close();
+            {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "MARK2 closed, before execute");
+            }
             host.execute(&[&list]);
+            {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "MARK2 executed, before read_words");
+            }
 
             for (idx, (dst, at)) in probes.iter().enumerate() {
                 let w = read_words(dst, *at, 5);
