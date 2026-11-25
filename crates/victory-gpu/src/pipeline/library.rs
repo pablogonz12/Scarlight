@@ -45,7 +45,14 @@
 //! library run 77 saved from such pages was refused by run 78). Measured
 //! with a 64 MB file written past the system's cache, mapped and replaced:
 //! 16,352 of 16,384 pages read zeros with the handle closed, none with it
-//! open (the test below). `VICTORY_LIBRARY_HANDLE=0`: closed, as before.
+//! open (the test below). `VICTORY_LIBRARY_HANDLE=0`: closed, as before.//!
+//! The list has a cap ([`EARLY_MAX`] keys). A run that finds more goes to
+//! a title with more pipelines than the cap: the extra keys are dropped,
+//! not put in the place of older ones, so the list keeps the pipelines
+//! that were drawn with first (the ones the measured scene needs) and the
+//! tail of a title's creation order is left to its own workers. Both
+//! [`save`] and the first read of the list say how many keys were listed,
+//! the cap, and how many were dropped, so a run never truncates in silence.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -438,7 +445,13 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
-/// Title pipelines listed for an early start, at most.
+/// Title pipelines listed for an early start, at most. A title that asks
+/// for more keeps the first this many keys (the ones drawn with first) and
+/// loses the tail; `save` logs how many were dropped. Our own lists are
+/// 2,238 keys and 1,785 buildable pipelines, so nothing measured is near
+/// it: the cap is a guard against a title whose keys never repeat, not a
+/// tuning value, and it moves only with a measurement of a list that
+/// needed more.
 const EARLY_MAX: usize = 8192;
 
 fn library() -> Option<&'static Library> {
@@ -621,6 +634,7 @@ pub(crate) fn save(now: bool) {
         }
     };
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    let dropped = DROPPED.load(Ordering::Relaxed);
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
@@ -636,12 +650,14 @@ pub(crate) fn save(now: bool) {
             )
         });
     }
-    let written = library_written
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+    let written = library_written        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
         Ok(()) => tracing::info!(
             bytes,
             early = used.len(),
+            cap = EARLY_MAX,
+            truncated = dropped > 0,
+            dropped,
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
@@ -691,6 +707,8 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
 static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
+/// Keys refused since the start because the list was at [`EARLY_MAX`].
+static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
@@ -700,7 +718,14 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
         let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
-        tracing::info!(pipelines = set.len(), "title pipelines to start early");
+        // A list at the cap was truncated when it was written: say so.
+        let truncated = set.len() >= EARLY_MAX;
+        tracing::info!(
+            pipelines = set.len(),
+            cap = EARLY_MAX,
+            truncated,
+            "title pipelines to start early"
+        );
         *used = Some(set);
     }
     used
@@ -711,12 +736,36 @@ pub(crate) fn wanted_early(key: &str) -> bool {
     used().as_ref().is_some_and(|s| s.contains(key))
 }
 
+/// Adds `key` to `set` unless it holds `cap` keys already; says whether it
+/// was added. A refused key never evicts one that is there.
+fn insert_capped(set: &mut HashSet<String>, cap: usize, key: &str) -> bool {
+    if set.contains(key) {
+        return false;
+    }
+    if set.len() >= cap {
+        return false;
+    }
+    set.insert(key.to_owned())
+}
+
+/// The title pipeline with `key` was drawn or dispatched with.
 /// A draw or dispatch requested the title pipeline with `key`.
 pub(crate) fn note_used(key: &str) {
     let mut used = used();
     let set = used.get_or_insert_with(HashSet::new);
-    if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
+    if insert_capped(set, EARLY_MAX, key) {
         USED_CHANGED.store(true, Ordering::Relaxed);
+    } else if set.len() >= EARLY_MAX && !set.contains(key) {
+        // Logged once, when the cap is first reached, and counted for every
+        // key after it: a run never loses the tail without a word.
+        let dropped = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if dropped == 1 {
+            tracing::warn!(
+                cap = EARLY_MAX,
+                "early pipeline list at its cap: further keys are dropped, not listed \
+                 (logged once; the count is in the next save)"
+            );
+        }
     }
 }
 
@@ -734,6 +783,34 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    #[test]
+    fn the_early_list_drops_keys_at_the_cap_and_counts_them() {
+        // A small cap first: the boundary rule, without a big set.
+        let mut set = HashSet::new();
+        assert!(insert_capped(&mut set, 3, "a"));
+        assert!(insert_capped(&mut set, 3, "b"));
+        assert!(insert_capped(&mut set, 3, "c"));
+        assert!(!insert_capped(&mut set, 3, "d"), "past the cap");
+        assert_eq!(set.len(), 3, "a refused key evicts nothing");
+        assert!(!set.contains("d"));
+        assert!(set.contains("a"), "the first keys stay");
+        // A key already listed is not a new one, cap or no cap.
+        assert!(!insert_capped(&mut set, 3, "a"));
+        assert_eq!(set.len(), 3);
+
+        // The real cap: one key short is listed, the last one is refused.
+        let mut full = HashSet::new();
+        for i in 0..EARLY_MAX {
+            assert!(
+                insert_capped(&mut full, EARLY_MAX, &format!("k{i}")),
+                "key {i}"
+            );
+        }
+        assert_eq!(full.len(), EARLY_MAX);
+        assert!(!insert_capped(&mut full, EARLY_MAX, "one-too-many"));
+        assert_eq!(full.len(), EARLY_MAX);
     }
 
     #[test]
