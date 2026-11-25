@@ -280,6 +280,7 @@ pub const SWITCHES: &[&str] = &[
     "VICTORY_FIRSTLANE_OWN",
     "VICTORY_FIRST_HALF",
     "VICTORY_GROUP_SYNC",
+    "VICTORY_HEAP_BOUNDS",
     "VICTORY_MESH_OUTPUT_STRICT",
     "VICTORY_SHADER_LOOP_LIMIT",
     "VICTORY_SHADER_LOOP_LIMIT_CS",
@@ -307,6 +308,7 @@ pub const DIAGNOSTIC_SWITCHES: &[&str] = &[
 /// shipped translation, so never part of its key.
 pub const TEST_SWITCHES: &[&str] = &[
     "VICTORY_CONSOLE_DXC",
+    "VICTORY_D3D12_GBV",
     "VICTORY_DIFF_ONLY",
     "VICTORY_DUMP_ALL",
     "VICTORY_DXIL",
