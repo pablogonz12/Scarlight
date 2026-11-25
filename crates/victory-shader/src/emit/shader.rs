@@ -160,6 +160,9 @@ pub(crate) struct Shader {
     /// Ballots made to learn whether a DPP source lane is in EXEC.
     #[cfg(test)]
     pub exec_ballots: u32,
+    /// Pixel `v_readfirstlane`s that keep a helper lane's own value.
+    #[cfg(test)]
+    pub helper_readfirst: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -218,6 +221,8 @@ impl Shader {
             nonuniform_handles: 0,
             #[cfg(test)]
             exec_ballots: 0,
+            #[cfg(test)]
+            helper_readfirst: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,

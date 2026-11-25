@@ -68,6 +68,9 @@ pub(crate) struct Lowered {
     /// Ballots made to learn whether a DPP source lane is in EXEC.
     #[cfg(test)]
     pub exec_ballots: u32,
+    /// Pixel `v_readfirstlane`s that keep a helper lane's own value.
+    #[cfg(test)]
+    pub helper_readfirst: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -2289,6 +2292,8 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             exec_ballots: self.s.exec_ballots,
+            #[cfg(test)]
+            helper_readfirst: self.s.helper_readfirst,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -4356,6 +4361,34 @@ impl<'a> Lower<'a> {
         let lane = self.s.m.select(c, any, lane, me);
         let at = self.read_lane(x, lane);
         (self.s.m.select(c, any, at, first), any)
+    }
+
+    /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader: a
+    /// helper lane takes its own value instead (ported from
+    /// project-flamingo #686, `22066e545`).
+    ///
+    /// On the console, whole-quad mode puts helper lanes in EXEC, so a
+    /// waterfall loop (read the first lane's value, run the lanes with that
+    /// value, take them out of EXEC) serves helper lanes too. On the host,
+    /// wave operations leave helper lanes out (DXIL before
+    /// `WaveOpsIncludeHelperLanes`): once only helper lanes are left in such a
+    /// loop, `WaveReadLaneFirst` reads no lane, no lane matches, and the loop
+    /// runs to its limit in every such lane. With its own value a helper lane
+    /// matches in the first pass and leaves; what a helper lane computes only
+    /// feeds derivatives, and its stores are dropped.
+    fn helper_reads_own(&mut self, own: V, first: V) -> V {
+        if !self.s.pixel {
+            return first;
+        }
+        let c = self.cur;
+        let helper = self
+            .s
+            .op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        #[cfg(test)]
+        {
+            self.s.helper_readfirst += 1;
+        }
+        self.s.m.select(c, helper, own, first)
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
@@ -7761,6 +7794,7 @@ impl<'a> Lower<'a> {
                 } else {
                     mine
                 };
+                let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
             _ => {
@@ -11608,6 +11642,63 @@ mod tests {
         })
     }
 
+
+    /// [`lowers`] for a pixel program with no inputs and no bound targets.
+    fn lower_ps(words: &[u32]) -> Result<Lowered, crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+    }
+
+    /// project-flamingo #686 (`22066e545`): in a pixel shader a bare
+    /// `v_readfirstlane_b32` keeps a helper lane's own value
+    /// (`select(isHelperLane(), own, first)`), so a waterfall loop over it
+    /// lets helper lanes leave in the first pass; compute stays bare.
+    #[test]
+    fn pixel_readfirstlane_keeps_a_helper_lanes_own_value() {
+        // v_readfirstlane_b32 s0, v0; v_mov_b32 v0, s0; s_endpgm
+        let words = [0x7E00_0500, 0x7E00_0200, S_ENDPGM];
+        let ps = lower_ps(&words).expect("pixel readfirstlane");
+        assert!(ps.wave_ops, "v_readfirstlane uses wave operations");
+        assert_eq!(
+            ps.helper_readfirst, 1,
+            "a pixel v_readfirstlane wraps isHelperLane"
+        );
+
+        let cs = lowers_cs(&words, 0, false, [1, 1, 1]).expect("compute readfirstlane");
+        assert!(cs.wave_ops);
+        assert_eq!(
+            cs.helper_readfirst, 0,
+            "a compute v_readfirstlane stays bare waveReadLaneFirst"
+        );
+    }
 
     /// Lowers a compute program with the root parameters `layout` (in user
     /// SGPRs from s0 on) and the used resources `used`.
