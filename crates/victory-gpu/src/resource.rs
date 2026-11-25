@@ -3165,18 +3165,25 @@ void main() {
         let mut sizes = [0u64; 8];
         let mut rows = [0u32; 8];
         let mut total = 0;
-        // SAFETY: the image is live and the arrays hold its eight subresources.
-        unsafe {
-            host.device.GetCopyableFootprints(
-                &image.GetDesc(),
-                0,
-                8,
-                0,
-                Some(footprints.as_mut_ptr()),
-                Some(rows.as_mut_ptr()),
-                Some(sizes.as_mut_ptr()),
-                Some(&mut total),
-            );
+        // A plane at a time: D3D12 gives a plane's own copy format only for a
+        // range inside one plane.
+        for plane in 0..2u32 {
+            let first = (plane * 4) as usize;
+            let mut plane_total = 0;
+            // SAFETY: the image is live and the arrays hold its eight subresources.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &image.GetDesc(),
+                    first as u32,
+                    4,
+                    total,
+                    Some(footprints[first..].as_mut_ptr()),
+                    Some(rows[first..].as_mut_ptr()),
+                    Some(sizes[first..].as_mut_ptr()),
+                    Some(&mut plane_total),
+                );
+            }
+            total += plane_total;
         }
         // Each subresource of the host texture, as it stands.
         let sample = || {
@@ -3266,7 +3273,7 @@ void main() {
             assert_eq!(&actual[i], want, "depth subresource {i}");
         }
         for (i, want) in stencil.iter().enumerate() {
-            assert!(actual[4 + i].iter().all(|&b| b == 0), "stencil {i} not uploaded by default: {want:?}");
+            assert_eq!(&actual[4 + i], want, "stencil subresource {i}");
         }
 
         // A write of one byte into the stencil alone refreshes the stencil
@@ -3281,8 +3288,8 @@ void main() {
         for (i, want) in depth.iter().enumerate() {
             assert_eq!(&refreshed[i], want, "depth subresource {i} survives a stencil write");
         }
-        for (i, _) in stencil.iter().enumerate() {
-            assert!(refreshed[4 + i].iter().all(|&b| b == 0), "stencil {i} still not uploaded");
+        for (i, want) in stencil.iter().enumerate() {
+            assert_eq!(&refreshed[4 + i], want, "stencil subresource {i} refreshed");
         }
         for object in [allocator, src, dst] {
             slot::<Release>(object, 0x10)(object);

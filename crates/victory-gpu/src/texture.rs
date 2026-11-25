@@ -1824,7 +1824,7 @@ fn plane_of(i: u32, mips: u32, subresources_per_plane: u32) -> (usize, u32, u32)
 /// (`VICTORY_TEXTURE_PLANES=0`: the first plane alone, as before).
 fn planes_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_PLANES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_PLANES").is_none_or(|v| v != "0"))
 }
 
 /// The planes of `layout` the host takes, where the host takes more than
@@ -1921,18 +1921,25 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
     let mut total = 0;
-    // SAFETY: outputs for `count` subresources.
-    unsafe {
-        host.device.GetCopyableFootprints(
-            &d,
-            0,
-            count,
-            0,
-            Some(footprints.as_mut_ptr()),
-            Some(rows.as_mut_ptr()),
-            None,
-            Some(&mut total),
-        );
+    // A plane at a time: D3D12 gives a depth-stencil plane's own copy format
+    // only when the subresources asked for are one plane's.
+    for (plane, _) in layout.planes.iter().enumerate() {
+        let first = (plane as u32 * subresources_per_plane) as usize;
+        let mut plane_total = 0;
+        // SAFETY: outputs for this plane's subresources.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &d,
+                first as u32,
+                subresources_per_plane,
+                total,
+                Some(footprints[first..].as_mut_ptr()),
+                Some(rows[first..].as_mut_ptr()),
+                None,
+                Some(&mut plane_total),
+            );
+        }
+        total = total.max(total + plane_total);
     }
     // The buffer covers every footprint's whole rows: `GetCopyableFootprints`
     // leaves the last row of the last footprint unpadded, and a placed copy
