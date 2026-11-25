@@ -29,6 +29,8 @@ pub mod dxgi;
 mod dxc;
 pub mod fence;
 pub mod frame;
+#[cfg(any(windows, test))]
+mod frame_budget;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
@@ -52,12 +54,18 @@ mod switches;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod shader_meta;
+#[cfg(windows)]
 mod shadow;
 pub mod signature;
+#[cfg(all(windows, test))]
+mod test_device;
 #[cfg(windows)]
 mod stand_in;
 #[cfg(windows)]
 mod texture;
+#[cfg(all(test, windows))]
+mod warptest;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]
