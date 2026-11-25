@@ -1683,8 +1683,20 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    /// Title memory the read-backs of `backs` write once the list has run,
+    /// `[start, end)`: a copy recorded after one of these reads title bytes
+    /// older than the read-back unless the two run in submissions of their
+    /// own (`crate::list::read_back_cuts`).
+    read_backs: Vec<(usize, usize)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+}
+
+/// Whether any `[start, end)` in `ranges` overlaps `[at, at + len)`.
+#[cfg(any(windows, test))]
+fn overlaps(ranges: &[(usize, usize)], at: usize, len: usize) -> bool {
+    let end = at.saturating_add(len);
+    ranges.iter().any(|&(start, stop)| start < end && at < stop)
 }
 
 impl Deferred {
@@ -5151,6 +5163,26 @@ impl HostList {
         self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
     }
 
+    /// Notes `[start, start + len)` of title memory as written by this
+    /// list's read-backs once it has run (`defer_read_back`).
+    pub(crate) fn note_read_back(&self, start: usize, len: usize) {
+        self.deferred().read_backs.push((start, start.saturating_add(len)));
+    }
+
+    /// Whether this list writes title memory after its submission has run
+    /// (a read back), so a copy or draw recorded after one must run in a
+    /// submission of its own.
+    pub(crate) fn has_read_backs(&self) -> bool {
+        !self.deferred().read_backs.is_empty()
+    }
+
+    /// Whether a read-back write of this list lands in `[start, start + len)`
+    /// of title memory.
+    pub(crate) fn reads_after_read_back(&self, start: usize, len: usize) -> bool {
+        let deferred = self.deferred();
+        crate::host::overlaps(&deferred.read_backs, start, len)
+    }
+
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
@@ -6873,3 +6905,134 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+
+/// Read-back ranges and what a list does after one (`crate::list::read_back`):
+/// the parts a title list is recorded in, and how cheaply a copy is checked
+/// against them.
+#[cfg(test)]
+mod read_back_tests {
+    use super::overlaps;
+
+    /// One thing a list records, as far as read-backs matter.
+    #[derive(Clone, Copy)]
+    enum Op {
+        /// A texture to buffer copy: the rows it writes to title memory.
+        ReadBack(usize, usize),
+        /// A buffer to buffer copy of `len` bytes at `dst` from `src`.
+        Copy(usize, usize, usize),
+        /// A buffer to texture copy from title memory at `at`.
+        Upload(usize, usize),
+        /// A draw or dispatch, which prepares its reads at submission.
+        Draw,
+    }
+
+    /// The parts a list records its `ops` in, by the rule the paucity of
+    /// the code allows: a copy or upload that reads pending read-back rows,
+    /// and any draw after one, starts a new part (title memory there holds
+    /// the bytes from before the read-back until the part has run).
+    fn parts(ops: &[Op]) -> Vec<usize> {
+        let mut parts = vec![0];
+        let mut read_backs: Vec<(usize, usize)> = Vec::new();
+        for op in ops {
+            let cut = match *op {
+                Op::ReadBack(at, len) => {
+                    read_backs.push((at, at + len));
+                    false
+                }
+                Op::Copy(dst, src, len) => overlaps(&read_backs, src, len) || overlaps(&read_backs, dst, len),
+                Op::Upload(at, len) => overlaps(&read_backs, at, len),
+                Op::Draw => !read_backs.is_empty(),
+            };
+            if cut {
+                parts.push(0);
+                read_backs.clear();
+            }
+            *parts.last_mut().expect("a part") += 1;
+        }
+        parts
+    }
+
+    #[test]
+    fn a_read_back_range_covers_its_rows_only() {
+        let rows = [(0x1000, 0x1040)];
+        assert!(overlaps(&rows, 0x1000, 16), "the first row");
+        assert!(overlaps(&rows, 0x1030, 16), "the last row");
+        assert!(overlaps(&rows, 0x1000, 0x40), "the whole range");
+        assert!(overlaps(&rows, 0xff0, 0x20), "overlapping the start");
+        assert!(overlaps(&rows, 0x1020, 0x40), "running past the end");
+        assert!(!overlaps(&rows, 0x1040, 16), "the byte after the range");
+        assert!(!overlaps(&rows, 0xfe0, 0x20), "ending where the range starts");
+        assert!(!overlaps(&rows, 0x2000, 16), "elsewhere");
+        assert!(!overlaps(&[], 0x1000, 16), "no read-backs");
+        // A range that records nothing touches nothing, and one that would
+        // wrap ends at the top of memory.
+        assert!(!overlaps(&[(0x1000, 0x1000)], 0x1000, 16), "an empty read-back range");
+        assert!(overlaps(&[(usize::MAX - 8, usize::MAX)], usize::MAX - 4, 16));
+    }
+
+    #[test]
+    fn a_copy_after_a_read_back_of_its_rows_starts_a_new_part() {
+        // The title reads a texture back into a buffer, then copies that
+        // buffer elsewhere in the same list: the copy's bytes are the
+        // read-back's only once the read-back has run.
+        let ops = [
+            Op::Copy(0x9000, 0x8000, 0x100),
+            Op::ReadBack(0x8000, 0x40),
+            Op::Copy(0xa000, 0x8000, 0x40),
+        ];
+        assert_eq!(parts(&ops), [2, 1], "the copy after the read-back waits for it");
+        // A copy of bytes the read-back did not write stays in the part.
+        let apart = [
+            Op::ReadBack(0x8000, 0x40),
+            Op::Copy(0xa000, 0x8000 + 0x40, 0x40),
+            Op::Copy(0xa000, 0x8000 - 0x40, 0x40),
+        ];
+        assert_eq!(parts(&apart), [3], "a copy beside the read-back rows");
+        // A copy that writes over the read-back's rows reads nothing, but
+        // it overwrites the bytes the read-back lands on: same cut.
+        let over = [Op::ReadBack(0x8000, 0x40), Op::Copy(0x8000, 0x2000, 0x40)];
+        assert_eq!(parts(&over), [1, 1]);
+    }
+
+    #[test]
+    fn a_draw_or_an_upload_after_a_read_back_starts_a_new_part() {
+        // A draw prepares the buffers and textures it reads at submission.
+        let drawn = [
+            Op::ReadBack(0x8000, 0x40),
+            Op::Draw,
+            Op::Draw,
+        ];
+        assert_eq!(parts(&drawn), [1, 2], "both draws wait for the read-back");
+        // The metering targets the title reads back every frame are small
+        // float targets; the world's draws come after them.
+        let upload = [
+            Op::ReadBack(0x8000, 0x10),
+            Op::Upload(0x8000, 0x10),
+            Op::Upload(0x9000, 0x10),
+        ];
+        assert_eq!(parts(&upload), [1, 2], "the upload of the read-back's bytes waits");
+        // Nothing pending, nothing cut: a list of draws is one part.
+        assert_eq!(parts(&[Op::Draw, Op::Draw, Op::Copy(0, 0x1000, 16)]), [3]);
+    }
+
+    #[test]
+    fn a_lists_read_backs_are_checked_quickly() {
+        // Every copy, upload and draw of a list is checked against its
+        // read-backs: the world records a few thousand commands a frame, and
+        // the check must not show up in it.
+        let ranges: Vec<(usize, usize)> = (0..64).map(|i| (0x1000 + i * 0x1000, 0x1000 + i * 0x1000 + 0x40)).collect();
+        let started = std::time::Instant::now();
+        let mut hits = 0u32;
+        for i in 0..4096 {
+            let at = 0x1000 + (i * 37) % 0x40000;
+            hits += u32::from(overlaps(&ranges, at, 16));
+        }
+        let elapsed = started.elapsed();
+        eprintln!("{} checks against {} read-back ranges took {elapsed:?}", 4096, ranges.len());
+        assert!(hits > 0, "the probes reach some of the ranges");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "4096 checks against 64 ranges took {elapsed:?}"
+        );
+    }
+}

@@ -30,6 +30,10 @@ BlueKaiman.
 
 ## Design notes
 
+- **fuzeofficial** ([Marvisak/VIctory #2608](https://github.com/Marvisak/VIctory/pull/2608)), GPL-3.0: the
+  idea of cutting a command list at its texture read-backs and running the part after one in a submission
+  of its own, so a copy or draw recorded behind a read-back is prepared after its bytes are in title
+  memory (`crate::list::cut_read_back`). Reimplemented on the parts a queue already runs.
 - **xcl** ([ivall/xcl](https://github.com/ivall/xcl) and its fork Bathyal), GPL-2.0-only: the
   wave-pairing approach and the NVIDIA wave lane-assignment report used in
   [docs/wave64-on-wave32.md](docs/wave64-on-wave32.md). No code taken.
