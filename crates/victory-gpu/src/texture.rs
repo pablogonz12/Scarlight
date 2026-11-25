@@ -49,6 +49,10 @@ pub(crate) struct Staging {
     /// The resource the staging buffer is of, for the resident mip window
     /// its views are narrowed to ([`note_resident`]).
     resource: This,
+    /// The title released the resource: a list may still hold this staging
+    /// and refresh it, and that must not note a window under an address
+    /// another texture may have been given ([`forget`]).
+    released: std::sync::atomic::AtomicBool,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
     /// uploaded it, and whether one has uploaded it at all: a list records
@@ -59,6 +63,10 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// The frame of its last refresh, `NEVER` if it has had none: what
+    /// `VICTORY_TEXTURE_REFRESH_EVERY` bounds a texture's staleness by
+    /// ([`Staging::due`]).
+    looked: std::sync::atomic::AtomicU64,
     /// Which of the title's contents each copy and each present carries,
     /// and in what order ([`present_order`]).
     present: Present,
@@ -605,6 +613,52 @@ fn unmapped_frames() -> u64 {
     })
 }
 
+/// Frames between two looks at a texture at most (`VICTORY_TEXTURE_REFRESH_EVERY`,
+/// default 1: every frame, as before). A world that renders at a frame a second
+/// spends most of that frame reading title memory for textures: measured on one
+/// title and machine, one frame had 24,821 texture refreshes pulling 24.8 GB of
+/// title memory with none of them skipped, 6,814 ms of the frame's 7,000 ms of
+/// texture work spent waiting for it (Marvisak/VIctory#2478). At 8 the same
+/// frame was 145-522 ms instead of 2,333-6,906 ms. The cost is staleness: a
+/// texture's contents lag by up to this many frames. Asked at each refresh,
+/// so it may be turned live (`crate::switches`).
+fn refresh_every() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let base = *N.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_REFRESH_EVERY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1)
+    });
+    crate::switches::u64v("VICTORY_TEXTURE_REFRESH_EVERY", base)
+}
+
+/// Whether a texture at `address` is looked at in `frame`, `every` frames
+/// apart at most: round-robin by its own address, so the frames share the
+/// work instead of one frame taking all of it. `every` 0 or 1, and every
+/// frame when the switch is unset: each frame, as before. (`address` alone
+/// would put every texture of a heap on the same frame; the address's
+/// 64 KiB are the unit, as their layout is.)
+fn due_at(every: u64, frame: u64, address: usize) -> bool {
+    every <= 1 || frame.wrapping_add((address >> 16) as u64).is_multiple_of(every)
+}
+
+/// No refresh yet ([`Staging::looked`]): older than any frame can be.
+const NEVER: u64 = u64::MAX;
+
+/// Whether a texture at `address` whose last refresh was in `looked` is read
+/// in `frame`, `every` frames apart at most: on its own turn, so the frames
+/// share the reads, and on any frame once it has gone `every` frames without
+/// one, so a texture a title uses only on frames that are not its turn cannot
+/// stay stale for longer than the interval. Never twice in one frame.
+fn due(every: u64, frame: u64, address: usize, looked: u64) -> bool {
+    if every <= 1 || looked == NEVER {
+        return true;
+    }
+    let age = frame.wrapping_sub(looked);
+    (age >= 1 && due_at(every, frame, address)) || age >= every
+}
+
 /// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
 fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     let started = std::time::Instant::now();
@@ -795,6 +849,9 @@ pub(crate) fn host_written(resource: This) {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
         set.get_or_insert_with(Default::default).insert(resource as usize)
     };
+    // The host chain is complete; the window title memory was last found
+    // with is stale and must not clamp the views of it any more (#616).
+    note_resident(resource, (0, 0), true);
     // Diagnostics (run 177): where its title memory is, for placed views
     // the title reads that memory through ([`placed_in_host_written`]).
     if new && let Some((at, desc)) = crate::resource::texture_memory(resource) {
@@ -866,12 +923,22 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&resource);
+    if let Some(map) = map.as_mut()
+        && let Some(staging) = map.remove(&resource)
+    {
+        // A list not yet reset may still hold it and refresh it: that must
+        // not note a window for the released address.
+        staging.released.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
+    }
+    // Its resident window goes too: the address a handle names is given to
+    // other textures, which must not inherit a clamp meant for this one.
+    let mut resident = RESIDENT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = resident.as_mut() {
+        map.remove(&resource);
     }
     // Its memory may be given to other textures now (run 177: most of the
     // "HERO LEAD" lines were views in memory a released texture had held).
@@ -1004,6 +1071,18 @@ impl Staging {
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
         use std::sync::atomic::Ordering::Relaxed;
+        // `VICTORY_TEXTURE_REFRESH_EVERY`: read at most once every n frames
+        // (see [`due`]). Its contents then lag by up to that many frames, and
+        // what was detiled before stays what is uploaded. Only once it has
+        // been uploaded: a texture's first contents always arrive, or it
+        // would show what the staging buffer happened to hold.
+        let frame = crate::frame::current();
+        let every = refresh_every();
+        let looked = self.looked.load(Relaxed);
+        if every > 1 && self.uploaded.load(Relaxed) && !due(every, frame, self.memory as usize, looked) {
+            return;
+        }
+        self.looked.store(frame, Relaxed);
         let started = std::time::Instant::now();
         let read = self.refresh_now();
         let preparing = &crate::host::PREPARING;
@@ -1056,7 +1135,11 @@ impl Staging {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+            // Every scheduled refresh hashes, or with `VICTORY_TEXTURE_REFRESH_EVERY`
+            // the two turns would multiply (7 and 8: a change found 56 frames
+            // late, not 48).
+            let turn = refresh_every() > 1
+                || crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
             last.checked = unwritten && turn;
             // `VICTORY_TEXTURE_GUARD_TRUST=1`: a missed write is not learnt from.
             static TRUST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1099,7 +1182,9 @@ impl Staging {
             // narrowed to it while it lasts (a streamed texture's mips
             // arrive from the smallest, at the start of each slice).
             let window = resident_mips(self.memory, &self.layout);
-            note_resident(self.resource, window, false);
+            if !self.released.load(std::sync::atomic::Ordering::Relaxed) {
+                note_resident(self.resource, window, false);
+            }
             #[cfg(feature = "diagnostics")]
             if window.1 > 0 && window.0 > 0 {
                 crate::copystat::add(crate::copystat::C::ResidentNarrowed, 1);
@@ -1140,7 +1225,9 @@ impl Staging {
             return size;
         }
         // All of it is there: no view of it is narrowed any more.
-        note_resident(self.resource, (0, 0), true);
+        if !self.released.load(std::sync::atomic::Ordering::Relaxed) {
+            note_resident(self.resource, (0, 0), true);
+        }
         if through_copy() {
             // A read through the kernel, which needs no lock.
             drop(_mapped);
@@ -1626,20 +1713,68 @@ fn mapped_prefix(at: *const u8, len: usize) -> u64 {
     there
 }
 
+/// The resident mip window `(first, count)` of each texture, noted at its
+/// last staging refresh ([`note_resident`]) and read when a view of it is
+/// made ([`resident`]): one store, shared by both.
+static RESIDENT: Mutex<Option<HashMap<usize, (u32, u32)>>> = Mutex::new(None);
+
 /// The resident mip window `(first, count)` of a texture a view is made on:
 /// what [`resident_mips`] found at its last upload. `None` while it is all
 /// there (or nothing is known: no staging buffer, no view to narrow).
 pub(crate) fn resident(resource: This) -> Option<(u32, u32)> {
-    static RESIDENT: Mutex<Option<HashMap<usize, (u32, u32)>>> = Mutex::new(None);
     let map = RESIDENT.lock().unwrap_or_else(|e| e.into_inner());
     map.as_ref()?.get(&(resource as usize)).copied()
+}
+
+/// Whether views of a part-resident texture are narrowed to the mips whose
+/// memory is there (`VICTORY_RESIDENT_MIPS`; on unless 0). A streamed
+/// texture's mips that have not arrived read as zeros, and the console
+/// clamps the level of detail to what it holds; the host has no clamp but
+/// the view's own window ([`narrowed`]). idea from JMAN730/victory#672
+/// (jman/cursor/gpu-streamed-mip-view-616-111a).
+pub(crate) fn resident_mips_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Live (crate::switches): asked per view.
+    crate::switches::b(
+        "VICTORY_RESIDENT_MIPS",
+        *ON.get_or_init(|| std::env::var_os("VICTORY_RESIDENT_MIPS").is_none_or(|v| v != "0")),
+    )
+}
+
+/// Whether the host GPU wrote `resource` (a copy or resolve), so its
+/// contents are on the host and title-memory residency says nothing about
+/// what its views may name.
+pub(crate) fn is_host_written(resource: This) -> bool {
+    HOST_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&(resource as usize)))
+}
+
+/// The window a host view of `resource` asking for `asked` should name now:
+/// the title's own range once a host copy filled the chain
+/// ([`is_host_written`]), else the mips that are there ([`narrowed`]).
+pub(crate) fn wanted(
+    asked: (u32, u32),
+    resident: Option<(u32, u32)>,
+    mips: u32,
+    host_written: bool,
+) -> (u32, u32) {
+    let all = (asked.0, if asked.1 == 0 { mips.saturating_sub(asked.0) } else { asked.1 });
+    if host_written {
+        return all;
+    }
+    match resident {
+        Some(window) if window.1 > 0 => narrowed(asked, window, mips),
+        _ => all,
+    }
 }
 
 /// Notes the resident mip window of `resource` (`(0, 0)` when none of its
 /// mips is there): a view of it is narrowed to it while it stands, and
 /// widened when more has arrived.
 pub(crate) fn note_resident(resource: This, window: (u32, u32), whole: bool) {
-    static RESIDENT: Mutex<Option<HashMap<usize, (u32, u32)>>> = Mutex::new(None);
     let mut map = RESIDENT.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if whole {
@@ -1731,10 +1866,12 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         bytes: total,
         memory,
         resource,
+        released: std::sync::atomic::AtomicBool::new(false),
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        looked: std::sync::atomic::AtomicU64::new(NEVER),
         present: Present::default(),
     });
     map.insert(resource as usize, s.clone());
@@ -1925,6 +2062,92 @@ mod guard_tests {
 }
 
 #[cfg(test)]
+mod refresh_every_tests {
+    use super::{NEVER, due, due_at, refresh_every};
+
+    /// Unset, and `0` or `1`, is every frame: nothing changes for anyone who
+    /// does not ask for it, and `0` is the way to ask for it off again.
+    #[test]
+    fn unset_zero_and_one_are_every_frame() {
+        for every in [0, 1] {
+            for frame in 0..8 {
+                for address in [0x10_0000, 0x10_0040, 0x7f_0000_0000] {
+                    assert!(due_at(every, frame, address), "every {every}, frame {frame}, at {address:#x}");
+                }
+            }
+        }
+        if std::env::var_os("VICTORY_TEXTURE_REFRESH_EVERY").is_none() {
+            assert_eq!(refresh_every(), 1, "the switch's default is every frame");
+        }
+    }
+
+    /// A texture a title samples only on frames that are not its turn is
+    /// still read once the interval has passed: staleness is bounded by it,
+    /// and no texture is read twice in one frame.
+    #[test]
+    fn an_off_turn_texture_is_read_once_the_interval_has_passed() {
+        const EVERY: u64 = 8;
+        // Its turn is every eighth frame; a title that samples it on the
+        // frames in between (even frames here) still has it read.
+        let address = 0x11_0000usize;
+        let mut looked = NEVER;
+        let mut reads = Vec::new();
+        for frame in (0..64).step_by(2) {
+            if due(EVERY, frame, address, looked) {
+                reads.push(frame);
+                looked = frame;
+            }
+        }
+        assert_eq!(reads.len(), 64 / EVERY as usize, "one read every {EVERY} frames: {reads:?}");
+        for pair in reads.windows(2) {
+            assert!(pair[1] - pair[0] <= EVERY, "never stale for longer than {EVERY}: {reads:?}");
+        }
+        // Twice in one frame is not a second read, and the frame after it is
+        // off its turn: it waits for the interval.
+        assert!(!due(EVERY, 0, address, 0), "read already in this frame");
+        assert!(!due(EVERY, 1, address, 0), "one frame later, off its turn: no read");
+        // A texture used every frame is read once every n, on its own turn.
+        let mut looked = NEVER;
+        let mut reads = Vec::new();
+        for frame in 0..64 {
+            if due(EVERY, frame, 0x10_0000, looked) {
+                reads.push(frame);
+                looked = frame;
+            }
+        }
+        assert_eq!(reads.len(), 64 / EVERY as usize, "eight reads in 64 frames: {reads:?}");
+        assert!(reads.windows(2).all(|p| p[1] - p[0] == EVERY), "{reads:?}");
+    }
+
+    /// Every n frames at most, and a texture's turns are spread: over any n
+    /// frames each texture is looked at exactly once, and two textures far
+    /// apart in a heap are not looked at in the same frame.
+    #[test]
+    fn textures_take_turns_over_the_frames() {
+        const EVERY: u64 = 8;
+        // 64 KiB apart: one address unit each, so each has its own turn.
+        let addresses = [0x10_0000usize, 0x11_0000, 0x12_0000, 0x13_0000];
+        for &address in &addresses {
+            let turns: Vec<u64> = (0..64).filter(|&f| due_at(EVERY, f, address)).collect();
+            assert_eq!(turns.len(), 64 / EVERY as usize, "{address:#x} is read once every {EVERY} frames");
+            // Not two turns closer than n frames, nor further apart either.
+            for pair in turns.windows(2) {
+                assert_eq!(pair[1] - pair[0], EVERY, "{address:#x}: every {EVERY} frames");
+            }
+            // And the frames differ between textures, 64 KiB apart.
+            let in_window: Vec<u64> = (0..EVERY).filter(|&f| due_at(EVERY, f, address)).collect();
+            assert_eq!(in_window.len(), 1);
+            let others: Vec<u64> = addresses
+                .iter()
+                .filter(|&&a| a != address)
+                .map(|&a| (0..EVERY).find(|&f| due_at(EVERY, f, a)).unwrap())
+                .collect();
+            assert!(others.iter().all(|&f| f != in_window[0]), "{address:#x} shares its frame with another");
+        }
+    }
+}
+
+#[cfg(test)]
 mod present_tests {
     use super::Present;
 
@@ -1976,5 +2199,71 @@ mod present_tests {
         assert_eq!(o.content, 4);
         assert_eq!(o.staged, 4);
         assert!(!o.back);
+    }
+}
+
+#[cfg(test)]
+mod resident_tests {
+    use super::{narrowed, note_resident, resident, wanted};
+
+    /// A view of a part-resident texture names the resident suffix of what
+    /// it asked for, and never a mip that is not there. Hand-built windows
+    /// only: the mip counts are the ones `Layout::mip_extents` yields.
+    #[test]
+    fn the_window_is_clamped_to_the_resident_mips() {
+        // Eight mips asked for, the five smallest (3..8) arrived: those.
+        assert_eq!(narrowed((0, 0), (3, 5), 8), (3, 5));
+        // The whole chain arrived: as the title asked.
+        assert_eq!(narrowed((0, 0), (0, 8), 8), (0, 8));
+        // 0..3 asked for, only 2..6 there: the one mip of both, 2.
+        assert_eq!(narrowed((0, 3), (2, 4), 8), (2, 1));
+        // Nothing it asked for is there: the most detailed resident mip
+        // alone (the smallest mip is the picture, not a window of none).
+        assert_eq!(narrowed((0, 2), (5, 3), 8), (5, 1));
+        // A window reaching past the chain is cut at its end.
+        assert_eq!(narrowed((2, 0), (1, 2), 8), (2, 1));
+        // One level, and that level arrived: unchanged.
+        assert_eq!(narrowed((6, 1), (6, 2), 8), (6, 1));
+    }
+
+    /// One store behind the window: what a refresh notes is what a view of
+    /// it reads back, and clearing it (what a host copy filling the chain
+    /// does) is seen too. Each function used to have its own map, so
+    /// nothing ever read back what was noted.
+    #[test]
+    fn the_noted_window_is_the_one_read_back() {
+        // A handle no other test uses (the store is process-wide).
+        let resource = 0x6720_0011u64 as _;
+        assert_eq!(resident(resource), None, "nothing noted yet");
+        note_resident(resource, (3, 5), false);
+        assert_eq!(resident(resource), Some((3, 5)));
+        // More levels arrived: the window moves.
+        note_resident(resource, (2, 6), false);
+        assert_eq!(resident(resource), Some((2, 6)));
+        // Cleared (what a host copy filling the chain does, #616).
+        note_resident(resource, (0, 0), true);
+        assert_eq!(resident(resource), None);
+        // The title releasing the resource drops its window: the next one at
+        // that address starts unclamped.
+        note_resident(resource, (4, 2), false);
+        super::forget(resource as usize);
+        assert_eq!(resident(resource), None);
+        // And noted again after it: one store, both ways.
+        note_resident(resource, (1, 2), false);
+        assert_eq!(resident(resource), Some((1, 2)));
+        note_resident(resource, (0, 0), true);
+        assert_eq!(resident(resource), None);
+    }
+
+    /// A slot follows the resident suffix while it streams, and the title's
+    /// own range again once a host copy filled its chain (#616).
+    #[test]
+    fn a_host_copy_widens_it_back_to_the_titles_range() {
+        assert_eq!(wanted((0, 0), Some((4, 4)), 8, false), (4, 4));
+        assert_eq!(wanted((0, 0), Some((4, 4)), 8, true), (0, 8));
+        // Nothing known yet: what the title asked for, `0` levels being the
+        // rest of the chain.
+        assert_eq!(wanted((1, 0), None, 8, false), (1, 7));
+        assert_eq!(wanted((0, 3), Some((0, 8)), 8, false), (0, 3));
     }
 }
