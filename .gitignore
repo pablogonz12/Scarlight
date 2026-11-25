@@ -88,3 +88,4 @@ vkd3d-proton.cache*
 # Scratch space for tools and tests (local wine symlinks etc.); never commit
 # local paths or binaries here.
 /tools/tmp/
+__pycache__/
