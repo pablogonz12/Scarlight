@@ -72,13 +72,20 @@ Three steps. Full detail — every option, logs, uninstall, troubleshooting — 
 3. **Choose it for the game.** If the game is not in your library yet, add it first: *Steam → Games →
    Add a Non-Steam Game to My Library → Browse…* and pick its `.exe`. Then *Library → right-click the
    game → Properties → Compatibility →* tick
-   **Force the use of a specific Steam Play compatibility tool** and pick **Scarlight (Xbox Series)**.
+   **Force the use of a specific Steam Play compatibility tool** and pick **Scarlight 11.14.1** (the release you installed).
    Press Play.
 
 Two things a release leaves to you, both one step: if Steam cannot find the Proton Scarlight should run
-on, name yours in `compatibilitytools.d/Scarlight/scarlight.conf` (`PROTON=`); and put your own copy of
-DXC's `dxil.dll` and `dxcompiler.dll` in `Scarlight/files/` (Microsoft's binaries are not redistributed
+on, name yours in `compatibilitytools.d/Scarlight-<version>/scarlight.conf` (`PROTON=`); and put your own copy of
+DXC's `dxil.dll` and `dxcompiler.dll` in `Scarlight-<version>/files/` (Microsoft's binaries are not redistributed
 by a Linux release). [docs/steam.md](docs/steam.md) has both.
+
+## Releases
+
+Releases are on the [Releases page](https://github.com/pablogonz12/Scarlight/releases): a versioned
+tarball named after the Proton it runs on — **Scarlight 11.14.1** runs on GE-Proton11-14.
+[docs/RELEASES.md](docs/RELEASES.md) says what a version number means, how to install one, and how
+often a new one comes.
 
 ## Status
 
@@ -100,6 +107,10 @@ Measured 25 Nov 2026 on one machine: **AMD RX 9070 XT**, Mesa 26.3.1 (RADV), Cac
 No other card and no other game have been tried, so nothing here promises anything about yours.
 
 <!-- progress:start -->
+[![Shader instruction coverage](https://pablogonz12.github.io/Scarlight/progress/shaders.svg)](https://pablogonz12.github.io/Scarlight/progress/)
+
+Counted from the source on every change: which GPU instructions Scarlight can read and translate.
+Live page with history: [pablogonz12.github.io/Scarlight/progress](https://pablogonz12.github.io/Scarlight/progress/).
 Progress in detail — what is measured, how, and where each number comes from: [docs/PROGRESS.md](docs/PROGRESS.md).
 <!-- progress:end -->
 
