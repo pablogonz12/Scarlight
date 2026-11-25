@@ -303,6 +303,13 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 /// Translates a compute container straight to a SPIR-V module (native-path
 /// spike: no DXIL, no dxil-spirv). See [`spirv`] for what it covers.
 pub fn translate_spirv(container: &[u8]) -> Result<Vec<u32>, ShaderError> {
+    Ok(translate_spirv_program(container)?.words)
+}
+
+/// [`translate_spirv`] with the metadata the pipeline needs: the console's
+/// wave size to pin the subgroup to, and the thread-group size the module
+/// declares (see [`spirv::SpirvProgram`]).
+pub fn translate_spirv_program(container: &[u8]) -> Result<spirv::SpirvProgram, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -316,8 +323,7 @@ pub fn translate_spirv(container: &[u8]) -> Result<Vec<u32>, ShaderError> {
         })?;
     let p = crate::spill::build(&native)?;
     let io = io::raise(&p, &native)?;
-    let words = spirv::emit(&native, &p, &io)?;
-    Ok(words)
+    spirv::emit(&native, &p, &io)
 }
 
 /// Emits a program whose earlier stages already ran.

@@ -104,10 +104,19 @@ fn names(words: &[u32]) -> Vec<&'static str> {
 fn module(words: &[u32]) -> Vec<u32> {
     let native = program(words);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let m = spirv::emit(&native, &p, &Io::default()).expect("the program emits");
-    assert_operand_types(&m, &format!("{words:08x?}"));
-    assert_valid(&m, &format!("{words:08x?}"));
-    m
+    program_of(words, false, [64, 1, 1]).words
+}
+
+/// The emitted module with its metadata: `wave64`, thread-group size.
+fn program_of(words: &[u32], wave64: bool, threads: [u32; 3]) -> spirv::SpirvProgram {
+    let mut native = program(words);
+    native.wave64 = wave64;
+    native.io = StageIo::Cs(ComputeIo { rsrc2: 0, threads });
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let prog = spirv::emit(&native, &p, &Io::default()).expect("the program emits");
+    assert_operand_types(&prog.words, &format!("{words:08x?}"));
+    assert_valid(&prog.words, &format!("{words:08x?}"));
+    prog
 }
 
 // ---- reading a module back --------------------------------------------------
@@ -646,4 +655,84 @@ fn the_vector_bit_searches_use_the_glsl_ext() {
             .count();
         assert_eq!(found, 1, "no ext {ext} for VOP1 {op:#05x}: {m:08x?}");
     }
+}
+
+// ---- the console's wave size (subgroup pinning) -----------------------------
+
+const EXECUTION_MODE_OP: u16 = 16;
+const CAPABILITY_OP: u16 = 17;
+const LOCAL_SIZE: u32 = 17;
+
+/// The declared `LocalSize` of the module's entry point.
+fn local_size(m: &[u32]) -> Vec<u32> {
+    instructions(m)
+        .into_iter()
+        .find(|(op, ops)| *op == EXECUTION_MODE_OP && ops.len() == 5 && ops[1] == LOCAL_SIZE)
+        .map(|(_, ops)| ops[2..].to_vec())
+        .expect("an OpExecutionMode LocalSize")
+}
+
+/// The declared capabilities.
+fn capabilities(m: &[u32]) -> Vec<u32> {
+    instructions(m)
+        .into_iter()
+        .filter(|(op, _)| *op == CAPABILITY_OP)
+        .map(|(_, ops)| ops[0])
+        .collect()
+}
+
+/// The module says which console wave it runs, so the pipeline can pin the
+/// subgroup to it: `SpirvProgram::{wave_size, local_size}` travel with the
+/// words, and `LocalSize` is the program's own group size.
+#[test]
+fn the_wave_size_travels_with_the_module() {
+    let words = [v_mov_dpp(1)[0], v_mov_dpp(1)[1], S_ENDPGM];
+    let wave64 = program_of(&words, true, [64, 1, 1]);
+    assert_eq!(wave64.wave_size, 64);
+    assert_eq!(wave64.local_size, [64, 1, 1]);
+    assert_eq!(local_size(&wave64.words), [64, 1, 1]);
+    assert!(wave64.full_subgroups(), "64 threads, one 64-lane subgroup");
+
+    let wave32 = program_of(&words, false, [64, 1, 1]);
+    assert_eq!(wave32.wave_size, 32);
+    assert!(wave32.full_subgroups(), "64 threads, two 32-lane subgroups");
+}
+
+/// Cross-lane code needs the group-non-uniform capabilities, on both wave
+/// sizes: DPP row ops become shuffles inside the console's wave.
+#[test]
+fn a_cross_lane_program_declares_group_non_uniform() {
+    let words = [v_mov_dpp(1)[0], v_mov_dpp(1)[1], S_ENDPGM];
+    for wave64 in [true, false] {
+        let prog = program_of(&words, wave64, [64, 1, 1]);
+        let caps = capabilities(&prog.words);
+        assert!(caps.contains(&61), "GroupNonUniform ({wave64})");
+        assert!(caps.contains(&65), "GroupNonUniformShuffle ({wave64})");
+    }
+    // A program that stays inside its own lane asks for neither.
+    let prog = program_of(&[sop2(0x00, 2, 2, 2), S_ENDPGM], false, [64, 1, 1]);
+    let caps = capabilities(&prog.words);
+    assert!(!caps.contains(&61), "no cross-lane code");
+    assert!(!caps.contains(&65), "no cross-lane code");
+}
+
+/// `REQUIRE_FULL_SUBGROUPS` needs a whole number of subgroups per group: a
+/// 32-thread group run in 64-lane waves cannot have one, and the metadata has
+/// to say so rather than the flag being dropped quietly.
+#[test]
+fn a_group_smaller_than_the_wave_reports_no_full_subgroups() {
+    let prog = program_of(&[S_ENDPGM], true, [32, 1, 1]);
+    assert_eq!(prog.wave_size, 64);
+    assert_eq!(prog.local_size, [32, 1, 1]);
+    assert!(!prog.full_subgroups());
+}
+
+/// DPP row ops (`quad_perm`, `row_shl/shr`, `row_bcast15/31`) read lanes
+/// inside one 16-lane row of the console wave; the follow-up lowers each to
+/// `OpGroupNonUniformShuffle` with `SubgroupLocalInvocationId` as the lane,
+/// now that the subgroup is pinned to the program's wave size.
+#[test]
+#[ignore = "follow-up: DPP row ops -> OpGroupNonUniformShuffle within 16-lane rows"]
+fn dpp_row_ops_become_shuffles_within_16_lane_rows() {
+    todo!()
 }
