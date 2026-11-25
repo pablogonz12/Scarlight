@@ -52,10 +52,16 @@ mod switches;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod shader_meta;
+#[cfg(windows)]
 mod shadow;
 pub mod signature;
+#[cfg(all(windows, test))]
+mod test_device;
 #[cfg(windows)]
 mod texture;
+#[cfg(all(test, windows))]
+mod warptest;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]

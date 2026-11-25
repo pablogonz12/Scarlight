@@ -7,6 +7,7 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
+#[cfg(windows)]
 mod translate;
 
 use std::path::PathBuf;
@@ -123,6 +124,37 @@ enum Command {
     Warmup,
     /// Show the resolved configuration and check it.
     Config,
+    /// Bench the DirectStorage path over the title's own archive files
+    /// (read-only, never written): MB/s, the stage split per request
+    /// (queue, lock, read, inflate, dest) and worker utilisation, through
+    /// the same `execute` a load's requests take. No title, no display, no
+    /// Vulkan (loading.md).
+    #[cfg(feature = "diagnostics")]
+    DstorageBench {
+        /// The archive files to read (the title's `.rpf`s). Never written.
+        files: Vec<PathBuf>,
+        /// `raw` (reads into an address), `page` (reads into 64 KiB
+        /// physical pages, the title's destination form), `zlib` or
+        /// `zpage` (the load's inflate into either).
+        #[arg(long, default_value = "page")]
+        mode: String,
+        /// Workers, as the load's dstorage pool has them.
+        #[arg(long, default_value_t = 16)]
+        workers: usize,
+        /// Seconds of work.
+        #[arg(long, default_value_t = 10.0)]
+        seconds: f64,
+        /// Bytes per request.
+        #[arg(long, default_value_t = 1 << 20)]
+        block: usize,
+        /// MiB of the files to deflate for `--mode zlib` and `zpage`.
+        #[arg(long, default_value_t = 32)]
+        corpus_mb: usize,
+        /// Page destinations a worker rotates through: the load's requests
+        /// land in many pages, not always the same ones.
+        #[arg(long, default_value_t = 4)]
+        tiles: usize,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -190,6 +222,12 @@ fn main() -> Result<()> {
             verbose,
             disasm,
         } => shader::run(paths, verbose || disasm, disasm),
+        // `translate` checks the output with the host's D3D12: Windows only.
+        #[cfg(not(windows))]
+        Command::Translate { .. } => {
+            anyhow::bail!("translate checks shaders against the host's D3D12 and needs Windows")
+        }
+        #[cfg(windows)]
         Command::Translate {
             paths,
             validate,
@@ -219,6 +257,39 @@ fn main() -> Result<()> {
         Command::TitleId { exe } => title_id(&exe),
         Command::Warmup => run::warmup(),
         Command::Config => show_config(),
+        #[cfg(feature = "diagnostics")]
+        Command::DstorageBench {
+            files,
+            mode,
+            workers,
+            seconds,
+            block,
+            corpus_mb,
+            tiles,
+        } => {
+            use victory_hle::dstorage_bench::{Mode, Opts};
+            let mode = match mode.as_str() {
+                "raw" => Mode::Raw,
+                "page" => Mode::Page,
+                "zlib" => Mode::Zlib,
+                "zpage" => Mode::Zpage,
+                other => anyhow::bail!("--mode is raw, page, zlib or zpage, not {other:?}"),
+            };
+            let opts = Opts {
+                files,
+                workers: workers.clamp(1, 256),
+                seconds,
+                block: block.clamp(4096, 16 << 20),
+                mode,
+                corpus_mb,
+                tiles: tiles.clamp(1, 256),
+            };
+            let report = victory_hle::dstorage_bench::run(&opts)
+                .map_err(|e| anyhow::anyhow!(e))
+                .context("the dstorage bench")?;
+            report.print();
+            Ok(())
+        }
     }
 }
 
