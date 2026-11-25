@@ -74,6 +74,11 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   `crates/victory-gpu/src/descriptor/host.rs`, with `widen_due` kept on the hit path). Its section-heap windows
   did not come over: measured under Wine + vkd3d-proton + RADV, a committed section opens and the import under it
   is refused, silently substituting the driver's own memory (`xcl-bin/notes/zero-copy.md` 6).
+- **Marvisak/VIctory [#2721](https://github.com/Marvisak/VIctory/pull/2721)** (0xkn0wh3r3), GPL-3.0: the idea
+  that a frame past a budget says what bound it and why, split into our work around submissions, the GPU,
+  the copy-back and the rest, the largest named (`crates/victory-gpu/src/frame_budget.rs`,
+  `VICTORY_FRAME_BUDGET=0`). Reimplemented on this tree's counters and its own 50 ms budget: its
+  per-command timestamps, memory-trait breakdown and slow-pipeline guard are not taken.
 - **fxceless/victory-fork [PR #1097](https://github.com/fxceless/victory-fork/pull/1097)** (Azemed), GPL-3.0: the
   userspace table of the runtime's placeholder reservations, and the guards' block sets as bits (64 blocks to a
   word), so placeholder memory is no longer asked about the kernel block by block
