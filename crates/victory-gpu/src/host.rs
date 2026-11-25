@@ -6439,9 +6439,6 @@ impl Host {
             &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         ),
     ) -> Option<bool> {
-        // The diagnostic render-target override takes precedence.
-        #[cfg(feature = "diagnostics")]
-        let overlay = overlay.filter(|_| crate::capture::show_spec().is_none());
         let mut overlay = overlay.and_then(|(overlay, state)| {
             let extent = crate::present_compositor::extent(texture, overlay)?;
             Some((overlay, D3D12_RESOURCE_STATES(state as i32), extent))
@@ -6656,10 +6653,20 @@ impl Host {
                 None => self.execute(&[&p.copy]),
             }
             #[cfg(feature = "diagnostics")]
-            if let Some((buffer, footprint)) = capture {
-                #[cfg(test)]
-                inspect(&buffer, &footprint);
-                crate::capture::save_read_back(frame, &buffer, &footprint);
+            match (capture, shot) {
+                (Some((buffer, footprint)), Some(label)) => {
+                    #[cfg(test)]
+                    inspect(&buffer, &footprint);
+                    crate::capture::save_shot(frame, label, &buffer, &footprint);
+                }
+                (Some((buffer, footprint)), None) => {
+                    #[cfg(test)]
+                    inspect(&buffer, &footprint);
+                    crate::capture::save_read_back(frame, &buffer, &footprint);
+                }
+                // Not this frame: the next one reads the same request.
+                (None, Some(label)) => crate::capture::put_back(label),
+                (None, None) => {}
             }
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
             match present_result(status) {
