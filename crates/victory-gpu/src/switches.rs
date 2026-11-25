@@ -24,7 +24,13 @@
 //! - `VICTORY_TEXTURE_IN_PLACE` and `VICTORY_TEXTURE_INPLACE_MAX_MB`
 //!   ([`crate::texture`]) decide how the next refresh reads: in place under
 //!   the remap lock, and up to what size. Both are asked per refresh.
+//! - `VICTORY_TEXTURE_REFRESH_EVERY` ([`crate::texture`]) picks how many
+//!   frames apart a texture is looked at; the next refresh takes the new
+//!   value, and a texture already detiled keeps what it holds until its turn.
 //! - `VICTORY_LATE_WAITS` ([`crate::frame`]) picks how a wait sleeps.
+//! - `VICTORY_SKIP_CLEAN` ([`crate::shadow::skip_clean`]) picks whether a
+//!   copy nothing wrote since it was last brought up to date is left out of
+//!   the submission's refreshes; asked per copy at each flush.
 //! - `VICTORY_RELAY`, `VICTORY_LATE_WAIT`, `VICTORY_ASYNC_WRITEBACK`,
 //!   `VICTORY_QUEUE_WAIT` and `VICTORY_SPLIT_WAITS` change how submissions
 //!   are held and landed, so they are only taken when nothing is in the air
@@ -41,12 +47,13 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 /// The switches that may be changed live, in the order they are logged.
-const NAMES: [&str; 17] = [
+const NAMES: [&str; 19] = [
     "VICTORY_ASYNC_WRITEBACK",
     "VICTORY_TEXTURE_WAIT_US",
     "VICTORY_TEXTURE_IN_PLACE",
     "VICTORY_TEXTURE_INPLACE_MAX_MB",
     "VICTORY_TEXTURE_KEEP",
+    "VICTORY_TEXTURE_REFRESH_EVERY",
     "VICTORY_CARD_BUFFERS",
     "VICTORY_CARD_BUFFERS_MIN_MB",
     "VICTORY_CARD_BUFFERS_MB",
@@ -59,6 +66,7 @@ const NAMES: [&str; 17] = [
     "VICTORY_LATE_WAITS",
     "VICTORY_QUEUE_WAIT",
     "VICTORY_SPLIT_WAITS",
+    "VICTORY_SKIP_CLEAN",
 ];
 
 const N: usize = NAMES.len();

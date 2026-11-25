@@ -21,15 +21,21 @@ JMAN730, julio, KaiserBloo, KoLolX3, lameloball2813-ui, LaunchDoesntCode, LF2000
 localshotgun, lordon1a, Louis Faust, LUIS LARIOS, Luiz Neves, Lyrnc, Manuel Pérez, Maraco91,
 marquezini, Marvis, Matheus, meower, nathanbzrr, Nikita Romanovich, Noname0202, Nostyxx, Ortomanic,
 pablogonz12, Pablo González, Pedro Fortunato, Peter Bonanni, QB, quaternion, r4., raffclar,
-ruvenesh, Saitken91, Sakura-Byte, SkippySteve, swarm, tedin7, TG0000, undeadhuman37, Vanthys,
+ruvenesh, Saitken91, Sakura-Byte, SkippySteve, swarm, tedin7, TG0000, undeadhuman37, uwutaube, Vanthys,
 wrothgaril, Yaekai.
 
 ## Co-authors
 
-BlueKaiman.
+BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shader metadata cache, VIctory #2614).
 
 ## Design notes
 
+- **Marvisak/VIctory [#2478](https://github.com/Marvisak/VIctory/pull/2478)** (HoLa-Lee), GPL-3.0: the idea
+  of reading a texture once every N frames at most, round-robin by the texture's address, its measurements
+  (a frame of world entry at 6,814 ms of texture work, 145-522 ms at 8), and its name for the switch,
+  `VICTORY_TEXTURE_REFRESH_EVERY`. Reimplemented against this tree's refresh path
+  (`crates/victory-gpu/src/texture.rs`), not copied: only textures already uploaded are skipped, and the
+  switch is live (`crates/victory-gpu/src/switches.rs`).
 - **xcl** ([ivall/xcl](https://github.com/ivall/xcl) and its fork Bathyal), GPL-2.0-only: the
   wave-pairing approach and the NVIDIA wave lane-assignment report used in
   [docs/wave64-on-wave32.md](docs/wave64-on-wave32.md). No code taken.
@@ -46,6 +52,30 @@ BlueKaiman.
   GPL-3.0: narrowing a host shader resource view of a streamed texture to the mips whose memory is
   there, and remaking it when more levels arrive or a host copy fills the chain
   (`crates/victory-gpu/src/texture.rs`, `crates/victory-gpu/src/descriptor/host.rs`).
+- **Marvisak/VIctory [#2736](https://github.com/Marvisak/VIctory/pull/2736)** (brainbudt), GPL-3.0: copying
+  tiled textures as runs of whole micro-tile columns (one call per row and depth slice, 4-32 bytes at a
+  time) instead of one closure call per span, its `detile_throughput` benchmark, and its idea of keeping
+  the span walk as the reference (`crates/victory-formats/src/texture.rs`, `VICTORY_TEXTURE_RUNS=0`).
+  Reimplemented on this tree's pattern tables: the depth-pitch overlap check its fast path dropped is
+  kept, and a column-by-column fallback replaces its `unreachable!` for any pattern whose run width is
+  not 4-32 bytes.
+- **Marvisak/VIctory [#2735](https://github.com/Marvisak/VIctory/pull/2735)** (brainbudt), GPL-3.0: resolving a
+  BCPack slot through a 256-slot window table (one bit per transition, ranked inside its 64-bit word) instead
+  of a bucket search and an exact-division reciprocal, its `bcpack_decode_throughput` benchmark, and keeping
+  the range scan as the reference (`crates/victory-formats/src/bcpack.rs`, `VICTORY_BCPACK_WINDOWS=0`). Ported
+  whole, including its BC7 endpoint and index packing in `bc7_pack`.
+
+- **fxceless/victory-fork [PR #905](https://github.com/fxceless/victory-fork/pull/905)** (staronthehorizon,
+  from [PR #814](https://github.com/fxceless/victory-fork/pull/814)), GPL-3.0: the node test's rules that a
+  child that is not there is a miss whatever its box holds, and that an empty or inverted box and any NaN
+  coordinate miss in both node widths, with the reference's own tests
+  (`crates/victory-shader/src/bvh.rs`, `crates/victory-shader/src/emit/intersect.rs`).
+- **Marvisak/VIctory [#2706](https://github.com/Marvisak/VIctory/pull/2706)** (pes7), GPL-3.0: keeping a
+  pipeline library per build in `pipelines/<hash>`, so a rebuild never writes its few new pipelines over a
+  library the build before it warmed, with the newest two kept and only directories that hold a library
+  pruned. Reimplemented against this tree's library, which has no `victory_shader::SOURCE_HASH`: the key is
+  the executable's BLAKE3, the same bytes the shader cache keys its translations on
+  (`crates/victory-gpu/src/shader_cache.rs`), and `VICTORY_LIBRARY_PRUNE=0` keeps every library.
 
 ## Tools
 

@@ -643,21 +643,62 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     true
 }
 
+/// Views a worker keeps for its next page destination: a load sends
+/// thousands of tiny requests, and each new view costs a map, a commit and
+/// an unmap (which flushes every core's TLB, and under Wine is a wineserver
+/// request): 0.2 ms a request when measured, more than the read itself
+/// (perf-ledger.md). A few per thread, since a tile is asked for again.
+struct Cached {
+    /// (section, index of the run's first page, byte in the first page, len).
+    key: (usize, usize, usize, usize),
+    view: View,
+}
+
+const CACHE_SLOTS: usize = 16;
+/// The most bytes one thread keeps mapped between requests.
+const CACHE_BYTES: usize = 4 << 20;
+
+thread_local! {
+    static CACHED: std::cell::RefCell<Vec<Option<Cached>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static NEXT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether a worker keeps its views mapped between requests
+/// (`VICTORY_DSTORAGE_VIEW_CACHE_MB`, 0 for off: the bench's before).
+fn cache_bytes() -> usize {
+    static BYTES: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("VICTORY_DSTORAGE_VIEW_CACHE_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(CACHE_BYTES, |mb| mb << 20)
+    });
+    *BYTES
+}
+
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
 /// until dropped: DirectStorage decodes into it instead of a buffer it
-/// would then copy.
+/// would then copy. The view of a cached window goes back to its worker's
+/// cache instead of being unmapped, so the next request in the same pages
+/// costs no map at all.
 pub(crate) struct PageWindow {
-    view: View,
+    view: Option<View>,
+    key: (usize, usize, usize, usize),
+    /// The cache slot the view goes back to, and whose old view it replaces.
+    slot: usize,
     /// What the view shows, for the write watch ([`PageWindow::drop`]).
     slice: Slice,
     within: usize,
     len: usize,
+    /// Mapped for this window alone: unmapped when it drops.
+    own: bool,
 }
 
 impl PageWindow {
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
         let (within, len) = (self.within, self.len);
-        &mut self.view.bytes()[within..within + len]
+        let view = self.view.as_mut().expect("a window's view until it drops");
+        &mut view.bytes()[within..within + len]
     }
 }
 
@@ -667,6 +708,23 @@ impl Drop for PageWindow {
         // them: tell the write watch, which guards those blocks and cannot
         // see a write through this view.
         PhysicalWrite::end(&self.slice, self.within, self.len);
+        let Some(view) = self.view.take() else {
+            return;
+        };
+        let (key, slot) = (self.key, self.slot);
+        if self.own {
+            drop(view);
+            return;
+        }
+        CACHED.with(|cached| {
+            let mut cached = cached.borrow_mut();
+            if slot >= cached.len() {
+                cached.resize_with(slot + 1, || None);
+            }
+            if let Some(old) = cached[slot].replace(Cached { key, view }) {
+                drop(old);
+            }
+        });
     }
 }
 
@@ -680,15 +738,77 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
-    let view = View::map(slice, *n)?;
-    // Before anything is decoded into it, not after: opening a block a
-    // copy-back job holds stops the job's stale bytes landing on top.
-    PhysicalWrite::begin(slice, offset % PAGE, len);
-    Some(PageWindow {
-        view,
-        slice: slice.clone(),
-        within: offset % PAGE,
+    let within = offset % PAGE;
+    let key = (
+        Arc::as_ptr(&slice.section) as usize,
+        slice.index,
+        within,
         len,
+    );
+    // Before anything is decoded into it, and never after: opening a block a
+    // copy-back job holds stops the job's stale bytes landing on top, and
+    // the end-of-decode report in `Drop` still tells views mapped meanwhile.
+    PhysicalWrite::begin(slice, within, len);
+    let budget = cache_bytes();
+    let hit = CACHED.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        if cached.len() < CACHE_SLOTS {
+            cached.resize_with(CACHE_SLOTS, || None);
+        }
+        let slot = cached
+            .iter()
+            .position(|c| c.as_ref().is_some_and(|c| c.key == key))?;
+        let taken = cached[slot].take()?;
+        Some((slot, taken.view))
+    });
+    if let Some((slot, view)) = hit {
+        return Some(PageWindow {
+            view: Some(view),
+            key,
+            slot,
+            slice: slice.clone(),
+            within,
+            len,
+            own: false,
+        });
+    }
+    let view = View::map(slice, *n)?;
+    // A window longer than the budget (a big tile) is this request's alone:
+    // keeping it would hold that much of the title's memory.
+    if budget == 0 || len > budget {
+        return Some(PageWindow {
+            view: Some(view),
+            key,
+            slot: 0,
+            slice: slice.clone(),
+            within,
+            len,
+            own: true,
+        });
+    }
+    let slot = CACHED.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        if cached.len() < CACHE_SLOTS {
+            cached.resize_with(CACHE_SLOTS, || None);
+        }
+        let held: usize = cached.iter().flatten().map(|c| c.view.len).sum();
+        match cached.iter().position(Option::is_none) {
+            Some(slot) if held + view.len <= budget => slot,
+            _ => NEXT.with(|next| {
+                let slot = next.get() % cached.len().max(1);
+                next.set(slot + 1);
+                slot
+            }),
+        }
+    });
+    Some(PageWindow {
+        view: Some(view),
+        key,
+        slot,
+        slice: slice.clone(),
+        within,
+        len,
+        own: false,
     })
 }
 
