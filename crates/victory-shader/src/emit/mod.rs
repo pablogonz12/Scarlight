@@ -93,6 +93,8 @@ mod own_bits;
 mod rect;
 mod sampler;
 mod shader;
+#[cfg(test)]
+mod spirv_tests;
 pub mod spirv;
 mod threading;
 #[cfg(windows)]

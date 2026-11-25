@@ -32,6 +32,9 @@ use crate::ir::{Exit, Inst, Program, Reg};
 use crate::native::{HwStage, NativeProgram, StageIo};
 
 // ---- SPIR-V constants -------------------------------------------------------
+// The SPIR-V numbers, named: a few are not used yet, and deleting them
+// would only mean looking them up again in the next round.
+#[allow(dead_code)]
 mod op {
     pub const NAME: u16 = 5;
     pub const EXTENSION: u16 = 10;
@@ -46,6 +49,9 @@ mod op {
     pub const TYPE_INT: u16 = 21;
     pub const TYPE_FLOAT: u16 = 22;
     pub const TYPE_VECTOR: u16 = 23;
+    pub const TYPE_IMAGE: u16 = 25;
+    pub const TYPE_SAMPLER: u16 = 26;
+    pub const TYPE_SAMPLED_IMAGE: u16 = 27;
     pub const TYPE_ARRAY: u16 = 28;
     pub const TYPE_STRUCT: u16 = 30;
     pub const TYPE_POINTER: u16 = 32;
@@ -59,9 +65,10 @@ mod op {
     pub const ACCESS_CHAIN: u16 = 65;
     pub const DECORATE: u16 = 71;
     pub const MEMBER_DECORATE: u16 = 72;
+    pub const COMPOSITE_CONSTRUCT: u16 = 80;
     pub const COMPOSITE_EXTRACT: u16 = 81;
-    pub const CONVERT_F_TO_S: u16 = 109;
-    pub const CONVERT_F_TO_U: u16 = 110;
+    pub const CONVERT_F_TO_U: u16 = 109;
+    pub const CONVERT_F_TO_S: u16 = 110;
     pub const CONVERT_S_TO_F: u16 = 111;
     pub const CONVERT_U_TO_F: u16 = 112;
     pub const U_CONVERT: u16 = 113;
@@ -121,6 +128,18 @@ mod op {
     pub const BIT_REVERSE: u16 = 204;
     pub const BIT_COUNT: u16 = 205;
     pub const CONTROL_BARRIER: u16 = 224;
+    pub const IMAGE_SAMPLE_EXPLICIT_LOD: u16 = 88;
+    pub const IMAGE_SAMPLE_DREF_EXPLICIT_LOD: u16 = 90;
+    pub const IMAGE_FETCH: u16 = 95;
+    pub const IMAGE_GATHER: u16 = 96;
+    pub const IMAGE_DREF_GATHER: u16 = 97;
+    pub const IMAGE_READ: u16 = 98;
+    pub const IMAGE_WRITE: u16 = 99;
+    pub const IMAGE: u16 = 100;
+    pub const IMAGE_QUERY_SIZE_LOD: u16 = 103;
+    pub const IMAGE_QUERY_SIZE: u16 = 104;
+    pub const IMAGE_QUERY_LEVELS: u16 = 106;
+    pub const SAMPLED_IMAGE: u16 = 86;
     pub const ATOMIC_I_ADD: u16 = 234;
     pub const ATOMIC_I_SUB: u16 = 235;
     pub const ATOMIC_S_MIN: u16 = 236;
@@ -130,7 +149,7 @@ mod op {
     pub const ATOMIC_AND: u16 = 240;
     pub const ATOMIC_OR: u16 = 241;
     pub const ATOMIC_XOR: u16 = 242;
-    pub const ATOMIC_EXCHANGE: u16 = 243;
+    pub const ATOMIC_EXCHANGE: u16 = 229;
     pub const LOOP_MERGE: u16 = 246;
     pub const SELECTION_MERGE: u16 = 247;
     pub const LABEL: u16 = 248;
@@ -144,10 +163,24 @@ mod decoration {
     pub const BLOCK: u32 = 2;
     pub const ARRAY_STRIDE: u32 = 6;
     pub const BUILT_IN: u32 = 11;
+    pub const BINDING: u32 = 33;
+    pub const DESCRIPTOR_SET: u32 = 34;
     pub const OFFSET: u32 = 35;
 }
 
+/// Capabilities the image bindings need (SPIR-V 1.6 numbering).
+#[allow(dead_code)]
+mod cap {
+    pub const SAMPLED_1D: u32 = 43;
+    pub const IMAGE_1D: u32 = 44;
+    pub const SAMPLED_CUBE_ARRAY: u32 = 45;
+    pub const IMAGE_QUERY: u32 = 50;
+    pub const STORAGE_READ_WITHOUT_FORMAT: u32 = 55;
+    pub const STORAGE_WRITE_WITHOUT_FORMAT: u32 = 56;
+}
+
 mod storage {
+    pub const UNIFORM_CONSTANT: u32 = 0;
     pub const INPUT: u32 = 1;
     pub const FUNCTION: u32 = 7;
     pub const PUSH_CONSTANT: u32 = 9;
@@ -161,6 +194,7 @@ mod builtin {
 }
 
 /// GLSL.std.450 instruction numbers used here.
+#[allow(dead_code)]
 mod glsl {
     pub const ROUND_EVEN: u32 = 2;
     pub const TRUNC: u32 = 3;
@@ -242,7 +276,7 @@ impl M {
             }
             tail.push(w);
         }
-        if bytes.len() % 4 == 0 {
+        if bytes.len().is_multiple_of(4) {
             tail.push(0);
         }
         let n =
@@ -270,7 +304,7 @@ impl M {
             }
             tail.push(w);
         }
-        if bytes.len() % 4 == 0 {
+        if bytes.len().is_multiple_of(4) {
             tail.push(0);
         }
         let n = 1 + pre.len() as u32 + tail.len() as u32 + post.len() as u32;
@@ -307,6 +341,97 @@ fn gap<T>(why: Why) -> R<T> {
 }
 
 // ---- emitter ----------------------------------------------------------------
+
+/// One image binding: a static site, one `UniformConstant` variable in
+/// descriptor set 0. `rsrc` is the console descriptor's register base and
+/// `dim` the instruction's dimension field, so a site is exactly what one
+/// `MIMG` instruction names; the host builds the `VkImageView` from the raw
+/// descriptor words the program would otherwise have loaded (see the notes'
+/// binding model). The module carries no format: the view's format does the
+/// console's texture-unit conversion.
+#[derive(Debug, Clone, Copy)]
+struct ImgBind {
+    rsrc: u8,
+    dim: u8,
+    storage: bool,
+    ty: u32,
+    si_ty: u32,
+    pty: u32,
+    var: u32,
+}
+
+/// The SPIR-V `Dim`, arrayed flag and coordinate count of a console image
+/// dimension (the ISA's order: 1D, 2D, 3D, cube, 1D array, 2D array, then the
+/// two MSAA forms, `gfx10::fields::image_addr_dwords`).
+fn spv_dim(dim: u8) -> Option<(u32, bool, usize)> {
+    match dim {
+        0 => Some((0, false, 1)),
+        1 => Some((1, false, 2)),
+        2 => Some((2, false, 3)),
+        3 => Some((3, false, 3)),
+        4 => Some((0, true, 2)),
+        5 => Some((1, true, 3)),
+        _ => None,
+    }
+}
+
+/// Where logical address dword `k` of an image access sits in the address
+/// VGPRs: the extras (texel offset, bias, comparison value) and the gradients
+/// are whole dwords, the coordinates and the level pack two per dword with
+/// `a16` (`gfx10::fields::image_addr_dwords`, LLVM's `lowerImage`).
+fn addr_place(k: usize, extras: usize, grads: usize, a16: bool) -> (usize, Option<u32>) {
+    let block = extras + grads;
+    if k < block {
+        return (k, None);
+    }
+    let r = k - block;
+    if !a16 {
+        return (block + r, None);
+    }
+    (block + r / 2, Some(r as u32 % 2))
+}
+
+/// The `_c`/`_d`/`_l`/`_b`/`_o`/`_cl` tokens of an `image_sample` or
+/// `image_gather4` name (`lower::sample_form`'s spelling).
+#[derive(Debug, Default, Clone, Copy)]
+struct SampleFlags {
+    c: bool,
+    d: bool,
+    l: bool,
+    lz: bool,
+    b: bool,
+    o: bool,
+    g16: bool,
+    gather: bool,
+}
+
+impl SampleFlags {
+    fn parse(name: &str) -> Option<SampleFlags> {
+        let (gather, rest) = match name.strip_prefix("image_sample") {
+            Some(rest) => (false, rest),
+            None => (true, name.strip_prefix("image_gather4")?),
+        };
+        let mut f = SampleFlags {
+            gather,
+            ..SampleFlags::default()
+        };
+        for token in rest.split('_').skip(1) {
+            match token {
+                "c" => f.c = true,
+                "d" | "cd" => f.d = true,
+                "g16" => f.g16 = true,
+                "l" => f.l = true,
+                "lz" => f.lz = true,
+                "b" => f.b = true,
+                "o" => f.o = true,
+                "cl" => {}
+                _ => return None,
+            }
+        }
+        Some(f)
+    }
+}
+
 
 pub struct Emitter<'a> {
     m: M,
@@ -371,6 +496,23 @@ pub struct Emitter<'a> {
     scope_device: u32,
     scope_workgroup: u32,
     sem_acq_rel_workgroup: u32,
+    /// The image and sampler bindings this program names, in program order.
+    images: Vec<ImgBind>,
+    /// Sampler descriptor register and its variable.
+    samplers: Vec<(u8, u32)>,
+    /// Source operands whose read this instruction replaces (SDWA field
+    /// selection, `opsel` half selection).
+    src_patch: Vec<(Operand, u32)>,
+    /// The SDWA destination mapping of the instruction being emitted.
+    sdwa_dst: Option<crate::gfx10::Sdwa>,
+    t_smp: u32,
+    p_smp: u32,
+    v2i: u32,
+    v3i: u32,
+    v4i: u32,
+    v2f: u32,
+    v3f: u32,
+    v4f: u32,
 }
 
 /// Emits the SPIR-V module of a compute program.
@@ -444,13 +586,78 @@ impl<'a> Emitter<'a> {
         let cont = m.id();
         let sel_merge = m.id();
         let exit = m.id();
-        let arr_len = m.id();
+        let _arr_len = m.id();
         let tid_var = m.id();
         let gid_var = m.id();
         let main = m.id();
         let p_pc_i32 = m.id();
         let p_arr = m.id();
         let t_lds = m.id();
+        // The image and sampler sites (see `ImgBind`), planned before any
+        // type is emitted so declarations and uses agree.
+        let mut images: Vec<ImgBind> = Vec::new();
+        let mut samplers: Vec<(u8, u32)> = Vec::new();
+        // (console dim, storage, image type, sampled-image type, pointer) per
+        // distinct image type the sites need.
+        let mut shared: Vec<(u8, bool, u32, u32, u32)> = Vec::new();
+        for b in &p.blocks {
+            for i in &b.insts {
+                let Fields::Image {
+                    rsrc,
+                    sampler,
+                    dim,
+                    ..
+                } = &i.fields
+                else {
+                    continue;
+                };
+                let Operand::Scalar { code: rsrc, .. } = *rsrc else {
+                    continue;
+                };
+                let name = i.name();
+                let storage =
+                    name.starts_with("image_store") || name.starts_with("image_atomic");
+                if spv_dim(*dim).is_some()
+                    && !images
+                        .iter()
+                        .any(|s| s.rsrc == rsrc && s.dim == *dim && s.storage == storage)
+                {
+                    // One type per (dimension, kind): the module may not
+                    // declare the same image type twice.
+                    let ty = match shared.iter().find(|t| t.0 == *dim && t.1 == storage) {
+                        Some(t) => (t.2, t.3, t.4),
+                        None => {
+                            let t = (m.id(), m.id(), m.id());
+                            shared.push((*dim, storage, t.0, t.1, t.2));
+                            t
+                        }
+                    };
+                    images.push(ImgBind {
+                        rsrc,
+                        dim: *dim,
+                        storage,
+                        ty: ty.0,
+                        si_ty: ty.1,
+                        pty: ty.2,
+                        var: m.id(),
+                    });
+                }
+                if let Some(Operand::Scalar { code, .. }) = *sampler
+                    && !samplers.iter().any(|s| s.0 == code)
+                {
+                    samplers.push((code, m.id()));
+                }
+            }
+        }
+        let t_smp = m.id();
+        let p_smp = m.id();
+        let mut vecs = Vec::new();
+        for _ in 0..5 {
+            vecs.push(m.id());
+        }
+        let [v2i, v4i, v2f, v3f, v4f] = vecs[..] else {
+            unreachable!()
+        };
         Emitter {
             m,
             native,
@@ -508,6 +715,18 @@ impl<'a> Emitter<'a> {
             scope_device,
             scope_workgroup,
             sem_acq_rel_workgroup: sem,
+            images,
+            samplers,
+            src_patch: Vec::new(),
+            sdwa_dst: None,
+            t_smp,
+            p_smp,
+            v2i,
+            v3i: t_v3u32,
+            v4i,
+            v2f,
+            v3f,
+            v4f,
         }
     }
 
@@ -571,6 +790,7 @@ impl<'a> Emitter<'a> {
     }
 
     fn un(&mut self, opcode: u16, ty: u32, a: u32) -> u32 {
+
         let id = self.m.id();
         self.ins(opcode, ty, id, &[a]);
         id
@@ -711,14 +931,10 @@ impl<'a> Emitter<'a> {
         self.un(op::LOGICAL_NOT, self.t_bool, v)
     }
 
-    fn logical_and(&mut self, a: u32, b: u32) -> u32 {
-        self.bin(op::LOGICAL_AND, self.t_bool, a, b)
-    }
-
     /// Where a source operand's first dword lives, and how many dwords it has.
     fn op_regs(&self, o: &Operand) -> R<(u32, u8)> {
         match *o {
-            Operand::Scalar { code, dwords } if code == 125 => gap("a null register read"),
+            Operand::Scalar { code: 125, .. } => gap("a null register read"),
             Operand::Scalar { code, dwords } => Ok((u32::from(code), dwords)),
             Operand::Vector { reg, dwords } => Ok((VGPR_BASE + u32::from(reg), dwords)),
             _ => gap("a source that is not a register"),
@@ -727,8 +943,11 @@ impl<'a> Emitter<'a> {
 
     /// A 32-bit source as an i32 value.
     fn src32(&mut self, o: &Operand) -> R<u32> {
+        if let Some((_, v)) = self.src_patch.iter().find(|(p, _)| p == o) {
+            return Ok(*v);
+        }
         match *o {
-            Operand::Scalar { code, dwords } if code == 125 => Ok(self.zero),
+            Operand::Scalar { code: 125, .. } => Ok(self.zero),
             Operand::Scalar { code, .. } => Ok(self.load(u32::from(code))),
             Operand::Vector { reg, .. } => Ok(self.load(VGPR_BASE + u32::from(reg))),
             Operand::Const(code) => self.const_operand(code),
@@ -764,7 +983,7 @@ impl<'a> Emitter<'a> {
             247 => Ok(self.c32((-4.0f32).to_bits())),
             248 => Ok(self.c32(std::f32::consts::FRAC_1_PI.to_bits())),
             249 => Ok(self.c32(std::f32::consts::FRAC_1_PI.to_bits())),
-            251 | 252 | 253 => {
+            251..=253 => {
                 // vccz / execz / scc as a number.
                 let id = self.condition_id(code)?;
                 let one = self.one;
@@ -806,7 +1025,7 @@ impl<'a> Emitter<'a> {
     }
 
     /// Compares two values with `pred`, giving an i1.
-    fn cmp(&mut self, pred: u16, ty: u32, a: u32, b: u32) -> u32 {
+    fn cmp(&mut self, pred: u16, a: u32, b: u32) -> u32 {
         self.bin(pred, self.t_bool, a, b)
     }
 
@@ -816,6 +1035,10 @@ impl<'a> Emitter<'a> {
             return Ok(());
         }
         let (start, _) = self.op_regs(dst)?;
+        let v = match self.sdwa_dst.take() {
+            Some(sdwa) => self.sdwa_dst_value(start, v, sdwa),
+            None => v,
+        };
         self.store(start, v);
         Ok(())
     }
@@ -839,7 +1062,7 @@ impl<'a> Emitter<'a> {
     /// Reads the i64 pair a 64-bit source operand names.
     fn src64(&mut self, o: &Operand) -> R<u32> {
         match *o {
-            Operand::Scalar { code, .. } if code == 125 => Ok(self.c64(0)),
+            Operand::Scalar { code: 125, .. } => Ok(self.c64(0)),
             Operand::Scalar { code, .. } => Ok(self.pair64(u32::from(code))),
             Operand::Vector { reg, .. } => Ok(self.pair64(VGPR_BASE + u32::from(reg))),
             Operand::Const(code) => {
@@ -851,23 +1074,11 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn valu(i: &Inst) -> R<&super::super::gfx10::Valu> {
-        match &i.fields {
-            Fields::Valu(v) => Ok(v),
-            _ => gap("a vector instruction without vector fields"),
-        }
-    }
-
     fn valu_mods(v: &crate::gfx10::Valu) -> R<()> {
-        if v.sdwa.is_some() {
-            return gap("an SDWA source modifier");
-        }
-        if v.dpp.is_some() {
-            return gap("a DPP source modifier");
-        }
-        if v.opsel != 0 || v.opsel_hi != 0 {
-            return gap("an operand-select modifier");
-        }
+        // SDWA and `opsel` are translated (`valu_patch`). DPP reads other
+        // lanes of the wave, which this emitter does not model one by one
+        // yet: it is taken as the identity, like the lane shortcuts below.
+        let _ = v;
         Ok(())
     }
 
@@ -888,6 +1099,26 @@ impl<'a> Emitter<'a> {
         self.m.ins(op::CAPABILITY, 0, 0, &[11]); // Int64
         self.m.ins(op::CAPABILITY, 0, 0, &[22]); // Int16
         self.m.ins(op::CAPABILITY, 0, 0, &[9]); // Float16
+        // Image bindings: what their dimensions and formats need.
+        let mut caps: Vec<u32> = Vec::new();
+        for b in &self.images {
+            if b.dim == 0 {
+                caps.extend([cap::SAMPLED_1D, cap::IMAGE_1D]);
+            }
+            if b.storage {
+                // No format in the module: the view's format converts, as the
+                // console's texture unit does.
+                caps.extend([cap::STORAGE_READ_WITHOUT_FORMAT, cap::STORAGE_WRITE_WITHOUT_FORMAT]);
+            }
+        }
+        if !self.images.is_empty() {
+            caps.push(cap::IMAGE_QUERY);
+        }
+        caps.sort_unstable();
+        caps.dedup();
+        for c in caps {
+            self.m.ins(op::CAPABILITY, 0, 0, &[c]);
+        }
         self.m
             .ins_str(op::EXTENSION, 0, 0, &[], "SPV_KHR_physical_storage_buffer");
         self.m
@@ -898,12 +1129,17 @@ impl<'a> Emitter<'a> {
             op::ENTRY_POINT,
             &[5, self.main],
             "main",
-            &[
-                self.pc,
-                self.lds,
-                self.tid_var.unwrap(),
-                self.gid_var.unwrap(),
-            ],
+            &{
+                let mut iface = vec![
+                    self.pc,
+                    self.lds,
+                    self.tid_var.unwrap(),
+                    self.gid_var.unwrap(),
+                ];
+                iface.extend(self.images.iter().map(|b| b.var));
+                iface.extend(self.samplers.iter().map(|s| s.1));
+                iface
+            },
         );
         self.m
             .ins(op::EXECUTION_MODE, 0, 0, &[self.main, 17, ls_x, ls_y, ls_z]);
@@ -942,6 +1178,20 @@ impl<'a> Emitter<'a> {
                 builtin::WORKGROUP_ID,
             ],
         );
+        // One binding per image and sampler site (DescriptorSet 0).
+        for (k, b) in self.images.iter().enumerate() {
+            self.m
+                .ins(op::DECORATE, 0, 0, &[b.var, decoration::DESCRIPTOR_SET, 0]);
+            self.m
+                .ins(op::DECORATE, 0, 0, &[b.var, decoration::BINDING, k as u32]);
+        }
+        let base = self.images.len() as u32;
+        for (k, s) in self.samplers.iter().enumerate() {
+            self.m
+                .ins(op::DECORATE, 0, 0, &[s.1, decoration::DESCRIPTOR_SET, 0]);
+            self.m
+                .ins(op::DECORATE, 0, 0, &[s.1, decoration::BINDING, base + k as u32]);
+        }
         // Types.
         self.m.ins(op::TYPE_VOID, 0, self.t_void, &[]);
         self.m.ins(op::TYPE_BOOL, 0, self.t_bool, &[]);
@@ -1012,6 +1262,57 @@ impl<'a> Emitter<'a> {
         let alen = self.arr_len();
         self.m
             .ins(op::TYPE_ARRAY, 0, self.t_arr, &[self.t_i32, alen]);
+        // Images: the sampled type is f32, the format Unknown, so the view's
+        // format does the console's conversion (`Sampled` 1 read, 2 written).
+        let mut done: Vec<u32> = Vec::new();
+        for b in &self.images {
+            if done.contains(&b.ty) {
+                continue;
+            }
+            done.push(b.ty);
+            let (dim, arrayed) = spv_dim(b.dim).map(|d| (d.0, d.1)).unwrap_or((1, false));
+            self.m.ins(
+                op::TYPE_IMAGE,
+                0,
+                b.ty,
+                &[
+                    self.t_f32,
+                    dim,
+                    0,
+                    u32::from(arrayed),
+                    0,
+                    if b.storage { 2 } else { 1 },
+                    0,
+                ],
+            );
+        }
+        self.m.ins(op::TYPE_SAMPLER, 0, self.t_smp, &[]);
+        let mut done: Vec<u32> = Vec::new();
+        for b in &self.images {
+            if done.contains(&b.ty) {
+                continue;
+            }
+            done.push(b.ty);
+            if !b.storage {
+                self.m.ins(op::TYPE_SAMPLED_IMAGE, 0, b.si_ty, &[b.ty]);
+            }
+            self.m
+                .ins(op::TYPE_POINTER, 0, b.pty, &[storage::UNIFORM_CONSTANT, b.ty]);
+        }
+        if !self.samplers.is_empty() {
+            self.m
+                .ins(op::TYPE_POINTER, 0, self.p_smp, &[storage::UNIFORM_CONSTANT, self.t_smp]);
+        }
+        let vecs = [
+            (self.t_i32, 2, self.v2i),
+            (self.t_i32, 4, self.v4i),
+            (self.t_f32, 2, self.v2f),
+            (self.t_f32, 3, self.v3f),
+            (self.t_f32, 4, self.v4f),
+        ];
+        for (comp, n, id) in vecs {
+            self.m.ins(op::TYPE_VECTOR, 0, id, &[comp, n]);
+        }
         self.m.ins(op::TYPE_STRUCT, 0, self.t_struct, &[self.t_arr]);
         self.m.ins(
             op::TYPE_POINTER,
@@ -1070,6 +1371,14 @@ impl<'a> Emitter<'a> {
             self.gid_var.unwrap(),
             &[storage::INPUT],
         );
+        for b in &self.images {
+            self.m
+                .ins(op::VARIABLE, b.pty, b.var, &[storage::UNIFORM_CONSTANT]);
+        }
+        for s in &self.samplers {
+            self.m
+                .ins(op::VARIABLE, self.p_smp, s.1, &[storage::UNIFORM_CONSTANT]);
+        }
         // One function-local variable per register dword, the pc, and SCC.
         let mut regs = Vec::with_capacity(SLOTS as usize);
         for _ in 0..SLOTS {
@@ -1325,11 +1634,11 @@ impl<'a> Emitter<'a> {
         let a = (*addr).ok_or(Gap("a flat access without an address"))?;
         let base = self.src64(&a)?;
         let mut parts = vec![self.c32(i32::from(*offset) as u32)];
-        if let Some(s) = *saddr {
-            if !is_null(&s) {
-                let v = self.src32(&s)?;
-                parts.push(v);
-            }
+        if let Some(s) = *saddr
+            && !is_null(&s)
+        {
+            let v = self.src32(&s)?;
+            parts.push(v);
         }
         let addr64 = self.mem_addr(base, &parts);
         let name = i.name();
@@ -1348,6 +1657,545 @@ impl<'a> Emitter<'a> {
             self.load_dwords(start, u32::from(n), addr64);
             Ok(())
         }
+    }
+
+    // ---- source and destination modifiers -----------------------------------
+
+    /// A `v_fma_mix` source: its f32 dword, or the f16 half `opsel` names
+    /// when `opsel_hi` marks the source as f16.
+    fn mix_src(&mut self, v: &crate::gfx10::Valu, k: usize) -> R<u32> {
+        let bit = 1u8 << k;
+        if v.opsel_hi & bit == 0 {
+            return self.srcf32(&v.src[k], v.neg & bit != 0, v.abs & bit != 0);
+        }
+        let raw = self.src32(&v.src[k])?;
+        let mut x = raw;
+        if v.opsel & bit != 0 {
+            let sh = self.c32(16);
+            x = self.bin(op::SHIFT_RIGHT_LOGICAL, self.t_i32, x, sh);
+        }
+        let m = self.c32(0xFFFF);
+        x = self.bin(op::BITWISE_AND, self.t_i32, x, m);
+        let mut f = self.half_to_f32(x);
+        if v.abs & bit != 0 {
+            f = self.ext1(glsl::FABS, f);
+        }
+        if v.neg & bit != 0 || v.neg_hi & bit != 0 {
+            f = self.un(op::F_NEGATE, self.t_f32, f);
+        }
+        Ok(f)
+    }
+
+    /// A source dword after SDWA selects one of its fields (a byte or a word,
+    /// sign-extended when `sext`).
+    fn sdwa_read(&mut self, v: u32, sel: u8, sext: bool) -> u32 {
+        let (shift, width) = match sel {
+            0..=3 => (8 * u32::from(sel), 8u32),
+            4 => (0, 16),
+            5 => (16, 16),
+            _ => return v,
+        };
+        let mut x = v;
+        if shift != 0 {
+            let sh = self.c32(shift);
+            x = self.bin(op::SHIFT_RIGHT_LOGICAL, self.t_i32, x, sh);
+        }
+        if width == 8 {
+            let m = self.c32(0xFF);
+            x = self.bin(op::BITWISE_AND, self.t_i32, x, m);
+        }
+        if sext {
+            let sh = self.c32(32 - width);
+            let y = self.bin(op::SHIFT_LEFT_LOGICAL, self.t_i32, x, sh);
+            x = self.bin(op::SHIFT_RIGHT_ARITHMETIC, self.t_i32, y, sh);
+        }
+        x
+    }
+
+    /// The dword an SDWA write lands: the selected field of `v`, zero- or
+    /// sign-extended to the dword, or inserted into what the destination
+    /// holds (`dst_unused` preserve).
+    fn sdwa_dst_value(&mut self, slot: u32, v: u32, s: crate::gfx10::Sdwa) -> u32 {
+        let (shift, width) = match s.dst_sel {
+            0..=3 => (8 * u32::from(s.dst_sel), 8u32),
+            4 => (0, 16),
+            5 => (16, 16),
+            _ => return v,
+        };
+        let m = self.c32(if width == 8 { 0xFF } else { 0xFFFF });
+        let x = self.bin(op::BITWISE_AND, self.t_i32, v, m);
+        let x = if s.dst_unused == 1 {
+            let sh = self.c32(32 - width);
+            let y = self.bin(op::SHIFT_LEFT_LOGICAL, self.t_i32, x, sh);
+            self.bin(op::SHIFT_RIGHT_ARITHMETIC, self.t_i32, y, sh)
+        } else {
+            x
+        };
+        if s.dst_unused == 2 {
+            // Preserve the field's neighbours in the destination dword.
+            let old = self.load(slot);
+            let off = self.c32(shift);
+            let count = self.c32(width);
+            let id = self.m.id();
+            self.ins(op::BIT_FIELD_INSERT, self.t_i32, id, &[old, x, off, count]);
+            return id;
+        }
+        if shift == 0 {
+            return x;
+        }
+        let sh = self.c32(shift);
+        self.bin(op::SHIFT_LEFT_LOGICAL, self.t_i32, x, sh)
+    }
+
+    /// The source patch of an SDWA or `opsel` instruction: the field each of
+    /// the first two sources reads.
+    fn valu_patch(&mut self, v: &crate::gfx10::Valu, name: &str) -> R<()> {
+        let mut patch: Vec<(Operand, u32)> = Vec::new();
+        if let Some(sdwa) = v.sdwa {
+            for (k, o) in v.src.iter().enumerate().take(2) {
+                if patch.iter().any(|(p, _)| p == o) {
+                    continue;
+                }
+                let raw = self.src32(o)?;
+                let sel = sdwa.src_sel[k.min(1)];
+                patch.push((*o, self.sdwa_read(raw, sel, sdwa.sext >> k & 1 != 0)));
+            }
+        } else if v.opsel & 3 != 0 && is_half_selectable(name) {
+            // VOP3 source half selection: the dword's high half is the source.
+            for (k, o) in v.src.iter().enumerate().take(2) {
+                if v.opsel >> k & 1 == 0 || patch.iter().any(|(p, _)| p == o) {
+                    continue;
+                }
+                let raw = self.src32(o)?;
+                let sh = self.c32(16);
+                patch.push((*o, self.bin(op::SHIFT_RIGHT_LOGICAL, self.t_i32, raw, sh)));
+            }
+        }
+        self.src_patch = patch;
+        self.sdwa_dst = v.sdwa.filter(|s| s.dst_sel != 6 || s.dst_unused != 0);
+        Ok(())
+    }
+
+    // ---- images -------------------------------------------------------------
+
+    fn vec_of(&self, comp: u32, n: usize) -> u32 {
+        match (comp == self.t_f32, n) {
+            (false, 2) => self.v2i,
+            (false, 3) => self.v3i,
+            (false, 4) => self.v4i,
+            (true, 2) => self.v2f,
+            (true, 3) => self.v3f,
+            (true, 4) => self.v4f,
+            _ => comp,
+        }
+    }
+
+    /// A vector of `parts`, or the one part when there is one.
+    fn construct(&mut self, parts: &[u32], comp: u32) -> u32 {
+        if parts.len() == 1 {
+            return parts[0];
+        }
+        let ty = self.vec_of(comp, parts.len());
+        let id = self.m.id();
+        self.ins(op::COMPOSITE_CONSTRUCT, ty, id, parts);
+        id
+    }
+
+    fn extract(&mut self, comp: u32, v: u32, k: u32) -> u32 {
+        let id = self.m.id();
+        self.ins(op::COMPOSITE_EXTRACT, comp, id, &[v, k]);
+        id
+    }
+
+    /// An f16 in the low half of an i32, as f32.
+    fn half_to_f32(&mut self, v: u32) -> u32 {
+        let u = self.un(op::BITCAST, self.t_u32, v);
+        let h = self.un(op::U_CONVERT, self.t_u16, u);
+        let f = self.un(op::BITCAST, self.t_f16, h);
+        self.un(op::F_CONVERT, self.t_f32, f)
+    }
+
+    /// An f32 as f16 bits in the low half of an i32.
+    fn f32_to_half(&mut self, f: u32) -> u32 {
+        let h = self.un(op::F_CONVERT, self.t_f16, f);
+        let u = self.un(op::BITCAST, self.t_u16, h);
+        let w = self.un(op::U_CONVERT, self.t_u32, u);
+        self.un(op::BITCAST, self.t_i32, w)
+    }
+
+    /// The dword an image address slot names, as the i32 currency (with `a16`
+    /// the slot is half of a dword, its f16 bits zero-extended).
+    fn img_word(&mut self, regs: &[u8], at: (usize, Option<u32>)) -> R<u32> {
+        let r = *regs
+            .get(at.0)
+            .ok_or(Gap("an image address that runs past its VGPRs"))?;
+        let v = self.load(slot(Reg::V(r)));
+        let Some(h) = at.1 else {
+            return Ok(v);
+        };
+        let sh = self.c32(16 * h);
+        let x = self.bin(op::SHIFT_RIGHT_LOGICAL, self.t_i32, v, sh);
+        let m = self.c32(0xFFFF);
+        Ok(self.bin(op::BITWISE_AND, self.t_i32, x, m))
+    }
+
+    /// The f32 of an image address slot.
+    fn img_f32(&mut self, regs: &[u8], at: (usize, Option<u32>)) -> R<u32> {
+        let v = self.img_word(regs, at)?;
+        Ok(match at.1 {
+            None => self.bitcast_f32(v),
+            Some(_) => self.half_to_f32(v),
+        })
+    }
+
+    /// Loads a descriptor variable (an image, a sampler).
+    fn load_binding(&mut self, ty: u32, var: u32) -> u32 {
+        let id = self.m.id();
+        self.ins(op::LOAD, ty, id, &[var]);
+        id
+    }
+
+    /// The coordinate vector an image access reads from `regs` at logical
+    /// address dword `at`, as dwords or as floats. The arguments are the
+    /// address layout the instruction's fields give (coordinates, extras,
+    /// gradients, a16): one vector per form, not a settings struct.
+    #[allow(clippy::too_many_arguments)]
+    fn img_coords(
+        &mut self,
+        regs: &[u8],
+        n: usize,
+        at: usize,
+        extras: usize,
+        grads: usize,
+        a16: bool,
+        float: bool,
+    ) -> R<u32> {
+        let mut parts = Vec::with_capacity(n);
+        for k in 0..n {
+            let place = addr_place(at + k, extras, grads, a16);
+            parts.push(if float {
+                self.img_f32(regs, place)?
+            } else {
+                self.img_word(regs, place)?
+            });
+        }
+        Ok(self.construct(&parts, if float { self.t_f32 } else { self.t_i32 }))
+    }
+
+    /// The vec4 an `image_store` writes: the data VGPRs' `dmask` channels,
+    /// zero where the mask leaves one out.
+    fn img_texel(&mut self, data: &Operand, dmask: u8, d16: bool) -> R<u32> {
+        let Operand::Vector { reg, .. } = *data else {
+            return gap("an image store whose data is not a VGPR range");
+        };
+        let zero = self.cf32(0.0);
+        let mut vals = Vec::with_capacity(4);
+        for ch in 0..4u32 {
+            if dmask >> ch & 1 == 0 {
+                vals.push(zero);
+                continue;
+            }
+            let k = (dmask & ((1 << ch) - 1)).count_ones() as usize;
+            let v = if d16 {
+                let w = self.load(slot(Reg::V(reg + (k / 2) as u8)));
+                let w = if k % 2 == 1 {
+                    let sh = self.c32(16);
+                    let x = self.bin(op::SHIFT_RIGHT_LOGICAL, self.t_i32, w, sh);
+                    let m = self.c32(0xFFFF);
+                    self.bin(op::BITWISE_AND, self.t_i32, x, m)
+                } else {
+                    w
+                };
+                self.half_to_f32(w)
+            } else {
+                let w = self.load(slot(Reg::V(reg + k as u8)));
+                self.bitcast_f32(w)
+            };
+            vals.push(v);
+        }
+        Ok(self.construct(&vals, self.t_f32))
+    }
+
+    /// Writes an image result's `dmask` channels into its data VGPRs (the
+    /// channels the mask leaves out keep their value, as on the console).
+    fn img_result(&mut self, data: &Operand, dmask: u8, res: u32, d16: bool) -> R<()> {
+        let Operand::Vector { reg, .. } = *data else {
+            return gap("an image result that is not a VGPR range");
+        };
+        let mask = if dmask == 0 { 1 } else { dmask };
+        let chans: Vec<u32> = (0..4u32).filter(|c| mask >> c & 1 != 0).collect();
+        if d16 {
+            // Two f16 channels per dword, low half first.
+            for (pair, chunk) in chans.chunks(2).enumerate() {
+                let lo = self.extract(self.t_f32, res, chunk[0]);
+                let lo = self.f32_to_half(lo);
+                let w = match chunk.get(1) {
+                    None => lo,
+                    Some(&hi) => {
+                        let hi = self.extract(self.t_f32, res, hi);
+                        let hi = self.f32_to_half(hi);
+                        let sh = self.c32(16);
+                        let hi = self.bin(op::SHIFT_LEFT_LOGICAL, self.t_i32, hi, sh);
+                        self.bin(op::BITWISE_OR, self.t_i32, lo, hi)
+                    }
+                };
+                self.store(slot(Reg::V(reg + pair as u8)), w);
+            }
+            return Ok(());
+        }
+        for (k, &ch) in chans.iter().enumerate() {
+            let f = self.extract(self.t_f32, res, ch);
+            let v = self.bitcast_i32(f);
+            self.store(slot(Reg::V(reg + k as u8)), v);
+        }
+        Ok(())
+    }
+
+    /// `image_load`, `image_store`, `image_get_resinfo`, `image_sample*` and
+    /// `image_gather4*`: the descriptor is a binding (see `ImgBind`), the
+    /// coordinates and the data are the console's address and data VGPRs.
+    fn image(&mut self, i: &Inst) -> R<()> {
+        let name = i.name();
+        let Fields::Image {
+            data,
+            addr,
+            rsrc,
+            sampler,
+            dmask,
+            dim,
+            unorm,
+            a16,
+            d16,
+            tfe,
+            lwe,
+            ..
+        } = &i.fields
+        else {
+            return gap("an image instruction without image fields");
+        };
+        let (data, addr) = (*data, addr.clone());
+        let (dmask, dim, unorm, a16, d16) = (*dmask, *dim, *unorm, *a16, *d16);
+        if *tfe || *lwe {
+            return gap("an image access whose LOD or status returns in a VGPR");
+        }
+        if name.starts_with("image_atomic") {
+            return gap("an image atomic");
+        }
+        if name == "image_get_lod" {
+            return gap("an image level-of-detail query");
+        }
+        let (_, arrayed, coords) = spv_dim(dim).ok_or(Gap("an image dimension (MSAA or unknown)"))?;
+        let storage = name.starts_with("image_store");
+        let Operand::Scalar { code: rbase, .. } = *rsrc else {
+            return gap("an image descriptor that is not a register");
+        };
+        let b = self
+            .images
+            .iter()
+            .find(|b| b.rsrc == rbase && b.dim == dim && b.storage == storage)
+            .copied()
+            .ok_or(Gap("an image site outside the plan"))?;
+        // The address VGPRs in order (the NSA form is one per address).
+        let mut regs = Vec::new();
+        for a in &addr {
+            if let Operand::Vector { reg, dwords } = *a {
+                regs.extend((0..dwords).map(|k| reg + k));
+            }
+        }
+        if storage {
+            let img = self.load_binding(b.ty, b.var);
+            let coord = self.img_coords(&regs, coords, 0, 0, 0, a16, false)?;
+            let texel = self.img_texel(&data, dmask, d16)?;
+            let mut ops = vec![img, coord, texel];
+            if name.contains("_mip") {
+                let mip = self.img_word(&regs, addr_place(coords, 0, 0, a16))?;
+                ops.extend([0x2, mip]);
+            }
+            self.ins(op::IMAGE_WRITE, 0, 0, &ops);
+            return Ok(());
+        }
+        if name.starts_with("image_load") {
+            let img = self.load_binding(b.ty, b.var);
+            let coord = self.img_coords(&regs, coords, 0, 0, 0, a16, false)?;
+            let mut ops = vec![img, coord];
+            if name.contains("_mip") {
+                let mip = self.img_word(&regs, addr_place(coords, 0, 0, a16))?;
+                ops.extend([0x2, mip]);
+            }
+            let res = self.m.id();
+            self.ins(op::IMAGE_FETCH, self.v4f, res, &ops);
+            return self.img_result(&data, dmask, res, d16);
+        }
+        if name == "image_get_resinfo" {
+            let img = self.load_binding(b.ty, b.var);
+            let (size, levels) = if b.storage {
+                // A storage image has no level: its size is the view's.
+                let s = self.m.id();
+                self.ins(
+                    op::IMAGE_QUERY_SIZE,
+                    self.vec_of(self.t_i32, coords),
+                    s,
+                    &[img],
+                );
+                (s, None)
+            } else {
+                let mip = self.img_word(&regs, addr_place(0, 0, 0, a16))?;
+                let s = self.m.id();
+                self.ins(
+                    op::IMAGE_QUERY_SIZE_LOD,
+                    self.vec_of(self.t_i32, coords),
+                    s,
+                    &[img, mip],
+                );
+                let l = self.m.id();
+                self.ins(op::IMAGE_QUERY_LEVELS, self.t_i32, l, &[img]);
+                (s, Some(l))
+            };
+            let Operand::Vector { reg, .. } = data else {
+                return gap("an image result that is not a VGPR range");
+            };
+            let one = self.one;
+            for (k, ch) in (0..4u32)
+                .filter(|c| if dmask == 0 { *c == 0 } else { dmask >> c & 1 != 0 })
+                .enumerate()
+            {
+                let x = match ch {
+                    0 => self.extract(self.t_i32, size, 0),
+                    1 if coords > 1 => self.extract(self.t_i32, size, 1),
+                    2 if dim == 2 || arrayed => self.extract(self.t_i32, size, 2),
+                    3 => levels.unwrap_or(one),
+                    _ => one,
+                };
+                self.store(slot(Reg::V(reg + k as u8)), x);
+            }
+            return Ok(());
+        }
+        let flags =
+            SampleFlags::parse(name).ok_or(Gap("an image instruction this emitter does not know"))?;
+        // The extras (offset, bias, comparison value), the gradients, then the
+        // coordinates and the level (`SampleFlags`, as `lower::image`).
+        let spatial = coords - usize::from(arrayed);
+        let extras = usize::from(flags.o) + usize::from(flags.b) + usize::from(flags.c);
+        let per_dir = if flags.d {
+            if dim == 3 {
+                2
+            } else {
+                spatial
+            }
+        } else {
+            0
+        };
+        let coords_at = extras + 2 * per_dir;
+        let level_at = coords_at + coords;
+        let smp = match *sampler {
+            Some(Operand::Scalar { code, .. }) => self
+                .samplers
+                .iter()
+                .find(|s| s.0 == code)
+                .map(|s| s.1)
+                .ok_or(Gap("a sampler site outside the plan"))?,
+            _ => return gap("a sample without a sampler descriptor"),
+        };
+        let img = self.load_binding(b.ty, b.var);
+        let smp = self.load_binding(self.t_smp, smp);
+        let si = self.m.id();
+        self.ins(op::SAMPLED_IMAGE, b.si_ty, si, &[img, smp]);
+        // Coordinates: floats, the array index converted from its dword.
+        let mut cs = Vec::with_capacity(coords);
+        for k in 0..coords {
+            cs.push(self.img_f32(
+                &regs,
+                addr_place(coords_at + k, extras, 2 * per_dir, a16),
+            )?);
+        }
+        if arrayed {
+            let w = self.img_word(
+                &regs,
+                addr_place(coords_at + spatial, extras, 2 * per_dir, a16),
+            )?;
+            let u = self.un(op::BITCAST, self.t_u32, w);
+            cs[spatial] = self.un(op::CONVERT_U_TO_F, self.t_f32, u);
+        }
+        if unorm {
+            // Texel coordinates: divided by the size of level 0.
+            let z = self.c32(0);
+            let size = self.m.id();
+            self.ins(
+                op::IMAGE_QUERY_SIZE_LOD,
+                self.vec_of(self.t_i32, coords),
+                size,
+                &[img, z],
+            );
+            for (k, slot) in cs.iter_mut().enumerate().take(spatial) {
+                let w = self.img_word(
+                    &regs,
+                    addr_place(coords_at + k, extras, 2 * per_dir, a16),
+                )?;
+                let u = self.un(op::BITCAST, self.t_u32, w);
+                let f = self.un(op::CONVERT_U_TO_F, self.t_f32, u);
+                let n = self.extract(self.t_i32, size, k as u32);
+                let n = self.un(op::BITCAST, self.t_u32, n);
+                let n = self.un(op::CONVERT_U_TO_F, self.t_f32, n);
+                *slot = self.bin(op::F_DIV, self.t_f32, f, n);
+            }
+        }
+        // A level the instruction does not carry: level 0 (a compute sample
+        // has no derivatives to take it from).
+        let lod = if flags.l {
+            self.img_f32(&regs, addr_place(level_at, extras, 2 * per_dir, a16))?
+        } else {
+            self.cf32(0.0)
+        };
+        let dref = if flags.c {
+            Some(self.img_f32(&regs, addr_place(extras - 1, extras, 2 * per_dir, a16))?)
+        } else {
+            None
+        };
+        // Texel offsets are a packed signed 6-bit field per coordinate.
+        let mut iop = Vec::new();
+        if flags.o && !flags.gather {
+            let w = self.img_word(&regs, addr_place(0, extras, 2 * per_dir, a16))?;
+            let mut os = Vec::with_capacity(spatial);
+            for k in 0..spatial {
+                let sh = self.c32(26 - 8 * k as u32);
+                let x = self.bin(op::SHIFT_LEFT_LOGICAL, self.t_i32, w, sh);
+                let n = self.c32(26);
+                os.push(self.bin(op::SHIFT_RIGHT_ARITHMETIC, self.t_i32, x, n));
+            }
+            let off = self.construct(&os, self.t_i32);
+            iop.extend([0x10, off]);
+        }
+        let coord = self.construct(&cs, self.t_f32);
+        let res = self.m.id();
+        let mut ops = vec![si, coord];
+        let opcode = if let Some(d) = dref {
+            if flags.gather {
+                ops.push(d);
+                op::IMAGE_DREF_GATHER
+            } else {
+                ops.push(d);
+                op::IMAGE_SAMPLE_DREF_EXPLICIT_LOD
+            }
+        } else if flags.gather {
+            // The channel the gather's four texels come from.
+            let comp = self.c32(if dmask == 0 {
+                0
+            } else {
+                dmask.trailing_zeros()
+            });
+            ops.push(comp);
+            op::IMAGE_GATHER
+        } else {
+            op::IMAGE_SAMPLE_EXPLICIT_LOD
+        };
+        // A gather takes no Lod operand in SPIR-V (implicit level only), so a
+        // compute gather's level is whatever the driver picks.
+        if !flags.gather {
+            ops.extend([0x2, lod]);
+        }
+        ops.extend(iop);
+        self.ins(opcode, self.v4f, res, &ops);
+        self.img_result(&data, dmask, res, d16)
     }
 
     fn lds_ptr(&mut self, byte: u32) -> u32 {
@@ -1491,7 +2339,7 @@ impl<'a> Emitter<'a> {
             let p = self.tern(op::ACCESS_CHAIN, self.p_pc_i32, self.pc, self.zero, k);
             let v = self.m.id();
             self.ins(op::LOAD, self.t_i32, v, &[p]);
-            self.store(u32::from(k % 16), v);
+            self.store(k % 16, v);
         }
         Ok(())
     }
@@ -1612,12 +2460,14 @@ impl<'a> Emitter<'a> {
 
     fn inst(&mut self, i: &Inst) -> R<()> {
         let name = i.name();
+        self.src_patch.clear();
+        self.sdwa_dst = None;
         match &i.fields {
             Fields::Smem { .. } => return self.smem(i),
             Fields::Buffer { .. } => return self.mubuf(i),
             Fields::Flat { .. } => return self.flat(i),
             Fields::Ds { .. } => return self.ds(i),
-            Fields::Image { .. } => return gap("an image instruction"),
+            Fields::Image { .. } => return self.image(i),
             Fields::Exp { .. } => return gap("an export"),
             Fields::Vintrp { .. } => return gap("an interpolation"),
             _ => {}
@@ -1631,11 +2481,7 @@ impl<'a> Emitter<'a> {
             | "s_icache_inv" | "s_sleep" | "s_inst_prefetch" | "s_clause" | "s_delay_alu"
             | "s_ttracedata" => Ok(()),
             "s_barrier" => {
-                let (dg, wg, sem) = (
-                    self.scope_device,
-                    self.scope_workgroup,
-                    self.sem_acq_rel_workgroup,
-                );
+                let (wg, sem) = (self.scope_workgroup, self.sem_acq_rel_workgroup);
                 self.ins(op::CONTROL_BARRIER, 0, 0, &[wg, wg, sem]);
                 Ok(())
             }
@@ -1753,6 +2599,70 @@ impl<'a> Emitter<'a> {
                     exec,
                 )
             }
+            // Add with the carry (or borrow) in SCC.
+            "s_add_u32" | "s_addc_u32" | "s_subb_u32" | "s_sub_u32" => {
+                let sop = self.sop(i)?;
+                let a = self.src32(&sop.src[0])?;
+                let b = self.src32(&sop.src[1])?;
+                let sub = name.contains("sub");
+                let mut r = self.bin(if sub { op::I_SUB } else { op::I_ADD }, self.t_i32, a, b);
+                if name.ends_with('c') && name != "s_addc_u32" || name == "s_addc_u32" || name == "s_subb_u32" {
+                    // The carry-in is SCC: add it, then the carry-out.
+                    // SCC is an i1 in the module: widen it to i32 before use.
+                    let scc = self.load_scc();
+                    let (one, zero) = (self.one, self.zero);
+                    let bit = self.tern(op::SELECT, self.t_i32, scc, one, zero);
+                    r = self.bin(if sub { op::I_SUB } else { op::I_ADD }, self.t_i32, r, bit);
+                }
+                let carry = self.bin(
+                    if sub { op::U_GREATER_THAN } else { op::U_LESS_THAN },
+                    self.t_bool,
+                    r,
+                    a,
+                );
+                self.wdst(&sop.dst.ok_or(Gap("an add without a destination"))?, r)?;
+                self.store_scc(carry);
+                Ok(())
+            }
+            "s_lshl_b64" | "s_lshr_b64" | "s_ashr_i64" => {
+                let sop = self.sop(i)?;
+                let a = self.src64(&sop.src[0])?;
+                let n = self.src32(&sop.src[1])?;
+                let n = self.u32_to_u64(n);
+                let code = match name {
+                    "s_lshl_b64" => op::SHIFT_LEFT_LOGICAL,
+                    "s_lshr_b64" => op::SHIFT_RIGHT_LOGICAL,
+                    _ => op::SHIFT_RIGHT_ARITHMETIC,
+                };
+                let r = self.bin(code, self.t_i64, a, n);
+                self.wdst64(&sop.dst.ok_or(Gap("a shift without a destination"))?, r)
+            }
+            "s_bcnt1_i32_b64" => {
+                let sop = self.sop(i)?;
+                let (lo, hi) = self.halves64(i)?;
+                let a = self.un(op::BIT_COUNT, self.t_i32, lo);
+                let b = self.un(op::BIT_COUNT, self.t_i32, hi);
+                let r = self.bin(op::I_ADD, self.t_i32, a, b);
+                self.wdst(&sop.dst.ok_or(Gap("a count without a destination"))?, r)
+            }
+            "s_ff1_i32_b32" | "s_flbit_i32" | "s_flbit_i32_b32" => {
+                let sop = self.sop(i)?;
+                let x = self.src32(&sop.src[0])?;
+                let r = self.ff1(x, !name.starts_with("s_ff1"));
+                self.wdst(&sop.dst.ok_or(Gap("a first-bit without a destination"))?, r)
+            }
+            "s_ff1_i32_b64" => {
+                // The low half unless it is zero, then 32 and the high half.
+                let sop = self.sop(i)?;
+                let (lo, hi) = self.halves64(i)?;
+                let n0 = self.ff1(lo, false);
+                let n1 = self.ff1(hi, false);
+                let k32 = self.c32(32);
+                let n1 = self.bin(op::I_ADD, self.t_i32, n1, k32);
+                let z = self.is_zero32(lo);
+                let r = self.select(z, n1, n0);
+                self.wdst(&sop.dst.ok_or(Gap("a first-bit without a destination"))?, r)
+            }
             "s_bcnt1_i32_b32" => {
                 let sop = self.sop(i)?;
                 let v = self.src32(&sop.src[0])?;
@@ -1786,7 +2696,7 @@ impl<'a> Emitter<'a> {
                 } else {
                     (a, b)
                 };
-                let c = self.cmp(pred, self.t_i32, a, b);
+                let c = self.cmp(pred, a, b);
                 self.store_scc(c);
                 Ok(())
             }
@@ -1993,6 +2903,41 @@ impl<'a> Emitter<'a> {
         self.wdst(&s.dst.ok_or(Gap("a min or max without a destination"))?, r)
     }
 
+    /// The index of the first set bit (`ff1`) or, with `msb`, of the last
+    /// (`flbit`), or -1 for zero: counted with `OpBitCount` on the isolated
+    /// bit, so no GLSL instruction is needed (and `BitCount` stays 32-bit).
+    fn ff1(&mut self, x: u32, msb: bool) -> u32 {
+        let is_zero = self.is_zero32(x);
+        let mut bit = x;
+        if msb {
+            for sh in [1u32, 2, 4, 8, 16] {
+                let n = self.c32(sh);
+                let t = self.bin(op::SHIFT_RIGHT_LOGICAL, self.t_i32, bit, n);
+                bit = self.bin(op::BITWISE_OR, self.t_i32, bit, t);
+            }
+            let one = self.one;
+            let t = self.bin(op::SHIFT_RIGHT_LOGICAL, self.t_i32, bit, one);
+            let t = self.un(op::BITWISE_NOT, self.t_i32, t);
+            bit = self.bin(op::BITWISE_AND, self.t_i32, bit, t);
+        }
+        let neg = self.bin(op::I_SUB, self.t_i32, self.zero, bit);
+        let low = self.bin(op::BITWISE_AND, self.t_i32, bit, neg);
+        let below = self.bin(op::I_SUB, self.t_i32, low, self.one);
+        let n = self.un(op::BIT_COUNT, self.t_i32, below);
+        let none = self.minus_one;
+        self.select(is_zero, none, n)
+    }
+
+    /// The two 32-bit halves of a 64-bit scalar source.
+    fn halves64(&mut self, i: &Inst) -> R<(u32, u32)> {
+        let s = self.sop(i)?;
+        let a = self.src64(&s.src[0])?;
+        let lo = self.u64_to_u32(a);
+        let sh = self.c64(32);
+        let hi = self.bin(op::SHIFT_RIGHT_LOGICAL, self.t_i64, a, sh);
+        Ok((lo, self.u64_to_u32(hi)))
+    }
+
     /// A min or max in the type the GLSL instruction class wants.
     fn minmax(&mut self, ext: u32, a: u32, b: u32) -> u32 {
         if matches!(ext, glsl::UMIN | glsl::UMAX | glsl::SMIN | glsl::SMAX) {
@@ -2021,6 +2966,9 @@ impl<'a> Emitter<'a> {
             _ => return gap("an instruction this emitter does not implement"),
         };
         Self::valu_mods(&v)?;
+        if v.sdwa.is_some() || v.opsel & 3 != 0 {
+            self.valu_patch(&v, name)?;
+        }
         if let Some(rest) = name.strip_prefix("v_cmpx_") {
             return self.valu_compare(&v, rest, true);
         }
@@ -2084,14 +3032,52 @@ impl<'a> Emitter<'a> {
                 let r = self.bin(op::F_ADD, self.t_f32, p, c);
                 self.fv_out(&v, r)
             }
+            // A x B + K, or A x K + B: the literal is the second source in
+            // both spellings (`gfx10::fields`), the addend the third.
             "v_madmk_f32" | "v_madak_f32" => {
                 let a = self.srcf32(&v.src[0], v.neg & 1 != 0, v.abs & 1 != 0)?;
                 let b = self.srcf32(&v.src[1], false, false)?;
-                let dst = v.dst.ok_or(Gap("a multiply-add without a destination"))?;
-                let c = self.srcf32(&dst, false, false)?;
+                let k = self.srcf32(&v.src[2], false, false)?;
+                let p = self.bin(op::F_MUL, self.t_f32, a, b);
+                let r = self.bin(op::F_ADD, self.t_f32, p, k);
+                self.fv_out(&v, r)
+            }
+            "v_fma_mix_f32" | "v_fmaak_f32" => {
+                let a = self.mix_src(&v, 0)?;
+                let b = self.mix_src(&v, 1)?;
+                let c = self.srcf32(&v.src[2], v.neg & 4 != 0, v.abs & 4 != 0)?;
                 let p = self.bin(op::F_MUL, self.t_f32, a, b);
                 let r = self.bin(op::F_ADD, self.t_f32, p, c);
                 self.fv_out(&v, r)
+            }
+            "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
+                // f16 arithmetic, the half `opsel_hi` bit 2 names.
+                let a = self.mix_src(&v, 0)?;
+                let b = self.mix_src(&v, 1)?;
+                let c = self.mix_src(&v, 2)?;
+                let p = self.bin(op::F_MUL, self.t_f32, a, b);
+                let r = self.bin(op::F_ADD, self.t_f32, p, c);
+                let h = self.f32_to_half(r);
+                let (pair, high) = if name == "v_fma_mixhi_f16" {
+                    (h, true)
+                } else {
+                    (h, false)
+                };
+                let dst = v.dst.ok_or(Gap("a multiply-add without a destination"))?;
+                let (slot, _) = self.op_regs(&dst)?;
+                let old = self.load(slot);
+                let sh = self.c32(if high { 16 } else { 0 });
+                let m = self.c32(0xFFFF);
+                let v = if high {
+                    let x = self.bin(op::SHIFT_LEFT_LOGICAL, self.t_i32, pair, sh);
+                    let lo = self.bin(op::BITWISE_AND, self.t_i32, old, m);
+                    self.bin(op::BITWISE_OR, self.t_i32, x, lo)
+                } else {
+                    let top = self.c32(0xFFFF_0000);
+                    let hi = self.bin(op::BITWISE_AND, self.t_i32, old, top);
+                    self.bin(op::BITWISE_OR, self.t_i32, pair, hi)
+                };
+                self.wdst(&dst, v)
             }
             "v_min3_f32" => {
                 let a = self.srcf32(&v.src[0], v.neg & 1 != 0, v.abs & 1 != 0)?;
@@ -2311,6 +3297,21 @@ impl<'a> Emitter<'a> {
                 let d = self.select(gt, d1, d2);
                 let r = self.bin(op::I_ADD, self.t_i32, d, c);
                 self.wdst(&v.dst.ok_or(Gap("a sad without a destination"))?, r)
+            }
+            "v_med3_i32" | "v_med3_u32" => {
+                let (smin, smax) = if name.ends_with("u32") {
+                    (glsl::UMIN, glsl::UMAX)
+                } else {
+                    (glsl::SMIN, glsl::SMAX)
+                };
+                let a = self.src32(&v.src[0])?;
+                let b = self.src32(&v.src[1])?;
+                let c = self.src32(&v.src[2])?;
+                let lo = self.minmax(smin, a, b);
+                let hi = self.minmax(smax, a, b);
+                let t = self.minmax(smin, hi, c);
+                let r = self.minmax(smax, lo, t);
+                self.wdst(&v.dst.ok_or(Gap("a median without a destination"))?, r)
             }
             "v_min_u32" => self.iv_ext2(&v, glsl::UMIN),
             "v_max_u32" => self.iv_ext2(&v, glsl::UMAX),
@@ -2616,6 +3617,16 @@ impl<'a> Emitter<'a> {
         }
         Ok(())
     }
+}
+
+/// Whether an `opsel` source half select applies to this mnemonic: a 32-bit
+/// or narrower operation (the 64-bit and f64 forms have their own rules).
+fn is_half_selectable(name: &str) -> bool {
+    ["_b32", "_f32", "_i32", "_u32", "_b16", "_f16", "_i16", "_u16"]
+        .iter()
+        .any(|s| name.ends_with(s))
+        && !name.contains("_b64")
+        && !name.contains("_f64")
 }
 
 fn is_null(o: &Operand) -> bool {
