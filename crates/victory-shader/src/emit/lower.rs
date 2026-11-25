@@ -10535,6 +10535,8 @@ impl<'a> Lower<'a> {
                 Some(index) if used.is_some_and(|u| u.stride == 1) => {
                     self.s.m.bin(c, Bin::Add, index, off)
                 }
+                // A zero bound stride: `index * 0`, the byte at `off`.
+                Some(_) if used.is_some_and(|u| u.stride == 0) => off,
                 Some(_) => return Err("a byte or 16-bit buffer access by index"),
             };
             let h = self.handle(site, src, false, (11 | u, 0))?;
@@ -10620,6 +10622,12 @@ impl<'a> Lower<'a> {
                 Some(index) if used.is_some_and(|u| u.stride == 1) => {
                     let byte = self.s.m.bin(c, Bin::Add, index, off);
                     (self.handle(site, src, false, (11 | u, 0))?, [byte, iu, iu])
+                }
+                // A typeless RAW view bound with a zero structure stride
+                // (project-flamingo #720, `7e956a90a`): the element stride is
+                // the console's `index * 0`, so the access is raw at `off`.
+                Some(_) if used.is_some_and(|u| u.stride == 0) => {
+                    (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu])
                 }
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
@@ -10710,6 +10718,12 @@ impl<'a> Lower<'a> {
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
                         args.extend([byte, iu]);
                     }
+                    // A typeless RAW view bound with a zero structure stride
+                    // (project-flamingo #720): raw at `off`, the index dropped.
+                    Some(_) if used.is_some_and(|u| u.stride == 0) => {
+                        args.push(self.handle(site, src, false, (11 | u, 0))?);
+                        args.extend([off, iu]);
+                    }
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
                         if stride < 4 || !stride.is_multiple_of(4) {
@@ -10782,6 +10796,19 @@ impl<'a> Lower<'a> {
                         self.s.t.res_ret,
                         139,
                         &[h, byte, iu, mask, align],
+                    )
+                }
+                // A typeless RAW view bound with a zero structure stride
+                // (project-flamingo #720): raw at `off`, the index dropped.
+                Some(_) if used.is_some_and(|u| u.stride == 0) => {
+                    let h = self.handle(site, src, false, (11 | u, 0))?;
+                    self.s.op(
+                        c,
+                        "rawBufferLoad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        139,
+                        &[h, off, iu, mask, align],
                     )
                 }
                 Some(index) => {
@@ -12063,6 +12090,72 @@ mod tests {
             }]
         };
         lower_with(&words, layout(), used()).unwrap();
+    }
+
+    /// project-flamingo #720 (`7e956a90a`): a typeless RAW view bound with a
+    /// zero structure stride is a flat byte buffer, not "a structured buffer
+    /// of unknown stride": the index contributes `index * 0`, so an indexed
+    /// load, store or atomic is raw at `off`.
+    #[test]
+    fn a_zero_bound_stride_makes_an_indexed_access_raw() {
+        // s_mov_b32 s4, s0; s_load_dwordx4 s[8:11], s[4:5], null (the
+        // descriptor), then an indexed access through s[8:11]: the MUBUF
+        // opcode changes, the operands stay v0 (index), s16 (descriptor).
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF408_0302,
+            0xFA00_0010, // s_load_dwordx4 s[12:15], s[4:5], 0x10
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0x8590_0C08, // s_cselect_b64 s[16:17], s[8:9], s[12:13]
+            0x8592_0E0A, // s_cselect_b64 s[18:19], s[10:11], s[14:15]
+        ];
+        let mubuf = |opcode: u32| {
+            [
+                0xE0 << 24 | opcode << 18 | 0x2000, // idxen
+                0x8004_0100,                        // v1, s[16:19], 0
+            ]
+        };
+        let used = || {
+            vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                // A typeless RAW view: no element stride.
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }]
+        };
+        let layout = || vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        for (opcode, what) in [
+            (0x0C, "buffer_load_dword"),
+            (0x1C, "buffer_store_dword"),
+            (0x32, "buffer_atomic_add"),
+        ] {
+            let mut code = words.to_vec();
+            code.extend(mubuf(opcode));
+            code.extend([
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]);
+            lower_with(&code, layout(), used()).unwrap_or_else(|e| panic!("{what}: {e}"));
+        }
+        // The stride the console metadata declares still wins where it is a
+        // real one: 4 dwords is a structured buffer, not a raw one.
+        let mut code = words.to_vec();
+        code.extend(mubuf(0x0C));
+        code.extend([0xD834_0000, 0x0000_0100, S_ENDPGM]);
+        let structured = vec![UsedResource {
+            stride: 4,
+            ..used().remove(0)
+        }];
+        lower_with(&code, layout(), structured).expect("a structured buffer still lowers");
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
