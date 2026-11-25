@@ -1031,8 +1031,12 @@ impl State {
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
-            // Title memory by address: what the shader finds it by.
+            // Title memory by address: what the shader finds it by. A builder
+            // stage's writes through it stay in the copies
+            // ([`crate::pipeline::builder_map_host`]): #1198's rule for the
+            // map, and the writes run 98 killed the title with.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
+                let writes = writes && !crate::pipeline::builder_map_host(self.pipeline as This);
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
