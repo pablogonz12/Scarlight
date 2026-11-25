@@ -777,10 +777,12 @@ impl HostPipeline {
                     {
                         tracing::warn!(error = %e, ?shaders, ?state, params = params.len(), "host mesh pipeline refused");
                         if let Ok(dir) = std::env::var("VICTORY_REFUSED_DIR") {
-                            for (idx, (st, _)) in stages.iter().enumerate() {
-                                if let (Some(t), Some(sh)) = (st.translated(), shaders.get(idx)) {
+                            // From the stage that supplies the bytes: its order is not
+                            // the title's stream order.
+                            for (st, _) in &stages {
+                                if let Some(t) = st.translated() {
                                     let _ = std::fs::write(
-                                        std::path::Path::new(&dir).join(format!("{}.{}.dxil", sh.hash, sh.stage)),
+                                        std::path::Path::new(&dir).join(format!("{}.{}.dxil", st.hash, st.stage)),
                                         &t.host.dxil,
                                     );
                                 }

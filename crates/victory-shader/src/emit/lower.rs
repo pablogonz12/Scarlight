@@ -11559,6 +11559,7 @@ mod tests {
     // Descriptor words read as numbers: kept in their own file (lower.rs is at the size limit).
     mod desc_data;
     mod mad_u16_lerp;
+    mod vop3p_dot;
 
     /// Tables of 2D textures at s0 and samplers at s1.
     fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {

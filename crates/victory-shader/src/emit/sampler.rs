@@ -47,7 +47,14 @@ impl StaticSampler {
     /// previous linear-mip approximation. Comparison/min/max reduction
     /// bits and the sampler's LOD bounds are unchanged.
     pub fn filter_for_host(&self, aniso_point_mip_supported: bool) -> u32 {
-        if !(aniso_point_mip_supported && aniso_point_mip()) && self.filter & !0x180 == 0x54 {
+        self.filter_for_policy(aniso_point_mip_supported && aniso_point_mip())
+    }
+
+    /// [`Self::filter_for_host`] with the policy given rather than read from
+    /// `VICTORY_ANISO_POINT_MIP`: whether the host's anisotropic point-mip
+    /// filter is used.
+    pub fn filter_for_policy(&self, aniso_point_mip: bool) -> u32 {
+        if !aniso_point_mip && self.filter & !0x180 == 0x54 {
             self.filter | 1
         } else {
             self.filter
@@ -168,14 +175,30 @@ mod tests {
                     filter,
                     ..StaticSampler::from_words([0, 0x0054_0100, (mip << 26) | 0x00F0_0000, 0])
                 };
-                assert_eq!(s.filter_for_host(false), fallback);
-                assert_eq!(s.filter_for_host(true), filter);
+                assert_eq!(s.filter_for_policy(false), fallback);
+                assert_eq!(s.filter_for_policy(true), filter);
                 assert_eq!(
                     (s.min_lod, s.max_lod),
                     if mip == 0 { (0.0, 0.0) } else { (1.0, 5.25) }
                 );
             }
         }
+    }
+
+    /// The switch and the device query are decided together: a device without
+    /// the filter falls back whatever `VICTORY_ANISO_POINT_MIP` says.
+    #[test]
+    fn the_switch_and_the_device_decide_together() {
+        let s = StaticSampler {
+            filter: 0x54,
+            ..StaticSampler::from_words([0; 4])
+        };
+        assert_eq!(s.filter_for_host(false), s.filter_for_policy(false));
+        assert_eq!(s.filter_for_host(false), 0x55);
+        assert_eq!(
+            s.filter_for_host(true),
+            s.filter_for_policy(aniso_point_mip())
+        );
     }
 
     #[test]
@@ -186,8 +209,8 @@ mod tests {
                     filter: base | reduction,
                     ..StaticSampler::from_words([0; 4])
                 };
-                assert_eq!(s.filter_for_host(false), s.filter);
-                assert_eq!(s.filter_for_host(true), s.filter);
+                assert_eq!(s.filter_for_policy(false), s.filter);
+                assert_eq!(s.filter_for_policy(true), s.filter);
             }
         }
     }
