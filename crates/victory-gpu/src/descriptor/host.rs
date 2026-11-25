@@ -13,6 +13,70 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+/// How the "title slot past the host heap" line reads (`VICTORY_SLOT_DIAG`,
+/// read once at start-up).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SlotDiag {
+    /// The first slot past the heap says it, and no other. The title walks
+    /// its slots in increasing order, so a line per new high-water mark is a
+    /// line per slot: 199 846 of the first 200 000 lines of a run, ~8 000 a
+    /// second, on the thread recording the frame - the whole of the first
+    /// frame's 21 s stall (Marvisak/VIctory#2634).
+    Once,
+    /// One line per slot, as before: for a run that has to count them.
+    All,
+    /// Silent.
+    Off,
+}
+
+impl SlotDiag {
+    /// `VICTORY_SLOT_DIAG`: unset or `once` reads once, `all` reads every
+    /// slot (the old way), `0` or `off` reads none.
+    fn parse(value: Option<&str>) -> Self {
+        match value {
+            None | Some("once") => Self::Once,
+            Some("all") => Self::All,
+            Some("0" | "off") => Self::Off,
+            Some(_) => Self::Once,
+        }
+    }
+
+    /// The mode this process runs with.
+    fn now() -> Self {
+        static MODE: std::sync::OnceLock<SlotDiag> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| Self::parse(std::env::var("VICTORY_SLOT_DIAG").ok().as_deref()))
+    }
+}
+
+/// Says the "slot past the host heap" line for `index` in `mode`, reusing
+/// `once` to say it once per process (a `static` at the call site; a value of
+/// its own in the tests).
+fn say_slot_past(
+    once: &std::sync::Once,
+    mode: SlotDiag,
+    index: u32,
+    count: u32,
+    for_draw: bool,
+) {
+    let says = match mode {
+        SlotDiag::Off => false,
+        SlotDiag::All => true,
+        SlotDiag::Once => {
+            let mut says = false;
+            once.call_once(|| says = true);
+            says
+        }
+    };
+    if says {
+        tracing::warn!(
+            index,
+            count,
+            for_draw,
+            "title slot past the host heap: slots above the host heap's count are not mirrored"
+        );
+    }
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -617,20 +681,21 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 /// (`victory_shader`'s `title_view_limit`), so a title heap larger than the
 /// room left must not put the title's slots where the dynamic ones are.
 /// Upstream PR #2628 (moe-miau) for the same layout.
-fn view_layout(requested: u32, null: u32) -> (u32, u32, u32) {
-    view_layout_with(requested, null, victory_shader::emit::title_view_clamp())
+fn view_layout(requested: u32, null: u32, dynamic: u32) -> (u32, u32, u32) {
+    view_layout_with(requested, null, dynamic, victory_shader::emit::title_view_clamp())
 }
 
-/// [`view_layout`], with the title clamp's switch given.
-fn view_layout_with(requested: u32, null: u32, clamp: bool) -> (u32, u32, u32) {
-    if null == 0 {
-        return (requested, requested, requested + DYNAMIC);
+/// [`view_layout`], with the dynamic slots the heap keeps (`dynamic`: none in
+/// sampler heaps) and the title clamp's switch given.
+fn view_layout_with(requested: u32, null: u32, dynamic: u32, clamp: bool) -> (u32, u32, u32) {
+    if null == 0 || dynamic == 0 {
+        return (requested, requested, requested + dynamic);
     }
     let size = null + 1;
-    let base = null.saturating_sub(DYNAMIC);
+    let base = null.saturating_sub(dynamic);
     if !clamp {
         // Switched off: the dynamic slots follow the title's, as before.
-        let fitted = if requested + DYNAMIC <= null { requested } else { base };
+        let fitted = if requested + dynamic <= null { requested } else { base };
         return (fitted, fitted, size);
     }
     (requested.min(base), base, size)
@@ -685,7 +750,7 @@ impl HostHeap {
             victory_shader::emit::view_heap_limit()
         };
         let requested = count;
-        let (count, base, size) = view_layout(requested, null);
+        let (count, base, size) = view_layout(requested, null, extra);
         if null != 0 && count < requested {
             // shortcut: descriptors past the host's limit are left out; a title that reaches
             // them needs remapping. They read the null slot instead.
@@ -1448,17 +1513,12 @@ impl HostHeap {
 
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
-            // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
-            static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
-                tracing::warn!(
-                    index,
-                    count = self.count,
-                    for_draw,
-                    "title slot past the host heap"
-                );
-            }
+            // Diagnostic (heap cap): slots above the host heap's count are not
+            // mirrored. The title walks them in increasing order, so a line per
+            // new high-water mark is one line per slot; `VICTORY_SLOT_DIAG`
+            // takes once (the default), every slot (the old way) or none.
+            static SAID: std::sync::Once = std::sync::Once::new();
+            say_slot_past(&SAID, SlotDiag::now(), index, self.count, for_draw);
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
@@ -1681,6 +1741,18 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
+/// Checked `(start, bytes)` of `count` elements of `element` bytes starting
+/// at `base + first * element`: `None` on any `u64` overflow. A title's
+/// `FirstElement` is whatever its descriptor words held, so a view of other
+/// memory read as a buffer (or a bogus `FirstElement`) would otherwise wrap
+/// to a plausible address in release and panic in a debug build.
+fn checked_buffer_range(base: u64, first: u64, count: u32, element: u64) -> Option<(u64, u64)> {
+    let start = base.checked_add(first.checked_mul(element)?)?;
+    let bytes = u64::from(count).checked_mul(element)?;
+    start.checked_add(bytes)?;
+    Some((start, bytes))
+}
+
 /// The title memory a buffer shader or unordered access view reads: its
 /// address and length.
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
@@ -1704,13 +1776,14 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
         _ => return None,
     };
     let desc = srv_desc(words);
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        // A texture view of a buffer: its words are no buffer's.
+        return None;
+    }
     let element = element_size(&desc);
-    // SAFETY: a buffer view's union member.
+    // SAFETY: `ViewDimension` is `D3D12_SRV_DIMENSION_BUFFER`.
     let buffer = unsafe { desc.Anonymous.Buffer };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_buffer_range(base, buffer.FirstElement, buffer.NumElements, element)
 }
 
 /// The title memory the host slot of buffer view `view` is made on
@@ -1770,7 +1843,11 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
 /// [`buffer_range`] of an unordered access view of memory at `base`.
 fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     let desc = uav_desc(words);
-    // SAFETY: a buffer view's union member.
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        // A texture view of a buffer: its words are no buffer's.
+        return None;
+    }
+    // SAFETY: `ViewDimension` is `D3D12_UAV_DIMENSION_BUFFER`.
     let buffer = unsafe { desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
         u64::from(buffer.StructureByteStride)
@@ -1779,10 +1856,7 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     } else {
         crate::resource::element(desc.Format.0 as u32)?.0
     };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_buffer_range(base, buffer.FirstElement, buffer.NumElements, element)
 }
 
 /// The host resource a slot made by [`make`] views, if any.
@@ -1881,7 +1955,8 @@ fn buffer_srv(
             );
             return None;
         }
-        buffer.FirstElement += offset / element;
+        // A `FirstElement` the title wrote past `u64` is no view of the copy.
+        buffer.FirstElement = buffer.FirstElement.checked_add(offset / element)?;
     }
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
@@ -1995,7 +2070,8 @@ fn buffer_srv_alias(
         );
         return None;
     }
-    buffer.FirstElement += offset / element;
+    // A `FirstElement` the title wrote past `u64` is no view of the copy.
+    buffer.FirstElement = buffer.FirstElement.checked_add(offset / element)?;
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
@@ -2065,7 +2141,8 @@ fn buffer_uav(
             once!(offset, element, "unordered buffer view not on an element of its host copy");
             return None;
         }
-        buffer.FirstElement += offset / element;
+        // A `FirstElement` the title wrote past `u64` is no view of the copy.
+        buffer.FirstElement = buffer.FirstElement.checked_add(offset / element)?;
     }
     buffer.CounterOffsetInBytes = 0;
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
@@ -2663,17 +2740,96 @@ mod tests {
         assert_eq!(DYNAMIC, victory_shader::emit::DYNAMIC_VIEWS);
         let limit = (1 << 21) - 1;
         // A title heap that fits: its own slots stay, the dynamic ones below null.
-        assert_eq!(view_layout_with(1_245_184, limit, true), (1_245_184, limit - DYNAMIC, limit + 1));
+        assert_eq!(view_layout_with(1_245_184, limit, DYNAMIC, true), (1_245_184, limit - DYNAMIC, limit + 1));
         // A capped host (1,000,000 slots): the title's slots give way.
         let portable = 1_000_000 - 1;
-        let (count, base, size) = view_layout_with(1_245_184, portable, true);
+        let (count, base, size) = view_layout_with(1_245_184, portable, DYNAMIC, true);
         assert_eq!((count, base, size), (portable - DYNAMIC, portable - DYNAMIC, portable + 1));
         // A small title heap: the dynamic slots still lie below null.
-        assert_eq!(view_layout_with(100, limit, true), (100, limit - DYNAMIC, limit + 1));
+        assert_eq!(view_layout_with(100, limit, DYNAMIC, true), (100, limit - DYNAMIC, limit + 1));
         // No host heap probed: the dynamic slots follow the title's.
-        assert_eq!(view_layout_with(100, 0, true), (100, 100, 100 + DYNAMIC));
+        assert_eq!(view_layout_with(100, 0, DYNAMIC, true), (100, 100, 100 + DYNAMIC));
         // Switched off: as before, the dynamic slots follow the title's.
-        assert_eq!(view_layout_with(100, limit, false), (100, 100, limit + 1));
+        assert_eq!(view_layout_with(100, limit, DYNAMIC, false), (100, 100, limit + 1));
+        // A sampler heap keeps none, whatever the host's view limit.
+        assert_eq!(view_layout_with(100, 0, 0, true), (100, 100, 100));
+        assert_eq!(view_layout_with(100, limit, 0, true), (100, 100, 100));
+    }
+
+    /// A subscriber that only counts the lines said: what a diagnostic's cost
+    /// comes to offline.
+    #[derive(Clone, Default)]
+    struct Lines(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Lines {
+        fn said(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl tracing::Subscriber for Lines {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// The title asks for 1 245 184 slots, more than the 1 000 000 a host heap
+    /// holds, and walks them in increasing order. "Line when the high-water
+    /// mark moves" was therefore a line per slot: 199 846 of the first 200 000
+    /// lines of a run, ~8 000 a second, on the thread recording the frame,
+    /// which was the whole of the first frame's 21 s stall. A quarter of a
+    /// million slots past the heap now cost one line.
+    #[test]
+    fn a_slot_past_the_host_heap_is_said_once_not_per_slot() {
+        let lines = Lines::default();
+        tracing::subscriber::with_default(lines.clone(), || {
+            let once = std::sync::Once::new();
+            for index in 0..250_000u32 {
+                say_slot_past(&once, SlotDiag::Once, index, 1_000_000, true);
+            }
+        });
+        assert_eq!(lines.said(), 1);
+    }
+
+    /// The line can still be had per slot (the way it was, for a run that has
+    /// to count them) or not at all, and either way once it has been said in
+    /// the "once" mode it is not said again.
+    #[test]
+    fn the_slot_past_the_host_heap_follows_its_switch() {
+        let lines = Lines::default();
+        {
+            let lines = lines.clone();
+            tracing::subscriber::with_default(lines.clone(), move || {
+                let once = std::sync::Once::new();
+                for index in 0..3 {
+                    say_slot_past(&once, SlotDiag::All, index, 2, false);
+                }
+                assert_eq!(lines.said(), 3);
+                for index in 0..3 {
+                    say_slot_past(&once, SlotDiag::Off, index, 2, false);
+                }
+                assert_eq!(lines.said(), 3, "off says nothing");
+                say_slot_past(&once, SlotDiag::Once, 0, 2, false);
+                say_slot_past(&once, SlotDiag::Once, 1, 2, false);
+                assert_eq!(lines.said(), 4, "once, whatever the mode before it");
+            });
+        }
+        assert_eq!(SlotDiag::parse(None), SlotDiag::Once, "on by default");
+        assert_eq!(SlotDiag::parse(Some("once")), SlotDiag::Once);
+        assert_eq!(SlotDiag::parse(Some("all")), SlotDiag::All);
+        assert_eq!(SlotDiag::parse(Some("0")), SlotDiag::Off);
+        assert_eq!(SlotDiag::parse(Some("off")), SlotDiag::Off);
+        assert_eq!(SlotDiag::parse(Some("1")), SlotDiag::Once);
     }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
@@ -2811,6 +2967,87 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// A buffer view's `FirstElement` and `NumElements` are the title's: one
+    /// that would overflow `u64` (a bogus address, or a texture's words read
+    /// as a buffer's) is refused instead of wrapping to a plausible address.
+    #[test]
+    fn overflowing_buffer_ranges_are_refused() {
+        assert_eq!(checked_buffer_range(0x1000, 2, 4, 16), Some((0x1020, 64)));
+        assert_eq!(checked_buffer_range(0x1000, 0, 0, 16), Some((0x1000, 0)));
+        // `FirstElement * element` beyond `u64`: wraps to 0 when unchecked.
+        assert_eq!(checked_buffer_range(0x1000, 1u64 << 60, 1, 16), None);
+        assert_eq!(checked_buffer_range(0x1000, u64::MAX, 1, 1), None);
+        // The start fits, the whole view does not (release: wraps to a small one).
+        assert_eq!(checked_buffer_range(u64::MAX - 8, 0, u32::MAX, u64::from(u32::MAX)), None);
+        assert_eq!(checked_buffer_range(u64::MAX - 8, 0, 1, 16), None);
+
+        let mut resource = [0u32; 14];
+        resource[0] = 1; // D3D12_RESOURCE_DIMENSION_BUFFER
+        let view = |desc: [u32; 16]| View::Placed(false, resource, desc);
+
+        // The host's 40-byte descriptor words: format, dimension, component
+        // mapping, then the union at word 4 (a `u64` `FirstElement` there,
+        // `NumElements`, stride and flags after it).
+        let words = |format: u32, dimension: u32, first: u64, count: u32, stride: u32, flags: u32| {
+            let mut words = [0u32; 10];
+            words[0] = format;
+            words[1] = dimension;
+            words[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            (words[4], words[5]) = (first as u32, (first >> 32) as u32);
+            (words[6], words[7], words[8]) = (count, stride, flags);
+            words
+        };
+        let placed = |words: [u32; 10]| {
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&words);
+            desc[10] = 0x1000; // the view's address
+            view(desc)
+        };
+        let buffer = |first: u64| {
+            words(
+                DXGI_FORMAT_UNKNOWN.0 as u32,
+                D3D12_SRV_DIMENSION_BUFFER.0 as u32,
+                first,
+                4,
+                16,
+                D3D12_BUFFER_SRV_FLAG_NONE.0 as u32,
+            )
+        };
+
+        // A structured buffer view at a bogus first element: refused.
+        assert_eq!(buffer_range(&placed(buffer(1u64 << 60))), None);
+        assert_eq!(buffer_range(&placed(buffer(u64::MAX))), None);
+        // The same view with a first element that fits is a view of it.
+        assert_eq!(buffer_range(&placed(buffer(2))), Some((0x1020, 64)));
+
+        // A texture view of buffer memory is no buffer view at all: its words
+        // are a texture's, and reading them as a buffer's is a bogus address.
+        let texture = words(
+            DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(buffer_range(&placed(texture)), None);
+        // Through a table's unordered slot too (its dimension word is its own).
+        let unordered_texture = words(
+            DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(buffer_range(&View::Placed(true, resource, {
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&unordered_texture);
+            desc[10] = 0x1000;
+            desc
+        })), None);
     }
 
     /// A view written over memory that older views describe otherwise

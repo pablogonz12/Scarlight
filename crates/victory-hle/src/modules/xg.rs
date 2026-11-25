@@ -511,28 +511,33 @@ extern "system" fn tiling(
         }
         if let Some(n) = count.as_mut() {
             let slices = if tail { l.slices.min(2) } else { l.slices };
-            let wanted = (standard * slices).saturating_sub(first).min(*n);
-            for i in 0..wanted {
-                let (slice, mip) = ((first + i) / standard, (first + i) % standard);
-                let m = &l.mips[mip as usize];
-                let entry = if tail && slice > 0 {
-                    SubresourceTiling {
-                        width: 0,
-                        height: 0,
-                        depth: 0,
-                        start: 0,
-                    }
-                } else {
-                    SubresourceTiling {
-                        width: m.pitch / l.block[0],
-                        height: (m.rows / l.block[1]) as u16,
-                        depth: 1,
-                        start: ((u64::from(slice) * l.slice_size + m.offset) / TILE) as u32,
-                    }
-                };
-                out.add(i as usize).write(entry);
+            let available = (standard * slices).saturating_sub(first);
+            if out.is_null() {
+                *n = available;
+            } else {
+                let wanted = available.min(*n);
+                for i in 0..wanted {
+                    let (slice, mip) = ((first + i) / standard, (first + i) % standard);
+                    let m = &l.mips[mip as usize];
+                    let entry = if tail && slice > 0 {
+                        SubresourceTiling {
+                            width: 0,
+                            height: 0,
+                            depth: 0,
+                            start: 0,
+                        }
+                    } else {
+                        SubresourceTiling {
+                            width: m.pitch / l.block[0],
+                            height: (m.rows / l.block[1]) as u16,
+                            depth: 1,
+                            start: ((u64::from(slice) * l.slice_size + m.offset) / TILE) as u32,
+                        }
+                    };
+                    out.add(i as usize).write(entry);
+                }
+                *n = wanted;
             }
-            *n = wanted;
         }
     }
     S_OK
@@ -748,6 +753,22 @@ mod tests {
             (2, 1, 8, 1)
         );
         assert_eq!((shape, n, subs[0].start), ([256, 256, 1], 1, 1));
+
+        // Null `out` queries the available entry count without writing.
+        let mut query = 4;
+        assert_eq!(
+            tiling(
+                c,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut query,
+                0,
+                std::ptr::null_mut()
+            ),
+            S_OK
+        );
+        assert_eq!(query, 1);
         assert_eq!(release(c), 0);
 
         // 4 KiB modes have no 64 KiB tiling.

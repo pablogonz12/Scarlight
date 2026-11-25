@@ -21,15 +21,21 @@ JMAN730, julio, KaiserBloo, KoLolX3, lameloball2813-ui, LaunchDoesntCode, LF2000
 localshotgun, lordon1a, Louis Faust, LUIS LARIOS, Luiz Neves, Lyrnc, Manuel Pérez, Maraco91,
 marquezini, Marvis, Matheus, meower, nathanbzrr, Nikita Romanovich, Noname0202, Nostyxx, Ortomanic,
 pablogonz12, Pablo González, Pedro Fortunato, Peter Bonanni, QB, quaternion, r4., raffclar,
-ruvenesh, Saitken91, Sakura-Byte, SkippySteve, swarm, tedin7, TG0000, undeadhuman37, Vanthys,
+ruvenesh, Saitken91, Sakura-Byte, SkippySteve, swarm, tedin7, TG0000, undeadhuman37, uwutaube, Vanthys,
 wrothgaril, Yaekai.
 
 ## Co-authors
 
-BlueKaiman.
+BlueKaiman, kais7654, pushkarreddyy, shh.
 
 ## Design notes
 
+- **Marvisak/VIctory [#2478](https://github.com/Marvisak/VIctory/pull/2478)** (HoLa-Lee), GPL-3.0: the idea
+  of reading a texture once every N frames at most, round-robin by the texture's address, its measurements
+  (a frame of world entry at 6,814 ms of texture work, 145-522 ms at 8), and its name for the switch,
+  `VICTORY_TEXTURE_REFRESH_EVERY`. Reimplemented against this tree's refresh path
+  (`crates/victory-gpu/src/texture.rs`), not copied: only textures already uploaded are skipped, and the
+  switch is live (`crates/victory-gpu/src/switches.rs`).
 - **xcl** ([ivall/xcl](https://github.com/ivall/xcl) and its fork Bathyal), GPL-2.0-only: the
   wave-pairing approach and the NVIDIA wave lane-assignment report used in
   [docs/wave64-on-wave32.md](docs/wave64-on-wave32.md). No code taken.

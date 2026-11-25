@@ -6363,9 +6363,9 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         // An index the title made itself may not name a host slot.
         let from_heap = !sampler && src.heap_only(|s| {
-            matches!(s, Source::Loaded { load, .. } if self
-                .scalar.get(load).and_then(|a| self.x.native.layout.get(a.param))
-                .is_some_and(|p| p.root == RootType::ResourceHeap))
+            let (Source::Loaded { load, .. } | Source::Fetched { load, .. }) = s else { return false };
+            self.scalar.get(load).and_then(|a| self.x.native.layout.get(a.param))
+                .is_some_and(|p| p.root == RootType::ResourceHeap)
         });
         match src {
             Source::Loaded { load, first } => {
