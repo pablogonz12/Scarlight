@@ -74,6 +74,9 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   `crates/victory-gpu/src/descriptor/host.rs`, with `widen_due` kept on the hit path). Its section-heap windows
   did not come over: measured under Wine + vkd3d-proton + RADV, a committed section opens and the import under it
   is refused, silently substituting the driver's own memory (`xcl-bin/notes/zero-copy.md` 6).
+- **Wasler's fork** ([Wasler/VIctory](https://github.com/Wasler/VIctory) `fxceless-test`, GPL-3.0): the
+  heap-buffer full-interval switch (`VICTORY_HEAP_FULL_EVERY`) and the integer color-target blend bypass
+  (`VICTORY_INTEGER_BLEND_BYPASS=0` turns it off), with its own test, kept with its authorship.
 
 ## Tools
 
