@@ -174,6 +174,34 @@ impl GraphicsState {
         }
     }
 
+    /// The blend state the host pipeline is made with. The console blends
+    /// into integer targets (MIN, MAX); D3D12 refuses a pipeline that
+    /// enables blending on one, so those targets write unblended and the
+    /// others keep the title's blending.
+    fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let mut blend = self.blend;
+        if !host_blend_on() {
+            return blend;
+        }
+        let count = (self.targets.NumRenderTargets as usize).min(8);
+        let integer = |i: usize| integer(self.targets.RTFormats[i]);
+        let independent = blend.IndependentBlendEnable.as_bool();
+        // Without independent blending, target 0's description is every target's.
+        let blended =
+            |i: usize| blend.RenderTarget[if independent { i } else { 0 }].BlendEnable.as_bool();
+        if !(0..count).any(|i| integer(i) && blended(i)) {
+            return blend;
+        }
+        if !independent {
+            blend.RenderTarget = [blend.RenderTarget[0]; 8];
+            blend.IndependentBlendEnable = true.into();
+        }
+        for i in (0..count).filter(|&i| integer(i)) {
+            blend.RenderTarget[i].BlendEnable = false.into();
+        }
+        blend
+    }
+
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
@@ -771,7 +799,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -978,6 +1006,42 @@ fn graphics_depth_bounds_pipeline(
     }
 }
 
+/// `VICTORY_HOST_BLEND=0` keeps the title's blend state on integer targets,
+/// which the host then refuses (the pipeline is dropped, as it was before).
+fn host_blend_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOST_BLEND").is_none_or(|v| v != "0"))
+}
+
+/// Whether a format holds integers (`_UINT`, `_SINT`): the host cannot blend
+/// into one, whatever the title's state says.
+fn integer(format: DXGI_FORMAT) -> bool {
+    matches!(
+        format,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+    )
+}
+
 /// A mesh pipeline from the title's graphics state: the pipeline-state
 /// stream form (no input layout).
 ///
@@ -1013,12 +1077,13 @@ fn mesh_pipeline(
         samples: Sub<DXGI_SAMPLE_DESC>,
         topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
     }
+    let blend = g.host_blend();
     let build = |depth: Sub<_>| {
         let mut stream = Stream {
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth,
@@ -1037,7 +1102,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
@@ -1208,6 +1273,46 @@ mod tests {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
         }
+    }
+
+    /// The console blends (MIN, MAX) into integer targets; the host refuses a
+    /// pipeline that enables blending on one, so those targets write
+    /// unblended and the others keep the title's blending.
+    #[test]
+    fn integer_targets_write_unblended() {
+        let state = |independent: bool| {
+            let mut g = GraphicsState {
+                topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                ..Default::default()
+            };
+            g.blend.IndependentBlendEnable = independent.into();
+            for t in &mut g.blend.RenderTarget {
+                t.BlendEnable = true.into();
+                t.BlendOp = D3D12_BLEND_OP_MAX;
+                t.BlendOpAlpha = D3D12_BLEND_OP_MAX;
+            }
+            g.depth.DepthEnable = false.into();
+            g.targets.NumRenderTargets = 3;
+            g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            g.targets.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            g.targets.RTFormats[2] = DXGI_FORMAT_R8_UINT;
+            g
+        };
+        for independent in [true, false] {
+            let blend = state(independent).host_blend();
+            assert!(blend.IndependentBlendEnable.as_bool(), "{independent}");
+            assert!(blend.RenderTarget[0].BlendEnable.as_bool());
+            assert!(blend.RenderTarget[1].BlendEnable.as_bool());
+            assert_eq!(blend.RenderTarget[1].BlendOp, D3D12_BLEND_OP_MAX);
+            assert!(!blend.RenderTarget[2].BlendEnable.as_bool(), "{independent}");
+        }
+        // No integer target: the title's description as it was.
+        let mut g = state(false);
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8_UNORM;
+        let blend = g.host_blend();
+        assert!(!blend.IndependentBlendEnable.as_bool());
+        assert!(blend.RenderTarget[0].BlendEnable.as_bool());
+        assert!(blend.RenderTarget[2].BlendEnable.as_bool());
     }
 
     /// A direct mesh dispatch forwards the caller's whole group grid: the

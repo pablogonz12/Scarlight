@@ -1617,22 +1617,68 @@ pub(crate) fn merged_stats() -> [u64; 3] {
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    #[inline]
+    fn all_differ_8(a: u64, b: u64) -> bool {
+        let d = a ^ b;
+        d.wrapping_sub(0x0101_0101_0101_0101) & !d & 0x8080_8080_8080_8080 == 0
+    }
+    #[inline]
+    unsafe fn load_u64(ptr: *const u8, off: usize) -> u64 {
+        unsafe { ptr.add(off).cast::<u64>().read_unaligned() }
+    }
     let n = now.len().min(was.len());
+    let (np, wp) = (now.as_ptr(), was.as_ptr());
     let mut runs = Vec::new();
     let mut i = 0;
     while i < n {
-        // Equal bytes, eight at a time while they last.
-        while i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
+        // Equal bytes: 64 bytes at a time, then 8 bytes at a time.
+        while i + 64 <= n {
+            let eq = unsafe {
+                load_u64(np, i) == load_u64(wp, i)
+                    && load_u64(np, i + 8) == load_u64(wp, i + 8)
+                    && load_u64(np, i + 16) == load_u64(wp, i + 16)
+                    && load_u64(np, i + 24) == load_u64(wp, i + 24)
+                    && load_u64(np, i + 32) == load_u64(wp, i + 32)
+                    && load_u64(np, i + 40) == load_u64(wp, i + 40)
+                    && load_u64(np, i + 48) == load_u64(wp, i + 48)
+                    && load_u64(np, i + 56) == load_u64(wp, i + 56)
+            };
+            if !eq {
+                break;
+            }
+            i += 64;
+        }
+        while i + 8 <= n && unsafe { load_u64(np, i) == load_u64(wp, i) } {
             i += 8;
         }
-        while i < n && now[i] == was[i] {
+        while i < n && unsafe { *np.add(i) == *wp.add(i) } {
             i += 1;
         }
         if i >= n {
             break;
         }
         let first = i;
-        while i < n && now[i] != was[i] {
+        // Differing bytes: 64 bytes at a time, then 8 bytes at a time.
+        while i + 64 <= n {
+            let diff = unsafe {
+                all_differ_8(load_u64(np, i), load_u64(wp, i))
+                    && all_differ_8(load_u64(np, i + 8), load_u64(wp, i + 8))
+                    && all_differ_8(load_u64(np, i + 16), load_u64(wp, i + 16))
+                    && all_differ_8(load_u64(np, i + 24), load_u64(wp, i + 24))
+                    && all_differ_8(load_u64(np, i + 32), load_u64(wp, i + 32))
+                    && all_differ_8(load_u64(np, i + 40), load_u64(wp, i + 40))
+                    && all_differ_8(load_u64(np, i + 48), load_u64(wp, i + 48))
+                    && all_differ_8(load_u64(np, i + 56), load_u64(wp, i + 56))
+            };
+            if !diff {
+                break;
+            }
+            i += 64;
+        }
+        while i + 8 <= n && unsafe { all_differ_8(load_u64(np, i), load_u64(wp, i)) } {
+            i += 8;
+        }
+        while i < n && unsafe { *np.add(i) != *wp.add(i) } {
             i += 1;
         }
         runs.push((first, i - first));
