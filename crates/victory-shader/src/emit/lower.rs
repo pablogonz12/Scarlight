@@ -1246,11 +1246,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 /// instructions end, unless a load at a fixed offset reads below that (then
 /// at `lowest`, the lowest offset any load or descriptor names). The
 /// program's constants follow its instructions, and a load at a computed
-/// offset reads them, not instruction bytes; a table from the first
-/// computed load's offset 0 was the whole program, tens of KiB, which
-/// NVIDIA's Vulkan driver keeps in every thread's local memory (under
-/// vkd3d-proton, a constant array is a private one): one such shader made
-/// it reserve GBs of video memory.
+/// offset reads them, not instruction bytes.
 fn code_table_start(
     p: &crate::ir::Program,
     addresses: &[&crate::resource::Address],
