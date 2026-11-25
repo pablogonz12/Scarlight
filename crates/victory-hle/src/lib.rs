@@ -11,6 +11,10 @@
 //! Resolution order for every import: an implementation in [`modules`],
 //! then the host if [`HostPolicy`] allows that DLL, then `Missing`.
 
+/// The offline bench of the DirectStorage path (the diagnostics build
+/// only: `victory dstorage-bench`).
+#[cfg(feature = "diagnostics")]
+pub mod dstorage_bench;
 mod host;
 pub mod modules;
 mod registry;
