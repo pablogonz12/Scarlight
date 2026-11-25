@@ -292,6 +292,34 @@ pub(crate) fn is_builder(this: This) -> bool {
     !this.is_null() && pipeline(this).builder
 }
 
+/// Whether a builder dispatch's writes through title memory **by address**
+/// stay in the host's copies instead of being copied back (`draw.rs`, the
+/// `memory_ready` call): upstream #1198's rule for the map — "what shaders
+/// write through the map stays in the host copies; the BVH the title builds
+/// on the GPU is only read on the GPU" — which this line did not have.
+///
+/// It is not policy only: `InitHeaders` writes a structure header (`-1`, a
+/// magic, `±FLT_MAX` bounds) at a pointer it *loads from a stride-40 table*
+/// (`bvh4/work/dis-44.txt`), and `ConstructBVH4` writes node bounds. Copied
+/// back, a header or a bound that is wrong by a little lands on a title
+/// object: at run 98 the title read a pointer field as `0xffffffffffffffff`
+/// seconds after the first builder dispatch and died.
+///
+/// What this keeps that `VICTORY_BVH_QUARANTINE=1` throws away: a stage's
+/// stores through ordinary root UAVs (ConstructBVH4's eight node heaps,
+/// verified dword for dword against the console's own heaps, `bvh4.md`) are
+/// still copied back, and other programs' writes through the map are
+/// untouched. Left in the copies, the builder's own structure writes are
+/// exactly what the title's trace programs read through the same map.
+///
+/// `VICTORY_BVH_HOST_STRUCTURES=0` puts the copy-back back, for an A/B.
+#[cfg(windows)]
+pub(crate) fn builder_map_host(this: This) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    is_builder(this)
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_HOST_STRUCTURES").is_none_or(|v| v != "0"))
+}
+
 /// A stage of the builder was dropped after all: none runs from here on.
 #[cfg(windows)]
 pub(crate) fn builder_off(why: &'static str) {

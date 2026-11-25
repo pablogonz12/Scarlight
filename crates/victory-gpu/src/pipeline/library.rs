@@ -460,15 +460,41 @@ fn library() -> Option<&'static Library> {
         .as_ref()
 }
 
+/// The host's pipeline library over `bytes`, which the caller keeps alive
+/// for as long as the library.
+///
+/// No bytes at all asks for an empty library, and there the blob is passed
+/// as a null pointer: D3D12 reads the bytes' length alone, but vkd3d-proton
+/// (the host of every run) refuses a blob that points at nothing and has no
+/// length with `E_INVALIDARG`, where Windows (CI's WARP) takes either. The
+/// interface's own `CreatePipelineLibrary` turns an empty slice into a
+/// pointer at nothing, so the call is made here with the pointer the host
+/// asks for.
+fn create(device: &ID3D12Device1, bytes: &[u8]) -> windows::core::Result<ID3D12PipelineLibrary1> {
+    let mut library: *mut core::ffi::c_void = std::ptr::null_mut();
+    let blob: *const core::ffi::c_void =
+        if bytes.is_empty() { std::ptr::null() } else { bytes.as_ptr().cast() };
+    // SAFETY: a live device, the interface `ID3D12PipelineLibrary` asks for
+    // by its IID, and `blob` either null with a length of 0 or a view of
+    // `bytes.len()` bytes. What it returns is a reference this call owns.
+    unsafe {
+        (Interface::vtable(device).CreatePipelineLibrary)(
+            Interface::as_raw(device),
+            blob,
+            bytes.len(),
+            &ID3D12PipelineLibrary::IID,
+            &mut library,
+        )
+        .ok()?;
+        let library: ID3D12PipelineLibrary = Interface::from_raw(library);
+        library.cast()
+    }
+}
+
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
-    let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // SAFETY: the bytes outlive the library (kept beside it).
-        unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
-        }
-    };
+    let make = |bytes: &[u8]| create(device, bytes);
     if !blob.bytes().is_empty() {
         match make(blob.bytes()) {
             Ok(library) => {
@@ -747,6 +773,17 @@ mod tests {
         let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
         };
+        // No library yet (the first run): an empty one, with a size to
+        // serialise, and nothing kept as its blob. The host could refuse
+        // this (vkd3d-proton does, for a blob that points at nothing while
+        // claiming no length), which would leave no library to store
+        // pipelines in at all.
+        let fresh = open(&device, Blob::None).expect("an empty library");
+        // SAFETY: a plain query on a live library.
+        assert!(unsafe { fresh.library.GetSerializedSize() } > 0);
+        assert!(matches!(fresh._blob, Blob::None));
+        // A blob the host rejects (another adapter or driver, damage) is let
+        // go and an empty library takes its place.
         let library = open(&device, Blob::Held(b"not a pipeline library".repeat(16))).expect("an empty library");
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
