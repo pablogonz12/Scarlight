@@ -26,3 +26,10 @@ pub fn branch_same_arms() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| enabled("VICTORY_BRANCH_SAME_ARMS"))
 }
+
+/// VOP3 integer `clamp` on add/sub saturates unsigned (carry → all ones,
+/// borrow → zero); `VICTORY_INT_CLAMP=0` refuses the modifier again.
+pub fn int_clamp() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| enabled("VICTORY_INT_CLAMP"))
+}

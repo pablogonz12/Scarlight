@@ -71,6 +71,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_F16_NEAREST",
                     "VICTORY_MASK_SCC_LANES",
                     "VICTORY_BRANCH_SAME_ARMS",
+                    "VICTORY_INT_CLAMP",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');

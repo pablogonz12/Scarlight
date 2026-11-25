@@ -52,6 +52,11 @@ BlueKaiman, kais7654, pushkarreddyy, shh.
   GPL-3.0: a `LaneExit::Branch` whose two arms name one block is lowered as the jump it is, so the
   edge map's `(from, to)` key is not written twice and that successor's PHIs keep their predecessor
   (`crates/victory-shader/src/emit/lower.rs`, `crates/victory-shader/src/emit/branch_tests.rs`).
+- **JMAN730/victory** ([project-flamingo#675](https://github.com/JMAN730/project-flamingo/pull/675)),
+  GPL-3.0: VOP3 integer `clamp` on add/sub is unsigned saturation (carry → all ones, borrow → zero),
+  applied in the lowering instead of refused as an integer output modifier, and a clamped add is no
+  wrapping sum for address analysis (`crates/victory-shader/src/emit/valu_clamp.rs`,
+  `crates/victory-shader/src/resource.rs`).
 
 ## Tools
 
