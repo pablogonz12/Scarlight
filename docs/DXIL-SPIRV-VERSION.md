@@ -37,3 +37,30 @@ A release does this itself now: the `Release` workflow
 (`VKD3D_COMMIT`, `DXIL_SPIRV_COMMIT`), records both in the tarball's `VERSION` and
 `files/licenses/VERSIONS.txt`, and attaches the source of that exact tree — vkd3d-proton with the
 overridden dxil-spirv — as `vkd3d-proton-source.tar.gz`. Bumping either commit is a release note.
+
+## The fixes that minimum carries
+
+`b540c8a2` is the floor for two separate reasons; keep both in mind when the pair is bumped
+again, because a converter from before either one is a converter we must not ship.
+
+- **The structurizer's dominator recomputation** (`b540c8a2` itself): the three node-test
+  compute programs above crash the older converter in `CFGNode::find_common_dominator`.
+- **[`7f5a7780`](https://github.com/HansKristian-Work/dxil-spirv/commit/7f5a7780) "Look up
+  resource extended properties by tag"** (23 Nov 2026): a resource's extended properties are
+  a list of (tag, value) pairs, and the stride was read from the second pair while a typed
+  buffer was detected from the first — a fixed first tag assumed. A `RWByteAddressBuffer`
+  carrying only `{ Atomic64Use, 1 }` therefore got a stride of 1, took the structured path
+  and added the undef element offset to the address, which hangs the GPU on some drivers.
+  We emit exactly that resource: `crates/victory-shader/src/emit/bitcode/opt.rs` sets
+  `atomic64` for any buffer a program performs a 64-bit atomic on and it becomes the
+  `Atomic64Use` property in `crates/victory-shader/src/emit/shader.rs`, while the same
+  buffer is read with raw loads. The old pin (`34f0ff84`, 20 Nov) predates the fix; the
+  three-program crash above and this hang are independent, so a bump that fixes only one is
+  still a bad pin.
+
+The commit is not in the DLL's strings. Check the checkout the DLL was built from, which is
+the subproject inside the vkd3d-proton tree and **not** the standalone stock checkout the
+offline gates use:
+
+    git -C <vkd3d-proton tree>/subprojects/dxil-spirv merge-base --is-ancestor 7f5a7780 HEAD \
+      && echo "has the fix"
