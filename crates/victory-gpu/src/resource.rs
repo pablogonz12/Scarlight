@@ -3091,6 +3091,25 @@ void main() {
         };
 
         let image = host_resource(dst).expect("the copy's host texture");
+        // The host texture's own subresources: mips × array slices × planes.
+        let hd = unsafe { image.GetDesc() };
+        let mut info = D3D12_FEATURE_DATA_FORMAT_INFO {
+            Format: hd.Format,
+            ..Default::default()
+        };
+        // SAFETY: a live device and a correctly sized format query.
+        let queried = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_INFO,
+                (&raw mut info).cast(),
+                size_of_val(&info) as u32,
+            )
+        };
+        assert!(queried.is_ok(), "the host's format query");
+        let planes = u32::from(info.PlaneCount).max(1);
+        assert_eq!(planes, 2, "the host's format {:?} has depth and stencil", hd.Format);
+        let count = u32::from(hd.MipLevels) * u32::from(hd.DepthOrArraySize) * planes;
+        assert_eq!(count, 8, "two mips and two slices in each of {planes} planes");
         let mut footprints = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 8];
         let mut sizes = [0u64; 8];
         let mut rows = [0u32; 8];
