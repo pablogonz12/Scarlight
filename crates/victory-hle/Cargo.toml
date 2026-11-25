@@ -49,6 +49,10 @@ windows-core = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile.workspace = true
 
+# A pipe for a test of a read that stays pending (`modules::dstorage`).
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Pipes"] }
+
 [features]
 # Debugging switches (scripted keys and the like).
 diagnostics = ["victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows", "dep:windows-core"]

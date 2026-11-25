@@ -59,8 +59,10 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
-    /// The [`Host::shared_buffer`]s small enough to share heaps.
-    small_buffers: crate::placed::Pool,
+    /// The [`Host::shared_buffer`]s small enough to share heaps. Leaked: a
+    /// placed buffer's slot goes back to it when the host destroys the
+    /// buffer, on a thread that holds no `Host` ([`crate::placed`]).
+    small_buffers: &'static crate::placed::Pool,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -669,7 +671,7 @@ fn create() -> windows::core::Result<Host> {
             crate::inplace::check_at_startup(&device);
         }
         Ok(Host {
-            small_buffers: crate::placed::Pool::new(device.clone()),
+            small_buffers: Box::leak(Box::new(crate::placed::Pool::new(device.clone()))),
             device,
             queue,
             fence,
@@ -6487,10 +6489,7 @@ impl Host {
     /// bytes: a caller whose shaders may read it through a root descriptor
     /// past that width asks for whole slots, which keeps such a read in its
     /// own buffer up to the slot's end.
-    pub(crate) fn shared_buffer(
-        &'static self,
-        width_bytes: u64,
-    ) -> Option<(ID3D12Resource, *mut u8)> {
+    pub(crate) fn shared_buffer(&self, width_bytes: u64) -> Option<(ID3D12Resource, *mut u8)> {
         if let Some(placed) = self.small_buffers.buffer(width_bytes) {
             return Some(placed);
         }
