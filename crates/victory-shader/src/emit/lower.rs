@@ -24,6 +24,9 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
 pub(super) mod intersect;
+#[path = "group_wide.rs"]
+mod group_wide;
+use group_wide::{all_group_blocks, lane_regions};
 
 type Why = &'static str;
 
@@ -243,6 +246,10 @@ struct Lower<'a> {
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
     exchange: Option<(u32, bool, Vec<bool>)>,
+    /// Multi-wave `widen` (`group > 64` in Wave32): `(lds_base, host_waves)` used by `wave_wide`
+    /// to reduce across every wave of the group, plus per-IR block group convergence (`all_group_blocks`).
+    group_wide: Option<(u32, u32)>,
+    all_group: Option<Vec<bool>>,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
     /// of its own ([`with_local_waves`]).
     local: bool,
@@ -350,68 +357,6 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
         }
     }
     Some(all)
-}
-
-/// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
-/// not post-dominate it, which only some lanes run. Not the branches the wave takes together
-/// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
-fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
-    let n = st.exits.len();
-    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (b, e) in st.exits.iter().enumerate() {
-        match *e {
-            LaneExit::Jump(t) => succ[b].push(t),
-            LaneExit::Branch { taken, not_taken, .. } => {
-                succ[b].push(taken);
-                succ[b].push(not_taken);
-            }
-            LaneExit::End => {}
-            LaneExit::Indirect => return None,
-        }
-    }
-    // post-dominators (bitsets; a virtual exit after every End)
-    let words = n.div_ceil(64);
-    let full = vec![u64::MAX; words];
-    let mut pdom: Vec<Vec<u64>> = (0..n).map(|b| if succ[b].is_empty() { let mut v = vec![0; words]; v[b / 64] |= 1 << (b % 64); v } else { full.clone() }).collect();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for b in (0..n).rev() {
-            if succ[b].is_empty() {
-                continue;
-            }
-            let mut v = full.clone();
-            for &t in &succ[b] {
-                for w in 0..words {
-                    v[w] &= pdom[t][w];
-                }
-            }
-            v[b / 64] |= 1 << (b % 64);
-            if v != pdom[b] {
-                pdom[b] = v;
-                changed = true;
-            }
-        }
-    }
-    let mut regions = Vec::new();
-    for (d, e) in st.exits.iter().enumerate() {
-        let LaneExit::Branch { when, .. } = *e else { continue };
-        if st.wide.contains(&d) || st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
-            continue; // a wave-wide or uniform branch: all lanes go the same way
-        }
-        // blocks reachable from the lane branch that do not post-dominate it
-        let mut seen = vec![false; n];
-        let mut stack: Vec<usize> = succ[d].clone();
-        while let Some(b) = stack.pop() {
-            if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
-                continue;
-            }
-            seen[b] = true;
-            stack.extend(succ[b].iter().copied());
-        }
-        regions.push((d, seen));
-    }
-    Some(regions)
 }
 
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
@@ -1277,6 +1222,8 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        let mut group_wide: Option<(u32, u32)> = None;
+        let mut all_group: Option<Vec<bool>> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
@@ -1350,6 +1297,21 @@ impl<'a> Lower<'a> {
                                 }
                             }
                         }
+                        let multi_wide = group > 64 && !x.st.wide.is_empty() && group.div_ceil(32) <= 32;
+                        let ag = if multi_wide { all_group_blocks(p, x.st) } else { None };
+                        if lds_ok && multi_wide && s.lds_dwords > 0 {
+                            let safe_lds = ag.as_ref().is_some_and(|ag| {
+                                (0..p.blocks.len()).all(|b| {
+                                    let needs_sync = p.blocks[b].insts.iter().any(lds)
+                                        || lds_meet.as_ref().is_some_and(|m| m.1.get(b).is_some_and(|&(a, e)| a || e));
+                                    !needs_sync || ag.get(b).copied().unwrap_or(false)
+                                })
+                            });
+                            if !safe_lds {
+                                lds_ok = false;
+                                lds_meet = None;
+                            }
+                        }
                         if lds_ok {
                             wave = 32;
                             split_lds = s.lds_dwords > 0 && group > 32;
@@ -1358,6 +1320,12 @@ impl<'a> Lower<'a> {
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
                                 s.lds_dwords += 2 * group.div_ceil(64);
+                                if multi_wide {
+                                    let host_waves = group.div_ceil(32);
+                                    group_wide = Some((s.lds_dwords, host_waves));
+                                    s.lds_dwords += host_waves;
+                                    all_group = ag;
+                                }
                             }
                         }
                     }
@@ -1560,6 +1528,8 @@ impl<'a> Lower<'a> {
                 _ => Default::default(),
             },
             exchange,
+            group_wide,
+            all_group,
             clane: None,
             pair: None,
             halves,
@@ -1944,6 +1914,9 @@ impl<'a> Lower<'a> {
                 need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");
             }
+            if self.group_wide.is_some() && !self.all_group(self.cur_ir) {
+                return Err("a wave reduction inside a divergent scalar branch");
+            }
             let bits = |l: &mut Self, v: V| if float { l.as_int(v) } else { v };
             let back = |l: &mut Self, v: V| if float { l.as_float(v) } else { v };
             match prefix {
@@ -2042,6 +2015,9 @@ impl<'a> Lower<'a> {
                 need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");
             }
+            if self.group_wide.is_some() && !self.all_group(self.cur_ir) {
+                return Err("a wave reduction inside a divergent scalar branch");
+            }
             let (lo0, lo1) = self.exchange_halves(self.cur, r_lo);
             let (hi0, hi1) = self.exchange_halves(self.cur, r_hi);
             let c = self.cur;
@@ -2127,6 +2103,9 @@ impl<'a> Lower<'a> {
                 return self.half_sum_wide(x, halves);
             }
             return Err(WHERE);
+        }
+        if halves && self.group_wide.is_some() && !self.all_group(self.cur_ir) {
+            return Err("a wave sum of 16-bit floats inside a divergent scalar branch");
         }
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -3182,6 +3161,11 @@ impl<'a> Lower<'a> {
                         // (a group of 32 or fewer has no other half to exchange with)
                         need(b.unwrap_or(0));
                         return Err("a lane mask exchanged where not every lane runs");
+                    } else if !self.exchange.as_ref().is_some_and(|e| e.1)
+                        && self.group_wide.is_some()
+                        && !b.is_none_or(|b| self.all_group(b))
+                    {
+                        return Err("a lane mask exchanged inside a divergent scalar branch");
                     }
                     xy = self.exchange_halves(at, xy.0);
                 }
@@ -3829,6 +3813,9 @@ impl<'a> Lower<'a> {
             need(made.unwrap_or(0));
             return Err("a lane mask exchanged where not every lane runs");
         }
+        if self.group_wide.is_some() && !made.is_none_or(|b| self.all_group(b)) {
+            return Err("a lane mask exchanged inside a divergent scalar branch");
+        }
         let some = self.s.m.cast(at, Cast::ZExt, some, i32t);
         let (lo, hi) = self.exchange_halves(at, some);
         let both = self.s.m.bin(at, Bin::Or, lo, hi);
@@ -3850,12 +3837,21 @@ impl<'a> Lower<'a> {
             let (name, code) = if any { ("waveAnyTrue", 113) } else { ("waveAllTrue", 114) };
             return Ok(self.s.op(c, name, Attr::NoUnwind, i1t, code, &[mine]));
         }
-        if self.local || !self.exchange.as_ref().is_some_and(|e| !e.1) {
+        if self.local || self.exchange.is_none() {
             return Err(WHY);
         }
         if !self.all_lanes(b) {
             need(b);
             return Err(WHY);
+        }
+        if self.exchange.as_ref().is_some_and(|e| e.1) {
+            // A thread group of at most 32 threads is a single host wave: no exchange needed.
+            let c = self.cur;
+            let mine = self.boolean(when, c)?;
+            let i1t = self.s.t.i1;
+            self.s.flags |= flags::WAVE_OPS;
+            let (name, code) = if any { ("waveAnyTrue", 113) } else { ("waveAllTrue", 114) };
+            return Ok(self.s.op(c, name, Attr::NoUnwind, i1t, code, &[mine]));
         }
         let c = self.cur;
         let mine = self.boolean(when, c)?;
@@ -3871,6 +3867,39 @@ impl<'a> Lower<'a> {
         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
         let some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[set]);
         self.s.flags |= flags::WAVE_OPS;
+        if let Some((slot, host_waves)) = self.group_wide {
+            if !self.all_group(b) {
+                return Err("a wave-wide branch inside a divergent scalar branch");
+            }
+            let thread = self.console_thread();
+            let c = self.cur;
+            let five = self.s.m.i32(5);
+            let hw = self.s.m.bin(c, Bin::LShr, thread, five);
+            let some = self.s.m.cast(c, Cast::ZExt, some, i32t);
+            let base = self.s.m.i32(slot);
+            let idx = self.s.m.bin(c, Bin::Add, base, hw);
+            let lds = self.s.lds();
+            let ptr = self.s.m.element(c, lds, idx);
+            self.s.m.store(c, ptr, some);
+            self.group_sync(c);
+            let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+            let count = self.s.m.i32(host_waves);
+            let z = self.s.m.i32(0);
+            let in_range = self.s.m.cmp(c, pred::IULT, lane, count);
+            let off = self.s.m.select(c, in_range, lane, z);
+            let ridx = self.s.m.bin(c, Bin::Add, base, off);
+            let rptr = self.s.m.element(c, lds, ridx);
+            let val = self.s.m.load(c, rptr);
+            let nz = self.s.m.cmp(c, pred::NE, val, z);
+            let all_some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[nz]);
+            self.group_sync(c);
+            return Ok(if any {
+                all_some
+            } else {
+                let t = self.s.m.bool(true);
+                self.s.m.bin(c, Bin::Xor, all_some, t)
+            });
+        }
         let some = self.s.m.cast(c, Cast::ZExt, some, i32t);
         let (lo, hi) = self.exchange_halves(c, some);
         let c = self.cur;
@@ -3882,6 +3911,11 @@ impl<'a> Lower<'a> {
     /// Whether every lane runs IR block `b` (always true without `exchange`).
     fn all_lanes(&self, b: usize) -> bool {
         self.exchange.as_ref().is_none_or(|(_, _, all)| all.get(b).copied().unwrap_or(false))
+    }
+
+    /// Whether every wave in the threadgroup runs IR block `b` (always true without `group_wide`).
+    fn all_group(&self, b: usize) -> bool {
+        self.all_group.as_ref().is_none_or(|ag| ag.get(b).copied().unwrap_or(false))
     }
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
@@ -7685,6 +7719,9 @@ impl<'a> Lower<'a> {
                         need(self.cur_ir);
                         return Err("a lane read where not every lane runs");
                     }
+                    if self.group_wide.is_some() && !self.all_group(self.cur_ir) {
+                        return Err("a lane read inside a divergent scalar branch");
+                    }
                     let cl = self.console_lane();
                     let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
                     let k = self.exchange_pair(slot);
@@ -7753,7 +7790,7 @@ impl<'a> Lower<'a> {
                     _ => true,
                 };
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
-                let r = if halves && !alike {
+                let r = if halves && !alike && !self.single_lane_readfirstlane(inst) {
                     if !self.all_lanes(self.cur_ir) {
                         // shortcut: `VICTORY_FIRSTLANE_OWN=1` takes the host wave's own
                         // first lane, exact when the value is the same in every lane of
@@ -7765,6 +7802,9 @@ impl<'a> Lower<'a> {
                         }
                         need(self.cur_ir);
                         return Err("a first-lane read where not every lane runs");
+                    }
+                    if self.group_wide.is_some() && !self.all_group(self.cur_ir) {
+                        return Err("a first-lane read inside a divergent scalar branch");
                     }
                     let c = self.cur;
                     if guard.is_none() && super::shader_opt() & super::bitcode::opt::FIRST != 0 {
@@ -8078,7 +8118,10 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
-        let mut high = v.opsel >> k & 1 != 0;
+        // RDNA2 ignores VOP3 op_sel on 16-bit compares (v_cmp_class not measured).
+        let name = inst.name();
+        let compare = name.starts_with("v_cmp") && !name.contains("class");
+        let mut high = !compare && v.opsel >> k & 1 != 0;
         if let Some(sd) = v.sdwa {
             match sd.src_sel.get(k).copied().unwrap_or(6) {
                 4 => {}
@@ -9156,6 +9199,51 @@ impl<'a> Lower<'a> {
     }
 
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        let sampler = self.descriptors.get(&((b, i), true)).copied();
+        if let Some(Source::Phi { block, args }) = sampler
+            && let [first @ Source::Constant(_), second @ Source::Constant(_)] = args.as_slice()
+            && let [left, right] = self.x.p.blocks[*block].preds.as_slice()
+        {
+            // Immediate samplers are separate static bindings. Sample both with
+            // the original derivatives, then select the texel on the same edge
+            // that supplied the console's sampler.
+            if self.block[*left].is_none() {
+                return self.image_with_sampler(inst, b, i, Some(second));
+            }
+            if self.block[*right].is_none() {
+                return self.image_with_sampler(inst, b, i, Some(first));
+            }
+            let edge = |pred: usize| {
+                self.edges.get(&(pred, *block)).copied().or(self.tail[pred])
+                    .ok_or("a sampler choice with an unfinished predecessor")
+            };
+            let (left, right) = (edge(*left)?, edge(*right)?);
+            let join = self.block[*block].ok_or("a sampler choice without a host block")?;
+            let chosen = self.s.m.phi(join, self.s.t.i1);
+            let (yes, no) = (self.s.m.bool(true), self.s.m.bool(false));
+            self.s.m.set_phi(chosen, vec![(yes, left), (no, right)]);
+            self.image_with_sampler(inst, b, i, Some(first))?;
+            let left = inst.writes.iter()
+                .map(|&(_, v)| self.i32_of(v))
+                .collect::<Result<Vec<_>, _>>()?;
+            self.image_with_sampler(inst, b, i, Some(second))?;
+            for (&(_, v), a) in inst.writes.iter().zip(left) {
+                let b = self.i32_of(v)?;
+                let result = self.s.m.select(self.cur, chosen, a, b);
+                self.vals.insert(v, Val::I32(result));
+            }
+            return Ok(());
+        }
+        self.image_with_sampler(inst, b, i, sampler)
+    }
+
+    fn image_with_sampler(
+        &mut self,
+        inst: &Inst,
+        b: usize,
+        i: usize,
+        sampler: Option<&Source>,
+    ) -> Result<(), Why> {
         let Fields::Image {
             data,
             addr,
@@ -9447,11 +9535,7 @@ impl<'a> Lower<'a> {
         // A gather at a named level, done as four texel reads (below).
         let mut gathered: Option<[V; 4]> = None;
         let r = if sample {
-            let ss = self
-                .descriptors
-                .get(&(site, true))
-                .copied()
-                .ok_or("an untracked sampler")?;
+            let ss = sampler.ok_or("an untracked sampler")?;
             // Comparison: the reference value is the first address after
             // the bias, and the sampler is a comparison sampler.
             let cmp = matches!(op, 64 | 65);
@@ -11540,6 +11624,30 @@ mod tests {
                 range(ResourceType::Sampler, 1, 1),
             ],
         )
+    }
+
+    #[test]
+    fn a_uniform_branch_can_choose_between_immediate_samplers() {
+        // A root constant selects wrap or clamp. Keep the sample live with an LDS store.
+        let words = [
+            0xBE84_0300, 0xBE85_0380,       // s[4:5] = texture table
+            0xF40C_0302, 0xFA00_0000,       // s_load_dwordx8 s[12:19], s[4:5], 0
+            0xBE89_0380, 0xBE8A_0380, 0xBE8B_0380, // sampler words 1-3
+            0xBF06_8001,                    // s_cmp_eq_u32 s1, 0
+            0xBF85_0002,                    // branch to clamp
+            0xBE88_0380, 0xBF82_0002,       // wrap, skip clamp
+            0xBE88_03FF, 0x0000_0092,       // clamp all axes
+            0xF09C_0F08, 0x0043_0C02,       // image_sample_lz v[12:15], ..., s[8:11]
+            0xD834_0000, 0x0000_0C00,       // ds_write_b32 v0, v12
+            S_ENDPGM,
+        ];
+        let (mut layout, mut used) = texture_tables();
+        layout[1] = root(RootType::Constants, 1, 1);
+        used.truncate(1);
+        let shader = lower_with(&words, layout, used).unwrap();
+        assert_eq!(shader.samplers.len(), 2);
+        assert!(shader.samplers.contains(&[0, 0, 0, 0]));
+        assert!(shader.samplers.contains(&[0x92, 0, 0, 0]));
     }
 
     #[test]
