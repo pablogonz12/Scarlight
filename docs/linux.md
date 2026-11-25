@@ -81,9 +81,11 @@ pays the whole cold cost again, which looks exactly like a code regression and i
 prefix per install, and point `MESA_SHADER_CACHE_DIR` at the same directory if you want the cache to
 outlive the prefix.
 
-`MESA_SHADER_CACHE_READ_ONLY=1` makes Mesa never write the cache; it is the only way to ship a
-prebuilt cache to other machines, and it is **not** what this script does — a read-only cache never
-fills in, so anything missing from it recompiles on every boot.
+Mesa's Fossilize cache path (`MESA_SHADER_CACHE_DISABLE`, `MESA_SHADER_CACHE_MAX_SIZE`, and a
+directory shipped with the build) is what sets a cache's limits; `MESA_SHADER_CACHE_READ_ONLY` is not
+a guarantee, since Mesa 24.1 still writes to a writable cache when it is set. This script keeps the
+cache writable per prefix and capped (above) instead: a prebuilt cache shipped to another machine is
+**not** what it does, and a cache that never fills in recompiles whatever is missing on every boot.
 
 ## 5. Title profiles (optional)
 
