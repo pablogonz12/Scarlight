@@ -27,6 +27,16 @@ pub(super) mod intersect;
 #[path = "group_wide.rs"]
 mod group_wide;
 use group_wide::{all_group_blocks, lane_regions};
+/// The wide reads of a console buffer load (`bitcode::opt::WIDE`).
+#[path = "lower/wide.rs"]
+mod wide;
+
+/// The form a test asks for the wide reads to take, whatever the process's
+/// `VICTORY_SHADER_OPT` says (`None`: the switch again).
+#[cfg(test)]
+pub(super) fn wide_for_test(wide: Option<bool>) {
+    wide::FORCE.with(|f| *f.borrow_mut() = wide);
+}
 
 type Why = &'static str;
 
@@ -68,6 +78,11 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Buffer loads in the module as the lowering left it, before the
+    /// clean-up: a test counts them (one a dword or, with
+    /// `bitcode::opt::WIDE`, one for every four).
+    #[cfg(test)]
+    pub buffer_loads: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -2257,6 +2272,11 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        #[cfg(test)]
+        let buffer_loads = {
+            let k = |s: &str| super::bitcode::census::KINDS.iter().position(|k| *k == s).expect("kind");
+            self.s.m.census().counts[k("buffer_load")]
+        };
         Ok(Lowered {
             wave_size,
             cmp_samplers,
@@ -2267,6 +2287,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            buffer_loads,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -5728,8 +5750,13 @@ impl<'a> Lower<'a> {
             let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
+            let wide = wide::loads();
             let mut raw = Vec::new();
-            for k in 0..count {
+            if wide {
+                let dwords = self.raw_dwords(h, addr, count);
+                raw.extend(dwords.into_iter().map(|x| (x, zero)));
+            }
+            for k in 0..if wide { 0 } else { count } {
                 let b = self.cur;
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(b, Bin::Add, addr, off);
@@ -5767,6 +5794,12 @@ impl<'a> Lower<'a> {
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
+            if wide::loads() {
+                for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+                return Ok(());
+            }
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);

@@ -147,3 +147,8 @@ Missing or wrong name? Open an issue.
   enables blending on one, so those targets are made to write unblended, per target and with independent
   blending turned on only where it was needed (`crates/victory-gpu/src/pipeline/host.rs`,
   `VICTORY_HOST_BLEND=0`). Its host-pipeline device test used `D3DCompile`; ours checks the state itself.
+- **avatarmanz/VIctory-7900XTX [200a9cc5](https://github.com/avatarmanz/VIctory-7900XTX/commit/200a9cc5e)**
+  (after fxceless/victory-fork [c36971b2](https://github.com/fxceless/victory-fork/commit/c36971b2)), GPL-3.0: the
+  dwords of one console buffer load read by one `rawBufferLoad` for every four of them instead of a call a dword,
+  behind `VICTORY_SHADER_OPT=64` (off by default, worth nothing on the card that measured it)
+  (`crates/victory-shader/src/emit/lower/wide.rs`).
