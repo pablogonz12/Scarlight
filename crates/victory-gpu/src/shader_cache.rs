@@ -65,6 +65,9 @@ fn build() -> &'static [u8; 32] {
                 // served the translations an earlier run of the same
                 // executable had cached with the switch unset.
                 for name in [
+                    // Reading an `ACCC` part's `FSPX` image as a program is
+                    // part of the translation (`VICTORY_FSPX=0` refuses it).
+                    "VICTORY_FSPX",
                     "VICTORY_WAVE_WIDE",
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
