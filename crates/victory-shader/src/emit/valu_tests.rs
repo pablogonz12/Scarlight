@@ -1743,3 +1743,66 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
             );
         }    }
 }
+
+/// `v_mad_u32_u16` / `v_mad_i32_i16` (op_sel[0:1] pick the halves of src0/src1,
+/// src2 is a full-width addend) and `v_lerp_u8` (a 4×8-bit average whose rounding
+/// bit is src2's low bit per byte) were decoded but unsupported (#405).
+#[test]
+fn mad_u32_u16_i32_i16_and_lerp_u8() {
+    let with_opsel = |op: u16, s0: u16, s1: u16, s2: u16, opsel: u8| -> [u32; 2] {
+        let [w0, w1] = vop3(op, 0, s0, s1, s2);
+        [w0 | u32::from(opsel) << 11, w1]
+    };
+    let half = |x: u32, hi: bool| (if hi { x >> 16 } else { x }) & 0xFFFF;
+    let cases = [
+        [0xFFFF_FFFF, 0x0002_0003, 7, 0],
+        [10, 0x0005_0000, 0xFFFF_FFF9, 0],
+    ];
+    // v_mad_u32_u16 v0, v1, v2, v3
+    let mad_u = build_valu_cs(&with_opsel(0x373, vgpr(1), vgpr(2), vgpr(3), 0));
+    run_cases(&mad_u, &cases, |label, i, x, out| {
+        let want = half(x[0], false)
+            .wrapping_mul(half(x[1], false))
+            .wrapping_add(x[2]);
+        assert_eq!(out, want, "{label} case {i}: v_mad_u32_u16 {x:08x?}");
+    });
+    let mad_u_hi = build_valu_cs(&with_opsel(0x373, vgpr(1), vgpr(2), vgpr(3), 0b0011));
+    run_cases(&mad_u_hi, &cases, |label, i, x, out| {
+        let want = half(x[0], true)
+            .wrapping_mul(half(x[1], true))
+            .wrapping_add(x[2]);
+        assert_eq!(out, want, "{label} case {i}: v_mad_u32_u16 hi {x:08x?}");
+    });
+    // v_mad_i32_i16 v0, v1, v2, v3: both halves sign-extend to 32 bits.
+    let sext = |x: u32, hi: bool| i64::from(half(x, hi) as u16 as i16);
+    let mad_i = build_valu_cs(&with_opsel(0x375, vgpr(1), vgpr(2), vgpr(3), 0));
+    run_cases(&mad_i, &cases, |label, i, x, out| {
+        let want = sext(x[0], false) * sext(x[1], false) + i64::from(x[2] as i32);
+        assert_eq!(out, want as u32, "{label} case {i}: v_mad_i32_i16 {x:08x?}");
+    });
+    let mad_i_hi = build_valu_cs(&with_opsel(0x375, vgpr(1), vgpr(2), vgpr(3), 0b0011));
+    run_cases(&mad_i_hi, &cases, |label, i, x, out| {
+        let want = sext(x[0], true) * sext(x[1], true) + i64::from(x[2] as i32);
+        assert_eq!(out, want as u32, "{label} case {i}: v_mad_i32_i16 hi {x:08x?}");
+    });
+    // v_lerp_u8 v0, v1, v2, v3
+    let lerp = build_valu_cs(&with_opsel(0x14d, vgpr(1), vgpr(2), vgpr(3), 0));
+    let want_lerp = |a: u32, b: u32, c: u32| {
+        (0..4).fold(0u32, |out, i| {
+            let sh = i * 8;
+            let sum = ((a >> sh) & 0xFF) + ((b >> sh) & 0xFF) + ((c >> sh) & 1);
+            out | (sum >> 1) << sh
+        })
+    };
+    let cases = [
+        [0xFFFF_FFFF, 0, 0x5555_5555, 0],
+        [0x00FF_0080, 0x0100_7F01, 0x0404_0404, 0],
+    ];
+    run_cases(&lerp, &cases, |label, i, x, out| {
+        assert_eq!(
+            out,
+            want_lerp(x[0], x[1], x[2]),
+            "{label} case {i}: v_lerp_u8 {x:08x?}"
+        );
+    });
+}

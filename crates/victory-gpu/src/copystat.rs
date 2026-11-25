@@ -59,6 +59,10 @@ pub(crate) enum C {
     BackCompared,
     /// Reading around unmapped pages after a failed bulk read.
     SparseUs,
+    /// Copies taken as bytes (`ptr::copy`) because the layer knew the whole
+    /// range was mapped: calls and bytes.
+    Plain,
+    PlainBytes,
     /// Guarding view memory (part of the write-watch askings' time).
     GuardUs,
     /// Bytes copied whole because their memory is neither write-watched
@@ -1105,7 +1109,7 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
-         {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
+         {:.2} MB unmapped; {:.0} copies as bytes {:.1} MB; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed, {:.0} written behind the guard; \
          presented textures from title memory {:.0}, of them a submission old {:.0}; \
@@ -1124,6 +1128,8 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::QueryUs as usize]),
         ms(c[C::MoveUs as usize]),
         mb(c[C::Unmapped as usize]),
+        c[C::Plain as usize],
+        mb(c[C::PlainBytes as usize]),
         faults as f64 / frames,
         c[C::Watches as usize],
         ms(c[C::WatchUs as usize]),
