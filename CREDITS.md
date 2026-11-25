@@ -43,6 +43,12 @@ BlueKaiman, kais7654, pushkarreddyy, shh.
   GPL-3.0: narrowing a host shader resource view of a streamed texture to the mips whose memory is
   there, and remaking it when more levels arrive or a host copy fills the chain
   (`crates/victory-gpu/src/texture.rs`, `crates/victory-gpu/src/descriptor/host.rs`).
+- **Marvisak/VIctory [#2545](https://github.com/Marvisak/VIctory/pull/2545)** (reeledMarek), GPL-3.0: a presented
+  texture the title already left in `COPY_SOURCE` was given an illegal `COPY_SOURCE -> COPY_SOURCE` barrier before
+  and after the copy up, and its recorded state was moved outside the submission lock. Reimplemented against this
+  tree's own per-list state bookkeeping (`HostList::settle`, `crates/victory-gpu/src/host.rs`), not copied: the
+  present's list records the move, the prelude makes it under the lock and records nothing when the texture is
+  there already.
 
 ## Tools
 
