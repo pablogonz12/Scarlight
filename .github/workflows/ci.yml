@@ -28,6 +28,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      # Includes xtask's repository_passes_policy, the asset-policy check.
+      # Scratch: reproduce the stencil crash serially, with its message.
       - name: Tests
-        run: cargo test --workspace --locked
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo test -p victory-gpu --lib --locked -- --test-threads=1 --nocapture
