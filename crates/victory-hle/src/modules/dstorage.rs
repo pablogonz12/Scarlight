@@ -418,6 +418,7 @@ enum Stage {
 }
 
 /// The stages above, in order (`Stage` as an index).
+#[cfg(feature = "diagnostics")]
 const STAGE_COUNT: usize = 6;
 /// The stages' names, for the summary.
 #[cfg(feature = "diagnostics")]
