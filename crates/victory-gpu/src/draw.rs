@@ -949,6 +949,9 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        if compute || pipeline_writes_uav(p) {
+            list.end_hoisted_indirect();
+        }
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -2619,7 +2622,10 @@ impl State {
             ));
             return false;
         }
-        let len = u64::from(stride) * u64::from(max.max(1));
+        if max == 0 {
+            return true;
+        }
+        let len = u64::from(stride) * u64::from(max);
         let Some(args) = crate::shadow::find_any(arguments, len) else {
             why("arguments outside title buffers");
             return false;
@@ -2652,6 +2658,7 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let windowed = windows()
+            && !crate::indirect::hoisting()
             && kind != DISPATCH
             && max == 1
             && count.is_none()
@@ -2661,6 +2668,49 @@ impl State {
         if !windowed || list.first_use(WINDOW_USE) {
             self.window = None;
         }
+        // The clamp of this draw hoisted into the list's submission prelude
+        // (`crate::indirect`): instead of a compute dispatch between the
+        // draws, with its own waits, state changes and a graphics rebind, it
+        // joins one batched pass for a run of indirect draws. Only when the
+        // shaders cannot write the arguments, whose batch reads them a
+        // prelude before the draw: the draw's state is prepared first, as
+        // nothing of ours clobbers it (`VICTORY_HOIST_INDIRECT=0` records
+        // the inline clamp as before).
+        let hoisted_at = if kind != DISPATCH
+            && crate::indirect::hoisting()
+            && !pipeline_writes_uav(p)
+            && crate::indirect::can_hoist(list, args.gpu(arguments), (kind, stride, max))
+        {
+            let ran = match kind {
+                DRAW | INDEXED => {
+                    (self.topology != RECTANGLES || self.completes_rects() || {
+                        once!("rectangles");
+                        false
+                    }) && self.prepare(list, kind == INDEXED)
+                }
+                MESH => self.prepare_for(list, false, true),
+                _ => false,
+            };
+            let at = if ran {
+                args.refresh(list, arguments, len);
+                if let Some((s, at)) = &counter {
+                    s.refresh(list, *at, 4);
+                }
+                crate::indirect::hoist(list, &args.buffer, args.gpu(arguments), (kind, stride, max))
+            } else {
+                None
+            };
+            if ran && at.is_none() {
+                // Prepared for nothing: the inline clamp binds its pipeline
+                // (and its compute root signature) over it.
+                list.end_hoisted_indirect();
+            }
+            at
+        } else {
+            list.end_hoisted_indirect();
+            None
+        };
+        let hoisted = hoisted_at.is_some();
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
         let hit = self
             .window
@@ -2668,7 +2718,7 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
-        let (bounded, at) = match hit {
+        let (bounded, at) = match hoisted_at.or(hit) {
             Some(hit) => hit,
             None => {
                 // A record a short step after the last window's last one
@@ -2726,12 +2776,13 @@ impl State {
                 (bounded, 0)
             }
         };
-        let ran = match kind {
-            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
-            MESH => self.prepare_for(list, false, true),
-            DISPATCH => self.bind(list, p, true),
-            _ => false,
-        };
+        let ran = hoisted
+            || match kind {
+                DRAW | INDEXED => self.prepare(list, kind == INDEXED),
+                MESH => self.prepare_for(list, false, true),
+                DISPATCH => self.bind(list, p, true),
+                _ => false,
+            };
         if !ran {
             crate::indirect::done(list, &bounded);
             why("prepare failed");
@@ -2759,7 +2810,9 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
+        if !hoisted {
+            crate::indirect::done(list, &bounded);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -2843,6 +2896,14 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
     } else {
         DEPTH_WRITE
     }
+}
+
+/// Whether any stage of `p` may write to GPU memory (a store to a buffer or
+/// an image): a draw of such a pipeline ends the list's hoisted clamp prefix
+/// (`crate::indirect`), whose batch reads the arguments a prelude before the
+/// draw rather than just before it.
+fn pipeline_writes_uav(p: &HostPipeline) -> bool {
+    p.stages.iter().any(|s| s.translated().stores)
 }
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {

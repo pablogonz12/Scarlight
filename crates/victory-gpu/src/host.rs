@@ -835,6 +835,9 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Indirect argument clamps hoisted from this list's initial non-writing
+    /// prefix into its submission prelude (`crate::indirect::HoistedClamps`).
+    hoisted_indirect: Mutex<crate::indirect::HoistedClamps>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -2998,6 +3001,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                hoisted_indirect: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -4635,6 +4639,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.end_hoisted_indirect();
         self.twins_to_depth();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -4663,6 +4668,7 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.hoisted_indirect.lock().unwrap_or_else(|e| e.into_inner()).reset();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -4971,7 +4977,8 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        let has_hoisted = !self.hoisted().is_empty();
+        if barriers.is_empty() && syncs.is_empty() && !has_hoisted {
             return None;
         }
         let Some((allocator, list)) = self
@@ -4994,6 +5001,11 @@ impl HostList {
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
+                }
+                if has_hoisted
+                    && let Some((budget_res, budget_gpu)) = self.budget_resource()
+                {
+                    self.hoisted().record_prelude(list, budget_res, budget_gpu);
                 }
                 list.Close()
             })
@@ -5239,6 +5251,24 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// The already-created indirect-work budget buffer and its GPU address.
+    pub(crate) fn budget_resource(&self) -> Option<(&ID3D12Resource, u64)> {
+        let (buffer, _) = self.budget.get()?.as_ref()?;
+        // SAFETY: a live buffer.
+        Some((buffer, unsafe { buffer.GetGPUVirtualAddress() }))
+    }
+
+    pub(crate) fn hoisted(&self) -> std::sync::MutexGuard<'_, crate::indirect::HoistedClamps> {
+        self.hoisted_indirect.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Ends the hoistable prefix of indirect clamps on this list: its
+    /// hoisted argument chunks leave `INDIRECT_ARGUMENT` for `COMMON` once,
+    /// so later writes and the next submission see them there.
+    pub(crate) fn end_hoisted_indirect(&self) {
+        self.hoisted().end(&self.list);
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
