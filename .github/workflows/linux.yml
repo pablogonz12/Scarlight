@@ -63,3 +63,22 @@ jobs:
           path: target/x86_64-pc-windows-msvc/release/victory.exe
           if-no-files-found: error
           retention-days: 14
+
+  # The platform-level crates (shader translator, formats, PE reader, HLE
+  # logic) build and test on the host with no Wine at all: this job keeps
+  # them that way, so the machine we work on can answer most questions
+  # before anything is cross-built. Running a title still needs Windows (or
+  # Wine/Proton with vkd3d-proton), and the crates that touch the host's
+  # D3D12 keep their tests Windows-only.
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      # The version pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-tests
+      - name: Tests
+        run: cargo test --workspace --locked
