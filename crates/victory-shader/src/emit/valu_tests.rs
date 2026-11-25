@@ -1743,3 +1743,96 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
             );
         }    }
 }
+
+/// `v_mov_b32` source modifiers (`abs`/`neg`) are bitwise sign-bit operations
+/// on 32-bit patterns (preserving denormals, `-0.0`, and NaN payloads/signaling
+/// bits), unless float output modifiers (`clamp`/`omod`) are active.
+#[test]
+fn v_mov_b32_modifiers_are_bitwise() {
+    let vmov_e64 = |abs: u8, neg: u8, clamp: bool, omod: u8| -> [u32; 2] {
+        [
+            0x35 << 26 | 0x181 << 16 | u32::from(clamp) << 15 | (u32::from(abs) & 7) << 8,
+            (u32::from(neg) & 7) << 29 | (u32::from(omod) & 3) << 27 | u32::from(vgpr(1)),
+        ]
+    };
+    let vmov_sdwa = |src_sel: u8, sext: bool, abs: bool, neg: bool| -> [u32; 2] {
+        [
+            vop1(0x001, 0, 0xF9),
+            u32::from(abs) << 21
+                | u32::from(neg) << 20
+                | u32::from(sext) << 19
+                | (u32::from(src_sel) & 7) << 16
+                | 6 << 8
+                | 1,
+        ]
+    };
+
+    let patterns: &[u32] = &[
+        0x0000_0000, // +0.0
+        0x8000_0000, // -0.0
+        0x3F80_0000, // +1.0
+        0xBF80_0000, // -1.0
+        0x7F80_0000, // +inf
+        0xFF80_0000, // -inf
+        0x0000_0001, // smallest +denorm
+        0x8000_0001, // smallest -denorm
+        0x007F_FFFF, // largest +denorm
+        0x807F_FFFF, // largest -denorm
+        0x7F80_0001, // +sNaN
+        0xFF80_0001, // -sNaN
+        0x7FC0_1234, // +qNaN with payload
+        0xFFC0_1234, // -qNaN with payload
+    ];
+    let inputs: Vec<[u32; 4]> = patterns.iter().map(|&x| [x, 0, 0, 0]).collect();
+
+    type BitwiseCase = ([u32; 2], fn(u32) -> u32, &'static str);
+    let bitwise_cases: &[BitwiseCase] = &[
+        (vmov_e64(0, 1, false, 0), |x| x ^ 0x8000_0000, "e64 -v1"),
+        (vmov_e64(1, 0, false, 0), |x| x & 0x7FFF_FFFF, "e64 |v1|"),
+        (vmov_e64(1, 1, false, 0), |x| x | 0x8000_0000, "e64 -|v1|"),
+        (
+            vmov_sdwa(6, false, false, true),
+            |x| x ^ 0x8000_0000,
+            "sdwa -v1",
+        ),
+        (
+            vmov_sdwa(4, false, false, true),
+            |x| (x & 0xFFFF) ^ 0x8000_0000,
+            "sdwa -v1.w0",
+        ),
+        (
+            vmov_sdwa(0, true, true, false),
+            |x| ((x as i8 as i32) as u32) & 0x7FFF_FFFF,
+            "sdwa |sext(v1.b0)|",
+        ),
+    ];
+
+    for &(inst, expected, label) in bitwise_cases {
+        let shader = build_valu_cs(&inst);
+        run_cases(&shader, &inputs, |backend, _, inp, got| {
+            let want = expected(inp[0]);
+            assert_eq!(
+                got, want,
+                "{backend}: {label}({:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0]
+            );
+        });
+    }
+
+    // Float output modifiers (`clamp` + `omod = mul:2`) take the negated bits as f32.
+    let float_shader = build_valu_cs(&vmov_e64(0, 1, true, 1));
+    let float_cases: &[(u32, u32)] = &[
+        ((-0.25f32).to_bits(), 0.5f32.to_bits()),
+        ((-0.75f32).to_bits(), 1.0f32.to_bits()),
+        ((0.25f32).to_bits(), 0.0f32.to_bits()),
+    ];
+    let float_inputs: Vec<[u32; 4]> = float_cases.iter().map(|&(x, _)| [x, 0, 0, 0]).collect();
+    run_cases(&float_shader, &float_inputs, |backend, i, inp, got| {
+        let want = float_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: e64 -v1 clamp mul:2 ({:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0]
+        );
+    });
+}
