@@ -1930,6 +1930,22 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
+    if layout.planes.len() > 1 {
+        // Each plane's footprints name the plane's own format: a copy placed
+        // in a buffer is measured in the footprint format's elements, and a
+        // depth-stencil resource's own (TYPELESS) format has none.
+        for (i, footprint) in footprints.iter_mut().enumerate() {
+            let plane = &layout.planes[i / subresources_per_plane as usize];
+            footprint.Footprint.Format =
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(if plane.stencil {
+                    62 // R8_UINT
+                } else if plane.layout.desc.element_bytes == 2 {
+                    53 // R16_TYPELESS
+                } else {
+                    39 // R32_TYPELESS
+                });
+        }
+    }
     let (buffer, data) = host.upload_buffer(total)?;
     crate::host::name(&buffer, || {
         format!(
