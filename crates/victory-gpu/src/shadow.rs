@@ -2039,7 +2039,9 @@ impl Shadow {
         // `VICTORY_REFRESH_BATCH=0` puts one step in per span, each with its
         // own lock of the list, as before the batch.
         static BATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let batch = *BATCH.get_or_init(|| std::env::var_os("VICTORY_REFRESH_BATCH").is_none_or(|v| v != "0"));
+        // Opt-in only: a tester on the same fork line found this family (fxceless #1068) causes black lighting
+        // (batch3, his notes, 25 Nov). Default off = the old one-step-per-span behaviour.
+        let batch = *BATCH.get_or_init(|| std::env::var_os("VICTORY_REFRESH_BATCH").is_some_and(|v| v == "1"));
         let spans = spans.into_iter().map(|(shadow, address, len)| {
             let len = len.min(shadow.start + shadow.len - address);
             (shadow, address as usize, len as usize)
