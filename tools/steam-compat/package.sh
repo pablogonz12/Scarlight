@@ -127,7 +127,7 @@ if [ -z "$VERSION" ]; then
     SERIES_RE="$(printf '%s' "$BASE_SERIES" | sed 's/\./\\./g')"
     LAST="$(git -C "$ROOT" tag --list "v$BASE_SERIES.*" |
       sed -n "s/^v$SERIES_RE\.\([0-9][0-9]*\)$/\1/p" | sort -n | tail -1)"
-    if [ -n "$LAST" ]; then REV=$((LAST + 1)); fi
+    if [ -n "$LAST" ]; then REV=$((10#$LAST + 1)); fi  # 10#: a revision like 08 is decimal, not octal
   fi
   VERSION="$BASE_SERIES.$REV"
 fi

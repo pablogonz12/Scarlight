@@ -41,7 +41,7 @@ SERIES_RE="$(printf '%s' "$SERIES" | sed 's/\./\\./g')"
 LAST="$(git -C "$ROOT" tag --list "v$SERIES.*" |
   sed -n "s/^v$SERIES_RE\.\([0-9][0-9]*\)$/\1/p" | sort -n | tail -1)"
 REV=1
-if [ -n "$LAST" ]; then REV=$((LAST + 1)); fi
+if [ -n "$LAST" ]; then REV=$((10#$LAST + 1)); fi  # 10#: a revision like 08 is decimal, not octal
 NEXT="$SERIES.$REV"
 # The tag's own commit time, not its date: a PR merged the same morning, before
 # the tag was cut, belongs to the release that already shipped it.

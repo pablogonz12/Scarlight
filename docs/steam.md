@@ -40,7 +40,7 @@ the host instead; nothing else changes.
 
    ```bash
    cd ~/.local/share/Steam/compatibilitytools.d/Scarlight-<version>
-   cp ../Scarlight-<older version>/scarlight.conf .   # keep your settings, if you had a release
+   [ -f scarlight.conf ] || cp ../Scarlight-<older version>/scarlight.conf .   # keep your settings, if you had a release
    [ -f scarlight.conf ] || cp scarlight.conf.example scarlight.conf
    ```
 4. **If Scarlight is already installed**, each version has its own directory, so a new release starts
