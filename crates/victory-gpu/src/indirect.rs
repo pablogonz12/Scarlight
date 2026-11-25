@@ -46,6 +46,10 @@ RWByteAddressBuffer dst_args : register(u0);
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
+// Whether a record that does not fit takes the rest (`VICTORY_INDIRECT_REST`).
+#ifndef REST
+#define REST 1
+#endif
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
 [RootSignature(RS)]
@@ -110,13 +114,28 @@ void main(uint3 id : SV_DispatchThreadID) {
         budget.InterlockedOr(0, 0, before);
         [allow_uav_condition]
         while (before < BUDGET) {
-            uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
+            // A record that does not fit whole takes the rest of the
+            // budget (`REST`) or nothing at all: a title whose records vary
+            // in cost loses every later draw of a list when one garbage
+            // record empties it, and which one that is may differ from
+            // frame to frame.
+            uint next = (BUDGET - before < cost) ? (REST ? BUDGET : before) : (before + cost);
             uint prev;
             budget.InterlockedCompareExchange(0, before, next, prev);
             if (prev == before) break;
             before = prev;
         }
         over = before >= BUDGET || BUDGET - before < cost;
+    }
+    // Diagnostics, in the budget's words after the budget (the frame line
+    // tells them): the records that ran empty for want of it, and the
+    // largest cost one of them had (below 2^22 the cost is not told).
+    if (over) {
+        uint was;
+        budget.InterlockedAdd(12, 1, was);
+        if (cost >= (1u << 22)) {
+            budget.InterlockedMax(16, cost, was);
+        }
     }
     if (kind <= 1) {
         if (over) {
@@ -138,6 +157,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+#[derive(Clone)]
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
@@ -167,11 +187,23 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
-    let bytes = compile(SOURCE, "main", "cs_5_1")?;
+    let source = format!("#define REST {}\n{SOURCE}", rest());
+    let bytes = compile(&source, "main", "cs_5_1")?;
     make_clamp(device, &bytes)
 }
 
 /// The clamp's root signature and pipeline over compiled `bytes`.
+/// Whether a record that does not fit in what is left of its list's budget
+/// takes the rest, so that every record after it runs empty too
+/// (`VICTORY_INDIRECT_REST=0`: it takes nothing, and the next one that fits
+/// runs). A list whose budget one garbage record empties loses all its later
+/// draws, and which record that is may differ from frame to frame. The frame
+/// line says how many records a frame a list refuses.
+fn rest() -> u32 {
+    static ON: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| u32::from(std::env::var("VICTORY_INDIRECT_REST").ok().as_deref() != Some("0")))
+}
+
 fn make_clamp(device: &ID3D12Device, bytes: &[u8]) -> windows::core::Result<Clamp> {
     // SAFETY: the root signature is inside the shader; the description
     // points at live bytes and never releases its pointer.
@@ -1154,6 +1186,100 @@ void main() {
             }
         }
         assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+    }
+
+    /// Two records that cost 200 and 100 with 250 left of the budget: one
+    /// fits either way, and what the other did with the rest is
+    /// `VICTORY_INDIRECT_REST`. Taking it (`REST` 1, the default) saturates
+    /// the budget, so every record after it runs empty; taking nothing
+    /// leaves the 50 that no record of this pair wants, and the next record
+    /// of the list that fits runs. Either way one record is refused, and the
+    /// clamp says so in the budget's words after the budget (word 3: the
+    /// records refused, word 4: the largest cost of one, 0 under 2^22).
+    #[test]
+    fn a_record_that_does_not_fit_takes_the_rest_or_nothing() {
+        let _once = crate::warptest::lock();
+        let Some(mut harness) = Harness::new() else {
+
+            return;
+        };
+        const KIND_DRAW: u32 = 0;
+        const STRIDE: u32 = 16;
+        const RECORDS: u32 = 2;
+        const BUDGET_CAP: u32 = 1 << 27;
+        const LEFT: u32 = 250;
+        let total = (STRIDE * RECORDS) as usize;
+        // One run of the clamp: what the budget holds after it, which
+        // records were kept, and the two words of notes.
+        let rest1 = harness.clamp.clone();
+        let rest0 = compile_cs(&harness.device, &format!("#define REST 0\n{SOURCE}")).expect("the clamp must compile");
+        let run = |harness: &mut Harness, clamp: &Clamp| -> (u32, Vec<u32>, u32, u32) {
+            let (src_buf, src_ptr, _) = harness.shared_buffer(total as u64);
+            let (_budget_buf, budget_ptr, budget_gpu) = harness.shared_buffer(256);
+            let (readback_buf, readback_ptr, _) = harness.shared_buffer(total as u64);
+        let dst_buf = harness.default_uav(total as u64);
+            // SAFETY: mapped buffers hold these bytes.
+            unsafe {
+                let words = src_ptr.cast::<u32>();
+                for (i, (count, instances)) in [(200u32, 1u32), (100, 1)].into_iter().enumerate() {
+                    words.add(i * 4).write_volatile(count);
+                    words.add(i * 4 + 1).write_volatile(instances);
+                }
+                (budget_ptr as *mut u32).write_volatile(BUDGET_CAP - LEFT);
+                for i in 1..5 {
+                    (budget_ptr as *mut u32).add(i).write_volatile(0);
+                }
+                std::ptr::write_bytes(readback_ptr, 0, total);
+            }
+            assert!(record_clamp(
+                clamp,
+                &harness.list,
+                &dst_buf,
+                budget_gpu,
+                (&src_buf, 0),
+                None,
+                (KIND_DRAW, STRIDE, RECORDS),
+            ));
+            done_on(&harness.list, &dst_buf);
+            // SAFETY: open list; live buffers.
+            unsafe {
+                harness.list.ResourceBarrier(&[transition(
+                    &dst_buf,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                harness
+                    .list
+                    .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total as u64);
+                harness.list.ResourceBarrier(&[transition(
+                    &dst_buf,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+            done_on(&harness.list, &readback_buf);
+            harness.submit_and_wait();
+            // SAFETY: the GPU work is done; the mappings are ours.
+            unsafe {
+                let notes = budget_ptr.cast::<u32>();
+                (
+                    notes.read_volatile(),
+                    std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), total / 4).to_vec(),
+                    notes.add(3).read_volatile(),
+                    notes.add(4).read_volatile(),
+                )
+            }
+        };
+        let (spent, out, refused, biggest) = run(&mut harness, &rest1);
+        assert_eq!(spent, BUDGET_CAP, "the record that did not fit took the rest");
+        assert_eq!((refused, biggest), (1, 0), "one refused, its cost under 2^22");
+        let kept = (0..RECORDS as usize).filter(|&i| out[i * 4] > 0).count();
+        assert_eq!(kept, 1, "one of the two fits either way");
+        let (spent, out, refused, biggest) = run(&mut harness, &rest0);
+        assert_eq!(spent, BUDGET_CAP - 50, "it took nothing: 50 are left");
+        assert_eq!((refused, biggest), (1, 0));
+        let kept = (0..RECORDS as usize).filter(|&i| out[i * 4] > 0).count();
+        assert_eq!(kept, 1);
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, `done`, `Host::execute`,
