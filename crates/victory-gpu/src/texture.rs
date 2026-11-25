@@ -1844,7 +1844,11 @@ fn planes_uploaded(
     if layout.planes.len() < 2 || !planes_on() {
         return 1;
     }
-    let Some(host_planes) = host_planes else {
+    // The host format must be a typed depth-stencil one: a copy writes one
+    // plane of a texture at a time, and D3D12 refuses that for a TYPELESS
+    // format (the runtime faults where it would size the copy).
+    const TYPED: [u32; 2] = [20, 45]; // D32_FLOAT_S8X24_UINT, D24_UNORM_S8_UINT
+    let Some(host_planes) = host_planes.filter(|_| TYPED.contains(&format)) else {
         return 1;
     };
     let matching = victory_formats::texture::format(format)
@@ -1929,22 +1933,6 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             None,
             Some(&mut total),
         );
-    }
-    if layout.planes.len() > 1 {
-        // Each plane's footprints name the plane's own format: a copy placed
-        // in a buffer is measured in the footprint format's elements, and a
-        // depth-stencil resource's own (TYPELESS) format has none.
-        for (i, footprint) in footprints.iter_mut().enumerate() {
-            let plane = &layout.planes[i / subresources_per_plane as usize];
-            footprint.Footprint.Format =
-                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(if plane.stencil {
-                    62 // R8_UINT
-                } else if plane.layout.desc.element_bytes == 2 {
-                    53 // R16_TYPELESS
-                } else {
-                    39 // R32_TYPELESS
-                });
-        }
     }
     let (buffer, data) = host.upload_buffer(total)?;
     crate::host::name(&buffer, || {

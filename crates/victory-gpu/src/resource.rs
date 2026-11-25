@@ -3047,7 +3047,7 @@ void main() {
         let null = std::ptr::null();
         let desc = ResourceDesc {
             depth_or_array_size: 2,
-            ..texture(2, 2, 19, 2) // R32G8X24_TYPELESS, sampled or copied
+            ..texture(2, 2, 20, 2) // D32_FLOAT_S8X24_UINT, sampled or copied
         };
         let layout = texture_layout(&desc).expect("a console layout");
         assert_eq!(layout.planes.len(), 2, "depth and stencil");
