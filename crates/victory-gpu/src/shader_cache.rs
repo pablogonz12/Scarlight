@@ -64,7 +64,7 @@ pub(crate) fn build_name() -> Option<String> {
 /// What identifies this build: the BLAKE3 of our executable file and of
 /// the translation settings it runs with (the loop limit, which a
 /// diagnostics build can change at run time).
-fn build() -> &'static [u8; 32] {
+pub(crate) fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
         let exe = std::env::current_exe().and_then(std::fs::read);

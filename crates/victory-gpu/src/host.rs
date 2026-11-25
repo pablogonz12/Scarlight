@@ -6102,6 +6102,10 @@ impl Meter {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
         let dropped = crate::draw::take_dropped() as f64 / frames;
+        // Of those, the ones whose pipeline was refused (lost every frame)
+        // and those still being made (lost this one).
+        let [refused_per_frame, waiting_per_frame] =
+            crate::pipeline::take_dropped_split().map(|count| count as f64 / frames);
         let indirect = crate::list::take_indirect() as f64 / frames;
         // What a shot's stats file says about this second of frames.
         #[cfg(feature = "diagnostics")]
@@ -6109,7 +6113,9 @@ impl Meter {
             "{fps:.1} fps {ms:.1} ms/frame (preparing {cpu:.1} ms: copies {copy_ms:.1} ms \
              {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} ms on \
              the GPU; copying back {back_ms:.1} ms {back_mb:.1} MB), {draws:.0} draws/frame, \
-             dropped {dropped:.0} without a host pipeline ({} being made), {indirect:.0} indirect",
+             dropped {dropped:.0} without a host pipeline ({refused_per_frame:.0} refused, \
+             {waiting_per_frame:.0} waiting for one, {} being made), \
+             {indirect:.0} indirect",
             crate::pipeline::making()
         ));
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
@@ -6234,8 +6240,8 @@ impl Meter {
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
-                 dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
+                 dropped {dropped:.0} without a host pipeline ({refused_per_frame:.0} refused, \
+                 {waiting_per_frame:.0} waiting for one, {making} being made) and {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                  {picked_waiting} waiting, {picked_away} passed over unmapped ({picked_kept} kept what they showed); depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
