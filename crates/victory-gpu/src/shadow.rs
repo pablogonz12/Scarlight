@@ -1610,46 +1610,6 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
-/// `runs` (in order) with those a gap of `gap` bytes or fewer apart made
-/// one run, the gap's bytes included.
-fn joined_over(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
-    if gap == 0 || runs.len() < 2 {
-        return runs;
-    }
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
-    for (at, n) in runs {
-        match out.last_mut() {
-            Some(last) if at - (last.0 + last.1) <= gap => last.1 = at + n - last.0,
-            _ => out.push((at, n)),
-        }
-    }
-    out
-}
-
-/// The gap, in bytes, over which the title bytes put into a copy in the
-/// card's memory under flights' shader writes are joined into one run
-/// (`VICTORY_MERGE_GAP`, 0 to 64; 0 by default: only the bytes the title
-/// changed go up, as before).
-///
-/// Run 219: the title rewrites some hundred pages of its big buffer a
-/// frame while flights that may write that buffer are in the air, and
-/// byte by byte the new content differs from the old in 38,000 runs a
-/// frame (equal bytes in between, mostly zeros), far over the 512 runs a
-/// submission may send, so the flights were settled twice a frame, 50 ms
-/// of the submitting thread. Joined over small gaps the same pages are a
-/// few runs.
-///
-/// What it gives up: a gap byte is equal in title memory and on the CPU
-/// side of the copy, and goes up with its run. If a flight in the air
-/// wrote exactly that byte on the card (a shader store within `gap` bytes
-/// between two bytes the title changed in the same frame), the store is
-/// overwritten with the old value, and no compare finds it. Exact (0) is
-/// the default for that reason.
-fn merge_gap() -> usize {
-    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *GAP.get_or_init(|| std::env::var("VICTORY_MERGE_GAP").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(0, |n| n.min(64)))
-}
-
 /// Whether a refresh of a copy in the card's memory stores and sends on
 /// only the bytes that differ from the copy's CPU side
 /// (`VICTORY_COPY_CHANGED=1`; `alt`: twenty seconds with, twenty without,
@@ -3003,7 +2963,7 @@ impl Shadow {
             COPY_CHANGED[1].fetch_add(sent as u64, Ordering::Relaxed);
             COPY_CHANGED[2].fetch_add(stretches.len() as u64, Ordering::Relaxed);
             let calls = COPY_CHANGED[3].fetch_add(1, Ordering::Relaxed) + 1;
-            if calls % 65536 == 0 {
+            if calls.is_multiple_of(65536) {
                 tracing::info!(
                     "copies in the card's memory, refreshed by what differs (VICTORY_COPY_CHANGED=1), since the start: {calls} refreshes read {} MB of title memory the title had written to; {} MB of it differed from the copy and went on to the card, in {} stretches",
                     COPY_CHANGED[0].load(Ordering::Relaxed) >> 20,
