@@ -80,6 +80,12 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   `VICTORY_FRAME_BUDGET=0`). Reimplemented on this tree's counters and its own 50 ms budget: its
   per-command timestamps, memory-trait breakdown and slow-pipeline guard are not taken.
 
+- **Belobug/VIctory-Belobug-AMD `ambient.rs`**, via **fxceless/victory-fork [PR #1093](https://github.com/fxceless/victory-fork/pull/1093)**
+  (m335671), GPL-3.0: the least indirect light, a compute pass after the program that resolves it, shaded from the
+  scene's depth alone and packed as R9G9B9E5 words (`crates/victory-gpu/src/ambient_floor.rs`,
+  `VICTORY_AMBIENT_FLOOR`). Its program name and both table offsets are not taken: the runner names the program and
+  the views, so no title's own hold in this tree.
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
