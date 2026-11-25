@@ -43,6 +43,12 @@ BlueKaiman, kais7654, pushkarreddyy, shh.
   GPL-3.0: narrowing a host shader resource view of a streamed texture to the mips whose memory is
   there, and remaking it when more levels arrive or a host copy fills the chain
   (`crates/victory-gpu/src/texture.rs`, `crates/victory-gpu/src/descriptor/host.rs`).
+- **Marvisak/VIctory [#2706](https://github.com/Marvisak/VIctory/pull/2706)** (pes7), GPL-3.0: keeping a
+  pipeline library per build in `pipelines/<hash>`, so a rebuild never writes its few new pipelines over a
+  library the build before it warmed, with the newest two kept and only directories that hold a library
+  pruned. Reimplemented against this tree's library, which has no `victory_shader::SOURCE_HASH`: the key is
+  the executable's BLAKE3, the same bytes the shader cache keys its translations on
+  (`crates/victory-gpu/src/shader_cache.rs`), and `VICTORY_LIBRARY_PRUNE=0` keeps every library.
 
 ## Tools
 

@@ -46,9 +46,14 @@
 //! with a 64 MB file written past the system's cache, mapped and replaced:
 //! 16,352 of 16,384 pages read zeros with the handle closed, none with it
 //! open (the test below). `VICTORY_LIBRARY_HANDLE=0`: closed, as before.
+//!
+//! Each build keeps its own library, in `dir/<build>` ([`KEPT`] of them;
+//! `VICTORY_LIBRARY_PRUNE=0` keeps every one): the entries are named after
+//! translated shaders, so the first run of a new build used to write its
+//! few pipelines over the library the build before it had warmed.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 
@@ -58,8 +63,77 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Keeps the pipeline library and the early list in `dir` from now on.
+///
+/// The library's pipelines are named after the shaders they were made from,
+/// so a rebuild of VIctory makes every name in it useless (the shader cache
+/// keys its translations on the same executable,
+/// [`crate::shader_cache::build_name`]). The first run after one used to
+/// write the few pipelines it made over the old library: measured on the
+/// title, a 926 MB library (27 160 pipelines, a 7.5 minute warm-up) became
+/// 612 KB, and bisecting between two builds paid that warm-up for each of
+/// them, in turn, every time. So each build keeps its library beside the
+/// others, in `dir/<build>`, and a run only ever writes its own; [`KEPT`]
+/// of the newest are kept (`VICTORY_LIBRARY_PRUNE=0`: every one of them).
 pub fn use_pipeline_cache(dir: PathBuf) {
-    let _ = DIR.set(dir);
+    let _ = DIR.set(keyed(&dir, &crate::shader_cache::build_name()));
+}
+
+/// Whether libraries of other builds are removed; `VICTORY_LIBRARY_PRUNE=0`
+/// leaves every one of them where it is.
+fn prune() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_PRUNE").is_none_or(|v| v != "0"))
+}
+
+/// Whether `dir` is a library directory this wrote: a name that is 16
+/// lowercase hex digits (a build's name,
+/// [`crate::shader_cache::build_name`]) holding [`LIBRARY_FILE`].
+fn is_translation(dir: &Path) -> bool {
+    let ours = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.len() == 16
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+    ours && dir.is_dir() && dir.join(LIBRARY_FILE).is_file()
+}
+
+/// How many libraries are kept: this build's and the previous build's,
+/// which is what a bisection between two builds needs.
+const KEPT: usize = 2;
+
+/// `dir`'s library for `build`, with older libraries pruned to [`KEPT`] (by
+/// modification time).
+fn keyed(dir: &Path, build: &str) -> PathBuf {
+    let path = dir.join(build);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return path;
+    };
+    if !prune() {
+        return path;
+    }
+    let mut others: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        // Only a directory this wrote: named like a translation and holding
+        // a library. Anything else in the cache directory (`backup/`, a
+        // copy of one) is not ours to delete.
+        .filter(|other| *other != path && is_translation(other))
+        .filter_map(|other| {
+            let at = other.metadata().ok()?.modified().ok()?;
+            Some((at, other))
+        })
+        .collect();
+    others.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    for (_, older) in others.into_iter().skip(KEPT - 1) {
+        // A library and a list or two: gone with the build that made them.
+        // Nothing this run reads is ever one of them.
+        let _ = std::fs::remove_dir_all(&older);
+    }
+    path
 }
 
 pub(crate) fn dir() -> Option<&'static std::path::Path> {
@@ -884,5 +958,99 @@ mod tests {
             pattern(page * 4096, &mut expected);
             assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
         }
+    }
+}
+
+#[cfg(test)]
+mod keyed_tests {
+    use super::*;
+
+    /// A cache directory of its own for one test.
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("victory-keyed-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A library a build saved in `dir`.
+    fn saved(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(LIBRARY_FILE), b"library").unwrap();
+        dir.join(LIBRARY_FILE)
+    }
+
+    /// Two builds never look at each other's pipelines: each has its own
+    /// directory under the cache directory, and what one saved is not
+    /// found where the other looks.
+    #[test]
+    fn builds_do_not_share_a_library() {
+        let dir = temp("separate");
+        let one = keyed(&dir, "00112233aabbccdd");
+        let two = keyed(&dir, "00112233aabbccde");
+        assert_ne!(one, two, "two builds share a directory");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::write(one.join(LIBRARY_FILE), b"one").unwrap();
+        assert!(!two.join(LIBRARY_FILE).exists(), "one build found the other's library");
+        // Each is a library directory of ours, so a later run of either
+        // reads its own again, and what one saved stays where it left it.
+        assert!(is_translation(&one));
+        std::fs::create_dir_all(&two).unwrap();
+        std::fs::write(two.join(LIBRARY_FILE), b"two").unwrap();
+        assert!(is_translation(&two));
+        assert_eq!(std::fs::read(one.join(LIBRARY_FILE)).unwrap(), b"one");
+        assert_eq!(std::fs::read(two.join(LIBRARY_FILE)).unwrap(), b"two");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same build looks in the same place every run, so a restart reads
+    /// what the run before it saved.
+    #[test]
+    fn the_same_build_reuses_its_library() {
+        let dir = temp("reuse");
+        let first = keyed(&dir, "00112233aabbccdd");
+        saved(&first);
+        std::fs::write(first.join(EARLY_FILE), b"early").unwrap();
+        let again = keyed(&dir, "00112233aabbccdd");
+        assert_eq!(first, again);
+        assert_eq!(std::fs::read(first.join(LIBRARY_FILE)).unwrap(), b"library");
+        assert_eq!(std::fs::read(first.join(EARLY_FILE)).unwrap(), b"early");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pruning keeps only directories this wrote: a `backup/` (or any
+    /// directory without a hash name) in the cache directory survives,
+    /// with what is in it, even when it is the oldest thing there.
+    #[test]
+    fn pruning_leaves_foreign_directories_alone() {
+        let dir = temp("prune");
+        // Two old libraries of ours, an old one of someone else's, and the
+        // one this build uses.
+        for (name, own) in [
+            ("00112233aabbccdd", true),
+            ("1111222233334444", true),
+            ("backup", false),
+        ] {
+            let at = dir.join(name);
+            std::fs::create_dir_all(&at).unwrap();
+            std::fs::write(at.join("sentinel"), b"keep me").unwrap();
+            if own {
+                std::fs::write(at.join(LIBRARY_FILE), b"library").unwrap();
+            }
+        }
+        let current = saved(&dir.join("ffffffffffffffff"));
+
+        assert_eq!(keyed(&dir, "ffffffffffffffff").join(LIBRARY_FILE), current);
+        assert!(dir.join("backup").join("sentinel").is_file(), "a foreign directory was deleted");
+        // [KEPT] libraries of ours are left: this build's and the newest
+        // other one.
+        let kept = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|at| is_translation(at))
+            .count();
+        assert_eq!(kept, KEPT);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
