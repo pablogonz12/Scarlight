@@ -94,6 +94,11 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
 - **Mesa** ([aco_opcodes.py](https://gitlab.freedesktop.org/mesa/mesa)), MIT: the reference list of
   RDNA2 instruction forms in `tools/progress/rdna2_isa_forms.txt` is generated from it.
 
+- **DexNom/VIctory [76749ce5](https://github.com/DexNom/VIctory/commit/76749ce58da23a43a3500454a8b69c53f05aa477)** (DexNom), GPL-3.0: a
+  wave64 lane mask parked in two SGPRs and restored one `s_mov_b32` at a time is recognised as the mask it was
+  copied from when both words still trace back to the same known pair through scalar moves
+  (`crates/victory-shader/src/structure.rs`); `VICTORY_DX_LANE_MASK_MOVES=0` keeps the split pair opaque.
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
