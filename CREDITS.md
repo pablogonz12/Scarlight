@@ -43,6 +43,12 @@ BlueKaiman, kais7654, pushkarreddyy.
   GPL-3.0: narrowing a host shader resource view of a streamed texture to the mips whose memory is
   there, and remaking it when more levels arrive or a host copy fills the chain
   (`crates/victory-gpu/src/texture.rs`, `crates/victory-gpu/src/descriptor/host.rs`).
+- **JMAN730/project-flamingo** ([#679](https://github.com/JMAN730/project-flamingo/pull/679),
+  [#662](https://github.com/JMAN730/project-flamingo/pull/662),
+  [#659](https://github.com/JMAN730/project-flamingo/pull/659)), GPL-3.0: unreachable blocks pruned before SSA
+  renaming (an unreachable predecessor left `NONE` in a phi argument), the RDNA2 `omod` signed-zero flush after
+  `write_f`, and each `s_buffer_load` address term dword-truncated before the terms are summed
+  (`crates/victory-shader/src/ir.rs`, `crates/victory-shader/src/emit/lower.rs`).
 
 ## Tools
 
