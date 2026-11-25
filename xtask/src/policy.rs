@@ -11,6 +11,9 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 const MAX_FILE_SIZE: usize = 512 * 1024;
+/// Rust sources are text the NUL-byte and magic checks still cover; the shader
+/// lowering alone is past 512 KiB, so they get more room than other files.
+const MAX_SOURCE_SIZE: usize = 1024 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
@@ -213,9 +216,14 @@ fn check_with(path: &str, content: &[u8], flags: (bool, bool)) -> Vec<String> {
     if !allowed && !skip_extension {
         problems.push("file type not on the allowlist".to_owned());
     }
-    if content.len() > MAX_FILE_SIZE {
+    let limit = if ext.as_deref() == Some("rs") {
+        MAX_SOURCE_SIZE
+    } else {
+        MAX_FILE_SIZE
+    };
+    if content.len() > limit {
         problems.push(format!(
-            "{} bytes exceeds the {MAX_FILE_SIZE}-byte limit",
+            "{} bytes exceeds the {limit}-byte limit",
             content.len()
         ));
     }
@@ -263,6 +271,15 @@ mod tests {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
+    }
+
+    #[test]
+    fn rust_sources_get_more_room_than_other_files() {
+        let big = "fn a() {}\n".repeat(60 * 1024).into_bytes();
+        assert!(check("crates/x/src/big.rs", &big).is_empty(), "a large source file");
+        assert!(!check("docs/big.md", &big).is_empty(), "other text keeps 512 KiB");
+        let huge = "fn a() {}\n".repeat(110 * 1024).into_bytes();
+        assert!(!check("crates/x/src/huge.rs", &huge).is_empty(), "sources stop at 1 MiB");
     }
 
     #[test]
