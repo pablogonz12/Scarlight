@@ -143,7 +143,7 @@ fn most() -> u64 {
     *MOST.get_or_init(|| std::env::var("VICTORY_INPLACE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4096) << 20)
 }
 
-/// In place now: windows and their bytes, title buffers and their bytes;
+/// In place now: windows and the pages they lock, title buffers and theirs;
 /// then, since the start: asks turned down because the memory is a view
 /// or not private memory committed whole, because the host refused,
 /// because of [`most`]; and what was let go because its memory changed.
@@ -183,12 +183,24 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
+    // Late wait can come on *after* [`level`] was read (`switches::poll`): a
+    // title buffer in place assumes every submission has been waited for, so
+    // the question is asked here, not of the cached level.
+    if !window && crate::host::late() {
+        STATS[4].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     // View memory: known from the runtime without asking Windows.
     if cover(start as usize, len as usize) != Cover::None {
         STATS[4].fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
+    // A window of a few KiB lies in a 64 KiB page that the heap locks whole,
+    // so the cap is charged (and [`gone`] releases) the rounded span, never
+    // the title's: seventeen 4 KiB spans can hold 1,088 KiB of imports, not
+    // the 68 KiB their lengths add up to.
+    let pages = charged(len);
+    if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + pages > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return None;
     }
@@ -205,7 +217,7 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
-            STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+            STATS[at + 1].fetch_add(pages, Ordering::Relaxed);
             Some(placed)
         }
         Err(None) => {
@@ -221,11 +233,20 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
-/// What [`place_for`] gave is gone.
+/// What the cap is charged for `len` bytes of title memory: the 64 KiB pages
+/// the heap locks, rounded up (`place_part`'s `bytes`), because the host locks
+/// and imports whole pages whatever the title's span is.
+fn charged(len: u64) -> u64 {
+    len.next_multiple_of(K64 as u64)
+}
+
+/// What [`place_for`] gave is gone. The bytes are the title's span, so they
+/// are rounded here exactly as [`place_for`] rounded them: what a heap locked
+/// and what it gives back must be the same number.
 pub(crate) fn gone(window: bool, bytes: u64) {
     let at = if window { 0 } else { 2 };
     STATS[at].fetch_sub(1, Ordering::Relaxed);
-    STATS[at + 1].fetch_sub(bytes, Ordering::Relaxed);
+    STATS[at + 1].fetch_sub(charged(bytes), Ordering::Relaxed);
 }
 
 /// What the startup self-check ([`check`]) found about this host: whether
@@ -350,6 +371,13 @@ fn ask(device: &ID3D12Device) -> (Health, String) {
             return (Health::Unchecked, "the check's own pages are not one allocation region".to_owned());
         }
         let (found, detail) = ask_page(&mut rig, device, base);
+        if found != Health::Sound {
+            // Not a sound host: the GPU's work on these pages may not have
+            // finished (a failed signal or wait is exactly one of the ways
+            // this is not sound), so the pages stay rather than being freed
+            // under it (256 KiB, once, and nothing is used in place).
+            return (found, detail);
+        }
         let freed = mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE) != 0;
         if !freed && found == Health::Sound {
             return (Health::Unchecked, "the check's own page could not be released".to_owned());
@@ -374,13 +402,25 @@ fn ask_page(rig: &mut Rig, device: &ID3D12Device, base: *mut u8) -> (Health, Str
     fill(base, SIZE, 3);
     let reads = match rig.fetch(&buffer, 0, SIZE) {
         Ok(got) => same(base, &got),
-        Err(e) => return (Health::Fallback, format!("the GPU's read failed: {e}")),
+        Err(e) => {
+            // A submission whose end is not known: the heap and the buffer
+            // stay with it (`std::mem::forget`) rather than being released
+            // while the GPU may still read them.
+            std::mem::forget(heap);
+            std::mem::forget(buffer);
+            return (Health::Fallback, format!("the GPU's read failed: {e}"));
+        }
     };
     // A page's worth, so that nothing of the copy is the host's idea of a
     // minimum: the pattern differs from the read pass's.
     let mut sent = [0u8; K64];
     fill(sent.as_mut_ptr(), sent.len(), 200);
-    let writes = rig.store(&buffer, 0, &sent).is_ok() && same(base, &sent);
+    if let Err(e) = rig.store(&buffer, 0, &sent) {
+        std::mem::forget(heap);
+        std::mem::forget(buffer);
+        return (Health::Fallback, format!("the GPU's write failed: {e}"));
+    }
+    let writes = same(base, &sent);
     let found = arrived(reads, writes);
     if found != Health::Sound {
         return (
@@ -1373,6 +1413,19 @@ mod tests {
             assert_eq!(health_of(found as u8), found);
         }
         assert_eq!(health_of(9), Health::Unknown, "a number nobody wrote is not asked yet");
+    }
+
+    /// The cap counts the pages a heap locks, not the title's span, and what
+    /// it gives back is the same number: seventeen 4 KiB spans are 1,088 KiB
+    /// of imports under a 1 MiB cap, not the 68 KiB their lengths add up to.
+    #[test]
+    fn the_cap_is_charged_the_pages_that_are_locked() {
+        assert_eq!(charged(0), 0);
+        assert_eq!(charged(4 * 1024), K64 as u64);
+        assert_eq!(charged(K64 as u64), K64 as u64);
+        assert_eq!(charged(K64 as u64 + 1), 2 * K64 as u64);
+        assert_eq!(charged(4 * 1024) * 17, 1088 * 1024);
+        assert!(charged(4 * 1024) * 17 > 1 << 20, "a 1 MiB cap admits these seventeen spans, so the count must be the pages");
     }
 
     /// The strict opening takes one shape only (vkd3d-proton
