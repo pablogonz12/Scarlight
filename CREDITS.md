@@ -61,6 +61,12 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   child that is not there is a miss whatever its box holds, and that an empty or inverted box and any NaN
   coordinate miss in both node widths, with the reference's own tests
   (`crates/victory-shader/src/bvh.rs`, `crates/victory-shader/src/emit/intersect.rs`).
+- **JMAN730/project-flamingo [PR #648](https://github.com/JMAN730/project-flamingo/pull/648)** (Cursor Agent),
+  GPL-3.0: the idea of answering a host texture the driver refuses with one that has fewer top mip levels
+  instead of none at all, and of keeping placed views at their full chains. Reimplemented on this tree's
+  lazy `Hosted`/`Made` textures (`crates/victory-gpu/src/resource.rs`, `VICTORY_MIP_RETRY=0`): every refusal
+  halves the chain down to one level rather than only `E_OUTOFMEMORY` dropping three, there is no
+  process-wide pressure, and views, copies and resolves read the recorded count.
 
 ## Tools
 
