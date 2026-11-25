@@ -1844,7 +1844,11 @@ fn planes_uploaded(
     if layout.planes.len() < 2 || !planes_on() {
         return 1;
     }
-    let Some(host_planes) = host_planes else {
+    // The host format must be a typed depth-stencil one: a copy writes one
+    // plane of a texture at a time, and D3D12 refuses that for a TYPELESS
+    // format (the runtime faults where it would size the copy).
+    const TYPED: [u32; 2] = [20, 45]; // D32_FLOAT_S8X24_UINT, D24_UNORM_S8_UINT
+    let Some(host_planes) = host_planes.filter(|_| TYPED.contains(&format)) else {
         return 1;
     };
     let matching = victory_formats::texture::format(format)
@@ -1917,19 +1921,36 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
     let mut total = 0;
-    // SAFETY: outputs for `count` subresources.
-    unsafe {
-        host.device.GetCopyableFootprints(
-            &d,
-            0,
-            count,
-            0,
-            Some(footprints.as_mut_ptr()),
-            Some(rows.as_mut_ptr()),
-            None,
-            Some(&mut total),
-        );
+    // A plane at a time: D3D12 gives a depth-stencil plane's own copy format
+    // only when the subresources asked for are one plane's.
+    for (plane, _) in layout.planes.iter().enumerate() {
+        let first = (plane as u32 * subresources_per_plane) as usize;
+        let mut plane_total = 0;
+        // SAFETY: outputs for this plane's subresources.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &d,
+                first as u32,
+                subresources_per_plane,
+                total,
+                Some(footprints[first..].as_mut_ptr()),
+                Some(rows[first..].as_mut_ptr()),
+                None,
+                Some(&mut plane_total),
+            );
+        }
+        total = total.max(total + plane_total);
     }
+    // The buffer covers every footprint's whole rows: `GetCopyableFootprints`
+    // leaves the last row of the last footprint unpadded, and a placed copy
+    // names RowPitch × Height bytes.
+    let total = footprints
+        .iter()
+        .zip(&rows)
+        .map(|(f, &r)| {
+            f.Offset + u64::from(f.Footprint.RowPitch) * u64::from(r) * u64::from(f.Footprint.Depth)
+        })
+        .fold(total, u64::max);
     let (buffer, data) = host.upload_buffer(total)?;
     crate::host::name(&buffer, || {
         format!(
@@ -2312,12 +2333,16 @@ mod present_tests {
         // R32G8X24_TYPELESS: 32-bit depth, 8-bit stencil, one byte a texel,
         // the host's own two planes.
         let depth_stencil = texture(19);
+        let typed_20 = texture(20);
         assert_eq!(depth_stencil.planes.len(), 2);
-        // Both planes unless the switch turns the second one off.
+        // Both planes only with the switch on and a typed host format the
+        // runtime can copy one plane of; one plane otherwise.
         let both = if super::planes_on() { 2 } else { 1 };
-        assert_eq!(planes_uploaded(&depth_stencil, Some(2), 19), both, "depth and stencil");
-        assert_eq!(planes_uploaded(&depth_stencil, Some(1), 19), 1, "a host with one plane");
-        assert_eq!(planes_uploaded(&depth_stencil, None, 19), 1, "a host that cannot say");
+        assert_eq!(planes_uploaded(&typed_20, Some(2), 20), both, "depth and stencil");
+        assert_eq!(planes_uploaded(&typed_20, Some(0), 20), 1, "a host that names no plane");
+        assert_eq!(planes_uploaded(&typed_20, Some(1), 20), 1, "a host with one plane");
+        assert_eq!(planes_uploaded(&typed_20, None, 20), 1, "a host that cannot say");
+        assert_eq!(planes_uploaded(&depth_stencil, Some(2), 19), 1, "a TYPELESS host format");
         let (depth, stencil) = (&depth_stencil.planes[0], &depth_stencil.planes[1]);
         assert_eq!((depth.layout.desc.element_bytes, stencil.layout.desc.element_bytes), (4, 1));
         assert_eq!(stencil.offset, depth.layout.size.next_multiple_of(stencil.layout.alignment));
