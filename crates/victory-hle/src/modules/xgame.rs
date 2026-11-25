@@ -68,6 +68,13 @@ extern "system" fn title_id(_: This, out: *mut u32) -> HRESULT {
 /// arguments from its configuration. The new `victory run` gets the same
 /// options, the new executable, and the title's arguments after `--`
 /// (the title reads the whole command line).
+#[cfg(not(windows))]
+extern "system" fn launch_new_game(_: This, _: *const c_char, _: *const c_char, _: *const c_void) {
+    // Off Windows there is no lifecycle module (it ends the run and starts a
+    // new process through the loader): there is nothing to relaunch into.
+}
+
+#[cfg(windows)]
 extern "system" fn launch_new_game(
     _: This,
     exe: *const c_char,
