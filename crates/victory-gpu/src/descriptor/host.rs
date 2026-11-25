@@ -26,6 +26,15 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// The slots made from a view narrowed to a part-resident texture's mips
+    /// ([`narrow_to_resident`]): the texture, the mips the title asked for
+    /// and those the host view names. More levels arriving (or a host copy
+    /// filling the chain) wants a wider window than the slot shows, and the
+    /// title's descriptor does not change, so `mirror` remakes these itself
+    /// (JMAN730/victory#672). `narrowed_count` says whether any is (read
+    /// without the lock on the mirror of every slot).
+    narrowed: Mutex<std::collections::HashMap<u32, (Narrowed, (u32, u32))>>,
+    narrowed_count: std::sync::atomic::AtomicUsize,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -594,6 +603,22 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// A slot the host made from a view narrowed to a part-resident texture's
+/// mips ([`narrow_to_resident`]): the texture, the window the title asked
+/// for and the one the host view names.
+#[derive(Clone, Copy)]
+struct Narrowed {
+    resource: crate::object::This,
+    asked: (u32, u32),
+}
+
+thread_local! {
+    /// What the last [`make`] on this thread narrowed, if anything: taken by
+    /// the slot that made it ([`HostHeap::note_narrowed`]).
+    static LAST_NARROW: std::cell::Cell<Option<(Narrowed, (u32, u32))>> =
+        const { std::cell::Cell::new(None) };
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -689,6 +714,8 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            narrowed: Mutex::default(),
+            narrowed_count: std::sync::atomic::AtomicUsize::new(0),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
@@ -968,6 +995,7 @@ impl HostHeap {
             Some(view) => null_for(&view, self.cpu(index)),
             None => null_view(self.cpu(index)),
         }
+        self.forget_narrowed(index);
         self.keep(index, None);
     }
 
@@ -1346,6 +1374,56 @@ impl HostHeap {
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
+    /// Whether host slot `index` shows a view narrowed to mips that more of
+    /// have arrived since (or whose chain a host copy has filled): the slot
+    /// has to be made again though the title's descriptor is unchanged.
+    fn widen_due(&self, index: u32) -> bool {
+        if self.narrowed_count.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return false;
+        }
+        let entry = {
+            let map = self.narrowed.lock().unwrap_or_else(|e| e.into_inner());
+            map.get(&index).copied()
+        };
+        let Some((n, host_mips)) = entry else {
+            return false;
+        };
+        let Some(texture) = crate::resource::host_resource(n.resource) else {
+            return false;
+        };
+        // SAFETY: a live resource while a slot still shows it.
+        let mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+        let want = crate::texture::wanted(
+            n.asked,
+            crate::texture::resident(n.resource),
+            mips,
+            crate::texture::is_host_written(n.resource),
+        );
+        want != host_mips
+    }
+
+    /// Records what the last [`make`] on this thread narrowed slot `index`
+    /// to: nothing when it is not a narrowed view any more.
+    fn note_narrowed(&self, index: u32) {
+        let n = LAST_NARROW.with(|c| c.take());
+        let mut map = self.narrowed.lock().unwrap_or_else(|e| e.into_inner());
+        match n {
+            Some(entry) => map.insert(index, entry),
+            None => map.remove(&index),
+        };
+        self.narrowed_count
+            .store(map.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Drops the narrowing of slot `index`: it shows something else now.
+    fn forget_narrowed(&self, index: u32) {
+        let mut map = self.narrowed.lock().unwrap_or_else(|e| e.into_inner());
+        if map.remove(&index).is_some() {
+            self.narrowed_count
+                .store(map.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
@@ -1380,7 +1458,10 @@ impl HostHeap {
             }
             return None;
         };
-        if made[index as usize] != key {
+        // A narrowed slot whose texture has more mips now is made again
+        // though its descriptor did not change: bindless draws never write
+        // the slot again, so nothing else would widen it (#672).
+        if made[index as usize] != key || self.widen_due(index) {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
@@ -1415,9 +1496,12 @@ impl HostHeap {
             }
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
+                self.forget_narrowed(index);
                 None
             } else {
-                make(&view, self.cpu(index))
+                let kept = make(&view, self.cpu(index));
+                self.note_narrowed(index);
+                kept
             };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
@@ -1474,6 +1558,14 @@ fn narrow_to_resident(
     texture: &ID3D12Resource,
     desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC,
 ) -> Option<(u32, u32)> {
+    if !crate::texture::resident_mips_on() {
+        return None;
+    }
+    // A copy or resolve filled the host chain: title-memory residency is
+    // stale and must not clamp the view (#616).
+    if crate::texture::is_host_written(resource) {
+        return None;
+    }
     let resident = crate::texture::resident(resource)?;
     if resident.1 == 0 {
         return None;
@@ -1521,6 +1613,9 @@ fn narrow_to_resident(
             };
         }
     }
+    // Remembered for the slot that shows it: more levels arriving want a
+    // wider window than this one, and its descriptor will not change.
+    LAST_NARROW.set(Some((Narrowed { resource, asked }, (first, count))));
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::ViewNarrowed, 1);
     Some((first, count))
@@ -2149,6 +2244,7 @@ fn twin_uav(
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+    LAST_NARROW.set(None);
     let host = host()?;
     let device = &host.device;
     match view {
