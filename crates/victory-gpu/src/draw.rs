@@ -519,7 +519,7 @@ fn uav_barrier(texture: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
                 // SAFETY: a borrowed pointer, as `host::transition` takes it:
                 // the barrier never releases it, and the list keeps the host
                 // copy alive until it has run.
-                pResource: unsafe { std::mem::transmute_copy(&texture) },
+                pResource: unsafe { std::mem::transmute_copy(texture) },
             }),
         },
     }
