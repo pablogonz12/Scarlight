@@ -24,6 +24,9 @@
 //! - `VICTORY_TEXTURE_IN_PLACE` and `VICTORY_TEXTURE_INPLACE_MAX_MB`
 //!   ([`crate::texture`]) decide how the next refresh reads: in place under
 //!   the remap lock, and up to what size. Both are asked per refresh.
+//! - `VICTORY_TEXTURE_REFRESH_EVERY` ([`crate::texture`]) picks how many
+//!   frames apart a texture is looked at; the next refresh takes the new
+//!   value, and a texture already detiled keeps what it holds until its turn.
 //! - `VICTORY_LATE_WAITS` ([`crate::frame`]) picks how a wait sleeps.
 //! - `VICTORY_SKIP_CLEAN` ([`crate::shadow::skip_clean`]) picks whether a
 //!   copy nothing wrote since it was last brought up to date is left out of
@@ -50,6 +53,7 @@ const NAMES: [&str; 18] = [
     "VICTORY_TEXTURE_IN_PLACE",
     "VICTORY_TEXTURE_INPLACE_MAX_MB",
     "VICTORY_TEXTURE_KEEP",
+    "VICTORY_TEXTURE_REFRESH_EVERY",
     "VICTORY_CARD_BUFFERS",
     "VICTORY_CARD_BUFFERS_MIN_MB",
     "VICTORY_CARD_BUFFERS_MB",

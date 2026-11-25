@@ -605,6 +605,36 @@ fn unmapped_frames() -> u64 {
     })
 }
 
+/// Frames between two looks at a texture at most (`VICTORY_TEXTURE_REFRESH_EVERY`,
+/// default 1: every frame, as before). A world that renders at a frame a second
+/// spends most of that frame reading title memory for textures: measured on one
+/// title and machine, one frame had 24,821 texture refreshes pulling 24.8 GB of
+/// title memory with none of them skipped, 6,814 ms of the frame's 7,000 ms of
+/// texture work spent waiting for it (Marvisak/VIctory#2478). At 8 the same
+/// frame was 145-522 ms instead of 2,333-6,906 ms. The cost is staleness: a
+/// texture's contents lag by up to this many frames. Asked at each refresh,
+/// so it may be turned live (`crate::switches`).
+fn refresh_every() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let base = *N.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_REFRESH_EVERY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1)
+    });
+    crate::switches::u64v("VICTORY_TEXTURE_REFRESH_EVERY", base)
+}
+
+/// Whether a texture at `address` is looked at in `frame`, `every` frames
+/// apart at most: round-robin by its own address, so the frames share the
+/// work instead of one frame taking all of it. `every` 0 or 1, and every
+/// frame when the switch is unset: each frame, as before. (`address` alone
+/// would put every texture of a heap on the same frame; the address's
+/// 64 KiB are the unit, as their layout is.)
+fn due_at(every: u64, frame: u64, address: usize) -> bool {
+    every <= 1 || frame.wrapping_add((address >> 16) as u64).is_multiple_of(every)
+}
+
 /// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
 fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     let started = std::time::Instant::now();
@@ -1007,6 +1037,19 @@ impl Staging {
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
         use std::sync::atomic::Ordering::Relaxed;
+        // `VICTORY_TEXTURE_REFRESH_EVERY`: not this texture's turn, so not
+        // read at all this frame (see [`refresh_every`]). Its contents then
+        // lag by up to that many frames, and what was detiled before stays
+        // what is uploaded. Only once it has been uploaded: a texture's
+        // first contents always arrive, or it would show what the staging
+        // buffer happened to hold.
+        let every = refresh_every();
+        if every > 1
+            && self.uploaded.load(Relaxed)
+            && !due_at(every, crate::frame::current(), self.memory as usize)
+        {
+            return;
+        }
         let started = std::time::Instant::now();
         let read = self.refresh_now();
         let preparing = &crate::host::PREPARING;
@@ -1969,6 +2012,54 @@ mod guard_tests {
         };
         last.changed(blake3::hash(b"a"));
         assert!(!last.missed);
+    }
+}
+
+#[cfg(test)]
+mod refresh_every_tests {
+    use super::{due_at, refresh_every};
+
+    /// Unset, and `0` or `1`, is every frame: nothing changes for anyone who
+    /// does not ask for it, and `0` is the way to ask for it off again.
+    #[test]
+    fn unset_zero_and_one_are_every_frame() {
+        for every in [0, 1] {
+            for frame in 0..8 {
+                for address in [0x10_0000, 0x10_0040, 0x7f_0000_0000] {
+                    assert!(due_at(every, frame, address), "every {every}, frame {frame}, at {address:#x}");
+                }
+            }
+        }
+        if std::env::var_os("VICTORY_TEXTURE_REFRESH_EVERY").is_none() {
+            assert_eq!(refresh_every(), 1, "the switch's default is every frame");
+        }
+    }
+
+    /// Every n frames at most, and a texture's turns are spread: over any n
+    /// frames each texture is looked at exactly once, and two textures far
+    /// apart in a heap are not looked at in the same frame.
+    #[test]
+    fn textures_take_turns_over_the_frames() {
+        const EVERY: u64 = 8;
+        // 64 KiB apart: one address unit each, so each has its own turn.
+        let addresses = [0x10_0000usize, 0x11_0000, 0x12_0000, 0x13_0000];
+        for &address in &addresses {
+            let turns: Vec<u64> = (0..64).filter(|&f| due_at(EVERY, f, address)).collect();
+            assert_eq!(turns.len(), 64 / EVERY as usize, "{address:#x} is read once every {EVERY} frames");
+            // Not two turns closer than n frames, nor further apart either.
+            for pair in turns.windows(2) {
+                assert_eq!(pair[1] - pair[0], EVERY, "{address:#x}: every {EVERY} frames");
+            }
+            // And the frames differ between textures, 64 KiB apart.
+            let in_window: Vec<u64> = (0..EVERY).filter(|&f| due_at(EVERY, f, address)).collect();
+            assert_eq!(in_window.len(), 1);
+            let others: Vec<u64> = addresses
+                .iter()
+                .filter(|&&a| a != address)
+                .map(|&a| (0..EVERY).find(|&f| due_at(EVERY, f, a)).unwrap())
+                .collect();
+            assert!(others.iter().all(|&f| f != in_window[0]), "{address:#x} shares its frame with another");
+        }
     }
 }
 
