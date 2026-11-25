@@ -47,7 +47,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 /// The switches that may be changed live, in the order they are logged.
-const NAMES: [&str; 18] = [
+const NAMES: [&str; 19] = [
     "VICTORY_ASYNC_WRITEBACK",
     "VICTORY_TEXTURE_WAIT_US",
     "VICTORY_TEXTURE_IN_PLACE",

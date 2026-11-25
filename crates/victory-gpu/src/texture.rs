@@ -59,6 +59,10 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// The frame of its last refresh, `NEVER` if it has had none: what
+    /// `VICTORY_TEXTURE_REFRESH_EVERY` bounds a texture's staleness by
+    /// ([`Staging::due`]).
+    looked: std::sync::atomic::AtomicU64,
     /// Which of the title's contents each copy and each present carries,
     /// and in what order ([`present_order`]).
     present: Present,
@@ -635,6 +639,22 @@ fn due_at(every: u64, frame: u64, address: usize) -> bool {
     every <= 1 || frame.wrapping_add((address >> 16) as u64).is_multiple_of(every)
 }
 
+/// No refresh yet ([`Staging::looked`]): older than any frame can be.
+const NEVER: u64 = u64::MAX;
+
+/// Whether a texture at `address` whose last refresh was in `looked` is read
+/// in `frame`, `every` frames apart at most: on its own turn, so the frames
+/// share the reads, and on any frame once it has gone `every` frames without
+/// one, so a texture a title uses only on frames that are not its turn cannot
+/// stay stale for longer than the interval. Never twice in one frame.
+fn due(every: u64, frame: u64, address: usize, looked: u64) -> bool {
+    if every <= 1 || looked == NEVER {
+        return true;
+    }
+    let age = frame.wrapping_sub(looked);
+    (age >= 1 && due_at(every, frame, address)) || age >= every
+}
+
 /// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
 fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     let started = std::time::Instant::now();
@@ -1037,19 +1057,18 @@ impl Staging {
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
         use std::sync::atomic::Ordering::Relaxed;
-        // `VICTORY_TEXTURE_REFRESH_EVERY`: not this texture's turn, so not
-        // read at all this frame (see [`refresh_every`]). Its contents then
-        // lag by up to that many frames, and what was detiled before stays
-        // what is uploaded. Only once it has been uploaded: a texture's
-        // first contents always arrive, or it would show what the staging
-        // buffer happened to hold.
+        // `VICTORY_TEXTURE_REFRESH_EVERY`: read at most once every n frames
+        // (see [`due`]). Its contents then lag by up to that many frames, and
+        // what was detiled before stays what is uploaded. Only once it has
+        // been uploaded: a texture's first contents always arrive, or it
+        // would show what the staging buffer happened to hold.
+        let frame = crate::frame::current();
         let every = refresh_every();
-        if every > 1
-            && self.uploaded.load(Relaxed)
-            && !due_at(every, crate::frame::current(), self.memory as usize)
-        {
+        let looked = self.looked.load(Relaxed);
+        if every > 1 && self.uploaded.load(Relaxed) && !due(every, frame, self.memory as usize, looked) {
             return;
         }
+        self.looked.store(frame, Relaxed);
         let started = std::time::Instant::now();
         let read = self.refresh_now();
         let preparing = &crate::host::PREPARING;
@@ -1102,7 +1121,11 @@ impl Staging {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+            // Every scheduled refresh hashes, or with `VICTORY_TEXTURE_REFRESH_EVERY`
+            // the two turns would multiply (7 and 8: a change found 56 frames
+            // late, not 48).
+            let turn = refresh_every() > 1
+                || crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
             last.checked = unwritten && turn;
             // `VICTORY_TEXTURE_GUARD_TRUST=1`: a missed write is not learnt from.
             static TRUST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1826,6 +1849,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        looked: std::sync::atomic::AtomicU64::new(NEVER),
         present: Present::default(),
     });
     map.insert(resource as usize, s.clone());
@@ -2017,7 +2041,7 @@ mod guard_tests {
 
 #[cfg(test)]
 mod refresh_every_tests {
-    use super::{due_at, refresh_every};
+    use super::{NEVER, due, due_at, refresh_every};
 
     /// Unset, and `0` or `1`, is every frame: nothing changes for anyone who
     /// does not ask for it, and `0` is the way to ask for it off again.
@@ -2033,6 +2057,44 @@ mod refresh_every_tests {
         if std::env::var_os("VICTORY_TEXTURE_REFRESH_EVERY").is_none() {
             assert_eq!(refresh_every(), 1, "the switch's default is every frame");
         }
+    }
+
+    /// A texture a title samples only on frames that are not its turn is
+    /// still read once the interval has passed: staleness is bounded by it,
+    /// and no texture is read twice in one frame.
+    #[test]
+    fn an_off_turn_texture_is_read_once_the_interval_has_passed() {
+        const EVERY: u64 = 8;
+        // Its turn is every eighth frame; a title that samples it on the
+        // frames in between (even frames here) still has it read.
+        let address = 0x11_0000usize;
+        let mut looked = NEVER;
+        let mut reads = Vec::new();
+        for frame in (0..64).step_by(2) {
+            if due(EVERY, frame, address, looked) {
+                reads.push(frame);
+                looked = frame;
+            }
+        }
+        assert_eq!(reads.len(), 64 / EVERY as usize, "one read every {EVERY} frames: {reads:?}");
+        for pair in reads.windows(2) {
+            assert!(pair[1] - pair[0] <= EVERY, "never stale for longer than {EVERY}: {reads:?}");
+        }
+        // Twice in one frame is not a second read, and the frame after it is
+        // off its turn: it waits for the interval.
+        assert!(!due(EVERY, 0, address, 0), "read already in this frame");
+        assert!(!due(EVERY, 1, address, 0), "one frame later, off its turn: no read");
+        // A texture used every frame is read once every n, on its own turn.
+        let mut looked = NEVER;
+        let mut reads = Vec::new();
+        for frame in 0..64 {
+            if due(EVERY, frame, 0x10_0000, looked) {
+                reads.push(frame);
+                looked = frame;
+            }
+        }
+        assert_eq!(reads.len(), 64 / EVERY as usize, "eight reads in 64 frames: {reads:?}");
+        assert!(reads.windows(2).all(|p| p[1] - p[0] == EVERY), "{reads:?}");
     }
 
     /// Every n frames at most, and a texture's turns are spread: over any n
