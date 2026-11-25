@@ -5521,6 +5521,22 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
+        // Copies nothing wrote since they were last brought up to date gain
+        // nothing from their refresh: the flush leaves them out, their bytes
+        // where the check would have left them ([`crate::shadow::skip_clean`]).
+        if crate::shadow::skip_clean() {
+            let started = std::time::Instant::now();
+            self.refreshes.retain(|(shadow, from, to)| {
+                let clean = shadow.clean(*from, *to);
+                #[cfg(feature = "diagnostics")]
+                if clean {
+                    crate::copystat::add(crate::copystat::C::Skipped, 1);
+                    crate::copystat::add(crate::copystat::C::SkippedBytes, (to - from) as u64);
+                }
+                !clean
+            });
+            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
