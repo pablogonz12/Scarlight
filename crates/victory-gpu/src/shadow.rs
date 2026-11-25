@@ -3218,7 +3218,11 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         return Some(shadow);
     }
     let mut map = buffers_write();
-    let entry = map.get_mut(&key)?;
+    // The title may have released it between the two guards: as a miss.
+    let Some(entry) = map.get_mut(&key) else {
+        drop(map);
+        return loose(address, end, len <= 1, any);
+    };
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
