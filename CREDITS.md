@@ -50,6 +50,11 @@ BlueKaiman, kais7654, pushkarreddyy.
   Reimplemented on this tree's pattern tables: the depth-pitch overlap check its fast path dropped is
   kept, and a column-by-column fallback replaces its `unreachable!` for any pattern whose run width is
   not 4-32 bytes.
+- **Marvisak/VIctory [#2735](https://github.com/Marvisak/VIctory/pull/2735)** (brainbudt), GPL-3.0: resolving a
+  BCPack slot through a 256-slot window table (one bit per transition, ranked inside its 64-bit word) instead
+  of a bucket search and an exact-division reciprocal, its `bcpack_decode_throughput` benchmark, and keeping
+  the range scan as the reference (`crates/victory-formats/src/bcpack.rs`, `VICTORY_BCPACK_WINDOWS=0`). Ported
+  whole, including its BC7 endpoint and index packing in `bc7_pack`.
 
 ## Tools
 
