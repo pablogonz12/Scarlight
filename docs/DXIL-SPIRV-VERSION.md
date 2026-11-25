@@ -69,4 +69,5 @@ by hand, put the line in the folder the DLLs came from. Check the **recorded** r
 whatever the checkout points at now (it can be moved after the build):
 
     git -C <vkd3d-proton tree>/subprojects/dxil-spirv merge-base --is-ancestor 7f5a7780 <recorded> \
+      && git -C <vkd3d-proton tree>/subprojects/dxil-spirv merge-base --is-ancestor b540c8a2 <recorded> \
       && echo "has the fix"
