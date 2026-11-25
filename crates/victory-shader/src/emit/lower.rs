@@ -5644,9 +5644,13 @@ impl<'a> Lower<'a> {
         let kind = self.used_kind(src);
         let c = self.cur;
         let (base, extra) = self.built_offset(src)?;
-        // Hardware clears the low 2 bits of each addend (built base, soffset,
-        // immediate offset) before summing, so soffset=3 and offset:3 load
-        // byte 0, not byte 4 from carrying the low bits across.
+        // Hardware clears the low 2 bits of each *instruction* addend
+        // (soffset, immediate offset) before summing, so soffset=3 and
+        // offset:3 load byte 0, not byte 4 from carrying the low bits across.
+        // The built descriptor address (constant `base` + computed `extra`)
+        // is one operand already combined by `resource::combine_sum`: add
+        // those parts first, then truncate their sum, so carries from
+        // constructing the descriptor are kept.
         let align = |l: &mut Self, v: V| match l.s.m.int_value(v) {
             Some(n) => l.s.m.i32((n as u32) & !3),
             None => {
@@ -5658,13 +5662,23 @@ impl<'a> Lower<'a> {
             (Some(x), Some(y)) => l.s.m.i32((x as u32).wrapping_add(y as u32)),
             _ => l.s.m.bin(c, Bin::Add, a, b),
         };
-        let imm = (*offset as u32) & !3;
-        // Without the fix the immediate offset and the built base were
-        // summed untruncated before the computed part was added.
         let mut addr = if rdna2_fixes() {
-            self.s.m.i32(imm.wrapping_add(base & !3))
+            let mut built = self.s.m.i32(base);
+            if let Some(x) = extra {
+                built = add(self, built, x);
+            }
+            let built = align(self, built);
+            let imm = self.s.m.i32((*offset as u32) & !3);
+            add(self, built, imm)
         } else {
-            self.s.m.i32((*offset as u32).wrapping_add(base))
+            // Before the fix: the built base and the immediate offset were
+            // summed untruncated, then the computed part added.
+            let imm = (*offset as u32).wrapping_add(base);
+            let mut addr = self.s.m.i32(imm);
+            if let Some(x) = extra {
+                addr = add(self, addr, x);
+            }
+            addr
         };
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
             let so = self.operand(inst, soffset)?;
@@ -5771,7 +5785,10 @@ impl<'a> Lower<'a> {
         for k in 0..count {
             let x = match constant {
                 Some(base) => {
-                    let byte = base + 4 * k;
+                    // Shader byte arithmetic wraps; debug builds must not
+                    // panic when a near-end constant address expands to
+                    // dwordxN (e.g. soffset 0xfffffffc, dwordx2).
+                    let byte = base.wrapping_add(4 * k);
                     let row = match rows.get(&(byte >> 4)) {
                         Some(&r) => r,
                         None => {
@@ -11836,7 +11853,7 @@ mod tests {
 
     #[test]
     fn s_buffer_load_truncates_each_address_term_before_adding() {
-        // Hardware masks base, soffset, and imm_offset with & ~3 independently
+        // Hardware masks soffset and imm_offset with & ~3 independently
         // before adding (VIC-BT-025): soffset=3 and offset:3 load byte 0, not 6.
         let program = |soffset_imm: u32, imm: u32| {
             let w0 = 0x3d << 26 | 8 << 18 | 13 << 6 | 4; // s13 from s[8:11]
