@@ -89,6 +89,11 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   source-counted progress page (reference instruction forms, history chart). No code taken.
 - **Mesa** ([aco_opcodes.py](https://gitlab.freedesktop.org/mesa/mesa)), MIT: the reference list of
   RDNA2 instruction forms in `tools/progress/rdna2_isa_forms.txt` is generated from it.
+- **uwutaube/VIctory [217229460](https://github.com/uwutaube/VIctory/commit/217229460)** (uwutaube), GPL-3.0,
+  a port of Marvisak/VIctory [#1778](https://github.com/Marvisak/VIctory/pull/1778) by fiestorra: a sampler heap of
+  our own bound when the title binds none, because every root signature we make indexes the sampler heap directly
+  and D3D12 requires a heap of each kind before such a signature is set (the debug layer's id 1419; NVIDIA removes
+  the device). `VICTORY_SAMPLER_HEAP=0` turns it off.
 
 ## Tools
 
