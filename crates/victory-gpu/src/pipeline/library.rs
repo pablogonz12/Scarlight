@@ -462,12 +462,16 @@ impl Drop for Held<'_> {
 /// The names held now.
 static NAMES: Names = Names::new();
 
+/// With `VICTORY_LIBRARY_LOCK=1`: one library call at a time, as before.
+pub(super) fn serialized() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_LOCK").is_some_and(|v| v == "1"))
+}
+
 /// With `VICTORY_LIBRARY_LOCK=1`: held by every library call, as before.
 fn one_call() -> Option<MutexGuard<'static, ()>> {
-    static ON: OnceLock<bool> = OnceLock::new();
     static CALLING: Mutex<()> = Mutex::new(());
-    ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_LOCK").is_some_and(|v| v == "1"))
-        .then(|| CALLING.lock().unwrap_or_else(|e| e.into_inner()))
+    serialized().then(|| CALLING.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
@@ -560,10 +564,9 @@ pub(crate) fn pipeline(
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
-    let Some(library) = library() else {
-        MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
-    };
+    // The name is held (and a crash in this run's name recorded) on both
+    // paths: with no library the make is still a driver compile a crash
+    // must be able to name, and same-name creations wait for it.
     let _held = NAMES.hold(name);
     if abandoned(name) {
         // E_FAIL: the driver's compiler crashed on it in this run.
@@ -571,6 +574,12 @@ pub(crate) fn pipeline(
         return Err(windows::core::Error::from_hresult(fail));
     }
     HOLDS.set(Some(name.to_owned()));
+    let Some(library) = library() else {
+        MADE.fetch_add(1, Ordering::Relaxed);
+        let pso = create();
+        HOLDS.set(None);
+        return pso;
+    };
     let began = std::time::Instant::now();
     let loaded = {
         let _all = one_call();

@@ -98,7 +98,10 @@ unsafe fn redirect(image: HMODULE, from: usize, to: usize) -> usize {
 
 /// What winevulkan calls in place of `ExitProcess`.
 unsafe extern "system" fn exit(code: u32) -> ! {
-    if !super::make::worker_lost() {
+    // Parking keeps what the driver and vkd3d-proton held, but the parked
+    // thread never unwinds: with `VICTORY_LIBRARY_LOCK=1` that would keep
+    // the library's one-call lock for the rest of the run, so it exits.
+    if !super::make::worker_lost() || super::library::serialized() {
         // SAFETY: what the caller asked for.
         unsafe { ExitProcess(code) }
     }
