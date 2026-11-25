@@ -20,7 +20,7 @@ mod sp3;
 
 pub use fields::{Cache, Dpp, Fields, NULL, Operand, Sdwa, Valu};
 
-use std::collections::BTreeMap;
+use std::borrow::Borrow;
 
 use crate::ShaderError;
 
@@ -70,14 +70,30 @@ pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
     if !code.len().is_multiple_of(4) {
         return Err(isa(code.len(), "code size is not a multiple of 4"));
     }
-    let mut found = Decoded::Ascending(Vec::new());
+    // Far jumps can land at unaligned byte offsets. Record each exact start.
+    let mut starts = vec![0u8; code.len().div_ceil(8)];
+    let mut list = Vec::new();
+    let mut max_bytes = 0;
     let mut pending = vec![0usize];
     while let Some(mut offset) = pending.pop() {
-        while !found.contains(offset) {
+        loop {
+            let seen = |at: usize| starts.get(at / 8).is_some_and(|b| b & (1 << (at % 8)) != 0);
+            if seen(offset) {
+                break;
+            }
             let inst = instruction(code, offset)?;
             let next = offset + 4 * inst.words.len();
-            let flow = control(&inst, code.len(), |at| found.before(at))?;
-            found.insert(inst);
+            let flow = control(&inst, code.len(), |at| {
+                // Only far jumps look back. A more distant predecessor cannot end
+                // at 'at'. Use the nearest start even when instructions overlap.
+                (at.saturating_sub(max_bytes)..at)
+                    .rev()
+                    .find(|&pos| seen(pos))
+                    .map(|pos| instruction(code, pos).expect("previously decoded instruction"))
+            })?;
+            max_bytes = max_bytes.max(next - offset);
+            starts[offset / 8] |= 1 << (offset % 8);
+            list.push(inst);
             match flow {
                 Flow::Next => offset = next,
                 Flow::Stop => break,
@@ -89,10 +105,9 @@ pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
             }
         }
     }
-    let list = match found {
-        Decoded::Ascending(list) => list,
-        Decoded::Unordered(map) => map.into_values().collect(),
-    };
+    if !list.is_sorted_by_key(|i| i.offset) {
+        list.sort_unstable_by_key(|i| i.offset);
+    }
     if let Some(w) = list
         .windows(2)
         .find(|w| w[0].offset + 4 * w[0].words.len() > w[1].offset)
@@ -100,48 +115,6 @@ pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
         return Err(isa(w[1].offset, "a branch lands inside an instruction"));
     }
     Ok(list)
-}
-
-// The vector holds unique instructions in strictly increasing offset order.
-// Switch to a tree only when a new instruction must be inserted out of order.
-enum Decoded {
-    Ascending(Vec<Instruction>),
-    Unordered(BTreeMap<usize, Instruction>),
-}
-
-impl Decoded {
-    fn contains(&self, offset: usize) -> bool {
-        match self {
-            Self::Ascending(list) => {
-                list.last().is_some_and(|last| offset <= last.offset)
-                    && list.binary_search_by_key(&offset, |i| i.offset).is_ok()
-            }
-            Self::Unordered(map) => map.contains_key(&offset),
-        }
-    }
-
-    fn before(&self, at: usize) -> Option<&Instruction> {
-        match self {
-            Self::Ascending(list) => list[..list.partition_point(|i| i.offset < at)].last(),
-            Self::Unordered(map) => map.range(..at).next_back().map(|(_, i)| i),
-        }
-    }
-
-    fn insert(&mut self, inst: Instruction) {
-        match self {
-            Self::Ascending(list) if list.last().is_none_or(|last| last.offset < inst.offset) => {
-                list.push(inst);
-            }
-            Self::Ascending(list) => {
-                let mut map: BTreeMap<_, _> = list.drain(..).map(|i| (i.offset, i)).collect();
-                map.insert(inst.offset, inst);
-                *self = Self::Unordered(map);
-            }
-            Self::Unordered(map) => {
-                map.insert(inst.offset, inst);
-            }
-        }
-    }
 }
 
 /// Where execution goes after an instruction.
@@ -156,11 +129,12 @@ pub(crate) enum Flow {
 }
 
 /// Control flow after `inst`, resolving far jumps. `before(at)` returns the
-/// decoded instruction with the highest offset below `at`, if any.
-pub(crate) fn control<'a>(
+/// decoded instruction with the highest offset below `at`, if any. It may
+/// also return `None` when that instruction does not end at `at`.
+pub(crate) fn control<I: Borrow<Instruction>>(
     inst: &Instruction,
     len: usize,
-    before: impl Fn(usize) -> Option<&'a Instruction>,
+    before: impl Fn(usize) -> Option<I>,
 ) -> Result<Flow, ShaderError> {
     Ok(match flow(inst, inst.offset + 4 * inst.words.len(), len)? {
         Flow::Stop if inst.name() == Some("s_setpc_b64") => {
@@ -197,8 +171,8 @@ fn flow(inst: &Instruction, next: usize, len: usize) -> Result<Flow, ShaderError
 /// into s(n+1), `s_setpc_b64 s[n:n+1]`, looking back over the straight-line
 /// run just decoded. Any other `s_setpc_b64` (e.g. a handover to the next
 /// merged stage through registers) gives `None`.
-fn far_jump<'a>(
-    before: impl Fn(usize) -> Option<&'a Instruction>,
+fn far_jump<I: Borrow<Instruction>>(
+    before: impl Fn(usize) -> Option<I>,
     setpc: &Instruction,
     len: usize,
 ) -> Result<Option<usize>, ShaderError> {
@@ -209,6 +183,7 @@ fn far_jump<'a>(
         let Some(prev) = before(at) else {
             break;
         };
+        let prev = prev.borrow();
         if prev.offset + 4 * prev.words.len() != at {
             break;
         }
@@ -380,6 +355,8 @@ fn isa(offset: usize, reason: &'static str) -> ShaderError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     const S_ENDPGM: u32 = 0xBF81_0000;
@@ -398,6 +375,206 @@ mod tests {
             .iter()
             .map(|i| (i.offset, i.words.len(), i.name().unwrap_or("?")))
             .collect()
+    }
+
+    // The loop exit is pending while the decoder visits the nested diamonds.
+    // The latch jumps back to a known header, so both else arms are discovered
+    // out of order before the traversal moves on to the next loop.
+    fn nested_loops() -> Vec<u8> {
+        let mut words = [0x8001_8100, 0x0600_0100].repeat(20);
+        for _ in 0..32 {
+            words.extend([
+                0xBF00_0100, // loop header: s_cmp_eq_i32
+                sopp(4, 12), // exit to the next header (or endpgm)
+                0xBF00_0201,
+                sopp(4, 7), // outer else
+                0xBF00_0302,
+                sopp(4, 3), // inner else
+                0xBE80_03FF,
+                0x3F80_0000, // then: s_mov_b32 with literal
+                sopp(2, 1),  // inner join
+                0x7E00_0201,
+                sopp(2, 1), // outer join
+                0x0600_0100,
+                0x8001_8100,  // latch: s_add_u32
+                sopp(2, -14), // repeat
+            ]);
+        }
+        words.push(S_ENDPGM);
+        bytes(&words)
+    }
+
+    // Keep the original tree-only traversal as an independent reference for decode.
+    fn reference_decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
+        if !code.len().is_multiple_of(4) {
+            return Err(isa(code.len(), "code size is not a multiple of 4"));
+        }
+        let mut found = BTreeMap::new();
+        let mut pending = vec![0usize];
+        while let Some(mut offset) = pending.pop() {
+            while !found.contains_key(&offset) {
+                let inst = instruction(code, offset)?;
+                let next = offset + 4 * inst.words.len();
+                let flow = control(&inst, code.len(), |at| {
+                    found.range(..at).next_back().map(|(_, i)| i)
+                })?;
+                found.insert(offset, inst);
+                match flow {
+                    Flow::Next => offset = next,
+                    Flow::Stop => break,
+                    Flow::Jump(target) => offset = target,
+                    Flow::Branch(target) => {
+                        pending.push(target);
+                        offset = next;
+                    }
+                }
+            }
+        }
+        let list: Vec<Instruction> = found.into_values().collect();
+        if let Some(w) = list
+            .windows(2)
+            .find(|w| w[0].offset + 4 * w[0].words.len() > w[1].offset)
+        {
+            return Err(isa(w[1].offset, "a branch lands inside an instruction"));
+        }
+        Ok(list)
+    }
+
+    fn assert_same_decode(code: &[u8]) {
+        assert_eq!(
+            decode(code),
+            reference_decode(code),
+            "decoder mismatch for {code:x?}"
+        );
+    }
+
+    #[test]
+    fn matches_tree_decoder_across_encodings_and_truncations() {
+        // Vary all nine leading bits, the payload (including literal and DPP
+        // selectors), and each possible instruction length through five dwords.
+        for prefix in 0..512 {
+            for payload in [0, 0xE9, 0xEA, 0xF9, 0xFA, 0xFF, 0x55_FF02, 0x7F_FFFF] {
+                let code = bytes(&[prefix << 23 | payload, 0x03FE_0000, 1, 2, 3, S_ENDPGM]);
+                for len in (0..=code.len()).step_by(4) {
+                    assert_same_decode(&code[..len]);
+                }
+            }
+        }
+        assert_same_decode(&[1, 2, 3]);
+    }
+
+    #[test]
+    fn matches_tree_decoder_across_opcode_ranges() {
+        for (base, shift, opcodes) in [
+            (0x8000_0000, 23, 128),
+            (0xB000_0000, 23, 32),
+            (0xBE80_0000, 8, 256),
+            (0xBF00_0000, 16, 128),
+            (0xBF80_0000, 16, 128),
+            (0xF400_0000, 18, 256),
+            (0, 25, 64),
+            (0x7E00_0000, 9, 256),
+            (0x7C00_0000, 17, 256),
+            (0xD400_0000, 16, 1024),
+            (0xCC00_0000, 16, 128),
+            (0xC800_0000, 16, 4),
+            (0xD800_0000, 18, 256),
+            (0xE000_0000, 18, 256),
+            (0xE800_0000, 16, 8),
+            (0xF000_0000, 18, 128),
+            (0xDC00_0000, 18, 128),
+            (0xF800_0000, 0, 1),
+        ] {
+            for op in 0..opcodes {
+                for (flags, w1) in [(0, 0), (1, 1 << 21), (1 << 14, 0xFF), (2 << 14, 0)] {
+                    assert_same_decode(&bytes(&[
+                        base | op << shift | flags,
+                        w1,
+                        S_ENDPGM,
+                        S_ENDPGM,
+                    ]));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matches_tree_decoder_across_branch_targets() {
+        // Conditional and unconditional edges, including backward jumps,
+        // revisits, holes, out-of-range targets and jumps into literal data.
+        for op in [2, 4] {
+            for a in -2..=9 {
+                for b in -8..=4 {
+                    assert_same_decode(&bytes(&[
+                        sopp(op, a),
+                        0xBE80_03FF,
+                        S_ENDPGM,
+                        sopp(2, 2),
+                        sopp(4, -4),
+                        S_ENDPGM,
+                        sopp(op, b),
+                        S_ENDPGM,
+                    ]));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matches_tree_on_nested_loops_and_random_streams() {
+        assert_same_decode(&nested_loops());
+        let mut state = 0x9e37_79b9_u32;
+        for _ in 0..4096 {
+            let mut words = [0u32; 24];
+            for w in &mut words {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let delta = (state % 25) as i16 - 12;
+                *w = match state >> 29 {
+                    0 => sopp(2, delta),
+                    1 | 2 => sopp(4, delta),
+                    3 => 0xBE80_03FF,
+                    4 => S_ENDPGM,
+                    5 => state,
+                    _ => 0x0600_0100,
+                };
+            }
+            assert_same_decode(&bytes(&words));
+        }
+    }
+
+    #[test]
+    fn preserves_overlap_error_precedence_and_unaligned_far_targets() {
+        // The pending target is a literal. Its own decode/flow error takes
+        // precedence over the overlap, which is only checked after traversal.
+        for literal in [S_ENDPGM, sopp(2, -100), 0xFFFF_FFFF] {
+            assert_same_decode(&bytes(&[sopp(4, 1), 0xBE80_03FF, literal, S_ENDPGM]));
+        }
+        // Discover the literal first, then the instruction which contains it.
+        assert_same_decode(&bytes(&[
+            sopp(4, 1),
+            sopp(2, 1),
+            0xBE80_03FF,
+            S_ENDPGM,
+            S_ENDPGM,
+        ]));
+        for target in 0u32..=32 {
+            let mut code = bytes(&[
+                0xBE88_1F00,
+                0x8008_FF08,
+                target.wrapping_sub(4),
+                0x8209_8009,
+                0xBE80_2008,
+                0,
+                0,
+                S_ENDPGM,
+            ]);
+            if (20..=28).contains(&target) {
+                code[target as usize..target as usize + 4].copy_from_slice(&S_ENDPGM.to_le_bytes());
+            }
+            assert_same_decode(&code);
+        }
     }
 
     #[test]
