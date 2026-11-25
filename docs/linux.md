@@ -46,6 +46,9 @@ GAME_EXE="<the title's exe>"
 export WINEPREFIX="$HOME/.local/share/scarlight-prefix"
 export WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,d3d11,d3d10core,d3dcompiler_47=n,b"
 export VKD3D_CONFIG=ignore_shared_fence
+export MESA_SHADER_CACHE_DIR="$WINEPREFIX/mesa-cache"   # see "Mesa shader cache" below
+export MESA_SHADER_CACHE_DISABLE=false
+export MESA_SHADER_CACHE_MAX_SIZE=8G
 export VICTORY_HOOKS=1   # place the patches your build's profile lists; see title-profiles.md
 export VICTORY_GAME_DIR="$GAME_DIR"
 export VICTORY_LOG="${VICTORY_LOG:-info}"
@@ -56,6 +59,34 @@ exec "$PROTON/files/bin/wine" "$EXE" run "$GAME_DIR/$GAME_EXE" --execute
 Make it executable once with `chmod +x play.sh`. Pass switches in front: `VICTORY_GPU_TIMING=1 ./play.sh`;
 they are listed under [switches](#switches). If you use GE-Proton's own D3D12 DLLs, make sure your
 prefix has them installed or copy them next to the exe.
+
+### Mesa shader cache
+
+Mesa (RADV/ANV) keeps its own on-disk cache of compiled shaders, and it is worth a great deal here:
+building all **751** programs of the fixed scene from cold costs **37,672 ms** of pipeline creation
+in total, and the same run against a warm cache costs **148 ms**. The whole set is **8.7 MB in 253
+files**, so the disk cost is trivial next to the time it buys.
+
+Mesa's default cache limit is 1 GiB and it **evicts** when full — a shader evicted is a full
+recompile on the next boot — so the play script sets the cache explicitly:
+
+| Variable | Value | Why |
+|---|---|---|
+| `MESA_SHADER_CACHE_DIR` | inside the prefix | one place per install; see the per-prefix note below |
+| `MESA_SHADER_CACHE_DISABLE` | `false` | some drivers and wrappers default the cache off |
+| `MESA_SHADER_CACHE_MAX_SIZE` | `8G` | measured to hold the scene with room to spare; 16 GiB is planned and untested |
+
+The directory is **per prefix**: a run started under another `WINEPREFIX` finds an empty cache and
+pays the whole cold cost again, which looks exactly like a code regression and is not one. Keep one
+prefix per install, and point `MESA_SHADER_CACHE_DIR` at the same directory if you want the cache to
+outlive the prefix.
+
+A cache can also be shipped with a build and read instead of written
+(`MESA_SHADER_CACHE_READ_ONLY=1` with `MESA_SHADER_CACHE_DIR` pointing at the shipped directory):
+that is the only way to hand another machine a warm cache without letting anything write to it, and
+it is **not** what this script does. A shipped cache cannot take the shaders a run misses, and one
+that is older than the build recompiles what it lacks, so the play script keeps a writable cache per
+prefix, capped as above.
 
 ## 5. Title profiles (optional)
 
@@ -155,6 +186,7 @@ Then point `EXE` in `play.sh` at `target/x86_64-pc-windows-msvc/diag/victory.exe
 | `VICTORY_HOOKS=1` | Places the code patches the profile for this build lists (see [title profiles](title-profiles.md)). Nothing is patched without a profile, and a patch whose bytes do not match is skipped. `VICTORY_NO_WATCHDOG=1`, the old name, still works |
 | `VICTORY_ASYNC_WRITEBACK=1` | **Experimental**, off by default; has hung the title in our tests |
 | `VICTORY_LOG=info` | Normal per-frame log; `VICTORY_LOG=<target>=debug` for debug output from one area |
+| `VICTORY_LOG_FILE=<path>` | Appends the log to that file instead of stderr. A title Steam starts has no terminal, so its stderr goes nowhere; with this, `play.sh` leaves the log where you can read it (`Z:\home\you\victory.log` is the Linux path as Wine sees it). Without it the log stays on stderr |
 | `VICTORY_GPU_TIMING=1` | Diagnostics builds only: runs and waits for each command list on its own, and logs any list over 50 ms with its slowest commands. Serialising the submission changes what you measure; the per-frame copy statistics are logged without it |
 | `VICTORY_SHOW_TARGET=<n>` / `busiest` | Diagnostics builds only: shows the nth texture the frame rendered to or wrote, in first-use order — the index a target dump uses — instead of the title's picture; `busiest` picks the displayable target the most draws wrote. A frame with fewer targets shows the title's own picture |
 
@@ -174,6 +206,7 @@ detail to act on.
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | Diagnostics build only. Omits draws and dispatches, indirect ones included, whose pipeline has a listed 16-digit shader hash; the profile's `skip.shaders` is used when this is unset |
 | `VICTORY_SKIP_WAVE64=mesh,compute` | Diagnostics build only. Omits draws and dispatches whose pipeline has a 64-lane program in a listed stage (diagnostic on 32-lane hosts); the profile's `skip.stages` is used when this is unset |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | Stops translated shader loops after `n` iterations per lane instead of 2^20; a real loop longer than `n` is cut short too, so 32 is a diagnostic value and 256-1024 a safer probe |
+| `VICTORY_SHADER_LOOP_LIMIT_CS=<n>` | Diagnostics build only. Sets that limit for compute programs alone (unset, they follow `VICTORY_SHADER_LOOP_LIMIT`); a low general limit also cuts genuine compute loops short, since a lane that reaches the limit leaves the program without its writes |
 | `VICTORY_D3D12_DEBUG=1` | Host D3D12 debug layer; `VICTORY_D3D12_GBV=1` adds GPU-based validation (slow) |
 | `VICTORY_D3D12_DRED=1` | On a GPU failure, logs the allocation hit and the commands in flight |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | Records what the title plays, from our process only |

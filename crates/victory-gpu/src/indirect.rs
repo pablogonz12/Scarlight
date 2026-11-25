@@ -423,7 +423,6 @@ mod tests {
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
-    use windows::Win32::Graphics::Dxgi::*;
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
     use windows::core::Interface;
 
@@ -438,7 +437,9 @@ void main() {
 }
 "#;
 
-    struct WarpHarness {
+    /// A D3D12 device, queue, allocator, list and fence for one test, on the
+    /// adapter `VICTORY_TEST_ADAPTER` picks (WARP, or the card under Wine).
+    struct Harness {
         device: ID3D12Device,
         queue: ID3D12CommandQueue,
         allocator: ID3D12CommandAllocator,
@@ -450,20 +451,11 @@ void main() {
         worker: Clamp,
     }
 
-    impl WarpHarness {
+    impl Harness {
         fn new() -> Option<Self> {
-            // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
+            let device = crate::test_device::device(D3D_FEATURE_LEVEL_12_0)?;
+            // SAFETY: D3D12 test harness setup on the test device.
             unsafe {
-                let factory: IDXGIFactory4 =
-                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
-                let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
-                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
-                    return None;
-                }
-                let mut device: Option<ID3D12Device> = None;
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
-                let device = device?;
                 let queue: ID3D12CommandQueue = device
                     .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                         Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -478,7 +470,7 @@ void main() {
                     .ok()?;
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
                 let event = CreateEventW(None, false, false, None).ok()?;
-                let clamp = make_for(&device).expect("clamp shader must compile on WARP");
+                let clamp = make_for(&device).expect("clamp shader must compile on the test device");
                 let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
                 Some(Self {
                     device,
@@ -626,39 +618,41 @@ void main() {
     /// stores the hash it made: each compare flags what changed since the
     /// compare before it, also a change back.
     #[test]
-    fn warp_card_compare_stores_the_hash_it_made_when_told() {
-        let Some(mut warp) = WarpHarness::new() else {
+    fn card_compare_stores_the_hash_it_made_when_told() {
+        let _once = crate::warptest::lock();
+        let Some(mut harness) = Harness::new() else {
+
             return;
         };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        let compare = compile_cs(&harness.device, crate::host::CARD_COMPARE).expect("the card compare must compile on the test device");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
-        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
-        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
-        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let (_now, now_ptr, now_gpu) = harness.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = harness.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = harness.shared_buffer(64);
         let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
         // SAFETY: the mapping holds `size` bytes.
         unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
         // One pass over the three pieces; what it left in `differs` (7s
         // where it stored nothing).
-        let run = |warp: &mut WarpHarness, mode: u32| -> [u32; 3] {
+        let run = |harness: &mut Harness, mode: u32| -> [u32; 3] {
             // SAFETY: our open list, live buffers, the compare's own root
             // signature; the mappings hold what is read and written.
             unsafe {
                 for piece in 0..PIECES as usize {
                     differs_ptr.cast::<u32>().add(piece).write_volatile(7);
                 }
-                warp.list.SetComputeRootSignature(&compare.root);
-                warp.list.SetPipelineState(&compare.pso);
+                harness.list.SetComputeRootSignature(&compare.root);
+                harness.list.SetPipelineState(&compare.pso);
                 let constants = [0u32, 0, size as u32, PIECES, 0, mode];
-                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
-                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
-                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                harness.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                harness.list.SetComputeRootShaderResourceView(1, now_gpu);
+                harness.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                harness.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                harness.list.Dispatch(PIECES.div_ceil(64), 1, 1);
             }
-            warp.submit_and_wait();
+            harness.submit_and_wait();
             // SAFETY: as above.
             [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
         };
@@ -666,24 +660,24 @@ void main() {
         // SAFETY (each): inside the mapping.
         let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
         // 0: the hashes are stored, nothing is flagged.
-        assert_eq!(run(&mut warp, 0), [7, 7, 7]);
-        assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+        assert_eq!(run(&mut harness, 0), [7, 7, 7]);
+        assert_eq!(run(&mut harness, 1), [0, 0, 0]);
         // A change in the second piece: flagged, and with 1 flagged again
         // (the hash stays the old one).
         set(content[at] ^ 0x40);
-        assert_eq!(run(&mut warp, 1), [0, 1, 0]);
-        assert_eq!(run(&mut warp, 1), [0, 1, 0]);
+        assert_eq!(run(&mut harness, 1), [0, 1, 0]);
+        assert_eq!(run(&mut harness, 1), [0, 1, 0]);
         // Changed back: with 1 the piece looks untouched.
         set(content[at]);
-        assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+        assert_eq!(run(&mut harness, 1), [0, 0, 0]);
         // With 2 the change is flagged once, and the hash is the new one.
         set(content[at] ^ 0x40);
-        assert_eq!(run(&mut warp, 2), [0, 1, 0]);
-        assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        assert_eq!(run(&mut harness, 2), [0, 1, 0]);
+        assert_eq!(run(&mut harness, 2), [0, 0, 0]);
         // Changed back: flagged, where 1 saw nothing.
         set(content[at]);
-        assert_eq!(run(&mut warp, 2), [0, 1, 0]);
-        assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        assert_eq!(run(&mut harness, 2), [0, 1, 0]);
+        assert_eq!(run(&mut harness, 2), [0, 0, 0]);
     }
 
     /// The last record's span is its payload: a tight title buffer asks for
@@ -735,7 +729,7 @@ void main() {
         assert_eq!(validate_layout((1, 20, u32::MAX), 0, None), None);
     }
 
-    /// WARP D3D12 execution test proving:
+    /// A D3D12 execution test on the test device proving:
     /// (a) `countBuffer` with a small count (`3`) and `4,093` garbage tail slots
     ///     (`max = 4096`) does NOT blow `BUDGET` or zero valid dispatches in
     ///     this or subsequent `ExecuteIndirect` calls in the same list,
@@ -743,8 +737,10 @@ void main() {
     /// (c) full `stride` bytes (`stride = 24` > `12`) are copied for active
     ///     records into `dst_args` at offset `0`.
     #[test]
-    fn warp_count_buffer_ignores_garbage_tail_and_preserves_source() {
-        let Some(mut warp) = WarpHarness::new() else {
+    fn count_buffer_ignores_garbage_tail_and_preserves_source() {
+        let _once = crate::warptest::lock();
+        let Some(mut harness) = Harness::new() else {
+
             return;
         };
         const KIND_DISPATCH: u32 = 2;
@@ -755,13 +751,13 @@ void main() {
         const COUNT_OFFSET_2: usize = 192;
 
         let src_bytes = ARGS_OFFSET + (STRIDE as usize) * (MAX as usize) + 64;
-        let (src_buf, src_ptr, _) = warp.shared_buffer(src_bytes as u64);
-        let (count_buf, count_ptr, _) = warp.shared_buffer(512);
-        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
-        let (_hits_buf, hits_ptr, hits_gpu) = warp.shared_buffer(256);
-        let (readback_buf, readback_ptr, _) = warp.shared_buffer((STRIDE * 8) as u64);
-        let dst_buf = warp.default_uav(u64::from(STRIDE) * u64::from(MAX));
-        let sig = warp.signature(KIND_DISPATCH, STRIDE);
+        let (src_buf, src_ptr, _) = harness.shared_buffer(src_bytes as u64);
+        let (count_buf, count_ptr, _) = harness.shared_buffer(512);
+        let (_budget_buf, budget_ptr, budget_gpu) = harness.shared_buffer(256);
+        let (_hits_buf, hits_ptr, hits_gpu) = harness.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = harness.shared_buffer((STRIDE * 8) as u64);
+        let dst_buf = harness.default_uav(u64::from(STRIDE) * u64::from(MAX));
+        let sig = harness.signature(KIND_DISPATCH, STRIDE);
 
         // Fill the entire source buffer with non-zero sentinel bytes, then
         // populate 3 valid records at `ARGS_OFFSET` and 4,093 huge garbage
@@ -819,8 +815,8 @@ void main() {
         // 5 records of `dst_buf` out for inspection, then record Call #2
         // (`eff_count = 2` out of `MAX = 4096`) reusing `dst_buf` in the same list!
         assert!(record_clamp(
-            &warp.clamp,
-            &warp.list,
+            &harness.clamp,
+            &harness.list,
             &dst_buf,
             budget_gpu,
             (&src_buf, ARGS_OFFSET as u64),
@@ -829,10 +825,10 @@ void main() {
         ));
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
-            warp.list.SetComputeRootSignature(&warp.worker.root);
-            warp.list.SetPipelineState(&warp.worker.pso);
-            warp.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
-            warp.list.ExecuteIndirect(
+            harness.list.SetComputeRootSignature(&harness.worker.root);
+            harness.list.SetPipelineState(&harness.worker.pso);
+            harness.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            harness.list.ExecuteIndirect(
                 &sig,
                 MAX,
                 &dst_buf,
@@ -841,20 +837,20 @@ void main() {
                 COUNT_OFFSET_1 as u64,
             );
         }
-        done_on(&warp.list, &dst_buf);
+        done_on(&harness.list, &dst_buf);
 
         // Snapshot `dst_buf` after Call #1 (from `COMMON`, copy 5 * STRIDE bytes,
         // then return `dst_buf` to `COMMON` before Call #2).
         // SAFETY: open command list; `dst_buf` returned to `COMMON` by `done_on`.
         unsafe {
-            warp.list.ResourceBarrier(&[transition(
+            harness.list.ResourceBarrier(&[transition(
                 &dst_buf,
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            warp.list
+            harness.list
                 .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, u64::from(STRIDE * 5));
-            warp.list.ResourceBarrier(&[transition(
+            harness.list.ResourceBarrier(&[transition(
                 &dst_buf,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
                 D3D12_RESOURCE_STATE_COMMON,
@@ -864,8 +860,8 @@ void main() {
         // Call #2 in the SAME command list (`eff_count = 2` -> records 0 and 1:
         // 6 + 5 = 11 groups). Would run empty if Call #1's tail blew `BUDGET`!
         assert!(record_clamp(
-            &warp.clamp,
-            &warp.list,
+            &harness.clamp,
+            &harness.list,
             &dst_buf,
             budget_gpu,
             (&src_buf, ARGS_OFFSET as u64),
@@ -874,10 +870,10 @@ void main() {
         ));
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
-            warp.list.SetComputeRootSignature(&warp.worker.root);
-            warp.list.SetPipelineState(&warp.worker.pso);
-            warp.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
-            warp.list.ExecuteIndirect(
+            harness.list.SetComputeRootSignature(&harness.worker.root);
+            harness.list.SetPipelineState(&harness.worker.pso);
+            harness.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            harness.list.ExecuteIndirect(
                 &sig,
                 MAX,
                 &dst_buf,
@@ -886,9 +882,9 @@ void main() {
                 COUNT_OFFSET_2 as u64,
             );
         }
-        done_on(&warp.list, &dst_buf);
+        done_on(&harness.list, &dst_buf);
 
-        warp.submit_and_wait();
+        harness.submit_and_wait();
 
         // SAFETY: GPU execution finished; read mapped host results.
         let (hits, spent, after_src, after_count, clamped_words) = unsafe {
@@ -942,7 +938,7 @@ void main() {
         assert_ne!(clamped_words[21], 0xDEAD_BEEF);
     }
 
-    /// WARP D3D12 test proving `BUDGET` saturates without 32-bit unsigned
+    /// A D3D12 test on the test device proving `BUDGET` saturates without 32-bit unsigned
     /// wraparound across >64 huge indexed-draw records (`count = None`), while
     /// preserving `StartIndexLocation`, `BaseVertexLocation`,
     /// `StartInstanceLocation`, and custom stride padding, and leaving
@@ -952,8 +948,10 @@ void main() {
     /// charge nothing; clamped as single records the same slots are clamped
     /// to the most and spend the budget.
     #[test]
-    fn warp_window_leaves_unfilled_slots_empty_and_uncharged() {
-        let Some(mut warp) = WarpHarness::new() else {
+    fn window_leaves_unfilled_slots_empty_and_uncharged() {
+        let _once = crate::warptest::lock();
+        let Some(mut harness) = Harness::new() else {
+
             return;
         };
         const KIND_MESH: u32 = 10;
@@ -970,10 +968,10 @@ void main() {
             }
         }
         for ahead in [true, false] {
-            let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
-            let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
-            let (readback_buf, readback_ptr, _) = warp.shared_buffer(total as u64);
-            let dst_buf = warp.default_uav(total as u64);
+            let (src_buf, src_ptr, _) = harness.shared_buffer(total as u64);
+            let (_budget_buf, budget_ptr, budget_gpu) = harness.shared_buffer(256);
+            let (readback_buf, readback_ptr, _) = harness.shared_buffer(total as u64);
+            let dst_buf = harness.default_uav(total as u64);
 
             // SAFETY: mapped buffers of these sizes.
             unsafe {
@@ -982,8 +980,8 @@ void main() {
                 std::ptr::write_bytes(readback_ptr, 0, total);
             }
             assert!(record_clamp_as(
-                &warp.clamp,
-                &warp.list,
+                &harness.clamp,
+                &harness.list,
                 &dst_buf,
                 budget_gpu,
                 (&src_buf, 0),
@@ -991,22 +989,22 @@ void main() {
                 (KIND_MESH, STRIDE, RECORDS),
                 ahead,
             ));
-            done_on(&warp.list, &dst_buf);
+            done_on(&harness.list, &dst_buf);
             // SAFETY: an open list; the scratch buffer is copied for the check.
             unsafe {
-                warp.list.ResourceBarrier(&[transition(
+                harness.list.ResourceBarrier(&[transition(
                     &dst_buf,
                     D3D12_RESOURCE_STATE_COMMON,
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                 )]);
-                warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total as u64);
-                warp.list.ResourceBarrier(&[transition(
+                harness.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total as u64);
+                harness.list.ResourceBarrier(&[transition(
                     &dst_buf,
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                     D3D12_RESOURCE_STATE_COMMON,
                 )]);
             }
-            warp.submit_and_wait();
+            harness.submit_and_wait();
             // SAFETY: the work is done; mapped buffers.
             let (spent, largest, out) = unsafe {
                 (
@@ -1048,8 +1046,10 @@ void main() {
     }
 
     #[test]
-    fn warp_budget_saturates_without_wraparound_and_preserves_draw_fields() {
-        let Some(mut warp) = WarpHarness::new() else {
+    fn budget_saturates_without_wraparound_and_preserves_draw_fields() {
+        let _once = crate::warptest::lock();
+        let Some(mut harness) = Harness::new() else {
+
             return;
         };
         const KIND_INDEXED: u32 = 1;
@@ -1058,10 +1058,10 @@ void main() {
         const BUDGET_CAP: u32 = 1 << 27;
 
         let total_bytes = (STRIDE * RECORDS) as usize;
-        let (src_buf, src_ptr, _) = warp.shared_buffer(total_bytes as u64);
-        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
-        let (readback_buf, readback_ptr, _) = warp.shared_buffer(total_bytes as u64);
-        let dst_buf = warp.default_uav(total_bytes as u64);
+        let (src_buf, src_ptr, _) = harness.shared_buffer(total_bytes as u64);
+        let (_budget_buf, budget_ptr, budget_gpu) = harness.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = harness.shared_buffer(total_bytes as u64);
+        let dst_buf = harness.default_uav(total_bytes as u64);
 
         let mut initial_src = vec![0u8; total_bytes];
         for i in 0..RECORDS as usize {
@@ -1087,32 +1087,32 @@ void main() {
         }
 
         assert!(record_clamp(
-            &warp.clamp,
-            &warp.list,
+            &harness.clamp,
+            &harness.list,
             &dst_buf,
             budget_gpu,
             (&src_buf, 0),
             None,
             (KIND_INDEXED, STRIDE, RECORDS),
         ));
-        done_on(&warp.list, &dst_buf);
+        done_on(&harness.list, &dst_buf);
 
         // SAFETY: open command list; copy clamped scratch buffer for verification.
         unsafe {
-            warp.list.ResourceBarrier(&[transition(
+            harness.list.ResourceBarrier(&[transition(
                 &dst_buf,
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            warp.list
+            harness.list
                 .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total_bytes as u64);
-            warp.list.ResourceBarrier(&[transition(
+            harness.list.ResourceBarrier(&[transition(
                 &dst_buf,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
                 D3D12_RESOURCE_STATE_COMMON,
             )]);
         }
-        warp.submit_and_wait();
+        harness.submit_and_wait();
 
         // SAFETY: GPU work completed.
         let (spent, after_src, out_words) = unsafe {
