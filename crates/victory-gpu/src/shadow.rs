@@ -1989,6 +1989,7 @@ impl Shadow {
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     /// Whether this host copy's bytes are the title memory itself (in place):
     /// the shaders write there, so there is no snapshot and no copy-back.
+    #[cfg(test)]
     pub(crate) fn in_place(&self) -> bool {
         self.place.is_some()
     }
