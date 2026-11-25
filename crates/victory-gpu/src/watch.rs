@@ -20,7 +20,7 @@
 //! hashed, not guarded. A system call writing into a guarded block fails
 //! (none is known to).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use crate::writeback::Done;
@@ -437,25 +437,142 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
+/// A set of 64 KiB block numbers as a bit per block: 64 blocks (4 MiB) to a
+/// `u64` word, in a `BTreeMap`. The guards hold a block per 64 KiB of every
+/// view the title copies, and a frame asks about some 150,000 of them
+/// ([`guard`]) and takes back thousands ([`open`]): over words those are a
+/// few bitwise operations and a `trailing_zeros` a block, where a set of
+/// numbers walked a node a block.
+struct BlockSet(BTreeMap<usize, u64>);
+
+impl BlockSet {
+    const fn new() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    /// The bits of blocks `lo_bit..hi_bit` of one word.
+    #[inline]
+    fn word_mask(lo_bit: usize, hi_bit: usize) -> u64 {
+        let count = hi_bit - lo_bit;
+        let bits = if count >= 64 { u64::MAX } else { (1u64 << count) - 1 };
+        bits << lo_bit
+    }
+
+    #[inline]
+    fn contains(&self, block: usize) -> bool {
+        self.0.get(&(block >> 6)).is_some_and(|&w| (w & (1u64 << (block & 63))) != 0)
+    }
+
+    #[inline]
+    fn word(&self, index: usize) -> u64 {
+        self.0.get(&index).copied().unwrap_or(0)
+    }
+
+    #[inline]
+    fn insert(&mut self, block: usize) {
+        *self.0.entry(block >> 6).or_insert(0) |= 1u64 << (block & 63);
+    }
+
+    #[inline]
+    fn remove(&mut self, block: usize) {
+        let key = block >> 6;
+        if let Some(w) = self.0.get_mut(&key) {
+            *w &= !(1u64 << (block & 63));
+            if *w == 0 {
+                self.0.remove(&key);
+            }
+        }
+    }
+
+    fn insert_range(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let (first, last) = (from >> 6, (to - 1) >> 6);
+        for w in first..=last {
+            let lo = if w == first { from & 63 } else { 0 };
+            let hi = if w == last { ((to - 1) & 63) + 1 } else { 64 };
+            *self.0.entry(w).or_insert(0) |= Self::word_mask(lo, hi);
+        }
+    }
+
+    fn remove_range(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let (first, last) = (from >> 6, (to - 1) >> 6);
+        let mut empty = Vec::new();
+        for (&w, bits) in self.0.range_mut(first..=last) {
+            let lo = if w == first { from & 63 } else { 0 };
+            let hi = if w == last { ((to - 1) & 63) + 1 } else { 64 };
+            *bits &= !Self::word_mask(lo, hi);
+            if *bits == 0 {
+                empty.push(w);
+            }
+        }
+        for w in empty {
+            self.0.remove(&w);
+        }
+    }
+
+    /// How many blocks of `from..to` are in the set.
+    fn count_range(&self, from: usize, to: usize) -> usize {
+        if from >= to {
+            return 0;
+        }
+        let (first, last) = (from >> 6, (to - 1) >> 6);
+        let mut n = 0;
+        for (&w, &bits) in self.0.range(first..=last) {
+            let lo = if w == first { from & 63 } else { 0 };
+            let hi = if w == last { ((to - 1) & 63) + 1 } else { 64 };
+            n += (bits & Self::word_mask(lo, hi)).count_ones() as usize;
+        }
+        n
+    }
+
+    /// The runs `(from, to)` of blocks of `from..to` that are in the set.
+    fn runs_in(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        if from >= to {
+            return runs;
+        }
+        let (first, last) = (from >> 6, (to - 1) >> 6);
+        for (&w, &bits) in self.0.range(first..=last) {
+            let lo = if w == first { from & 63 } else { 0 };
+            let hi = if w == last { ((to - 1) & 63) + 1 } else { 64 };
+            let mut m = bits & Self::word_mask(lo, hi);
+            while m != 0 {
+                let block = (w << 6) + m.trailing_zeros() as usize;
+                match runs.last_mut() {
+                    Some((_, end)) if *end == block => *end = block + 1,
+                    _ => runs.push((block, block + 1)),
+                }
+                m &= m - 1;
+            }
+        }
+        runs
+    }
+}
+
 struct Guards {
     /// Blocks we made read-only.
-    protected: BTreeSet<usize>,
+    protected: BlockSet,
     /// Of those, the ones not written since a copy took them.
-    clean: BTreeSet<usize>,
+    clean: BlockSet,
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
-    absent: BTreeSet<usize>,
+    absent: BlockSet,
     /// Blocks of title memory a copy has taken whole (or a guard has made
     /// read-only, which only committed memory allows): memory that is there,
     /// so a copy may go straight at its bytes ([`mapped`]).
-    mapped: BTreeSet<usize>,
+    mapped: BlockSet,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
-    protected: BTreeSet::new(),
-    clean: BTreeSet::new(),
-    absent: BTreeSet::new(),
-    mapped: BTreeSet::new(),
+    protected: BlockSet::new(),
+    clean: BlockSet::new(),
+    absent: BlockSet::new(),
+    mapped: BlockSet::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -473,11 +590,14 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // pages: 0.6 ms for the title's 174 MB heap, 16 times a frame, and most
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    if first >= last {
+        return Some(Vec::new());
+    }
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
         let g = guards();
-        let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first)
+        g.protected.contains(first) || g.absent.contains(first)
     };
     if !known && !is_view(start, end) {
         return None;
@@ -485,50 +605,66 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     install();
     let mut g = guards();
     let mut written = Vec::new();
-    let mut run: Option<usize> = None;
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    // The range's clean blocks, in order: read off the set in one pass,
-    // not looked up one block at a time. A frame asks about some 10 GB of
-    // view memory, 150,000 blocks, nearly all clean: the lookups were most
-    // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
-    // the set meanwhile is the block it stands at or ones before it.
-    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
-    if clean.len() == last - first {
-        // Nothing written, mapped or new since the range was last taken.
-        return Some(written);
-    }
-    let mut next_clean = 0;
+    let mut run: Option<(usize, usize)> = None;
     let mut uncommitted_until = first;
-    for block in first..=last {
-        while next_clean < clean.len() && clean[next_clean] < block {
-            next_clean += 1;
-        }
-        let is_clean = next_clean < clean.len() && clean[next_clean] == block;
-        let mut open = block < last && !is_clean;
-        if open && g.absent.contains(&block) {
-            // Ordinary commits need no runtime mapping notification. Reuse
-            // this asking's query for the following blocks in the same region.
-            if block >= uncommitted_until {
-                uncommitted_until = uncommitted_end(block);
+    // The clean blocks are read a word at a time, and only the ones that are
+    // not clean are looked at: a frame asks about some 150,000 blocks,
+    // nearly all clean, and the lookups one at a time were most of the
+    // 60-90 ms a frame of "guards" (run 54).
+    let (first_w, last_w) = (first >> 6, (last - 1) >> 6);
+    for w in first_w..=last_w {
+        let lo = if w == first_w { first & 63 } else { 0 };
+        let hi = if w == last_w { ((last - 1) & 63) + 1 } else { 64 };
+        let mask = BlockSet::word_mask(lo, hi);
+        let mut open = mask & !g.clean.word(w);
+        if open == 0 {
+            if let Some((r0, r1)) = run.take() {
+                protect(&mut g, r0, r1);
             }
-            open = block >= uncommitted_until;
-            if open {
-                g.absent.remove(&block);
-            }
+            continue;
         }
-        if open {
-            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.protected.contains(&block) {
-                // Written through the runtime, still read-only.
-                g.clean.insert(block);
-            } else {
-                run.get_or_insert(block);
+        while open != 0 {
+            let block = (w << 6) + open.trailing_zeros() as usize;
+            open &= open - 1;
+            let mut due = true;
+            if g.absent.contains(block) {
+                // Ordinary commits need no runtime mapping notification. Reuse
+                // this asking's query for the following blocks in the same region.
+                if block >= uncommitted_until {
+                    uncommitted_until = uncommitted_end(block);
+                }
+                due = block >= uncommitted_until;
+                if due {
+                    g.absent.remove(block);
+                }
+            }
+            if !due {
+                if let Some((r0, r1)) = run.take() {
+                    protect(&mut g, r0, r1);
+                }
                 continue;
             }
+            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+            if g.protected.contains(block) {
+                // Written through the runtime, still read-only.
+                if let Some((r0, r1)) = run.take() {
+                    protect(&mut g, r0, r1);
+                }
+                g.clean.insert(block);
+                continue;
+            }
+            match run {
+                Some((r0, r1)) if r1 == block => run = Some((r0, block + 1)),
+                Some((r0, r1)) => {
+                    protect(&mut g, r0, r1);
+                    run = Some((block, block + 1));
+                }
+                None => run = Some((block, block + 1)),
+            }
         }
-        if let Some(from) = run.take() {
-            protect(&mut g, from, block);
-        }
+    }
+    if let Some((r0, r1)) = run.take() {
+        protect(&mut g, r0, r1);
     }
     Some(written)
 }
@@ -595,10 +731,10 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         }
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
-        g.protected.extend(from..to);
-        g.clean.extend(from..to);
+        g.protected.insert_range(from, to);
+        g.clean.insert_range(from, to);
         // The kernel only made committed memory read-only: it is there.
-        g.mapped.extend(from..to);
+        g.mapped.insert_range(from, to);
     };
     if set(from, to) {
         note(g, from, to);
@@ -609,7 +745,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             note(g, block, block + 1);
         } else if block < uncommitted_end(block) {
             g.absent.insert(block);
-            g.mapped.remove(&block);
+            g.mapped.remove(block);
         }
     }
 }
@@ -634,21 +770,29 @@ fn uncommitted_end(block: usize) -> usize {
 /// notes them written; true if any was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g
-        .protected
-        .range(start / BLOCK..end.div_ceil(BLOCK))
-        .copied()
-        .collect();
-    for &block in &blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
-        // It was read-only by our hand, so it is committed and mapped.
-        g.mapped.insert(block);
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    let runs = g.protected.runs_in(first, last);
+    if runs.is_empty() {
+        return false;
     }
-    !blocks.is_empty()
+    g.protected.remove_range(first, last);
+    g.clean.remove_range(first, last);
+    for (r0, r1) in runs {
+        let mut old = 0;
+        // SAFETY: blocks we made read-only. One call a run; a run crosses no
+        // view boundary, since views are mapped in whole blocks.
+        let ok = unsafe { VirtualProtect((r0 * BLOCK) as *const _, (r1 - r0) * BLOCK, PAGE_READWRITE, &mut old) } != 0;
+        // It was read-only by our hand, so it is committed and mapped.
+        g.mapped.insert_range(r0, r1);
+        if !ok && r1 - r0 > 1 {
+            for block in r0..r1 {
+                let mut old = 0;
+                // SAFETY: a block we made read-only.
+                unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+            }
+        }
+    }
+    true
 }
 
 /// Whether every 64 KiB block of `[at, at + len)` is title memory the layer
@@ -661,9 +805,8 @@ pub(crate) fn mapped(at: usize, len: usize) -> bool {
         return false;
     }
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    let g = guards();
-    // One pass over the set, not a lookup a block at a time.
-    g.mapped.range(first..last).count() == last - first
+    // One pass over the words, not a lookup a block at a time.
+    guards().mapped.count_range(first, last) == last - first
 }
 
 /// A kernel copy took all of `[at, at + len)` of title memory: every block
@@ -675,8 +818,7 @@ pub(crate) fn copied(at: usize, len: usize) {
         return;
     }
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    let mut g = guards();
-    g.mapped.extend(first..last);
+    guards().mapped.insert_range(first, last);
 }
 
 /// Blocks a write-back job holds `(a flag, whether the block was being given
@@ -797,8 +939,8 @@ pub(crate) fn back_open(at: usize, len: usize) {
     if !opened.is_empty() {
         let mut g = guards();
         for block in opened {
-            g.protected.remove(&block);
-            g.clean.remove(&block);
+            g.protected.remove(block);
+            g.clean.remove(block);
         }
     }
 }
@@ -924,21 +1066,12 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();
-    let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
-    let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
-    for block in absent {
-        g.absent.remove(&block);
-    }
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    g.absent.remove_range(first, last);
     // What is there now is new: a copy must ask the kernel again.
-    let was: Vec<usize> = g.mapped.range(range.clone()).copied().collect();
-    for block in was {
-        g.mapped.remove(&block);
-    }
-    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
-    for block in blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
-    }
+    g.mapped.remove_range(first, last);
+    g.protected.remove_range(first, last);
+    g.clean.remove_range(first, last);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -1020,8 +1153,8 @@ fn install() {
                     written = is_write,
                     protect = format_args!("{:#x}", if n != 0 { info.Protect } else { 0 }),
                     noaccess = n != 0 && info.Protect == PAGE_NOACCESS,
-                    guarded = g.protected.contains(&(at / BLOCK)),
-                    absent = g.absent.contains(&(at / BLOCK)),
+                    guarded = g.protected.contains(at / BLOCK),
+                    absent = g.absent.contains(at / BLOCK),
                     owed = back().get(&(at / BLOCK)).is_some(),
                     "an access fault this handler cannot resolve: not writable, not a write-back job's block"
                 );
