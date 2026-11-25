@@ -6211,20 +6211,24 @@ impl<'a> Lower<'a> {
             // buffer's others: vkd3d-proton reads a load at a computed offset
             // through a per-component raw access, which on NVIDIA misses a
             // dword the same invocation has just stored.
-            let (at, sh) = match self.s.m.int_value(off) {
+            match self.s.m.int_value(off) {
                 Some(o) if switches::field() => {
                     let (at, sh) = field_in_dword(o as u32);
-                    (self.s.m.i32(at), self.s.m.i32(sh))
+                    let (at, sh) = (self.s.m.i32(at), self.s.m.i32(sh));
+                    let w = load(self, at, 1)[0];
+                    vec![self.s.m.bin(c, Bin::LShr, w, sh)]
                 }
+                // `VICTORY_FIELD_DWORD=0`: the run-time alignment, in main's
+                // instruction order.
                 _ => {
                     let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
                     let at = self.s.m.bin(c, Bin::And, off, not3);
+                    let w = load(self, at, 1)[0];
                     let byte = self.s.m.bin(c, Bin::And, off, three);
-                    (at, self.s.m.bin(c, Bin::Shl, byte, three))
+                    let sh = self.s.m.bin(c, Bin::Shl, byte, three);
+                    vec![self.s.m.bin(c, Bin::LShr, w, sh)]
                 }
-            };
-            let w = load(self, at, 1)[0];
-            vec![self.s.m.bin(c, Bin::LShr, w, sh)]
+            }
         } else {
             load(self, off, total / 32)
         };
@@ -7106,7 +7110,11 @@ impl<'a> Lower<'a> {
                     let a = f(self, 0)?;
                     return float(self, a);
                 }
-                let a = self.src_bits(inst, 0)?;
+                let a = if switches::mods() {
+                    self.src_bits(inst, 0)?
+                } else {
+                    self.src(inst, 0)?
+                };
                 if v.clamp || v.omod != 0 {
                     let a = self.as_float(a);
                     return float(self, a);
@@ -7604,7 +7612,11 @@ impl<'a> Lower<'a> {
                     let r = self.s.m.select(c, cond, bb, a);
                     return float(self, r);
                 }
-                let (a, bb) = (self.src_bits(inst, 0)?, self.src_bits(inst, 1)?);
+                let (a, bb) = if switches::mods() {
+                    (self.src_bits(inst, 0)?, self.src_bits(inst, 1)?)
+                } else {
+                    (self.src(inst, 0)?, self.src(inst, 1)?)
+                };
                 let r = self.s.m.select(c, cond, bb, a);
                 int(self, r)
             }
