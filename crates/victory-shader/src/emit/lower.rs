@@ -67,7 +67,7 @@ pub(crate) struct Lowered {
     pub wave_ops: bool,
     /// Ballots made to learn whether a DPP source lane is in EXEC.
     #[cfg(test)]
-    pub src_lane_ballots: u32,
+    pub exec_ballots: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -2288,7 +2288,7 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
-            src_lane_ballots: self.s.src_lane_ballots,
+            exec_ballots: self.s.exec_ballots,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -4453,6 +4453,8 @@ impl<'a> Lower<'a> {
             } else {
                 self.read_lane(x, src)
             };
+            // An inactive source lane reads 0, not the stale VGPR.
+            let r = self.active_lane_or_zero(r, src);
             let reg = dst_reg.ok_or("a swizzle result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
@@ -6679,7 +6681,7 @@ impl<'a> Lower<'a> {
         let i32t = self.s.t.i32;
         #[cfg(test)]
         {
-            self.s.src_lane_ballots += 1;
+            self.s.exec_ballots += 1;
         }
         let t = self.s.m.bool(true);
         let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
@@ -6705,6 +6707,44 @@ impl<'a> Lower<'a> {
         let bit = self.s.m.bin(c, Bin::LShr, word, sh);
         let bit = self.s.m.bin(c, Bin::And, bit, one);
         self.s.m.cmp(c, pred::NE, bit, z)
+    }
+
+    /// `value` when the console lane `lane` of this host wave is in EXEC,
+    /// else 0: a cross-lane read such as `ds_swizzle_b32` gives 0 from an
+    /// inactive source lane rather than the stale VGPR `waveReadLaneAt`
+    /// would see (ported from project-flamingo #697, `7b3b66859`).
+    fn active_lane_or_zero(&mut self, value: V, lane: V) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        #[cfg(test)]
+        {
+            self.s.exec_ballots += 1;
+        }
+        let yes = self.s.m.bool(true);
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let ballot = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[yes]);
+        self.s.flags |= flags::WAVE_OPS;
+        let lo = self.s.m.extract(c, ballot, 0);
+        let (k31, k32, one, z) = (
+            self.s.m.i32(31),
+            self.s.m.i32(32),
+            self.s.m.i32(1),
+            self.s.m.i32(0),
+        );
+        let word = if self.wave() > 32 {
+            let hi = self.s.m.extract(c, ballot, 1);
+            let low = self.s.m.cmp(c, pred::IULT, lane, k32);
+            self.s.m.select(c, low, lo, hi)
+        } else {
+            lo
+        };
+        let sh = self.s.m.bin(c, Bin::And, lane, k31);
+        let bit = self.s.m.bin(c, Bin::LShr, word, sh);
+        let bit = self.s.m.bin(c, Bin::And, bit, one);
+        let on = self.s.m.cmp(c, pred::NE, bit, z);
+        self.s.m.select(c, on, value, z)
     }
 
     /// DPP: src0 as read from another lane, and which lanes write their

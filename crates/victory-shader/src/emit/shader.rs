@@ -159,7 +159,7 @@ pub(crate) struct Shader {
     pub nonuniform_handles: u32,
     /// Ballots made to learn whether a DPP source lane is in EXEC.
     #[cfg(test)]
-    pub src_lane_ballots: u32,
+    pub exec_ballots: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -217,7 +217,7 @@ impl Shader {
             flags: 0,
             nonuniform_handles: 0,
             #[cfg(test)]
-            src_lane_ballots: 0,
+            exec_ballots: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
