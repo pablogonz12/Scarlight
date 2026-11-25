@@ -1055,10 +1055,12 @@ mod keyed_tests {
     #[test]
     fn the_library_used_last_is_kept() {
         let dir = temp("used");
-        let stale = saved(&keyed(&dir, "00112233aabbccdd", false));
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // The build used last is the one saved first, so only the warm run
+        // can make it the newest.
         let previous = keyed(&dir, "1111222233334444", false);
         saved(&previous);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let stale = saved(&keyed(&dir, "00112233aabbccdd", false));
         std::thread::sleep(std::time::Duration::from_millis(20));
         // The previous build runs again and adds nothing to its library.
         assert_eq!(keyed(&dir, "1111222233334444", false), previous);
