@@ -49,6 +49,10 @@ pub(crate) struct Staging {
     /// The resource the staging buffer is of, for the resident mip window
     /// its views are narrowed to ([`note_resident`]).
     resource: This,
+    /// The title released the resource: a list may still hold this staging
+    /// and refresh it, and that must not note a window under an address
+    /// another texture may have been given ([`forget`]).
+    released: std::sync::atomic::AtomicBool,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
     /// uploaded it, and whether one has uploaded it at all: a list records
@@ -869,8 +873,12 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&resource);
+    if let Some(map) = map.as_mut()
+        && let Some(staging) = map.remove(&resource)
+    {
+        // A list not yet reset may still hold it and refresh it: that must
+        // not note a window for the released address.
+        staging.released.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
@@ -1108,7 +1116,9 @@ impl Staging {
             // narrowed to it while it lasts (a streamed texture's mips
             // arrive from the smallest, at the start of each slice).
             let window = resident_mips(self.memory, &self.layout);
-            note_resident(self.resource, window, false);
+            if !self.released.load(std::sync::atomic::Ordering::Relaxed) {
+                note_resident(self.resource, window, false);
+            }
             #[cfg(feature = "diagnostics")]
             if window.1 > 0 && window.0 > 0 {
                 crate::copystat::add(crate::copystat::C::ResidentNarrowed, 1);
@@ -1149,7 +1159,9 @@ impl Staging {
             return size;
         }
         // All of it is there: no view of it is narrowed any more.
-        note_resident(self.resource, (0, 0), true);
+        if !self.released.load(std::sync::atomic::Ordering::Relaxed) {
+            note_resident(self.resource, (0, 0), true);
+        }
         if through_copy() {
             // A read through the kernel, which needs no lock.
             drop(_mapped);
@@ -1788,6 +1800,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         bytes: total,
         memory,
         resource,
+        released: std::sync::atomic::AtomicBool::new(false),
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
