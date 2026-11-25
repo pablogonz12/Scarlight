@@ -1787,6 +1787,9 @@ void main() {
     /// and `HostList::reset` end-to-end on the host device.
     #[test]
     fn host_list_reuses_and_grows_scratch_across_submissions() {
+        // The one device at a time every test that opens one takes (`#137`:
+        // parallel WARP devices crash CI).
+        let _once = crate::warptest::lock();
         let Some(host) = super::host() else {
             return;
         };
