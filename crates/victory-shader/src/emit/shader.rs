@@ -163,6 +163,9 @@ pub(crate) struct Shader {
     /// Pixel `v_readfirstlane`s that keep a helper lane's own value.
     #[cfg(test)]
     pub helper_readfirst: u32,
+    /// `dx.op.discard`s a pixel program makes.
+    #[cfg(test)]
+    pub pixel_discards: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -223,6 +226,8 @@ impl Shader {
             exec_ballots: 0,
             #[cfg(test)]
             helper_readfirst: 0,
+            #[cfg(test)]
+            pixel_discards: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,

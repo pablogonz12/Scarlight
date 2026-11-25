@@ -71,6 +71,9 @@ pub(crate) struct Lowered {
     /// Pixel `v_readfirstlane`s that keep a helper lane's own value.
     #[cfg(test)]
     pub helper_readfirst: u32,
+    /// `dx.op.discard`s a pixel program makes (survival and masking).
+    #[cfg(test)]
+    pub pixel_discards: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -220,6 +223,14 @@ struct Lower<'a> {
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
     exported: Vec<bool>,
+    /// Per IR block: a `vm` export is behind every lane entering it.
+    vm_exported: Vec<bool>,
+    /// Per-lane Valid Mask SSA value while lowering a pixel block.
+    vm_live: Option<V>,
+    /// Phi of `vm_live` at the start of multi-predecessor pixel blocks.
+    vm_live_phis: Vec<Option<V>>,
+    /// `vm_live` leaving each IR block (pixel shaders).
+    vm_live_out: Vec<Option<V>>,
     /// Reverse-postorder index per IR block.
     rpo: Vec<usize>,
     /// DXIL block each IR block ends in (guarded stores split blocks).
@@ -1535,6 +1546,10 @@ impl<'a> Lower<'a> {
             strides: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
+            vm_exported: vec![false; p.blocks.len()],
+            vm_live: None,
+            vm_live_phis: vec![None; p.blocks.len()],
+            vm_live_out: vec![None; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
@@ -2233,6 +2248,18 @@ impl<'a> Lower<'a> {
                 .filter(|&q| self.block[q].is_some())
                 .collect();
             self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
+            self.vm_exported[b] =
+                !preds.is_empty() && preds.iter().all(|&q| self.vm_exported_out(q));
+            if self.s.pixel {
+                self.vm_live = Some(if preds.is_empty() {
+                    // Alive until the first Valid-Mask export.
+                    self.s.m.bool(true)
+                } else {
+                    let phi = self.s.m.phi(self.cur, self.s.t.i1);
+                    self.vm_live_phis[b] = Some(phi);
+                    phi
+                });
+            }
             for (i, phi) in p.blocks[b].phis.iter().enumerate() {
                 let val = match phi.reg {
                     Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
@@ -2270,6 +2297,9 @@ impl<'a> Lower<'a> {
                 self.lds_meeting();
             }
             self.tail[b] = Some(self.cur);
+            if self.s.pixel {
+                self.vm_live_out[b] = self.vm_live;
+            }
             self.exit(b)?;
         }
         self.fill_phis()?;
@@ -2294,6 +2324,8 @@ impl<'a> Lower<'a> {
             exec_ballots: self.s.exec_ballots,
             #[cfg(test)]
             helper_readfirst: self.s.helper_readfirst,
+            #[cfg(test)]
+            pixel_discards: self.s.pixel_discards,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2302,6 +2334,15 @@ impl<'a> Lower<'a> {
 
     fn exported_out(&self, b: usize) -> bool {
         self.exported[b] || self.has_done_export(b)
+    }
+
+    fn vm_exported_out(&self, b: usize) -> bool {
+        self.vm_exported[b] || self.has_vm_export(b)
+    }
+
+    fn has_vm_export(&self, b: usize) -> bool {
+        (0..self.x.p.blocks[b].insts.len())
+            .any(|i| self.exports.get(&(b, i)).is_some_and(|e| e.vm))
     }
 
     fn has_done_export(&self, b: usize) -> bool {
@@ -10815,17 +10856,15 @@ impl<'a> Lower<'a> {
         }
         let guard = self.guard(b, i)?;
         let mesh = self.s.mesh.is_some();
-        let c = self.cur;
-        if let Some(g) = guard
-            && !mesh
-        {
-            if !(e.done && self.s.pixel) {
-                return Err("a conditional export");
-            }
-            let t = self.s.m.bool(true);
-            let kill = self.s.m.bin(c, Bin::Xor, g, t);
-            self.s
-                .op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+        // Pixel survival is the EXEC of the last `vm` export (not `done`).
+        if self.s.pixel && e.vm {
+            self.vm_live = Some(match guard {
+                Some(g) => g,
+                None => self.s.m.bool(true),
+            });
+        }
+        if guard.is_some() && !mesh && !self.s.pixel {
+            return Err("a conditional export");
         }
         if mesh && e.target == Target::Primitive {
             return self.emit_indices(e, guard);
@@ -10982,6 +11021,8 @@ impl<'a> Lower<'a> {
                 guard
             };
             self.begin_guarded(mesh_guard)
+        } else if self.s.pixel {
+            self.begin_guarded(guard)
         } else {
             None
         };
@@ -11191,11 +11232,26 @@ impl<'a> Lower<'a> {
                 Term::CondBr(cond, t, f)
             }
             LaneExit::End => {
-                if self.s.pixel && !self.exported[b] && !self.has_done_export(b) {
-                    // A lane leaving without its final export was killed.
-                    let t = self.s.m.bool(true);
-                    self.s
-                        .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+                if self.s.pixel {
+                    // Last `vm` export's EXEC is the survival mask; paths that
+                    // never hit a Valid-Mask or `done` export were killed.
+                    let kill = if self.vm_exported[b] || self.has_vm_export(b) {
+                        let live = self.vm_live.expect("pixel vm_live");
+                        let t = self.s.m.bool(true);
+                        Some(self.s.m.bin(self.cur, Bin::Xor, live, t))
+                    } else if !self.exported[b] && !self.has_done_export(b) {
+                        Some(self.s.m.bool(true))
+                    } else {
+                        None
+                    };
+                    if let Some(kill) = kill {
+                        self.s
+                            .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+                        #[cfg(test)]
+                        {
+                            self.s.pixel_discards += 1;
+                        }
+                    }
                 }
                 Term::Ret
             }
@@ -11450,6 +11506,21 @@ impl<'a> Lower<'a> {
             self.s.m.set_phi(v, incoming);
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
+            self.s.m.set_phi(phi, incoming);
+        }
+        for (b, phi) in self.vm_live_phis.iter().enumerate() {
+            let Some(&phi) = phi.as_ref() else {
+                continue;
+            };
+            let mut incoming = Vec::new();
+            for &q in &p.blocks[b].preds {
+                let Some(qb) = self.tail[q] else {
+                    continue;
+                };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let live = self.vm_live_out[q].unwrap_or_else(|| self.s.m.bool(true));
+                incoming.push((live, qb));
+            }
             self.s.m.set_phi(phi, incoming);
         }
         Ok(())
@@ -11759,6 +11830,80 @@ mod tests {
             user_data,
             slot,
         }
+    }
+
+    /// project-flamingo `bc649eebd` (VIC-BT-011): pixel survival follows the
+    /// last `exp` with `vm`, and conditional non-`done` MRT writes are latched
+    /// under EXEC instead of being refused or killed on `done`'s guard alone.
+    #[test]
+    fn pixel_export_tracks_last_vm_and_masks_mrt_under_exec() {
+        use super::super::container::SigElement;
+        // v_cmp_eq_u32 vcc, 0, v0; s_and_saveexec_b32 s0, vcc_lo -- narrow
+        // EXEC without a branch so the exports stay guarded in one block.
+        // exp mrt0 v0,v0,v0,v0 (no done, no vm) -- before the fix "a
+        // conditional export". exp null done vm -- last Valid Mask.
+        let words = [
+            0x7D84_0080u32, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE80_3C6A,    // s_and_saveexec_b32 s0, vcc_lo
+            0xF800_000F,
+            0,
+            0xF800_1890,
+            0,
+            S_ENDPGM,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 1,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 5,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        assert_eq!(io.exports.len(), 2);
+        assert!(!io.exports[0].done && !io.exports[0].vm);
+        assert!(io.exports[1].done && io.exports[1].vm);
+        assert!(
+            st.guards.iter().flatten().any(|g| g.is_some()),
+            "narrowed EXEC must guard the colour export"
+        );
+        let lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![target],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .expect("conditional MRT + last-vm done must lower");
+        assert!(
+            lowered.pixel_discards > 0,
+            "pixel exit must discard from the last Valid Mask"
+        );
     }
 
     #[test]
