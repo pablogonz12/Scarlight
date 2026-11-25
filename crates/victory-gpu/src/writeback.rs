@@ -17,9 +17,12 @@
 //!   range (`Shadow::writing`) instead of taking title memory over bytes
 //!   still to be put back (issue #32, "a snapshot per submission").
 //!
-//! A job's block protection is dropped even if the merge panics (the
-//! [`Release`] guard below), so a fault cannot leave pages inaccessible
-//! (issue #32, "an unwind guard").
+//! A job's block protection is dropped even if the merge panics: [`Job`]'s
+//! own `Drop` gives the blocks back and lets go of whoever waits on it, and
+//! the worker catches the panic and goes on to the next job, so a fault
+//! cannot leave pages inaccessible for the rest of the run (issue #32, "an
+//! unwind guard"). A job the worker never runs - because it is gone, or
+//! because the job turned out empty - is let go the same way.
 
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -98,6 +101,19 @@ impl Job {
     }
 }
 
+impl Drop for Job {
+    /// The job is done with, or it will never run: its blocks are given back
+    /// the protection they had, then whoever faulted on one of them is let go.
+    /// Order matters: a title thread that wakes on `finish` must find its page
+    /// accessible. This also covers a panic in the merge (`run` below leaves it
+    /// to this drop on the way out) and a job the worker never took.
+    fn drop(&mut self) {
+        let blocks = std::mem::take(&mut self.blocks);
+        crate::watch::back_release(&blocks, &self.done);
+        self.done.finish();
+    }
+}
+
 /// Whether a job has finished, for threads that faulted on its blocks.
 #[derive(Default)]
 pub(crate) struct Done {
@@ -125,17 +141,21 @@ impl Done {
     }
 }
 
-/// Gives a job's blocks back if the job does not (a panic in the merge).
-struct Release(Arc<Done>, Vec<usize>);
-
-impl Drop for Release {
-    fn drop(&mut self) {
-        crate::watch::back_release(&self.1, &self.0);
-    }
-}
-
 struct Worker {
     jobs: mpsc::Sender<Job>,
+}
+
+/// A job's work on the worker: the copy-back's merge, then the bottom-of-pipe
+/// writes. Nothing here is allowed to end the worker - [`Job`]'s drop gives
+/// the blocks back on a panic, and the caller catches it and goes on.
+fn run(job: Job) {
+    crate::host::hand_back_now(&job.back);
+    for (at, what, bytes) in &job.writes {
+        // The job's blocks are the job's to write: opened first, or the
+        // kernel's write would fail on the protection the job itself set.
+        crate::watch::back_open(*at, *bytes);
+        what.write(*at as *mut u8, *bytes);
+    }
 }
 
 /// The worker, started on first use.
@@ -147,24 +167,20 @@ fn worker() -> &'static Worker {
             .name("victory-gpu-writeback".into())
             .spawn(move || {
                 IS_WORKER.with(|w| w.set(true));
-                for mut job in work {
+                for job in work {
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
-                    let done = job.done();
-                    let blocks = Release(done.clone(), std::mem::take(&mut job.blocks));
                     // The merge (and the scan before it) as the submitting
-                    // thread did them; then every range is done with, which
-                    // lets the title's next refreshes take those bytes.
-                    crate::host::hand_back_now(&job.back);
-                    for (at, what, bytes) in &job.writes {
-                        // The job's blocks are the job's to write: opened
-                        // first, or the kernel's write would fail on the
-                        // protection the job itself set.
-                        crate::watch::back_open(*at, *bytes);
-                        what.write(*at as *mut u8, *bytes);
+                    // thread did them; the job's drop then gives every range
+                    // back, which lets the title's next refreshes take those
+                    // bytes. A job that panics must not end the worker: its
+                    // own pages are given back by that drop, and the next
+                    // submission's copy-back still runs (issue #32).
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(job))).is_err() {
+                        tracing::error!(
+                            "a write-back job panicked: its blocks were given back and the worker goes on (that submission's copy-back is lost)"
+                        );
                     }
-                    drop(blocks);
-                    done.finish();
                     #[cfg(feature = "diagnostics")]
                     {
                         crate::copystat::add(crate::copystat::C::AsyncJobs, 1);
@@ -184,13 +200,76 @@ fn worker() -> &'static Worker {
 /// [`crate::watch::back_begin`] first.
 pub(crate) fn submit(job: Job) {
     if worker().jobs.send(job).is_err() {
-        // The worker is gone (only at process exit): nothing to wait for.
+        // The worker is gone (only at process exit): the job's own drop gives
+        // its blocks back, so nothing stays inaccessible for the rest of the
+        // run.
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A page a job holds is given back when the job is, also when it never
+    /// ran (no worker, an empty job, a panic): the title must not find memory
+    /// of its own inaccessible for the rest of the run (issue #32).
+    #[test]
+    fn a_job_dropped_without_running_gives_its_pages_back() {
+        use windows_sys::Win32::System::Memory::{
+            MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS,
+            PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualQuery,
+        };
+        let block = crate::watch::BLOCK;
+        // SAFETY: an allocation of the test's own, protected and queried by
+        // this test only.
+        unsafe {
+            let base = VirtualAlloc(
+                std::ptr::null(),
+                2 * block,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!base.is_null());
+            let mut job = Job::new();
+            let done = job.done();
+            job.blocks = crate::watch::back_begin(&done, base as usize, base as usize + 2 * block);
+            assert!(!job.blocks.is_empty(), "the job holds the pages");
+            let protection = |at: usize| {
+                let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                assert_ne!(VirtualQuery(at as *const _, &mut info, std::mem::size_of_val(&info)), 0);
+                info.Protect
+            };
+            assert_eq!(protection(base as usize), PAGE_NOACCESS);
+            drop(job);
+            assert_eq!(protection(base as usize), PAGE_READWRITE, "the pages are the title's again");
+            assert!(done.finished(), "and whoever waited on the job is let go");
+            VirtualFree(base.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    /// A job that panics on the worker still gives its blocks back and finishes,
+    /// so a title thread that faulted on one of its pages is let go instead of
+    /// waiting for a job that will never finish (issue #32).
+    #[test]
+    fn a_panicking_job_finishes_and_lets_its_waiters_go() {
+        let done = Arc::new(Done::default());
+        let waiter = done.clone();
+        let thread = std::thread::spawn(move || {
+            waiter.wait();
+            true
+        });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let done = done.clone();
+            move || {
+                let _job = Job { back: Vec::new(), writes: Vec::new(), blocks: Vec::new(), done };
+                panic!("the merge panics");
+            }
+        }));
+        assert!(outcome.is_err());
+        assert!(done.finished(), "the job's own drop finishes it on the way out");
+        assert!(thread.join().unwrap(), "the waiter was let go");
+    }
 
     /// A wait returns only once the job finished, on another thread.
     #[test]
