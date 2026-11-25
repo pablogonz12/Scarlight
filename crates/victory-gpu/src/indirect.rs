@@ -1146,11 +1146,54 @@ void main() {
         /// readback memory its words are copied into.
         fn budget(&self) -> TestBudget {
             let buffer = self.default_uav(256);
-            let zero = self.default_uav(256);
+            // The zeroes come from upload memory, as the layer's do: a copy
+            // source the device may read without a state of its own.
+            let zero = self.upload(256);
             let (readback, ptr, _) = self.shared_buffer(256);
             // SAFETY: plain creation of a mapping, and a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             TestBudget { buffer, zero, readback, ptr, gpu }
+        }
+
+        /// An upload buffer of `size` zero bytes (mapped, not kept).
+        fn upload(&self, size: u64) -> ID3D12Resource {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_UPLOAD,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size.max(4),
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut buffer: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: plain creation and persistent CPU mapping of an upload
+            // buffer, written once here and read by the card only.
+            unsafe {
+                self.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_GENERIC_READ,
+                        None,
+                        &mut buffer,
+                    )
+                    .unwrap();
+                let made = buffer.as_ref().unwrap();
+                made.Map(0, None, Some(&mut data)).unwrap();
+                std::ptr::write_bytes(data, 0, size as usize);
+            }
+            buffer.unwrap()
         }
 
         /// Records the budget's clearing on the card (`zero` holds zeroes).
