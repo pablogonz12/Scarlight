@@ -1564,6 +1564,18 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
+/// Checked `(start, bytes)` of `count` elements of `element` bytes starting
+/// at `base + first * element`: `None` on any `u64` overflow. A title's
+/// `FirstElement` is whatever its descriptor words held, so a view of other
+/// memory read as a buffer (or a bogus `FirstElement`) would otherwise wrap
+/// to a plausible address in release and panic in a debug build.
+fn checked_buffer_range(base: u64, first: u64, count: u32, element: u64) -> Option<(u64, u64)> {
+    let start = base.checked_add(first.checked_mul(element)?)?;
+    let bytes = u64::from(count).checked_mul(element)?;
+    start.checked_add(bytes)?;
+    Some((start, bytes))
+}
+
 /// The title memory a buffer shader or unordered access view reads: its
 /// address and length.
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
@@ -1587,13 +1599,14 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
         _ => return None,
     };
     let desc = srv_desc(words);
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        // A texture view of a buffer: its words are no buffer's.
+        return None;
+    }
     let element = element_size(&desc);
-    // SAFETY: a buffer view's union member.
+    // SAFETY: `ViewDimension` is `D3D12_SRV_DIMENSION_BUFFER`.
     let buffer = unsafe { desc.Anonymous.Buffer };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_buffer_range(base, buffer.FirstElement, buffer.NumElements, element)
 }
 
 /// The title memory the host slot of buffer view `view` is made on
@@ -1653,7 +1666,11 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
 /// [`buffer_range`] of an unordered access view of memory at `base`.
 fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     let desc = uav_desc(words);
-    // SAFETY: a buffer view's union member.
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        // A texture view of a buffer: its words are no buffer's.
+        return None;
+    }
+    // SAFETY: `ViewDimension` is `D3D12_UAV_DIMENSION_BUFFER`.
     let buffer = unsafe { desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
         u64::from(buffer.StructureByteStride)
@@ -1662,10 +1679,7 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     } else {
         crate::resource::element(desc.Format.0 as u32)?.0
     };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_buffer_range(base, buffer.FirstElement, buffer.NumElements, element)
 }
 
 /// The host resource a slot made by [`make`] views, if any.
@@ -1764,7 +1778,8 @@ fn buffer_srv(
             );
             return None;
         }
-        buffer.FirstElement += offset / element;
+        // A `FirstElement` the title wrote past `u64` is no view of the copy.
+        buffer.FirstElement = buffer.FirstElement.checked_add(offset / element)?;
     }
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
@@ -1878,7 +1893,8 @@ fn buffer_srv_alias(
         );
         return None;
     }
-    buffer.FirstElement += offset / element;
+    // A `FirstElement` the title wrote past `u64` is no view of the copy.
+    buffer.FirstElement = buffer.FirstElement.checked_add(offset / element)?;
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
@@ -1948,7 +1964,8 @@ fn buffer_uav(
             once!(offset, element, "unordered buffer view not on an element of its host copy");
             return None;
         }
-        buffer.FirstElement += offset / element;
+        // A `FirstElement` the title wrote past `u64` is no view of the copy.
+        buffer.FirstElement = buffer.FirstElement.checked_add(offset / element)?;
     }
     buffer.CounterOffsetInBytes = 0;
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
@@ -2671,6 +2688,94 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// A buffer view's `FirstElement` and `NumElements` are the title's: one
+    /// that would overflow `u64` (a bogus address, or a texture's words read
+    /// as a buffer's) is refused instead of wrapping to a plausible address.
+    #[test]
+    fn overflowing_buffer_ranges_are_refused() {
+        assert_eq!(checked_buffer_range(0x1000, 2, 4, 16), Some((0x1020, 64)));
+        assert_eq!(checked_buffer_range(0x1000, 0, 0, 16), Some((0x1000, 0)));
+        // `FirstElement * element` beyond `u64`: wraps to 0 when unchecked.
+        assert_eq!(checked_buffer_range(0x1000, 1u64 << 60, 1, 16), None);
+        assert_eq!(checked_buffer_range(0x1000, u64::MAX, 1, 1), None);
+        // The start fits, the whole view does not (release: wraps to a small one).
+        assert_eq!(checked_buffer_range(u64::MAX - 8, 0, u32::MAX, u64::from(u32::MAX)), None);
+        assert_eq!(checked_buffer_range(u64::MAX - 8, 0, 1, 16), None);
+
+        let mut resource = [0u32; 14];
+        resource[0] = 1; // D3D12_RESOURCE_DIMENSION_BUFFER
+        let view = |desc: [u32; 16]| View::Placed(false, resource, desc);
+
+        // A structured buffer view at a bogus first element: refused.
+        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: 1u64 << 60,
+                    NumElements: 4,
+                    StructureByteStride: 16,
+                    Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                },
+            },
+        };
+        // SAFETY: the host's 40-byte descriptor words.
+        let words: [u32; 10] = unsafe { std::mem::transmute_copy(&srv) };
+        let mut desc = [0u32; 16];
+        desc[..10].copy_from_slice(&words);
+        desc[10] = 0x1000; // the view's address
+        assert_eq!(buffer_range(&view(desc)), None);
+        // The same view with a first element that fits is a view of it.
+        let mut fits = words;
+        fits[4] = 2; // FirstElement low half
+        fits[5] = 0; // FirstElement high half
+        let mut desc = [0u32; 16];
+        desc[..10].copy_from_slice(&fits);
+        desc[10] = 0x1000;
+        assert_eq!(buffer_range(&view(desc)), Some((0x1020, 64)));
+
+        // A texture view of buffer memory is no buffer view at all.
+        let texture = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: u32::MAX,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        // SAFETY: the host's 40-byte descriptor words.
+        let words: [u32; 10] = unsafe { std::mem::transmute_copy(&texture) };
+        let mut desc = [0u32; 16];
+        desc[..10].copy_from_slice(&words);
+        desc[10] = 0x1000;
+        assert_eq!(buffer_range(&view(desc)), None);
+        // A texture view of buffer memory through a table's unordered slot too.
+        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_UAV {
+                    MipSlice: 0,
+                    PlaneSlice: 0,
+                },
+            },
+        };
+        // SAFETY: the host's 40-byte descriptor words.
+        let words: [u32; 10] = unsafe { std::mem::transmute_copy(&uav) };
+        let mut desc = [0u32; 16];
+        desc[..10].copy_from_slice(&words);
+        desc[10] = 0x1000;
+        let mut unordered = resource;
+        unordered[0] = 1;
+        assert_eq!(buffer_range(&View::Placed(true, unordered, desc)), None);
     }
 
     /// A view written over memory that older views describe otherwise
