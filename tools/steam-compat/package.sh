@@ -11,16 +11,23 @@
 #   --exe PATH       the built victory.exe
 #                    (default: target/x86_64-pc-windows-msvc/release/victory.exe)
 #   --build NAME     the build name the exe is installed as, files/victory-<NAME>.exe (default: default)
-#   --version VER    version in the file name (default: latest git tag, else 0.0.0)
-#   --vkd3d-version TAG   the vkd3d-proton release --vkd3d came from (recorded, with its source URL)
+#   --version VER    the release version (default: <GE major>.<GE release>.<revision>, from
+#                    BASE and the existing v<major>.<release>.* tags; see docs/RELEASES.md)
+#   --vkd3d-version TAG   the vkd3d-proton version --vkd3d came from (recorded)
+#   --vkd3d-source TEXT   where that version's corresponding source is (recorded)
 #   --dxc-version TAG     the DXC release --dxc came from (recorded)
 #   --out DIR        where to write the tarball (default: dist)
 #   -h, --help       this text
 #
 # The result is dist/Scarlight-<version>.tar.gz whose single top folder is
-# Scarlight/, holding compatibilitytool.vdf, toolmanifest.vdf, scarlight,
-# scarlight.conf.example, files/ and the licence texts of everything redistributed
-# in it.
+# Scarlight-<version>/, holding compatibilitytool.vdf, toolmanifest.vdf, scarlight,
+# scarlight.conf.example, VERSION, files/ and the licence texts of everything
+# redistributed in it. Its display name is "Scarlight <version>" and its internal
+# name is "Scarlight-<version>", so two releases install side by side, as two
+# GE-Proton builds do.
+#
+# The version's major.release comes from tools/steam-compat/BASE (the GE-Proton
+# this release runs on), and --version may not name a different one.
 #
 # What it packs is what may be redistributed: Scarlight itself (GPL-3.0) and
 # vkd3d-proton (LGPL-2.1). Microsoft's d3dcompiler_47.dll and, by default, DXC's
@@ -39,9 +46,10 @@ EXE="$ROOT/target/x86_64-pc-windows-msvc/release/victory.exe"
 BUILDNAME="default"
 VERSION=""
 VKD3D_VERSION=""
+VKD3D_SOURCE=""
 OUT="$ROOT/dist"
 
-usage() { sed -n '2,28p' "$0"; }
+usage() { sed -n '2,36p' "$0"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -52,6 +60,7 @@ while [ $# -gt 0 ]; do
     --build) BUILDNAME="$2"; shift ;;
     --version) VERSION="$2"; shift ;;
     --vkd3d-version) VKD3D_VERSION="$2"; shift ;;
+    --vkd3d-source) VKD3D_SOURCE="$2"; shift ;;
     --dxc-version) DXC_VERSION="$2"; shift ;;
     --out) OUT="$2"; shift ;;
     -h | --help) usage; exit 0 ;;
@@ -88,29 +97,67 @@ if [ "$INCLUDE_DXC" = 1 ]; then
   done
 fi
 
+# The version is <GE major>.<GE release>.<revision>: Scarlight 11.14.1 runs on
+# GE-Proton11-14, and the revision counts within that GE release, so rebasing on
+# GE-Proton11-15 starts again at 11.15.1. BASE is the one place the GE release is
+# named; docs/RELEASES.md explains the scheme.
+BASE_FILE="$HERE/BASE"
+[ -f "$BASE_FILE" ] || {
+  echo "missing $BASE_FILE (the GE-Proton this release runs on, e.g. GE-Proton11-14)" >&2
+  exit 1
+}
+BASE="$(sed -n '1{s/[[:space:]]*$//;p;}' "$BASE_FILE")"
+case "$BASE" in
+  GE-Proton[0-9]*-[0-9]*) ;;
+  *)
+    echo "$BASE_FILE must hold one line, GE-Proton<major>-<release>; got '$BASE'" >&2
+    exit 2
+    ;;
+esac
+BASE_SERIES="${BASE#GE-Proton}"
+BASE_SERIES="${BASE_SERIES/-/.}" # 11-14 -> 11.14
+
 if [ -z "$VERSION" ]; then
-  # Release tags only: an unreleased checkout packs as 0.0.0, not as some
-  # other line's tag.
-  # Only a tag on HEAD names a release; `--abbrev=0` would take an older one.
-  VERSION="$(git -C "$ROOT" describe --tags --match 'v*' --exact-match 2>/dev/null || echo 0.0.0)"
+  # No tag of this GE release yet means revision 1; each tag adds one, so a
+  # rebase on a newer GE-Proton starts at .1 again by itself.
+  REV=1
+  if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    REV=$((1 + $(git -C "$ROOT" tag --list "v$BASE_SERIES.*" | wc -l)))
+  fi
+  VERSION="$BASE_SERIES.$REV"
 fi
 VERSION="${VERSION#v}"
+case "$VERSION" in
+  "$BASE_SERIES".[0-9]*) ;;
+  *)
+    echo "--version $VERSION does not belong to $BASE: this release's versions are $BASE_SERIES.<revision>" >&2
+    exit 2
+    ;;
+esac
+case "$VERSION" in
+  '' | .* | *. | *[!0-9.]* | *..*)
+    echo "--version must be <major>.<release>.<revision>; got '$VERSION'" >&2
+    exit 2
+    ;;
+esac
+COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf -- "$WORK"' EXIT
-STAGE="$WORK/Scarlight"
+STAGE="$WORK/Scarlight-$VERSION"
 mkdir -p "$STAGE/files/licenses"
 
 install -m 755 "$HERE/scarlight" "$STAGE/scarlight"
-cat >"$STAGE/compatibilitytool.vdf" <<'VDF'
+install -m 644 "$BASE_FILE" "$STAGE/BASE"
+cat >"$STAGE/compatibilitytool.vdf" <<VDF
 "compatibilitytools"
 {
   "compat_tools"
   {
-    "Scarlight"
+    "Scarlight-$VERSION"
     {
       "install_path" "."
-      "display_name" "Scarlight (Xbox Series)"
+      "display_name" "Scarlight $VERSION"
       "from_oslist" "windows"
       "to_oslist" "linux"
     }
@@ -126,6 +173,15 @@ cat >"$STAGE/toolmanifest.vdf" <<'VDF'
   "use_sessions" "1"
 }
 VDF
+# What a bug report needs: which build, from which commit, on which GE-Proton.
+cat >"$STAGE/VERSION" <<VERS
+version=$VERSION
+commit=$COMMIT
+base=$BASE
+vkd3d-proton=${VKD3D_VERSION:-unknown}
+dxc=$( [ "$INCLUDE_DXC" = 1 ] && echo "${DXC_VERSION:-unknown}" || echo none )
+VERS
+
 install -m 644 "$EXE" "$STAGE/files/victory-$BUILDNAME.exe"
 install -m 644 "$VKD3D/d3d12.dll" "$VKD3D/d3d12core.dll" "$STAGE/files/"
 if [ "$INCLUDE_DXC" = 1 ]; then
@@ -136,7 +192,7 @@ fi
 # the user (or the installer) to fill in. Shipped as scarlight.conf.example: the
 # tool copies it to scarlight.conf on first launch only, so an upgrade of an
 # installed tool never replaces the settings someone tuned.
-cat >"$STAGE/scarlight.conf.example" <<'CONF'
+cat >"$STAGE/scarlight.conf.example" <<CONF
 # Scarlight compatibility tool settings. Edit, then press Play again.
 # Full reference: docs/steam.md in the Scarlight repository.
 
@@ -144,8 +200,10 @@ cat >"$STAGE/scarlight.conf.example" <<'CONF'
 BUILD=__BUILD__
 
 # The Proton whose Wine Scarlight runs on: a folder name in this
-# compatibilitytools.d, or a full path to a Proton folder.
-PROTON=GE-Proton11-14-x86_64
+# compatibilitytools.d, or a full path to a Proton folder. Empty means the
+# GE-Proton this release is built for ($BASE, in the BASE file next to this
+# one); failing that, the newest GE-Proton11-* installed, with a warning.
+PROTON=
 
 # Microsoft's d3dcompiler_47.dll is optional and not shipped. If you have one
 # you are licensed to use, put its path here; empty means use Wine's built-in.
@@ -202,13 +260,12 @@ Scarlight $VERSION
   built from https://github.com/pablogonz12/Scarlight, GPL-3.0-or-later (see LICENSE).
 
 vkd3d-proton ${VKD3D_VERSION:-unknown}
-  files/d3d12.dll, files/d3d12core.dll, unmodified release binaries, LGPL-2.1-or-later.
-  Corresponding source for that exact version: the tag's source tree, cloned with
-  its submodules (dxil-spirv, Vulkan-Headers, SPIRV-Headers),
-  https://github.com/HansKristian-Work/vkd3d-proton/tree/${VKD3D_VERSION:-unknown},
-  which this release also attaches as vkd3d-proton-<tag>-source.tar.gz. If it is
-  missing, write to the project's issue tracker and we will send it; the offer is
-  good for three years after the release date.
+  files/d3d12.dll, files/d3d12core.dll: LGPL-2.1-or-later, built from that tree and
+  nothing else. Corresponding source: ${VKD3D_SOURCE:-https://github.com/HansKristian-Work/vkd3d-proton/tree/${VKD3D_VERSION:-unknown}},
+  cloned with its submodules (dxil-spirv, Vulkan-Headers, SPIRV-Headers), which the
+  release that carries these DLLs also attaches as a source archive. If it is missing,
+  write to the project's issue tracker and we will send it; the offer is good for
+  three years after the release date.
 
 ${DXC_NOTE}
 
@@ -221,9 +278,12 @@ mkdir -p "$OUT"
 TARBALL="$OUT/Scarlight-$VERSION.tar.gz"
 tar --sort=name --owner=0 --group=0 --numeric-owner \
   --mtime="@$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || echo 0)" \
-  -C "$WORK" -czf "$TARBALL" Scarlight
+  -C "$WORK" -czf "$TARBALL" "Scarlight-$VERSION"
+sha256sum "$TARBALL" > "$TARBALL.sha256"
 
 echo "$TARBALL"
-echo "  Scarlight/: compatibilitytool.vdf, toolmanifest.vdf, scarlight, scarlight.conf.example, LICENSE, files/"
-echo "  files/: victory-$BUILDNAME.exe, d3d12.dll, d3d12core.dll, dxil.dll, dxcompiler.dll, licenses/"
+echo "  Scarlight-$VERSION/: compatibilitytool.vdf, toolmanifest.vdf, scarlight, VERSION,"
+echo "                      scarlight.conf.example, BASE, LICENSE, files/"
+echo "  files/: victory-$BUILDNAME.exe, d3d12.dll, d3d12core.dll, licenses/"
+echo "Steam will list it as \"Scarlight $VERSION\" (runs on $BASE)."
 echo "Extract it into Steam's compatibilitytools.d and restart Steam."
