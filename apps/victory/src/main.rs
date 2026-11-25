@@ -124,10 +124,6 @@ enum Command {
         /// The title's executable.
         exe: PathBuf,
     },
-    /// Make the title pipelines of earlier runs that the pipeline library
-    /// lacks, without starting the title (`run` does it at its start;
-    /// `VICTORY_WARMUP=0` turns that off).
-    Warmup,
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -228,7 +224,6 @@ fn main() -> Result<()> {
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
         Command::TitleId { exe } => title_id(&exe),
-        Command::Warmup => run::warmup(),
         Command::Config => show_config(),
     }
 }

@@ -369,7 +369,6 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         defs: &defs,
         phis: &phis,
     };
-    let mut first_halves: Vec<(Site, Attribute, Option<Value>)> = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -383,13 +382,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
-                        ("v_interp_p1_f32", _) => {
-                            let val = match *dst {
-                                Operand::Vector { reg, .. } => inst.write(Reg::V(reg)),
-                                _ => None,
-                            };
-                            first_halves.push((site, attribute, val));
-                        }
+                        ("v_interp_p1_f32", _) => {}
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
                                 return Err(unsupported(at, "an interpolation operand"));
@@ -409,14 +402,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     }
                 }
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
-                    "v_interp_p1ll_f16" => {
-                        let attribute = attribute(inst, &v.src[0])?;
-                        let val = match v.dst {
-                            Some(Operand::Vector { reg, .. }) => inst.write(Reg::V(reg)),
-                            _ => None,
-                        };
-                        first_halves.push((site, attribute, val));
-                    }
+                    "v_interp_p1ll_f16" => {}
                     "v_interp_p2_f16" => {
                         let attribute = attribute(inst, &v.src[0])?;
                         let read = |k: usize| match v.src.get(k) {
@@ -471,49 +457,6 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     });
                 }
                 _ => {}
-            }
-        }
-    }
-    // Any `v_interp_p1*` half whose result is read by something other than a
-    // paired `Interp::Interpolated` second half (or that is unpaired) must
-    // evaluate on its own as `Interp::Weighted` so downstream reads succeed.
-    if !first_halves.is_empty() {
-        let interp_p2: std::collections::HashSet<Site> = io
-            .interps
-            .iter()
-            .filter_map(|&(s, ref k)| matches!(k, Interp::Interpolated { .. }).then_some(s))
-            .collect();
-        let mut outside_reads: std::collections::HashSet<Value> = std::collections::HashSet::new();
-        for (b, block) in p.blocks.iter().enumerate() {
-            for (i, inst) in block.insts.iter().enumerate() {
-                if !interp_p2.contains(&(b, i)) {
-                    for &(_, v) in &inst.reads {
-                        outside_reads.insert(v);
-                    }
-                }
-            }
-        }
-        // Also propagate through phis that are read outside `interp_p2`.
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for block in &p.blocks {
-                for phi in &block.phis {
-                    if outside_reads.contains(&phi.value) {
-                        for &v in &phi.args {
-                            if outside_reads.insert(v) {
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        for (site, attribute, val) in first_halves {
-            if val.is_some_and(|v| outside_reads.contains(&v))
-                && !io.interps.iter().any(|(s, _)| *s == site)
-            {
-                io.interps.push((site, Interp::Weighted { attribute }));
             }
         }
     }

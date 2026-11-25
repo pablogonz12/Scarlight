@@ -207,115 +207,6 @@ impl GraphicsState {
         )
     }
 
-    /// The state as bytes for the warm-up file (`super::warmfile`): the
-    /// plain structures as they are in memory (none holds a pointer), the
-    /// input elements field by field with their names.
-    pub(crate) fn to_bytes(&self) -> Vec<u8> {
-        fn plain<T>(out: &mut Vec<u8>, v: &T) {
-            // SAFETY: a plain structure of integers; its bytes are read as is.
-            out.extend_from_slice(unsafe { std::slice::from_raw_parts((v as *const T).cast::<u8>(), size_of::<T>()) });
-        }
-        let mut out = Vec::new();
-        plain(&mut out, &self.blend);
-        plain(&mut out, &self.rasterizer);
-        plain(&mut out, &self.depth);
-        plain(&mut out, &self.targets);
-        plain(&mut out, &self.samples);
-        for v in [
-            self.sample_mask,
-            self.strip_cut.0 as u32,
-            self.topology.0 as u32,
-            self.depth_format.0 as u32,
-            self.depth_bounds as u32,
-            self.inputs.len() as u32,
-        ] {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        for (e, name) in self.inputs.iter().zip(&self.names) {
-            let name = name.as_bytes();
-            out.extend_from_slice(&(name.len() as u32).to_le_bytes());
-            out.extend_from_slice(name);
-            for v in [
-                e.SemanticIndex,
-                e.Format.0 as u32,
-                e.InputSlot,
-                e.AlignedByteOffset,
-                e.InputSlotClass.0 as u32,
-                e.InstanceDataStepRate,
-            ] {
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        out
-    }
-
-    /// The state `to_bytes` wrote; `None` for bytes of another shape.
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Option<GraphicsState> {
-        fn plain<T: Copy>(bytes: &[u8], at: &mut usize) -> Option<T> {
-            let part = bytes.get(*at..*at + size_of::<T>())?;
-            *at += size_of::<T>();
-            // SAFETY: as many bytes as the structure, which holds integers only.
-            Some(unsafe { part.as_ptr().cast::<T>().read_unaligned() })
-        }
-        fn int(bytes: &[u8], at: &mut usize) -> Option<u32> {
-            let part = bytes.get(*at..*at + 4)?;
-            *at += 4;
-            Some(u32::from_le_bytes([part[0], part[1], part[2], part[3]]))
-        }
-        let at = &mut 0;
-        let mut g = GraphicsState {
-            blend: plain(bytes, at)?,
-            rasterizer: plain(bytes, at)?,
-            depth: plain(bytes, at)?,
-            targets: plain(bytes, at)?,
-            samples: plain(bytes, at)?,
-            ..GraphicsState::default()
-        };
-        g.sample_mask = int(bytes, at)?;
-        g.strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE(int(bytes, at)? as i32);
-        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(int(bytes, at)? as i32);
-        g.depth_format = DXGI_FORMAT(int(bytes, at)? as i32);
-        g.depth_bounds = int(bytes, at)? != 0;
-        let count = int(bytes, at)? as usize;
-        if count > 64 {
-            return None;
-        }
-        let mut elements = Vec::new();
-        for _ in 0..count {
-            let len = int(bytes, at)? as usize;
-            let name = CString::new(bytes.get(*at..*at + len)?).ok()?;
-            *at += len;
-            let element = (
-                int(bytes, at)?,
-                int(bytes, at)?,
-                int(bytes, at)?,
-                int(bytes, at)?,
-                int(bytes, at)?,
-                int(bytes, at)?,
-            );
-            elements.push((name, element));
-        }
-        if *at != bytes.len() {
-            return None;
-        }
-        g.names = elements.iter().map(|(n, _)| n.clone()).collect();
-        // The names' heap blocks do not move when the vector does.
-        g.inputs = elements
-            .iter()
-            .zip(&g.names)
-            .map(|((_, e), name)| D3D12_INPUT_ELEMENT_DESC {
-                SemanticName: PCSTR(name.as_ptr().cast()),
-                SemanticIndex: e.0,
-                Format: DXGI_FORMAT(e.1 as i32),
-                InputSlot: e.2,
-                AlignedByteOffset: e.3,
-                InputSlotClass: D3D12_INPUT_CLASSIFICATION(e.4 as i32),
-                InstanceDataStepRate: e.5,
-            })
-            .collect();
-        Some(g)
-    }
-
     fn depth1(&self) -> D3D12_DEPTH_STENCIL_DESC1 {
         let d = &self.depth;
         D3D12_DEPTH_STENCIL_DESC1 {
@@ -1169,41 +1060,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_state_survives_the_warm_up_file() {
-        let mut g = GraphicsState::default();
-        g.targets.NumRenderTargets = 2;
-        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-        g.targets.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        g.sample_mask = 0xf;
-        g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
-        g.blend.RenderTarget[1].BlendEnable = true.into();
-        g.names = vec![CString::new("POSITION").unwrap(), CString::new("TEXCOORD").unwrap()];
-        g.inputs = g
-            .names
-            .iter()
-            .enumerate()
-            .map(|(i, name)| D3D12_INPUT_ELEMENT_DESC {
-                SemanticName: PCSTR(name.as_ptr().cast()),
-                SemanticIndex: i as u32,
-                Format: DXGI_FORMAT_R32G32B32_FLOAT,
-                InputSlot: i as u32,
-                AlignedByteOffset: 12 * i as u32,
-                InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
-                InstanceDataStepRate: 0,
-            })
-            .collect();
-        let bytes = g.to_bytes();
-        let back = GraphicsState::from_bytes(&bytes).expect("read back");
-        assert_eq!(back.describe(), g.describe());
-        assert_eq!(back.to_bytes(), bytes);
-        for cut in [0, 1, bytes.len() / 2, bytes.len() - 1] {
-            assert!(GraphicsState::from_bytes(&bytes[..cut]).is_none(), "cut at {cut}");
-        }
-        assert!(GraphicsState::from_bytes(&[bytes.as_slice(), &[0]].concat()).is_none());
-    }
-
     const VS: &str = "float4 main(uint i : SV_VertexID) : SV_Position {
         float2 p = float2((i << 1) & 2, i & 2);
         return float4(p * 2.0 - 1.0, 0.5, 1.0);
@@ -1457,16 +1313,6 @@ mod tests {
             }
         };
 
-        // WARP reports depth bounds support through `D3D12_FEATURE_D3D12_OPTIONS2`
-        // and then draws through the bounds: check that the host applies what it
-        // reports before holding it to the assertions below (the probe is the
-        // rejection case itself, so nothing is weakened where the feature works).
-        if run_draw(0.9, 1.0) != 0 {
-            eprintln!(
-                "host reports depth bounds support but draws through the bounds; skipped"
-            );
-            return;
-        }
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
     }

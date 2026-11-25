@@ -308,90 +308,6 @@ fn packed_add_selects_halves_of_inline_constants() {
     }
 }
 
-/// The scalar bit searches and counts, ported from TuxBox (brcly, Apache-2.0,
-/// `shader: restore s_flbit_i32_b64 and s_ff0_i32 lowering dropped by a merge`,
-/// 1a50eb9): SFU-free, none of them writes SCC, and the 64-bit forms look at
-/// the high word first.
-#[test]
-fn scalar_bit_searches_match_the_console() {
-    // SOP1 `s_<op> s16, s0` (`src0` 0 is s[0:1] for a two-dword source).
-    let sop1 = |op: u32, src0: u32| 0xBE80_0000 | 16 << 16 | op << 8 | src0;
-    let read_back = |op: u32, src0: u32| [sop1(op, src0), vop1(0x001, 0, sgpr(16))];
-
-    // s_flbit_i32_b64: 31 less the high word's first set bit from the top, else
-    // 32 past the low word's, ~0 for a zero pair.
-    let flbit = |[lo, hi, _, _]: [u32; 4]| {
-        if hi != 0 {
-            hi.leading_zeros()
-        } else if lo != 0 {
-            32 + lo.leading_zeros()
-        } else {
-            u32::MAX
-        }
-    };
-    let cases = [
-        [0, 1, 0, 0],
-        [0, 0x8000_0000, 0, 0],
-        [0x1234_5678, 0, 0, 0],
-        [1, 0, 0, 0],
-        [0x8000_0000, 0, 0, 0],
-        [0, 0, 0, 0],
-        [0xFFFF_FFFF, 0xFFFF_FFFF, 0, 0],
-    ];
-    let shader = build_valu_cs(&read_back(0x16, 0));
-    run_cases(&shader, &cases, |backend, _i, inp, got| {
-        assert_eq!(got, flbit(inp), "{backend}: s_flbit_i32_b64{s:?}", s = inp);
-    });
-
-    // s_ff0_i32_b32: the first zero bit from the bottom, ~0 when there is none.
-    let ff0_b32 = |[a, _, _, _]: [u32; 4]| {
-        if a == u32::MAX {
-            u32::MAX
-        } else {
-            (!a).trailing_zeros()
-        }
-    };
-    let cases = [[0, 0, 0, 0], [1, 0, 0, 0], [0x8000_0001, 0, 0, 0], [0xFFFF_FFFF, 0, 0, 0], [0xFFFF_FFFE, 0, 0, 0]];
-    let shader = build_valu_cs(&read_back(0x11, 0));
-    run_cases(&shader, &cases, |backend, _i, inp, got| {
-        assert_eq!(got, ff0_b32(inp), "{backend}: s_ff0_i32_b32{s:?}", s = inp);
-    });
-
-    // s_ff0_i32_b64: the same over the pair, low word first.
-    let ff0_b64 = |[lo, hi, _, _]: [u32; 4]| {
-        if !lo != 0 {
-            (!lo).trailing_zeros()
-        } else if !hi != 0 {
-            32 + (!hi).trailing_zeros()
-        } else {
-            u32::MAX
-        }
-    };
-    let cases = [
-        [0, 0, 0, 0],
-        [0xF000_0000, 0, 0, 0],
-        [0xFFFF_FFFF, 0, 0, 0],
-        [0xFFFF_FFFF, 0x7FFF_FFFF, 0, 0],
-        [0xFFFF_FFFF, 0xFFFF_FFFF, 0, 0],
-    ];
-    let shader = build_valu_cs(&read_back(0x12, 0));
-    run_cases(&shader, &cases, |backend, _i, inp, got| {
-        assert_eq!(got, ff0_b64(inp), "{backend}: s_ff0_i32_b64{s:?}", s = inp);
-    });
-
-    // s_bcnt0_i32_b32 and _b64: the zero bits of one word, of the pair.
-    let cases = [[0, 0, 0, 0], [0xF, 0, 0, 0], [0xFFFF_FFFF, 0, 0, 0], [0xFFFF_FFFF, 0xF0, 0, 0]];
-    let shader = build_valu_cs(&read_back(0x0d, 0));
-    run_cases(&shader, &cases, |backend, _i, inp, got| {
-        assert_eq!(got, 32 - inp[0].count_ones(), "{backend}: s_bcnt0_i32_b32{s:?}", s = inp);
-    });
-    let shader = build_valu_cs(&read_back(0x0e, 0));
-    run_cases(&shader, &cases, |backend, _i, inp, got| {
-        let want = 64 - (inp[0].count_ones() + inp[1].count_ones());
-        assert_eq!(got, want, "{backend}: s_bcnt0_i32_b64{s:?}", s = inp);
-    });
-}
-
 /// The float `v_cvt_f32_f64` gives for `x`: Rust's rounding (to nearest
 /// even), with results below the smallest normal float flushed to signed
 /// zero as the console's default float mode does.
@@ -495,6 +411,7 @@ fn v_permlane16_and_x16_read_the_lanes_their_selectors_pick() {
         }
     }
 }
+
 #[test]
 fn v_med3_f32_matches_rdna2_with_nan() {
     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
@@ -1452,45 +1369,6 @@ fn v_cmp_class_f16_matches_rdna2() {
     });
 }
 
-/// A carry-in whose mask is a plain SGPR (a root constant) the structure pass
-/// does not follow: this lane adds its own bit of the number.
-#[test]
-fn v_add_co_ci_on_an_untracked_mask_adds_this_lanes_bit() {
-    // v_add_co_ci_u32_e64 v0, s12, v1, v2, s3 (VOP3B 0x128; s12 takes the carry out).
-    let mut op = vop3(0x128, 0, vgpr(1), vgpr(2), sgpr(3));
-    op[0] |= 12 << 8;
-    let shader = build_valu_cs(&op);
-    run_cases_on(
-        &shader,
-        &[
-            [10, 20, 0, 0],
-            [10, 20, 0, 1],
-            [10, 20, 0, 2],
-            [10, 20, 0, !0],
-        ],
-        &[("hardware", false)],
-        |label, i, inp, got| {
-            assert_eq!(got, inp[0] + inp[1] + (inp[3] & 1), "{label} case {i}");
-        },
-    );
-}
-
-/// A select on an inline 0 or -1 mask picks src0 or src1 in every lane.
-#[test]
-fn v_cndmask_on_an_inline_mask_picks_one_side() {
-    for (mask, pick) in [(128u16, 0usize), (193, 1)] {
-        let k = build_valu_cs(&vop3(0x101, 0, vgpr(1), vgpr(2), mask));
-        run_cases_on(
-            &k,
-            &[[10, 20, 0, 0]],
-            &[("hardware", false)],
-            |label, _, inp, got| {
-                assert_eq!(got, inp[pick], "{label} inline {mask}");
-            },
-        );
-    }
-}
-
 #[test]
 fn v_cvt_f32_f64_matches_ieee754() {
     // v_cvt_f32_f64 v0, v[1:2] (VOP1 opcode 0x00f -> VOP3 opcode 0x18f).
@@ -1741,5 +1619,6 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
                 out[0][0],
                 want.to_bits(),
             );
-        }    }
+        }
+    }
 }

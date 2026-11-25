@@ -33,8 +33,6 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
-    /// Whether what it is made from went to the warm-up list.
-    warmed: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -58,24 +56,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
-            warmed: AtomicBool::new(false),
         }
-    }
-
-    pub(crate) fn key(&self) -> &str {
-        &self.key
-    }
-
-    /// What it is made from.
-    pub(crate) fn parts(&self) -> (&[Arc<Shader>], Option<&GraphicsState>) {
-        (&self.shaders, self.graphics.as_deref())
-    }
-
-    /// Makes it on this thread (the warm-up's workers); whether it has a
-    /// host pipeline.
-    pub(crate) fn make_here(&self) -> bool {
-        self.make();
-        self.made.get().is_some_and(|made| made.is_some())
     }
 
     fn make(&self) {
@@ -146,13 +127,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
-    let made = p.made.get()?.as_ref();
-    // What it is made from, for the next start's warm-up (only one that has
-    // a host pipeline: the list names pipelines to build).
-    if made.is_some() && !p.warmed.swap(true, Ordering::Relaxed) {
-        super::warm::note(p);
-    }
-    made
+    p.made.get()?.as_ref()
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -318,19 +293,12 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Number of background pipeline compile workers for a machine with `cores`
-/// logical processors.
-fn pipeline_worker_count(cores: usize) -> usize {
-    (cores / 2).clamp(2, 12)
-}
-
-/// Starts the workers (half the logical processors, 2 to 12) on first use.
+/// Starts the workers (half the logical processors, 2 to 8) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers =
-            pipeline_worker_count(std::thread::available_parallelism().map_or(4, |n| n.get()));
+        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
@@ -428,15 +396,5 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
         assert!(queue.pop().is_none());
-    }
-
-    #[test]
-    fn pipeline_worker_count_scales_with_cores() {
-        assert_eq!(pipeline_worker_count(2), 2);
-        assert_eq!(pipeline_worker_count(4), 2);
-        assert_eq!(pipeline_worker_count(8), 4);
-        assert_eq!(pipeline_worker_count(16), 8);
-        assert_eq!(pipeline_worker_count(28), 12);
-        assert_eq!(pipeline_worker_count(64), 12);
     }
 }

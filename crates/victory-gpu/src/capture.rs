@@ -179,11 +179,6 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let Some(folder) = folder() else { return };
-    save_png(&folder.join(format!("{name}.png")), width, height, pitch, bgra, rows);
-}
-
-/// Saves 8-bit RGBA or BGRA rows at `path`, at half size.
-fn save_png(path: &std::path::Path, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let (w, h) = ((width / 2).max(1), (height / 2).max(1));
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
@@ -210,7 +205,8 @@ fn save_png(path: &std::path::Path, width: u32, height: u32, pitch: usize, bgra:
     debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
     chunk(&mut png, b"IDAT", idat);
     chunk(&mut png, b"IEND", &[]);
-    match std::fs::write(path, png) {
+    let path = folder.join(format!("{name}.png"));
+    match std::fs::write(&path, png) {
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
         Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
     }
@@ -349,122 +345,8 @@ pub(crate) fn save_read_back(
     }
 }
 
-/// The shot asked for by the control folder, remembered at a present by
-/// [`poll`] and taken by the next one that can read the presented source.
-static PENDING: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
-
-/// Looks at the control folder, at most every 250 ms ([`victory_core::ctl`]
-/// takes the key requests itself) and remembers a shot for the frame being
-/// presented. With nothing requested this is a few `stat` calls.
-pub(crate) fn poll() {
-    let request = victory_core::ctl::tick();
-    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-    // A shot not saved yet stays pending: the newest one wins, and keys keep
-    // being taken meanwhile (they are held from `tick`).
-    if pending.is_none()
-        && let Some(victory_core::ctl::Request::Shot(label)) = request
-    {
-        *pending = Some(label);
-    }
-}
-
-/// The label of the shot the presented frame should be saved under, taken
-/// (so a frame reads the request once).
-pub(crate) fn take_request() -> Option<Option<String>> {
-    PENDING.lock().unwrap_or_else(|e| e.into_inner()).take()
-}
-
-/// Puts a shot the frame could not save back for the next one.
-pub(crate) fn put_back(label: Option<String>) {
-    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-    if pending.is_none() {
-        *pending = Some(label);
-    }
-}
-
-/// The stats line the meter last worked out (fps, the split of a frame,
-/// draws, drops); `None` before a second of frames.
-static STATS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-/// Records the meter's line for the stats file of a shot.
-pub(crate) fn note_stats(line: String) {
-    *STATS.lock().unwrap_or_else(|e| e.into_inner()) = Some(line);
-}
-
-/// Saves a frame read back by [`read_back`] as `<ctl>/shots/<stamp>-f<frame>.png`
-/// (the folder's label too, when the request had one), and one line of
-/// stats as the same name with `.txt`: what the meter last said, and the
-/// reasons draws and dispatches were dropped without a host pipeline.
-pub(crate) fn save_shot(
-    frame: u64,
-    label: Option<String>,
-    buffer: &ID3D12Resource,
-    footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
-) {
-    let Some(ctl) = victory_core::ctl::dir() else { return };
-    let f = footprint.Footprint;
-    let bgra = match f.Format {
-        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => false,
-        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => true,
-        other => {
-            tracing::warn!(format = other.0, "shot not saved: not 8-bit color");
-            return;
-        }
-    };
-    let shots = ctl.join("shots");
-    if let Err(e) = std::fs::create_dir_all(&shots) {
-        tracing::warn!(error = %e, path = %shots.display(), "shots folder not made");
-        return;
-    }
-    let stamp = victory_core::ctl::stamp();
-    let name = match &label {
-        Some(label) => format!("{stamp}-f{frame}-{label}"),
-        None => format!("{stamp}-f{frame}"),
-    };
-    let mut data = std::ptr::null_mut();
-    // SAFETY: the copy finished (every submission is waited for); the
-    // mapping spans the footprint's rows.
-    unsafe {
-        if buffer.Map(0, None, Some(&mut data)).is_err() {
-            return;
-        }
-        let len = f.RowPitch as usize * f.Height as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
-        save_png(
-            &shots.join(format!("{name}.png")),
-            f.Width,
-            f.Height,
-            f.RowPitch as usize,
-            bgra,
-            rows,
-        );
-        buffer.Unmap(0, None);
-    }
-    let stats = STATS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-        .unwrap_or_else(|| "no stats yet (fewer than a second of frames)".to_owned());
-    let mut line = format!("{stamp} frame={frame} {stats}");
-    let drops = crate::pipeline::drops_snapshot();
-    if !drops.is_empty() {
-        let reasons: Vec<String> = drops
-            .iter()
-            .map(|(why, n)| format!("{why} x{n}"))
-            .collect();
-        line.push_str(&format!(
-            " | without a host pipeline: {}",
-            reasons.join(", ")
-        ));
-    }
-    let path = shots.join(format!("{name}.txt"));
-    if let Err(e) = std::fs::write(&path, format!("{line}\n")) {
-        tracing::warn!(error = %e, path = %path.display(), "shot stats not saved");
-    }
-    tracing::info!(shot = %name, "shot saved");
-}
-
-/// With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in/// `VICTORY_CAPTURE_FRAMES` render to or write, in first-use order, saved
+/// With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in
+/// `VICTORY_CAPTURE_FRAMES` render to or write, in first-use order, saved
 /// at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`
 /// (what each holds at the end of the frame; formats normalized to show
 /// structure: floats scaled by their largest value, depth by its range).

@@ -12,8 +12,8 @@
 //! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
 //! [`signature`] command signatures, [`pipeline`] pipeline states,
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
-//! share, [`console`] which console model the title sees. Planned: `present`
-//! (swap chain).
+//! share, [`console`] which console model the title sees. Planned:
+//! `present` (swap chain).
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
@@ -31,8 +31,6 @@ mod spread;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
-#[cfg(windows)]
-mod dxc;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
@@ -62,7 +60,6 @@ pub mod root;
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
-mod switches;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
@@ -74,8 +71,6 @@ pub mod signature;
 mod texture;
 #[cfg(windows)]
 mod watch;
-#[cfg(windows)]
-mod writeback;
 
 #[cfg(windows)]
 pub use host::on_failure;
@@ -86,18 +81,3 @@ pub use watch::{
     title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
     writing as kernel_will_write,
 };
-
-/// Total installed physical RAM in bytes, queried once from the OS.
-#[cfg(windows)]
-pub(crate) fn total_system_ram_bytes() -> Option<u64> {
-    static TOTAL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *TOTAL.get_or_init(|| {
-        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-        // SAFETY: plain data the call fills in.
-        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        // SAFETY: a sized structure.
-        let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
-        (ok && m.ullTotalPhys > 0).then_some(m.ullTotalPhys)
-    })
-}

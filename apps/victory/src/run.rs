@@ -130,8 +130,6 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
-    // Before any title code runs: its watchdog and timers do not see it.
-    victory_hle::modules::d3d12x::warm_up();
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
@@ -154,35 +152,7 @@ pub fn run(
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
-    victory_hle::modules::d3d12x::report_shader_caches();
     Ok(())
-}
-
-/// `victory warmup`: makes the pipelines of earlier runs that the library
-/// lacks, without starting the title.
-#[cfg(windows)]
-pub fn warmup() -> Result<()> {
-    let cfg = victory_core::Config::load()?;
-    victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
-    match victory_hle::modules::d3d12x::warm_up() {
-        Some(r) => println!(
-            "warm-up        {} listed, {} compiled, {} already in the library, {} without a host pipeline, {:.1} s{}",
-            r.listed,
-            r.compiled,
-            r.loaded,
-            r.failed,
-            r.seconds,
-            if r.stopped { " (stopped)" } else { "" }
-        ),
-        None => println!("warm-up        nothing to do (no list yet, VICTORY_WARMUP=0, or no host GPU)"),
-    }
-    victory_hle::modules::d3d12x::report_shader_caches();
-    Ok(())
-}
-
-#[cfg(not(windows))]
-pub fn warmup() -> Result<()> {
-    anyhow::bail!("the pipeline warm-up needs the host D3D12 (Windows)")
 }
 
 /// The debugging aids (README): scheduled stack dumps, watched values and

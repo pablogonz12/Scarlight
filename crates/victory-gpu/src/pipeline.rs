@@ -561,26 +561,12 @@ pub(crate) fn note_why(why: String) {
 
 /// The drops counted since the last call, most first (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn take_drops() -> Vec<(String, u64)> {    let drops = DROPS.lock().unwrap_or_else(|e| e.into_inner()).take();
+pub(crate) fn take_drops() -> Vec<(String, u64)> {
+    let drops = DROPS.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut drops: Vec<(String, u64)> = drops.into_iter().flatten().collect();
     // Frame reports only show the first 40 reasons. Keep ties ordered so
     // a HashMap iteration order change cannot change which reasons appear.
     drops.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    drops
-}
-
-/// The reasons counted since the run began, most first, without consuming
-/// them: what a shot's stats line says about work without a host pipeline
-/// (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn drops_snapshot() -> Vec<(String, u64)> {
-    let drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    let mut drops: Vec<(String, u64)> = drops
-        .iter()
-        .flat_map(|m| m.iter().map(|(why, n)| (why.clone(), *n)))
-        .collect();
-    drops.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    drops.truncate(20);
     drops
 }
 
@@ -803,11 +789,6 @@ pub(crate) fn frame_log_counts() -> (u64, u64) {
 }
 #[cfg(windows)]
 mod make;
-#[cfg(windows)]
-mod warm;
-
-#[cfg(windows)]
-pub use warm::{Report as WarmUpReport, report_shader_caches, warm_up};
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

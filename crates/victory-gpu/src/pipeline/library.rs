@@ -62,10 +62,6 @@ pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
-pub(crate) fn dir() -> Option<&'static std::path::Path> {
-    DIR.get().map(PathBuf::as_path)
-}
-
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
@@ -446,10 +442,7 @@ fn library() -> Option<&'static Library> {
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            // `VICTORY_LIBRARY_COLD=1` (measurements): starts as if there
-            // were no library file; a save then writes a new one.
-            let cold = std::env::var_os("VICTORY_LIBRARY_COLD").is_some_and(|v| v == "1");
-            let blob = DIR.get().filter(|_| !cold).map_or(Blob::None, |d| Blob::of(d));
+            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
@@ -588,9 +581,6 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    // Through a temporary file at the end of a run (the writes a run makes
-    // as it goes are appended).
-    super::warm::flush(dir, now);
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
