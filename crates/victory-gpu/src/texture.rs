@@ -52,6 +52,10 @@ pub(crate) struct Staging {
     /// The resource the staging buffer is of, for the resident mip window
     /// its views are narrowed to ([`note_resident`]).
     resource: This,
+    /// The title released the resource: a list may still hold this staging
+    /// and refresh it, and that must not note a window under an address
+    /// another texture may have been given ([`forget`]).
+    released: std::sync::atomic::AtomicBool,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
     /// uploaded it, and whether one has uploaded it at all: a list records
@@ -922,12 +926,22 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&resource);
+    if let Some(map) = map.as_mut()
+        && let Some(staging) = map.remove(&resource)
+    {
+        // A list not yet reset may still hold it and refresh it: that must
+        // not note a window for the released address.
+        staging.released.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
+    }
+    // Its resident window goes too: the address a handle names is given to
+    // other textures, which must not inherit a clamp meant for this one.
+    let mut resident = RESIDENT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = resident.as_mut() {
+        map.remove(&resource);
     }
     // Its memory may be given to other textures now (run 177: most of the
     // "HERO LEAD" lines were views in memory a released texture had held).
@@ -1171,7 +1185,9 @@ impl Staging {
             // narrowed to it while it lasts (a streamed texture's mips
             // arrive from the smallest, at the start of each slice).
             let window = resident_mips(self.memory, &self.layout.planes[0].layout);
-            note_resident(self.resource, window, false);
+            if !self.released.load(std::sync::atomic::Ordering::Relaxed) {
+                note_resident(self.resource, window, false);
+            }
             #[cfg(feature = "diagnostics")]
             if window.1 > 0 && window.0 > 0 {
                 crate::copystat::add(crate::copystat::C::ResidentNarrowed, 1);
@@ -1212,7 +1228,9 @@ impl Staging {
             return size;
         }
         // All of it is there: no view of it is narrowed any more.
-        note_resident(self.resource, (0, 0), true);
+        if !self.released.load(std::sync::atomic::Ordering::Relaxed) {
+            note_resident(self.resource, (0, 0), true);
+        }
         if through_copy() {
             // A read through the kernel, which needs no lock.
             drop(_mapped);
@@ -1707,11 +1725,15 @@ fn mapped_prefix(at: *const u8, len: usize) -> u64 {
     there
 }
 
+/// The resident mip window `(first, count)` of each texture, noted at its
+/// last staging refresh ([`note_resident`]) and read when a view of it is
+/// made ([`resident`]): one store, shared by both.
+static RESIDENT: Mutex<Option<HashMap<usize, (u32, u32)>>> = Mutex::new(None);
+
 /// The resident mip window `(first, count)` of a texture a view is made on:
 /// what [`resident_mips`] found at its last upload. `None` while it is all
 /// there (or nothing is known: no staging buffer, no view to narrow).
 pub(crate) fn resident(resource: This) -> Option<(u32, u32)> {
-    static RESIDENT: Mutex<Option<HashMap<usize, (u32, u32)>>> = Mutex::new(None);
     let map = RESIDENT.lock().unwrap_or_else(|e| e.into_inner());
     map.as_ref()?.get(&(resource as usize)).copied()
 }
@@ -1765,7 +1787,6 @@ pub(crate) fn wanted(
 /// mips is there): a view of it is narrowed to it while it stands, and
 /// widened when more has arrived.
 pub(crate) fn note_resident(resource: This, window: (u32, u32), whole: bool) {
-    static RESIDENT: Mutex<Option<HashMap<usize, (u32, u32)>>> = Mutex::new(None);
     let mut map = RESIDENT.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if whole {
@@ -1932,6 +1953,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         bytes: total,
         memory,
         resource,
+        released: std::sync::atomic::AtomicBool::new(false),
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
@@ -2326,7 +2348,7 @@ mod present_tests {
 
 #[cfg(test)]
 mod resident_tests {
-    use super::{narrowed, wanted};
+    use super::{narrowed, note_resident, resident, wanted};
 
     /// A view of a part-resident texture names the resident suffix of what
     /// it asked for, and never a mip that is not there. Hand-built windows
@@ -2346,6 +2368,35 @@ mod resident_tests {
         assert_eq!(narrowed((2, 0), (1, 2), 8), (2, 1));
         // One level, and that level arrived: unchanged.
         assert_eq!(narrowed((6, 1), (6, 2), 8), (6, 1));
+    }
+
+    /// One store behind the window: what a refresh notes is what a view of
+    /// it reads back, and clearing it (what a host copy filling the chain
+    /// does) is seen too. Each function used to have its own map, so
+    /// nothing ever read back what was noted.
+    #[test]
+    fn the_noted_window_is_the_one_read_back() {
+        // A handle no other test uses (the store is process-wide).
+        let resource = 0x6720_0011u64 as _;
+        assert_eq!(resident(resource), None, "nothing noted yet");
+        note_resident(resource, (3, 5), false);
+        assert_eq!(resident(resource), Some((3, 5)));
+        // More levels arrived: the window moves.
+        note_resident(resource, (2, 6), false);
+        assert_eq!(resident(resource), Some((2, 6)));
+        // Cleared (what a host copy filling the chain does, #616).
+        note_resident(resource, (0, 0), true);
+        assert_eq!(resident(resource), None);
+        // The title releasing the resource drops its window: the next one at
+        // that address starts unclamped.
+        note_resident(resource, (4, 2), false);
+        super::forget(resource as usize);
+        assert_eq!(resident(resource), None);
+        // And noted again after it: one store, both ways.
+        note_resident(resource, (1, 2), false);
+        assert_eq!(resident(resource), Some((1, 2)));
+        note_resident(resource, (0, 0), true);
+        assert_eq!(resident(resource), None);
     }
 
     /// A slot follows the resident suffix while it streams, and the title's
