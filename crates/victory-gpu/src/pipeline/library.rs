@@ -429,6 +429,8 @@ fn one_call() -> Option<MutexGuard<'static, ()>> {
 }
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
+/// A library the driver refused, kept as it was ([`open`]).
+const REJECTED_FILE: &str = "host-pipelines.rejected.bin";
 /// A saved library that could not replace [`LIBRARY_FILE`] while this run
 /// had it mapped (a system that refuses to replace a mapped file): the next
 /// start renames it over the library first ([`Blob::of`]).
@@ -441,6 +443,14 @@ fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
+            // With RenderDoc loaded the device is RenderDoc's: the card's
+            // library is not for it, and what it would save is not for
+            // the card. Neither read nor written in such a run.
+            #[cfg(feature = "diagnostics")]
+            if crate::renderdoc::loaded() {
+                tracing::info!("RenderDoc is loaded: the host pipeline library is neither read nor saved in this run");
+                return None;
+            }
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);
@@ -452,41 +462,16 @@ fn library() -> Option<&'static Library> {
         .as_ref()
 }
 
-/// The host's pipeline library over `bytes`, which the caller keeps alive
-/// for as long as the library.
-///
-/// No bytes at all asks for an empty library, and there the blob is passed
-/// as a null pointer: D3D12 reads the bytes' length alone, but vkd3d-proton
-/// (the host of every run) refuses a blob that points at nothing and has no
-/// length with `E_INVALIDARG`, where Windows (CI's WARP) takes either. The
-/// interface's own `CreatePipelineLibrary` turns an empty slice into a
-/// pointer at nothing, so the call is made here with the pointer the host
-/// asks for.
-fn create(device: &ID3D12Device1, bytes: &[u8]) -> windows::core::Result<ID3D12PipelineLibrary1> {
-    let mut library: *mut core::ffi::c_void = std::ptr::null_mut();
-    let blob: *const core::ffi::c_void =
-        if bytes.is_empty() { std::ptr::null() } else { bytes.as_ptr().cast() };
-    // SAFETY: a live device, the interface `ID3D12PipelineLibrary` asks for
-    // by its IID, and `blob` either null with a length of 0 or a view of
-    // `bytes.len()` bytes. What it returns is a reference this call owns.
-    unsafe {
-        (Interface::vtable(device).CreatePipelineLibrary)(
-            Interface::as_raw(device),
-            blob,
-            bytes.len(),
-            &ID3D12PipelineLibrary::IID,
-            &mut library,
-        )
-        .ok()?;
-        let library: ID3D12PipelineLibrary = Interface::from_raw(library);
-        library.cast()
-    }
-}
-
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
-    let make = |bytes: &[u8]| create(device, bytes);
+    let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
+        // SAFETY: the bytes outlive the library (kept beside it).
+        unsafe {
+            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+        }
+    };
+    let mut rejected = false;
     if !blob.bytes().is_empty() {
         match make(blob.bytes()) {
             Ok(library) => {
@@ -505,7 +490,10 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     saving: RwLock::new(()),
                 });
             }
-            Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
+            Err(e) => {
+                rejected = true;
+                tracing::warn!(error = %e, "host pipeline library rejected; starting an empty one (the rejected file is kept as {REJECTED_FILE})");
+            }
         }
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
@@ -513,6 +501,17 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // The rejected bytes are let go (a mapped file is unmapped) before the
     // empty library is made: nothing reads them any more.
     drop(blob);
+    // And the file is kept under another name, not written over by this
+    // run's first save: a refusal may be this device's alone (run 263:
+    // RenderDoc's device refused the card's library, an empty one was
+    // saved over 366 MB of built pipelines, and the next run drew black
+    // until they were built again).
+    if rejected
+        && let Some(dir) = DIR.get()
+        && let Err(e) = std::fs::rename(dir.join(LIBRARY_FILE), dir.join(REJECTED_FILE))
+    {
+        tracing::warn!(error = %e, "the rejected host pipeline library could not be kept under its other name");
+    }
     let library = make(&[]).ok()?;
     Some(Library {
         library,
