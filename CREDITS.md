@@ -123,6 +123,13 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   `crates/victory-gpu/src/shadow.rs`). Reimplemented: theirs changes `copy_back_marked`, which this tree has no
   equivalent of (its `copy_back` merges into the copy and keeps one snapshot per submission).
 
+- **fxceless/victory-fork [PR #1130](https://github.com/fxceless/victory-fork/pull/1130)** (Lkxex), GPL-3.0:
+  detiling only the 64 KiB pages a texture's write watch says the title wrote, instead of the whole texture at
+  every refresh (`crates/victory-formats/src/texture.rs`'s `Layout::detile_window`,
+  `crates/victory-gpu/src/texture.rs`'s `Staging::refresh_pages`, `VICTORY_DETILE_DIRTY=0`). Its own page table
+  and its per-page reads are not taken: our subresource ranges come from the layout (`Layout::mip_extents`) and
+  the written pages are read in runs, with the rows outside the window skipped whole.
+
 - **Marvisak/VIctory [#2163](https://github.com/Marvisak/VIctory/pull/2163)** (0xkn0wh3r3), GPL-3.0: the
   built-in BCPack table's first BC7 dictionary entry has its 32 indices right after its width bytes, where
   every other entry repeats them first and holds 31 (`crates/victory-formats/src/bcpack.rs`).
@@ -133,6 +140,12 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   allocation and fence tracked so a remapped or released allocation is not landed
   (`crates/victory-gpu/src/texback.rs`).
 
+- **fxceless/victory-fork [PR #976](https://github.com/fxceless/victory-fork/pull/976)** (MoscaLosca), GPL-3.0: a
+  compute or mesh dispatch asking for more than the host's 65,535 groups in `x` runs as pieces, each told where
+  its groups start in a host-computed user-data dword the translated program adds to its group id
+  (`USER_GROUP_BASE`, `crates/victory-shader/src/emit/shader.rs`, `Lower::compute_id`;
+  `State::dispatch`/`dispatch_mesh`, `crates/victory-gpu/src/draw.rs`, `VICTORY_GROUP_SPLIT=0`), and the clamp's
+  budget words now count the largest group count a compute record asked for as well as the mesh one.
 - **fxceless/victory-fork [PR #981](https://github.com/fxceless/victory-fork/pull/981)** (avt0m4t), GPL-3.0: an
   embedded shader keys and translates on its declared DXBC bytes, so a packed record whose payload runs on past
   the container gets the same BLAKE3 as its standalone copy (`Container::as_bytes()`,
