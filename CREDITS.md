@@ -43,6 +43,11 @@ BlueKaiman, kais7654, pushkarreddyy, shh.
   GPL-3.0: narrowing a host shader resource view of a streamed texture to the mips whose memory is
   there, and remaking it when more levels arrive or a host copy fills the chain
   (`crates/victory-gpu/src/texture.rs`, `crates/victory-gpu/src/descriptor/host.rs`).
+- **Marvisak/VIctory [#2523](https://github.com/Marvisak/VIctory/pull/2523)** (shh) and
+  **[#2632](https://github.com/Marvisak/VIctory/pull/2632)** (Lkxex), GPL-3.0: holding a reference on a
+  file a queued DirectStorage read still needs, filling spare staging space from another queue, and the
+  single-record indirect clamp (`crates/victory-hle/src/modules/dstorage.rs`,
+  `crates/victory-gpu/src/indirect.rs`).
 
 ## Tools
 
