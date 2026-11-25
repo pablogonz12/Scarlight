@@ -80,6 +80,11 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   `VICTORY_FRAME_BUDGET=0`). Reimplemented on this tree's counters and its own 50 ms budget: its
   per-command timestamps, memory-trait breakdown and slow-pipeline guard are not taken.
 
+- **Chezzuss/VIctory batch 7 (unpublished), GPL-3.0**: clearing the ray-traced reflection image while the
+  ray-tracing structures are unbuilt, as `VICTORY_REFLECTION=miss`
+  (`crates/victory-gpu/src/reflection.rs`). Its `alpha`, `water` and `history` values and the sky-probe fallback
+  tracking that tells the passes apart are not taken: this tree clears one image, the opaque pass's.
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is

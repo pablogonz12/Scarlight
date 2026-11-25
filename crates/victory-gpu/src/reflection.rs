@@ -324,6 +324,26 @@ mod tests {
         assert_eq!(radiance_of(&[]), None);
     }
 
+    /// A hand-built dispatch of `CS_RayMiss`: its table names the radiance
+    /// image at `s1+104` as an R11G11B10 view of mip 3, and what the clear
+    /// makes of it.
+    #[test]
+    fn a_hand_built_ray_miss_image_is_cleared_to_black() {
+        let uavs = [(1, 96), (1, 104)];
+        let mode = mode_of("miss").unwrap().unwrap();
+        let i = radiance_of(&uavs).unwrap();
+        assert_eq!(uavs[i], (1, 104));
+        // format R11G11B10_FLOAT, TEXTURE2D, mip 3, no plane.
+        let (format, mip, first, count) =
+            extent_of(Some([26, 4, 3, 0, 0, 0, 0, 0, 0, 0]), 26, 1).unwrap();
+        assert_eq!((format, mip, first, count), (26, 3, 0, 1));
+        assert_eq!(colour_of(format, mode.level), Some([0.0, 0.0, 0.0, 1.0]));
+        // The transparent pass's image, if it were this one, would be left
+        // alone: this port clears the opaque pass's image only.
+        let other = [(1, 96), (1, 112)];
+        assert_eq!(radiance_of(&other), None);
+    }
+
     /// Float images to any level, integer ones only to zero, others never.
     #[test]
     fn clear_colours() {
