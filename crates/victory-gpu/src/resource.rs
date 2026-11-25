@@ -2138,6 +2138,7 @@ pub(crate) fn placed_known(address: u64, desc: &[u32; 14]) -> Option<This> {
         .map(|&r| r as This)
 }
 
+#[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // Words 1 and 13 of the description are the filler of its layout
     // (after the dimension, and at the end): the title leaves there what
