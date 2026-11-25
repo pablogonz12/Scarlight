@@ -79,6 +79,11 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   the copy-back and the rest, the largest named (`crates/victory-gpu/src/frame_budget.rs`,
   `VICTORY_FRAME_BUDGET=0`). Reimplemented on this tree's counters and its own 50 ms budget: its
   per-command timestamps, memory-trait breakdown and slow-pipeline guard are not taken.
+- **fxceless/victory-fork [#1068](https://github.com/fxceless/victory-fork/pull/1068)** (UwUCammie), GPL-3.0: the
+  idea that the title buffers' table is read most of the time and so wants a read lock, and that one submission's
+  buffer refreshes go into the list in one batch (`crates/victory-gpu/src/shadow.rs`, `VICTORY_REFRESH_BATCH=0` puts
+  one step in per span again). Its `defer_refreshes` came over as written; our `lookup` re-checks under the write
+  lock, so a copy is made once.
 - **JMAN730/project-flamingo [#747](https://github.com/JMAN730/project-flamingo/pull/747)** (Rareuncommon),
   GPL-3.0: lower `v_mul_hi_u32_u24`/`v_mul_hi_i32_i24` as the high dword of the 48-bit product of the low 24
   bits of each operand (`crates/victory-shader/src/emit/lower/valu_int.rs`). Reimplemented on this tree's
