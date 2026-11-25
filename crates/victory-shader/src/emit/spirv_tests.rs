@@ -736,3 +736,23 @@ fn a_group_smaller_than_the_wave_reports_no_full_subgroups() {
 fn dpp_row_ops_become_shuffles_within_16_lane_rows() {
     todo!()
 }
+
+/// The pipeline's side: the subgroup size to ask for, whether the console's
+/// full waves can be required, and the reason when they cannot.
+#[test]
+fn the_subgroup_plan_pins_the_wave_size() {
+    let words = [S_ENDPGM];
+    let plan = program_of(&words, true, [64, 1, 1]).subgroup_plan();
+    assert_eq!(plan.required_subgroup_size, 64);
+    assert!(plan.require_full_subgroups);
+    assert_eq!(plan.no_full_subgroups, None);
+
+    let plan = program_of(&words, false, [32, 1, 1]).subgroup_plan();
+    assert_eq!(plan.required_subgroup_size, 32, "wave32 programs");
+    assert!(plan.require_full_subgroups, "32 threads is one 32-lane subgroup");
+
+    let plan = program_of(&words, true, [32, 1, 1]).subgroup_plan();
+    assert_eq!(plan.required_subgroup_size, 64, "still pinned to the wave");
+    assert!(!plan.require_full_subgroups);
+    assert!(plan.no_full_subgroups.is_some(), "the reason must be reported");
+}

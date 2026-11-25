@@ -558,6 +558,40 @@ impl SpirvProgram {
     pub fn full_subgroups(&self) -> bool {
         self.local_size[0].is_multiple_of(self.wave_size)
     }
+
+    /// What a Vulkan compute pipeline has to ask for to run this program the
+    /// way the console does, for whoever creates it (see
+    /// `docs/spirv-subgroup-size.md`): the subgroup size pinned to the
+    /// program's wave size, and full subgroups where the group allows it.
+    /// A group that cannot have full subgroups gets the reason here, so the
+    /// caller reports it rather than dropping the flag quietly.
+    pub fn subgroup_plan(&self) -> SubgroupPlan {
+        let full = self.full_subgroups();
+        SubgroupPlan {
+            required_subgroup_size: self.wave_size,
+            require_full_subgroups: full,
+            no_full_subgroups: (!full).then_some(NO_FULL_SUBGROUPS_GROUP),
+        }
+    }
+}
+
+/// `REQUIRE_FULL_SUBGROUPS` is out: `local_size[0]` is not a multiple of the
+/// wave size (a 32-thread group of a 64-lane wave, say). The subgroup size is
+/// still pinned; only the flag is left off.
+pub const NO_FULL_SUBGROUPS_GROUP: &str = "local_size_x is not a multiple of the wave size";
+
+/// The pipeline's side of [`SpirvProgram::wave_size`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubgroupPlan {
+    /// `requiredSubgroupSize` for
+    /// `VkPipelineShaderStageRequiredSubgroupSizeCreateInfo`, which must be
+    /// chained onto the shader stage (with `ALLOW_VARYING` off).
+    pub required_subgroup_size: u32,
+    /// Whether `VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT` can
+    /// be set: every subgroup complete, as a console wave is.
+    pub require_full_subgroups: bool,
+    /// Why it cannot, when it cannot.
+    pub no_full_subgroups: Option<&'static str>,
 }
 
 /// Emits the SPIR-V module of a compute program.
