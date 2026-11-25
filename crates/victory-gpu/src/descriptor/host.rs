@@ -2218,6 +2218,51 @@ fn casts_typed() -> bool {
     })
 }
 
+/// Whether [`fits`] refuses unordered access views in formats the host
+/// cannot store to. On by default; `VICTORY_TYPED_UAV=0` lets such a view
+/// reach the host (as before), which then removes the device.
+fn typed_uav_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TYPED_UAV").is_none_or(|v| v != "0"))
+}
+
+/// Whether the host creates a typed unordered access view in `format`,
+/// asked once per format. Hosts refuse some (B8G8R8X8_UNORM and the block
+/// formats on NVIDIA: no typed store there) by removing the device rather
+/// than failing the call, so [`fits`] leaves such a view's slot null. A
+/// host that stores to `format` (RADV through vkd3d-proton does, B8G8R8X8
+/// as B8G8R8A8 with the alpha ignored) keeps every view it had.
+fn typed_store(format: DXGI_FORMAT) -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    // 0: not asked, 1: refused, 2: stored to.
+    static SUPPORT: [AtomicU8; 256] = [const { AtomicU8::new(0) }; 256];
+    let Some(state) = usize::try_from(format.0).ok().and_then(|f| SUPPORT.get(f)) else {
+        return false;
+    };
+    match state.load(Relaxed) {
+        0 => {}
+        known => return known == 2,
+    }
+    let asked = host().is_some_and(|host| {
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: format,
+            ..Default::default()
+        };
+        // SAFETY: a plain query into our own structure.
+        let asked = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        };
+        asked.is_ok()
+            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+    });
+    state.store(if asked { 2 } else { 1 }, Relaxed);
+    asked
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -2261,24 +2306,17 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
-    // A typed unordered access view names a format the host takes that use
-    // of: one it does not (B5G5R5A1, B4G4R4A4 on NVIDIA) removed the device
-    // where such a view was made (#2725). Held back, it reads null and its
-    // writes are dropped, where the resource itself is made without the
-    // use (`crate::resource::taken_flags`).
-    let stored = |named: u32| {
-        if !unordered || !crate::resource::format_uses_on() {
-            return true;
-        }
-        if crate::resource::unordered_view_stored(own, Some(named), crate::resource::host_uses) {
-            return true;
-        }
-        once!(named, own, "an unordered view in a format the host cannot store");
-        false
-    };
     if view == 0 {
-        // A view without a description names the resource's own format.
-        return !typeless && stored(own);
+        if typeless {
+            return false;
+        }
+        // A default view of a texture in a format the host cannot store to
+        // removes the device: leave the slot null instead.
+        if unordered && typed_uav_check() && !typed_store(d.Format) {
+            once!(own, "an unordered view in a format the host cannot store");
+            return false;
+        }
+        return true;
     }
     // A view of a target whose format the host refuses, in the title's
     // format: in the stand-in the host copy has.
@@ -2286,7 +2324,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         if let Some(format) = format {
             *format = d.Format;
         }
-        return stored(own);
+        return true;
     }
     if family(view) != family(own) {
         once!(view, own, "view format of another family");
@@ -2295,13 +2333,23 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     let twin = crate::resource::SRGB
         .iter()
         .any(|&(s, l)| (s, l) == (view, own) || (l, s) == (view, own));
-    if let Some(format) = format.as_deref_mut()
+    let casts = twin && casts_typed();
+    // The format the host makes the view in: the texture's (the title's the
+    // host takes as it is), or the view's for a typeless texture and for the
+    // twins the host casts. A host that cannot store to it removes the
+    // device for a write there, so the slot stays null instead.
+    let created = if !typeless && !casts { own } else { view };
+    if unordered && typed_uav_check() && !typed_store(DXGI_FORMAT(created as i32)) {
+        once!(view = created, own, "an unordered view in a format the host cannot store");
+        return false;
+    }
+    if let Some(format) = format
+        && !casts
         && !typeless
-        && !(twin && casts_typed())
     {
         *format = d.Format;
     }
-    stored(format.as_ref().map_or(0, |f| f.0 as u32))
+    true
 }
 
 /// The title's unordered access view of a depth texture, as a view of the
@@ -2891,6 +2939,111 @@ mod tests {
         let View::Placed(_, resource, desc) = low.clone() else { unreachable!() };
         assert!(!same_placed_texture(&low, &View::Placed(true, resource, desc)));
         assert!(!same_placed_texture(&low, &View::Shader(0, None)));
+    }
+
+    /// Unordered views in formats the host cannot store to stay null
+    /// instead of removing the device, for shared sRGB render targets and
+    /// their linear twins as for default views: `fits` gives the host's own
+    /// answer for the format the view is made in.
+    #[test]
+    fn unordered_views_follow_the_hosts_typed_store_support() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let stores = |format: u32| {
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: DXGI_FORMAT(format as i32),
+                ..Default::default()
+            };
+            // SAFETY: a plain query into our own structure.
+            let asked = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of_val(&support) as u32,
+                )
+            };
+            asked.is_ok()
+                && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+        };
+        let texture = |format: DXGI_FORMAT| -> Option<ID3D12Resource> {
+            let mut tex: Option<ID3D12Resource> = None;
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 64,
+                Height: 64,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+                    | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            // SAFETY: plain committed texture creation.
+            unsafe {
+                host.device.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut tex,
+                )
+            }
+            .ok()?;
+            tex
+        };
+        // The title's shared pair: an sRGB render target the host makes
+        // typeless and a linear unordered access texture over it.
+        let Some(bgra) = texture(DXGI_FORMAT_B8G8R8A8_TYPELESS) else {
+            return; // no such texture on this host
+        };
+        let pair = |own: DXGI_FORMAT, view: Option<u32>| {
+            let tex = texture(own)?;
+            let mut format = view.map(|v| DXGI_FORMAT(v as i32));
+            let fits = fits(&tex, format.as_mut(), true);
+            let made = match format {
+                Some(f) => f,
+                // A default view names the texture's own format.
+                None => own,
+            };
+            Some((fits, stores(made.0 as u32)))
+        };
+        // RGBA8 and BGRA8 sRGB views are rewritten to their linear twins,
+        // whose typed store every host has.
+        for (own, view) in [
+            (DXGI_FORMAT_B8G8R8A8_TYPELESS, Some(91)),
+            (DXGI_FORMAT_B8G8R8A8_TYPELESS, Some(87)),
+            (DXGI_FORMAT_B8G8R8X8_TYPELESS, Some(93)),
+            (DXGI_FORMAT_B8G8R8X8_TYPELESS, Some(88)),
+            (DXGI_FORMAT_R8G8B8A8_TYPELESS, Some(29)),
+            (DXGI_FORMAT_R8G8B8A8_TYPELESS, Some(28)),
+        ] {
+            let Some((fits, stores)) = pair(own, view) else {
+                continue; // a texture this host cannot create
+            };
+            assert_eq!(fits, stores, "texture {own:?}, view {view:?}");
+        }
+        // A typed texture's default unordered view follows its own format.
+        for own in [
+            DXGI_FORMAT_B8G8R8X8_UNORM,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+        ] {
+            let Some((fits, stores)) = pair(own, None) else {
+                continue;
+            };
+            assert_eq!(fits, stores, "texture {own:?}, default view");
+        }
+        // A view of a texture without the unordered access flag is refused
+        // whatever the format, and a typeless one with no view format too.
+        assert!(!fits(&bgra, None, true));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// A null 3D UAV made on the real device leaves it alive.

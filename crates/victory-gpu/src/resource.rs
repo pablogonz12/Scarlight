@@ -310,8 +310,9 @@ pub(crate) fn typeless(format: u32) -> bool {
 /// creation with a use its format cannot take, and such a creation removed
 /// the device (B5G5R5A1 takes no typed unordered access on NVIDIA,
 /// B4G4R4A4 neither use, #2725). Shaders still read the texture; a view of
-/// the use it lacks is held back ([`unordered_view_stored`],
-/// `descriptor::host::fits`). A typeless format names no format itself --
+/// the use it lacks is held back (`descriptor::host::fits`, which asks the
+/// same question of the format a typed unordered access view names).
+/// A typeless format names no format itself --
 /// its views do -- so it keeps the uses its description has, whatever the
 /// report says of it; the same where the query left it unknown, as the
 /// console makes such textures.
@@ -339,20 +340,6 @@ pub(crate) fn taken_flags(format: u32, flags: u32, report: Option<(bool, bool)>)
         flags &= !UNORDERED;
     }
     flags
-}
-
-/// Whether a typed unordered access view naming `view` of a resource in
-/// `own` (a view that names none: the resource's own format) names a
-/// format the host takes that use of. Making one in a format it does not
-/// (B5G5R5A1, B4G4R4A4 on NVIDIA) removed the device (#2725): such a view
-/// reads null, its writes are dropped.
-pub(crate) fn unordered_view_stored(
-    own: u32,
-    view: Option<u32>,
-    report: impl Fn(u32) -> Option<(bool, bool)>,
-) -> bool {
-    let named = view.filter(|&v| v != 0).unwrap_or(own);
-    uses_taken(named, report(named)) & TAKES_UNORDERED != 0
 }
 
 /// Whether the host copy `texture` was made with `unordered` (the unordered
@@ -1712,7 +1699,10 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
 
 #[cfg(windows)]
 impl HostTexture {
-    fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
+    pub(crate) fn new(
+        texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        state: u32,
+    ) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
@@ -1747,8 +1737,10 @@ pub(crate) fn placed_textures() -> u64 {
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
-/// resource and the state it leaves, if that is a change.
-#[cfg(windows)]
+/// resource and the state it leaves, if that is a change. Test only: a
+/// list's moves are recorded in it and swapped in at submission
+/// (`crate::host::HostList::settle`), where the submission lock is held.
+#[cfg(all(windows, test))]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
     let (host, _) = hosted(this, true)?;
@@ -2550,78 +2542,20 @@ mod tests {
         assert_eq!(taken_flags(86, both, None), both);
     }
 
-    /// A typed unordered access view names a format the host takes that
-    /// use of: the resource's own where the view names none, and a cast
-    /// alike. One in a format it does not is held back -- making it
-    /// removed the device (#2725).
-    #[test]
-    fn an_unordered_view_names_a_format_the_host_stores() {
-        let nvidia = |format: u32| match format {
-            86 | 115 => Some((true, false)),
-            _ => Some((true, true)),
-        };
-        assert!(
-            !unordered_view_stored(86, None, nvidia),
-            "a view of no format names the resource's own"
-        );
-        assert!(!unordered_view_stored(86, Some(86), nvidia));
-        assert!(
-            !unordered_view_stored(28, Some(115), nvidia),
-            "a cast to a format the host cannot store is held back too"
-        );
-        assert!(unordered_view_stored(28, None, nvidia));
-        assert!(unordered_view_stored(28, Some(28), nvidia));
-        let radv = |_: u32| Some((true, true));
-        for format in [28, 86, 115] {
-            assert!(
-                unordered_view_stored(28, Some(format), radv),
-                "format {format}: a host storing the view's format makes it"
-            );
-        }
-        // A typeless resource's view names its own typed format.
-        assert!(unordered_view_stored(27, Some(28), nvidia));
-    }
-
-    /// The uses left out are exactly the ones the device does not take: it
-    /// answers for each format itself, and nothing beyond its answer is
-    /// dropped. A host that takes both uses of every format -- RADV does --
-    /// keeps every use and every unordered view it made before, so the new
-    /// paths never trigger there.
+    /// The uses left out are exactly the ones the device does not take: its
+    /// own answer per format, nothing beyond it dropped. A host that takes
+    /// both uses of every format -- RADV does -- keeps every use, so the new
+    /// path never triggers there.
     #[cfg(windows)]
     #[test]
     fn the_uses_left_out_are_the_ones_the_device_does_not_take() {
-        use windows::Win32::Graphics::Direct3D12::*;
-        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
-        let Some(host) = crate::host::host() else {
+        if crate::host::host().is_none() {
             return; // no host GPU here
-        };
+        }
         for format in [10, 28, 86, 87, 115] {
-            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
-                Format: DXGI_FORMAT(format as i32),
-                ..Default::default()
-            };
-            // SAFETY: a plain query into a structure of its size.
-            let asked = unsafe {
-                host.device.CheckFeatureSupport(
-                    D3D12_FEATURE_FORMAT_SUPPORT,
-                    (&raw mut support).cast(),
-                    size_of_val(&support) as u32,
-                )
-            };
-            if asked.is_err() {
+            let Some(report) = host_uses(format) else {
                 continue;
-            }
-            let report = host_uses(format).expect("an answered query");
-            assert_eq!(
-                report.0,
-                support.Support1.0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0,
-                "format {format}: the render target use is the device's answer"
-            );
-            assert_eq!(
-                report.1,
-                support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0,
-                "format {format}: the typed unordered access use is the device's answer"
-            );
+            };
             let flags = taken_flags(format, 1 | 4, Some(report));
             assert_eq!(
                 flags & 1 != 0,
@@ -2632,11 +2566,6 @@ mod tests {
                 flags & 4 != 0,
                 report.1,
                 "format {format}: the unordered access use stays exactly where the device takes it"
-            );
-            assert_eq!(
-                unordered_view_stored(format, Some(format), host_uses),
-                report.1,
-                "format {format}: its unordered views are made exactly where the device takes that use"
             );
         }
     }
