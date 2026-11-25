@@ -43,7 +43,8 @@ Scarlight ships no game files. It runs a copy of a game you legally own, on your
 ## What you need
 
 - **Linux with Steam**, native or Flatpak.
-- **A graphics card with a Mesa Vulkan driver**: AMD (RADV), Intel (ANV), or NVIDIA's open NVK.
+- **A graphics card with a Mesa Vulkan driver**: AMD (RADV) is the one tested; Intel (ANV) is checked
+  offline; NVIDIA's open NVK is planned and untried.
   Vulkan 1.3 or newer. A proprietary driver is not a target of this project.
 - **A Proton you already have**: GE-Proton or Valve's Proton. Scarlight uses its Wine; we neither
   ship nor fork Proton.
@@ -112,7 +113,7 @@ are about fit, not quality.
 | Target platform | Linux, through Steam | Windows 10/11 x64; no Linux target documented |
 | How a game is started | Picked in Steam's Compatibility list, then Play; Steam launches it | The project's own program on Windows; on Linux you would set up a Wine prefix by hand |
 | What you install | A release tarball into `compatibilitytools.d`, or one `install.sh`, plus a Proton you already have | Build from source with the project's toolchain on Windows, then supply the D3D12 and DXC files yourself |
-| Graphics driver focus | Built and tuned for Mesa's open Vulkan drivers (RADV, ANV, NVK) | Any Direct3D 12 driver with shader model 6.6 (mesh shaders for the world) |
+| Graphics driver focus | Built and tuned for Mesa's open Vulkan drivers: RADV first, ANV next, NVK planned | Any Direct3D 12 driver with shader model 6.6 (mesh shaders for the world) |
 | Shader route | The console's RDNA2 shaders are recompiled to DXIL today, then drawn through vkd3d-proton and Vulkan; direct SPIR-V is in progress | The console's RDNA2 shaders are recompiled to DXIL and drawn through Direct3D 12 |
 | Linux test coverage | One game on one card: RX 9070 XT, Mesa 26.3.1 RADV | None documented; their READMEs require Windows |
 
@@ -130,12 +131,12 @@ flowchart TB
         G["The game's own x86-64 code"] <-->|"console API calls"| R["Scarlight runtime<br/>console APIs · GPU command decoder · RDNA2 shader recompiler"]
     end
     R -->|"Direct3D 12 + DXIL"| V["vkd3d-proton"]
-    V -->|"Vulkan + SPIR-V"| M["Mesa: RADV · ANV · NVK"]
+    V -->|"Vulkan + SPIR-V"| M["Mesa: RADV (tested) · ANV · NVK (planned)"]
     M --> K["Linux kernel GPU driver<br/>amdgpu · xe / i915 · nouveau"]
 ```
 
 [![Mesa: built for it](https://img.shields.io/badge/Mesa-built%20for%20it-ff2e63?style=flat-square&labelColor=14072c)](https://docs.mesa3d.org/)
-[![Drivers: RADV · ANV · NVK](https://img.shields.io/badge/drivers-RADV%20%C2%B7%20ANV%20%C2%B7%20NVK-ff7a3d?style=flat-square&labelColor=14072c)](docs/hardware.md)
+[![Drivers: RADV · ANV](https://img.shields.io/badge/drivers-RADV%20%C2%B7%20ANV-ff7a3d?style=flat-square&labelColor=14072c)](docs/hardware.md)
 [![Vulkan 1.3](https://img.shields.io/badge/Vulkan-1.3%2B-19d8ff?style=flat-square&labelColor=14072c)](https://www.vulkan.org/)
 
 - **Steam starts it.** The game's `.exe` is a Non-Steam Game whose compatibility tool is Scarlight.
@@ -147,9 +148,9 @@ flowchart TB
   the console system APIs the game calls, decodes its GPU command streams, and recompiles its RDNA2
   shaders and pipelines for your card.
 - **vkd3d-proton and Mesa draw it.** Scarlight hands Direct3D 12 and DXIL to vkd3d-proton, which turns
-  them into Vulkan and SPIR-V for Mesa's RADV (AMD), ANV (Intel) or NVK (NVIDIA). Mesa is open source,
+  them into Vulkan and SPIR-V for Mesa's RADV (AMD) or ANV (Intel); NVK (NVIDIA) is planned. Mesa is open source,
   so the driver is ours to read, tune and fix — that is why the project is built around it. RADV on
-  RDNA4 is the only one tested so far.
+  RDNA4 is the only one tested in a game so far; ANV's pipelines are checked offline.
 
 Design notes: [docs/architecture.md](docs/architecture.md).
 
