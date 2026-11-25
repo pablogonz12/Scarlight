@@ -79,6 +79,12 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   the copy-back and the rest, the largest named (`crates/victory-gpu/src/frame_budget.rs`,
   `VICTORY_FRAME_BUDGET=0`). Reimplemented on this tree's counters and its own 50 ms budget: its
   per-command timestamps, memory-trait breakdown and slow-pipeline guard are not taken.
+- **miatson/VIctory [#2801](https://github.com/miatson/VIctory/pull/2801)** (miatson), GPL-3.0: the idea that
+  the console blends MIN/MAX into integer render targets, which the host refuses, so such a target is made to
+  write unblended when the pipeline is built (`crates/victory-gpu/src/pipeline/host.rs`). Its twin pipeline
+  states did not come over; the format list came across as it stands, now checked against the `DXGI_FORMAT`
+  constants by a test.
+
 - **JMAN730/project-flamingo [#747](https://github.com/JMAN730/project-flamingo/pull/747)** (Rareuncommon),
   GPL-3.0: lower `v_mul_hi_u32_u24`/`v_mul_hi_i32_i24` as the high dword of the 48-bit product of the low 24
   bits of each operand (`crates/victory-shader/src/emit/lower/valu_int.rs`). Reimplemented on this tree's
