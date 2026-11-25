@@ -55,6 +55,7 @@
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::Mutex;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
@@ -577,16 +578,25 @@ struct Views {
     sections: Vec<(usize, u64, bool)>,
 }
 
-static VIEWS: Mutex<Views> = Mutex::new(Views { views: BTreeMap::new(), sections: Vec::new() });
+static VIEWS: RwLock<Views> = RwLock::new(Views { views: BTreeMap::new(), sections: Vec::new() });
 
-fn views() -> std::sync::MutexGuard<'static, Views> {
-    VIEWS.lock().unwrap_or_else(|e| e.into_inner())
+/// The views, for reading. Every in-place ask asks [`cover`], and the level-2
+/// default asks it for every window and every title buffer, while the runtime
+/// writes a view only when it maps one: a read lock keeps those asks off each
+/// other instead of queueing them behind one mutex.
+fn views_read() -> RwLockReadGuard<'static, Views> {
+    VIEWS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The views, for the runtime to change them.
+fn views_write() -> RwLockWriteGuard<'static, Views> {
+    VIEWS.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
-    let mut v = views();
+    let mut v = views_write();
     v.sections.retain(|s| s.0 != section);
     v.sections.push((section, bytes, committed));
 }
@@ -594,14 +604,14 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
-    views().views.insert(at, (len, section, offset));
+    views_write().views.insert(at, (len, section, offset));
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
 /// the views that touch it are forgotten (the runtime tells again those it
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
-    let mut v = views();
+    let mut v = views_write();
     if v.views.is_empty() {
         return;
     }
@@ -646,7 +656,7 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
 
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.
 pub(crate) fn cover(at: usize, len: usize) -> Cover {
-    cover_in(&views().views, at, len)
+    cover_in(&views_read().views, at, len)
 }
 
 /// Whether `[at, at + len)` is private memory, all committed and
@@ -1221,7 +1231,7 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
             }
         }
     }
-    let v = views();
+    let v = views_read();
     let (count, bytes) = (v.views.len(), v.views.values().map(|view| view.0 as u64).sum::<u64>());
     let pages = v.views.values().filter(|view| view.0 == K64).count();
     let big = v.views.values().map(|view| view.0).max().unwrap_or(0);
@@ -1231,13 +1241,26 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         big >> 20
     ));
     for &(_, bytes, committed) in &v.sections {
-        lines.push(format!(
-            "census, a section of {} MB, {}",
-            bytes >> 20,
-            if committed { "committed: it can be opened as one heap" } else { "reserved: refused as a heap until it is made with SEC_COMMIT" }
-        ));
+        lines.push(format!("census, a section of {} MB, {}", bytes >> 20, section_verdict(committed)));
     }
     lines
+}
+
+/// What the census says of a section's memory, by whether it was made with
+/// `SEC_COMMIT`. Not "it can be opened as one heap": measured on this machine
+/// (`xcl-bin/notes/zero-copy.md` 6), a committed section cannot be. Its handle
+/// and its view both open, and the import under them fails (RADV refuses a
+/// file-backed host pointer, `VkAllocateMemory` giving `hr 0x8007000e`), after
+/// which vkd3d-proton quietly hands the buffers memory of its own: the API
+/// says yes, the GPU reads and writes somewhere else, and 267,386,880 of
+/// 268,435,456 bytes read back at the title's own address are wrong. Only
+/// private memory committed whole is placed, which is what [`From`] has.
+fn section_verdict(committed: bool) -> &'static str {
+    if committed {
+        "committed: not openable under Wine (the import of a section's pages is refused; measured, notes/zero-copy.md 6)"
+    } else {
+        "reserved: refused as a heap until it is made with SEC_COMMIT, and to no use then (the same refusal)"
+    }
 }
 
 /// With [`probe_level`] 2: one part of the title's own private memory
@@ -1415,6 +1438,18 @@ mod tests {
     /// ways" keeps title memory in place; a refusal, a silent fallback and a
     /// check that could not be made leave every copy a copy.
     #[test]
+    fn the_census_does_not_promise_a_section_heap() {
+        // #1117 places buffers over committed sections; under Wine the import
+        // is refused and vkd3d silently substitutes its own memory, so the
+        // census must never read as an invitation to place over one.
+        for committed in [true, false] {
+            let said = section_verdict(committed);
+            assert!(!said.contains("can be opened"), "{said}");
+            assert!(said.contains("not openable") || said.contains("no use"), "{said}");
+        }
+    }
+
+    #[test]
     fn only_a_host_that_reads_our_pages_keeps_memory_in_place() {
         assert!(in_place(Health::Sound));
         assert!(!in_place(Health::Unknown));
@@ -1493,33 +1528,22 @@ mod tests {
         }
     }
 
-    pub(crate) fn warp() -> Option<ID3D12Device> {
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
-        use windows::Win32::Graphics::Dxgi::*;
-        // SAFETY: plain DXGI queries and device creation on the software
-        // adapter; a card is never opened.
-        unsafe {
-            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
-            let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
-            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
-                return None;
-            }
-            let mut device: Option<ID3D12Device> = None;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
-            device
-        }
+    /// The device these tests run on (`VICTORY_TEST_ADAPTER`): WARP where DXGI
+    /// has it, the card otherwise. `skipped: no device` when there is none.
+    fn device() -> Option<ID3D12Device> {
+        crate::test_device::device(windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0)
     }
 
-    /// The probe, whole, on the software adapter: the same calls the card
-    /// gets. The runtime's and the kernel's rules hold there; the card's
-    /// driver is what a run with `VICTORY_INPLACE_PROBE=1` adds.
+    /// The probe, whole, on the test device: the same calls the card gets. The
+    /// runtime's and the kernel's rules hold there; the card's driver is what a
+    /// run with `VICTORY_INPLACE_PROBE=1` adds.
     #[test]
-    fn warp_probe_opens_title_like_memory_and_the_gpu_sees_its_bytes() {
+    fn probe_opens_title_like_memory_and_the_gpu_sees_its_bytes() {
         let _once = crate::warptest::lock();
-        let Some(device) = warp() else { return };
+        let Some(device) = device() else { return };
+
         if device.cast::<ID3D12Device13>().is_err() {
-            eprintln!("no ID3D12Device13 here: parts of an allocation cannot be opened");
+            eprintln!("skipped: no device: no ID3D12Device13, a part of an allocation cannot be opened");
             return;
         }
         let probe = probe(&device, &|| None, 4);
@@ -1528,9 +1552,41 @@ mod tests {
         }
         assert!(probe.part_reads, "the GPU reads private memory in place");
         assert!(probe.part_writes, "GPU writes land in private memory");
+        // A section through a view is not a promise of a card's driver:
+        // vkd3d-proton maps the section again and unmaps it before the GPU
+        // uses the heap (`device.c:7637`), so the page pool cannot be opened
+        // that way there (module docs, pablogonz12/Scarlight#144). The rule
+        // itself is asserted where the runtime's answer is all there is
+        // (`a_committed_section_in_place_on_the_software_adapter`).
+        eprintln!(
+            "in place probe: a committed section in place: reads {} writes {}, outlives views {}",
+            probe.section_reads, probe.section_writes, probe.section_outlives_views
+        );
+        assert!(probe.reserved_section_refused, "a reserved section is refused");
+    }
+
+    /// The committed section's rule, on the software adapter only: the rules
+    /// the runtime and the kernel keep (module docs). A card's driver is free
+    /// to answer otherwise (`pablogonz12/Scarlight#144`), so this half does not
+    /// follow it.
+    #[test]
+    fn a_committed_section_in_place_on_the_software_adapter() {
+        let _once = crate::warptest::lock();
+        let Some(device) = device() else { return };
+        if device.cast::<ID3D12Device13>().is_err() {
+            eprintln!("skipped: no device: no ID3D12Device13, a part of an allocation cannot be opened");
+            return;
+        }
+        if !crate::test_device::is_software(&device) {
+            eprintln!("skipped: not the software adapter (a card's driver is free to answer otherwise)");
+            return;
+        }
+        let probe = probe(&device, &|| None, 4);
+        for line in &probe.lines {
+            eprintln!("in place probe: {line}");
+        }
         assert!(probe.section_reads && probe.section_writes, "a committed section in place");
         assert!(probe.section_outlives_views, "the section's heap does not depend on views");
-        assert!(probe.reserved_section_refused, "a reserved section is refused");
     }
 
     /// Stage 1's own call on the software adapter: a title buffer that
@@ -1539,10 +1595,12 @@ mod tests {
     /// write lands at the title's address. Memory that is not committed
     /// whole is turned down without asking the host.
     #[test]
-    fn warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset() {
+    fn a_title_buffer_in_place_shows_its_bytes_at_its_offset() {
         let _once = crate::warptest::lock();
-        let Some(device) = warp() else { return };
+        let Some(device) = device() else { return };
+
         if device.cast::<ID3D12Device13>().is_err() {
+            eprintln!("skipped: no device: no ID3D12Device13, a part of an allocation cannot be opened");
             return;
         }
         // SAFETY: an allocation of the test's own.
@@ -1567,18 +1625,19 @@ mod tests {
         }
     }
 
-    /// The self-check on the software adapter: the same calls the card gets,
-    /// so the answer there is that our own page is the GPU's page too.
+    /// The self-check on the test device: the same calls the card gets, so the
+    /// answer there is that our own page is the GPU's page too.
     #[test]
-    fn warp_the_self_check_reads_and_writes_our_own_page() {
+    fn the_self_check_reads_and_writes_our_own_page() {
         let _once = crate::warptest::lock();
-        let Some(device) = warp() else { return };
+        let Some(device) = device() else { return };
+
         if device.cast::<ID3D12Device13>().is_err() {
-            eprintln!("no ID3D12Device13 here: a part of an allocation cannot be opened");
+            eprintln!("skipped: no device: no ID3D12Device13, a part of an allocation cannot be opened");
             return;
         }
         let (found, detail) = ask(&device);
-        assert_eq!(found, Health::Sound, "the software adapter reads and writes a page we hand it: {detail}");
+        assert_eq!(found, Health::Sound, "the test device reads and writes a page we hand it: {detail}");
     }
 
     /// The census names each kind of memory.

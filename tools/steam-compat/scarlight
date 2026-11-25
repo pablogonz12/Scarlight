@@ -14,7 +14,9 @@ shift || true
 
 # ---- settings (scarlight.conf overrides these defaults) --------------------
 BUILD=default
-PROTON=GE-Proton11-14-x86_64
+# Empty: find the GE-Proton this release is built for (BASE, next to this
+# script), or else the newest GE-Proton11-* installed. See below.
+PROTON=
 D3DCOMPILER=
 PROFILE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/victory/titles"
 MESA_CACHE_MAX_SIZE=16G
@@ -27,40 +29,86 @@ if [ ! -f "$HERE/scarlight.conf" ] && [ -f "$HERE/scarlight.conf.example" ]; the
 fi
 if [ -f "$HERE/scarlight.conf" ]; then . "$HERE/scarlight.conf"; fi
 # Empty settings mean "the default" (the installed conf ships them empty).
-[ -n "${PROTON:-}" ] || PROTON=GE-Proton11-14-x86_64
 [ -n "${BUILD:-}" ] || BUILD=default
 [ -n "${PROFILE_DIR:-}" ] || PROFILE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/victory/titles"
 [ -n "${MESA_CACHE_MAX_SIZE:-}" ] || MESA_CACHE_MAX_SIZE=16G
 [ -n "${VKD3D_CONFIG:-}" ] || VKD3D_CONFIG=ignore_shared_fence
 
+# The GE-Proton this build targets: one line, GE-Proton<major>-<release>, in the
+# BASE file next to this script (a release ships it; a source checkout has it).
+# The release's own version restarts at .1 on every new BASE - docs/RELEASES.md.
+BASE="$(sed -n '1{s/[[:space:]]*$//;p;}' "$HERE/BASE" 2>/dev/null || true)"
+[ -n "$BASE" ] || BASE=GE-Proton11-14
+VERSION="$(sed -n 's/^version=//p' "$HERE/VERSION" 2>/dev/null || true)"
+
 DATA="${STEAM_COMPAT_DATA_PATH:-$HOME/.local/share/scarlight}"
 LOG="$DATA/scarlight.log"
 mkdir -p "$DATA"
 
-# Which Proton's Wine to use. A name is looked for in this tool's own
-# compatibilitytools.d first, then in the usual Steam folders: inside Steam's
-# runtime container compatibilitytools.d is exposed, but not always under the
-# same root as the tool (Flatpak Steam, for one).
-if [ "${PROTON#/}" != "$PROTON" ]; then
-  PDIR="$PROTON"
-else
-  PDIR=""
-  for base in "$(dirname "$HERE")" \
-    "$HOME/.local/share/Steam/compatibilitytools.d" \
-    "$HOME/.steam/root/compatibilitytools.d" \
-    "$HOME/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d"; do
-    if [ -x "$base/$PROTON/files/bin/wine" ]; then
-      PDIR="$base/$PROTON"
-      break
+log() { printf '%s %s\n' "$(date +%T)" "$*" >> "$LOG"; }
+
+# ---- which Proton's Wine to run on -----------------------------------------
+# A name is looked for in this tool's own compatibilitytools.d first, then in the
+# usual Steam folders: inside Steam's runtime container compatibilitytools.d is
+# exposed, but not always under the same root as the tool (Flatpak Steam, for one).
+CT_DIRS=(
+  "$(dirname "$HERE")"
+  "$HOME/.local/share/Steam/compatibilitytools.d"
+  "$HOME/.steam/root/compatibilitytools.d"
+  "$HOME/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d"
+)
+GE_URL="https://github.com/GloriousEggroll/proton-ge-custom/releases"
+
+# Prints the folder of the Proton called $1, if a compatibilitytools.d has one.
+find_proton() {
+  local base
+  for base in "${CT_DIRS[@]}"; do
+    if [ -x "$base/$1/files/bin/wine" ]; then
+      printf '%s\n' "$base/$1"
+      return 0
     fi
   done
-  [ -n "$PDIR" ] || PDIR="$(dirname "$HERE")/$PROTON"
+  return 1
+}
+
+if [ "${PROTON#/}" != "$PROTON" ]; then
+  PDIR="$PROTON"
+elif [ -n "$PROTON" ]; then
+  PDIR="$(find_proton "$PROTON")" || PDIR="$(dirname "$HERE")/$PROTON"
+else
+  # BASE, as GE names its GitHub tarball (GE-Proton11-14-x86_64) or as
+  # ProtonUp-Qt extracts it (GE-Proton11-14).
+  PDIR=""
+  for name in "$BASE-x86_64" "$BASE"; do
+    if PDIR="$(find_proton "$name")"; then break; fi
+    PDIR=""
+  done
+  if [ -z "$PDIR" ]; then
+    # A newer GE-Proton of the same series usually runs this build; say so once
+    # and name the one this release expects.
+    # Only an install that has a Wine counts (a leftover folder or a half
+    # extracted tarball must not win), and they are compared by name: the newest
+    # GE-Proton11-20 beats GE-Proton11-9, whatever directory each sits in.
+    FOUND="$(for base in "${CT_DIRS[@]}"; do
+      for d in "$base"/GE-Proton11-*; do
+        if [ -x "$d/files/bin/wine" ]; then printf '%s\t%s\n' "$(basename "$d")" "$d"; fi
+      done
+    done | sort -V | tail -1 | cut -f2)"
+    if [ -z "$FOUND" ]; then
+      log "no GE-Proton in compatibilitytools.d; $BASE is required ($GE_URL)"
+      echo "scarlight: no GE-Proton found in compatibilitytools.d; $BASE is required." >&2
+      echo "  Install it from $GE_URL (or set PROTON in this tool's scarlight.conf)." >&2
+      exit 1
+    fi
+    PDIR="$FOUND"
+    WARN="no $BASE in compatibilitytools.d; using $(basename "$PDIR") (this release expects $BASE)"
+    log "$WARN"
+    echo "scarlight: $WARN" >&2
+  fi
 fi
 WINE="$PDIR/files/bin/wine"
 WSRV="$PDIR/files/bin/wineserver"
 export WINEPREFIX="$DATA/pfx"
-
-log() { printf '%s %s\n' "$(date +%T)" "$*" >> "$LOG"; }
 
 case "$verb" in
   getcompatpath) "$WINE" winepath -w "$1" 2>/dev/null; exit ;;
@@ -76,10 +124,11 @@ esac
 GAME="${1:-}"
 shift || true
 
-log "---- $verb build=$BUILD proton=$PROTON game=$GAME"
+log "---- $verb build=$BUILD version=${VERSION:-dev} base=$BASE proton=$(basename "$PDIR") game=$GAME"
 if [ ! -x "$WINE" ]; then
-  log "no Wine at $WINE (set PROTON in scarlight.conf)"
-  notify-send "Scarlight" "Proton not found: $PROTON (edit scarlight.conf)" 2>/dev/null
+  log "no Wine at $WINE; $BASE is the GE-Proton this release expects (set PROTON in scarlight.conf)"
+  echo "scarlight: no Wine at $WINE; install $BASE from $GE_URL" >&2
+  notify-send "Scarlight" "Proton not found: $BASE (edit scarlight.conf)" 2>/dev/null
   exit 1
 fi
 if [ ! -f "$GAME" ]; then

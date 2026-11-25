@@ -1,10 +1,12 @@
 //! One test at a time on the software adapter.
 //!
 //! `d3d10warp.dll` is one software rasterizer for the whole process, and the
-//! tests that ask the software adapter for a device (`indirect`'s four
-//! `warp_*`, `inplace`'s three, and the adapter check in `host`) each open
-//! one of their own. The harness runs the tests in parallel by default, and
-//! on windows-latest four of those devices at once fault the test exe with
+//! tests that ask the software adapter for a device (`indirect`'s four,
+//! `inplace`'s three, and the adapter check in `host`) each open one of their
+//! own; under `VICTORY_TEST_ADAPTER=hw` the same tests take it with a card,
+//! so a run on the real adapter is one device test at a time too. The harness
+//! runs the tests in parallel by default, and on windows-latest four of those
+//! devices at once fault the test exe with
 //! `STATUS_ACCESS_VIOLATION` (0xc0000005) inside WARP: `indirect`'s four
 //! alone crashed 1 run in 12 with `--test-threads=4` and every one of the
 //! four passed 12 of 12 alone and 12 of 12 with `--test-threads=1`, and in

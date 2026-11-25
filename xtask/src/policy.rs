@@ -25,6 +25,10 @@ const ALLOWED_NAME_SUFFIXES: &[&str] = &[".desktop.in"];
 /// a `#!` first line is a text file we wrote, not a blob.
 const SCRIPT_DIR_PREFIX: &str = "tools/";
 const SCRIPT_SHEBANG: &[u8] = b"#!";
+/// The one extensionless data file under `tools/`: the GE-Proton release a
+/// Scarlight release is cut from, one `GE-Proton<major>-<release>` line. The
+/// packager reads it for the version, the entry script for the Proton to use.
+const BASE_FILE: &str = "tools/steam-compat/BASE";
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
     ".gitattributes",
@@ -207,7 +211,7 @@ fn check_with(path: &str, content: &[u8], flags: (bool, bool)) -> Vec<String> {
             .as_deref()
             .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e))
         || ALLOWED_NAME_SUFFIXES.iter().any(|s| name.ends_with(s))
-        || (ext.is_none() && is_tool_script(path, content));
+        || (ext.is_none() && (is_tool_script(path, content) || is_tool_base_file(path, content)));
     if !allowed && !skip_extension {
         problems.push("file type not on the allowlist".to_owned());
     }
@@ -238,6 +242,24 @@ fn check_with(path: &str, content: &[u8], flags: (bool, bool)) -> Vec<String> {
 /// carries no extension the allowlist could judge.
 fn is_tool_script(path: &str, content: &[u8]) -> bool {
     path.starts_with(SCRIPT_DIR_PREFIX) && content.starts_with(SCRIPT_SHEBANG)
+}
+
+/// `tools/steam-compat/BASE`: exactly one line, `GE-Proton<digits>-<digits>` and
+/// nothing else, so it can never become a place to hide data.
+fn is_tool_base_file(path: &str, content: &[u8]) -> bool {
+    if path != BASE_FILE {
+        return false;
+    }
+    let line = content.strip_suffix(b"\n").unwrap_or(content);
+    let Some(rest) = line.strip_prefix(b"GE-Proton") else {
+        return false;
+    };
+    let mut parts = rest.split(|b| *b == b'-');
+    let (Some(major), Some(release), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let digits = |part: &[u8]| !part.is_empty() && part.iter().all(|b| b.is_ascii_digit());
+    digits(major) && digits(release)
 }
 
 /// Longest run of characters that could be hex or base64 payload.
@@ -318,6 +340,13 @@ mod tests {
             !check("tools/scarlight-launcher/scarlight", b"no shebang here\n").is_empty(),
             "an extensionless file under tools/ must be a script"
         );
+        assert!(
+            check("tools/steam-compat/BASE", b"GE-Proton11-14\n").is_empty(),
+            "the BASE file is the one extensionless data file we ship"
+        );
+        assert!(!check("tools/steam-compat/BASE", b"GE-Proton11\n").is_empty());
+        assert!(!check("tools/steam-compat/BASE", b"GE-Proton11-14-\n").is_empty());
+        assert!(!check("tools/other/BASE", b"GE-Proton11-14\n").is_empty());
         assert!(
             !check("scripts/thing", b"#!/bin/sh\n").is_empty(),
             "extensionless scripts outside tools/ stay refused"
