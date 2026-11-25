@@ -6053,6 +6053,11 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// When the last frame was counted, and the submission counters as they
+    /// were then, for the frame budget (`crate::frame_budget`): what of a
+    /// frame is ours and its card's, taken off the sums the line above uses.
+    shown: std::time::Instant,
+    counters: [u64; 5],
 }
 
 impl Meter {
@@ -6066,6 +6071,37 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            shown: now,
+            counters: [0; 5],
+        }
+    }
+
+    /// Says what a frame past the budget was bound by
+    /// ([`crate::frame_budget`]): its parts, the largest named.
+    fn budget(&mut self) {
+        let now = std::time::Instant::now();
+        let frame = now.saturating_duration_since(self.shown);
+        self.shown = now;
+        let counters = [
+            SUBMISSION_US[0].load(Ordering::Relaxed),
+            SUBMISSION_US[1].load(Ordering::Relaxed),
+            COPY_BACK[0].load(Ordering::Relaxed),
+            PREPARING[0].load(Ordering::Relaxed),
+            PREPARING[2].load(Ordering::Relaxed),
+        ];
+        let part = |i: usize| {
+            std::time::Duration::from_micros(counters[i].saturating_sub(self.counters[i]))
+        };
+        let phases = crate::frame_budget::Phases {
+            preparing: part(0),
+            gpu: part(1),
+            back: part(2),
+            copies: part(3),
+            textures: part(4),
+        };
+        self.counters = counters;
+        if let Some(text) = crate::frame_budget::say(frame, &phases) {
+            tracing::warn!("{text}");
         }
     }
 
@@ -6075,6 +6111,7 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
+        self.budget();
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
@@ -6101,6 +6138,8 @@ impl Meter {
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
+        // The sums above are from zero again: so is the frame budget's.
+        self.counters = [0; 5];
         let dropped = crate::draw::take_dropped() as f64 / frames;
         // Of those, the ones whose pipeline was refused (lost every frame)
         // and those still being made (lost this one).
