@@ -65,6 +65,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Ballots made to learn whether a DPP source lane is in EXEC.
+    #[cfg(test)]
+    pub src_lane_ballots: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -2284,6 +2287,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            src_lane_ballots: self.s.src_lane_ballots,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -6665,8 +6670,50 @@ impl<'a> Lower<'a> {
         r
     }
 
+    /// Whether lane `src` of this host wave is active here (in EXEC), from
+    /// `waveActiveBallot`. The console's DPP sources outside EXEC are out of
+    /// bounds when fetch-inactive is clear (ported from project-flamingo
+    /// #684, `19dda7a54`).
+    fn src_lane_active(&mut self, src: V) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        #[cfg(test)]
+        {
+            self.s.src_lane_ballots += 1;
+        }
+        let t = self.s.m.bool(true);
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let ballot = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[t]);
+        self.s.flags |= flags::WAVE_OPS;
+        let lo = self.s.m.extract(c, ballot, 0);
+        let (k31, k32, one, z) = (
+            self.s.m.i32(31),
+            self.s.m.i32(32),
+            self.s.m.i32(1),
+            self.s.m.i32(0),
+        );
+        let word = if self.wave() > 32 {
+            let hi = self.s.m.extract(c, ballot, 1);
+            let low = self.s.m.cmp(c, pred::IULT, src, k32);
+            self.s.m.select(c, low, lo, hi)
+        } else {
+            lo
+        };
+        let sh = self.s.m.bin(c, Bin::And, src, k31);
+        let bit = self.s.m.bin(c, Bin::LShr, word, sh);
+        let bit = self.s.m.bin(c, Bin::And, bit, one);
+        self.s.m.cmp(c, pred::NE, bit, z)
+    }
+
     /// DPP: src0 as read from another lane, and which lanes write their
     /// result (none: all).
+    ///
+    /// When `fi` is clear, an inactive source lane is out of bounds the same
+    /// way a row-bound miss is: `bound_ctrl` selects zero, else the lane
+    /// keeps its old destination. DPP8 has no `bound_ctrl` bit and always
+    /// zeros inactive sources when `fi` is clear.
     fn dpp(&mut self, inst: &Inst, dpp: Dpp) -> Result<(V, Option<V>), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -6677,9 +6724,15 @@ impl<'a> Lower<'a> {
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
         // Quad permutations and DPP8 stay in groups the pixel layout shares.
         let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
+        let fi = match dpp {
+            Dpp::Lanes { fi, .. } | Dpp::Row { fi, .. } => fi,
+        };
         let mesh_quad = self.s.mesh.is_some() && quad;
         if !mesh_quad {
             self.cross_lane(quad)?;
+        } else if !fi {
+            // Inactive-source checks need a wave ballot; mesh cannot.
+            self.cross_lane(false)?;
         }
         let c = self.cur;
         let lane = self.lane_index();
@@ -6697,7 +6750,7 @@ impl<'a> Lower<'a> {
                 let pick = self.s.m.bin(c, Bin::LShr, sel, sh);
                 let pick = self.s.m.bin(c, Bin::And, pick, seven);
                 let base = self.s.m.bin(c, Bin::And, lane, not7);
-                (self.s.m.bin(c, Bin::Or, base, pick), None, None, false)
+                (self.s.m.bin(c, Bin::Or, base, pick), None, None, true)
             }
             Dpp::Row {
                 ctrl,
@@ -6761,8 +6814,17 @@ impl<'a> Lower<'a> {
         } else {
             self.read_lane(x, src)
         };
+        // Geometric bounds, and source EXEC when fetch-inactive is clear.
+        let mut valid = inside;
+        if !fi {
+            let active = self.src_lane_active(src);
+            valid = Some(match valid {
+                Some(v) => self.s.m.bin(c, Bin::And, v, active),
+                None => active,
+            });
+        }
         let mut enable = None;
-        if let Some(inside) = inside {
+        if let Some(inside) = valid {
             if zero {
                 let z = k(self, 0);
                 r = self.s.m.select(c, inside, r, z);
