@@ -633,12 +633,17 @@ struct Guards {
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
+    /// Blocks of title memory a copy has taken whole (or a guard has made
+    /// read-only, which only committed memory allows): memory that is there,
+    /// so a copy may go straight at its bytes ([`mapped`]).
+    mapped: BTreeSet<usize>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
+    mapped: BTreeSet::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -780,6 +785,8 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
+        // The kernel only made committed memory read-only: it is there.
+        g.mapped.extend(from..to);
     };
     if set(from, to) {
         note(g, from, to);
@@ -790,6 +797,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             note(g, block, block + 1);
         } else if block < uncommitted_end(block) {
             g.absent.insert(block);
+            g.mapped.remove(&block);
         }
     }
 }
@@ -822,11 +830,41 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        // It was read-only by our hand, so it is committed and mapped.
+        g.mapped.insert(block);
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
     !blocks.is_empty()
+}
+
+/// Whether every 64 KiB block of `[at, at + len)` is title memory the layer
+/// knows is there ([`copied`]) or has guarded: then a copy can go at the
+/// bytes with `ptr::copy` instead of a kernel call, which on Wine costs a
+/// wineserver roundtrip for every write (Wine 11: `NtWriteVirtualMemory` has
+/// no self path) and a guarded `memmove` for every read.
+pub(crate) fn mapped(at: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    let g = guards();
+    // One pass over the set, not a lookup a block at a time.
+    g.mapped.range(first..last).count() == last - first
+}
+
+/// A kernel copy took all of `[at, at + len)` of title memory: every block
+/// of it is committed and mapped, so later copies of it (and of ranges
+/// inside it) may go at the bytes ([`mapped`]). Cleared for a range the
+/// runtime unmaps ([`title_memory_remapped`]).
+pub(crate) fn copied(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    let mut g = guards();
+    g.mapped.extend(first..last);
 }
 
 /// Blocks a write-back job holds `(a flag, whether the block was being given
@@ -1079,6 +1117,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in absent {
         g.absent.remove(&block);
     }
+    // What is there now is new: a copy must ask the kernel again.
+    let was: Vec<usize> = g.mapped.range(range.clone()).copied().collect();
+    for block in was {
+        g.mapped.remove(&block);
+    }
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
@@ -1203,6 +1246,22 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// A copy's whole range is known mapped, and only that: not one byte
+    /// past its end, and nothing before it was copied.
+    #[test]
+    fn a_copy_marks_the_blocks_it_took() {
+        let at = 0x7000_0000_0000usize;
+        let len = 3 * BLOCK;
+        assert!(!mapped(at, len), "nothing copied there yet");
+        copied(at, len);
+        assert!(mapped(at, len));
+        assert!(mapped(at + BLOCK, BLOCK), "a range inside it");
+        assert!(!mapped(at - BLOCK, BLOCK), "a block before it");
+        assert!(!mapped(at + len, BLOCK), "a block past it");
+        assert!(!mapped(at, len + 1), "a range that runs past it");
+        assert!(!mapped(at, 0));
+    }
 
     /// A write-back job's blocks are inaccessible to the title until the
     /// job released them, and a thread that faulted there waits for it.

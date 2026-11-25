@@ -366,9 +366,10 @@ struct Lane {
     clock: u64,
     /// Enqueued, not yet submitted.
     unsubmitted: Vec<Command>,
-    /// Submitted, by sequence number: reads not started, status entries
-    /// not written, reads running, and failures not yet reported.
-    reads: VecDeque<(u64, Request)>,
+    /// Submitted, by sequence number: reads not started (with the time
+    /// the title enqueued them), status entries not written, reads
+    /// running, and failures not yet reported.
+    reads: VecDeque<(u64, Request, std::time::Instant)>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
@@ -386,10 +387,116 @@ struct Job {
     seq: u64,
     request: Request,
     staging: u64,
+    /// When the title enqueued it: from there to the worker's start is the
+    /// time a request waited (the diagnostics summary's `queue` stage).
+    submitted: std::time::Instant,
 }
 
 // SAFETY: as for `Lane`.
 unsafe impl Send for Job {}
+
+/// Where a worker's time goes, as the diagnostics summary prints it per
+/// 5 s window (loading.md, "the 142 s middle"): a load's request is not its
+/// file read, and this is what says what the rest is.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+enum Stage {
+    /// Enqueued by the title to the worker's start.
+    Queue,
+    /// The scheduler's lock, taken again after a request.
+    Lock,
+    /// Fetching the source: the file read, or the copy out of title memory.
+    Read,
+    /// The zlib inflate.
+    Inflate,
+    /// The BCPack decode.
+    Bcpack,
+    /// Making the destination writable (opening its guarded blocks,
+    /// mapping its physical pages) and, when it could not be written in
+    /// place, the copy into it.
+    Destination,
+}
+
+/// The stages above, in order (`Stage` as an index).
+#[cfg(feature = "diagnostics")]
+const STAGE_COUNT: usize = 6;
+/// The stages' names, for the summary.
+#[cfg(feature = "diagnostics")]
+const STAGE_NAMES: [&str; STAGE_COUNT] = ["queue", "lock", "read", "inflate", "bcpack", "dest"];
+
+/// Nanoseconds workers spent in each stage (the diagnostics feature only:
+/// a plain release build has neither the counters nor the clocks).
+#[cfg(feature = "diagnostics")]
+static STAGE_NS: [AtomicU64; STAGE_COUNT] = [const { AtomicU64::new(0) }; STAGE_COUNT];
+
+/// The start of a stage: a clock with the diagnostics feature, nothing
+/// without it, so the release build's request path is unchanged.
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy)]
+struct Mark(std::time::Instant);
+
+#[cfg(feature = "diagnostics")]
+impl Mark {
+    fn begin() -> Mark {
+        Mark(std::time::Instant::now())
+    }
+
+    /// Charges `stage` the time since `begin`.
+    fn end(self, stage: Stage) {
+        STAGE_NS[stage as usize].fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(feature = "diagnostics"))]
+#[derive(Clone, Copy)]
+struct Mark;
+
+#[cfg(not(feature = "diagnostics"))]
+impl Mark {
+    fn begin() -> Mark {
+        Mark
+    }
+
+    fn end(self, _stage: Stage) {}
+}
+
+/// Charges `stage` a time measured by hand.
+#[cfg(feature = "diagnostics")]
+fn charged(stage: Stage, took: std::time::Duration) {
+    STAGE_NS[stage as usize].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn charged(_stage: Stage, _took: std::time::Duration) {}
+
+/// Prints and resets the stages over `requests` requests: their mean
+/// milliseconds each, and the workers they averaged (loading.md).
+#[cfg(feature = "diagnostics")]
+fn stage_means_line(requests: u64) {
+    let n = requests.max(1) as f64;
+    let ns = take_stages();
+    let mut means = String::new();
+    for ((name, ns), _) in STAGE_NAMES.iter().zip(ns).zip(0..) {
+        use std::fmt::Write;
+        let _ = write!(means, "{name} {:.1} ", ns as f64 / n / 1e6);
+    }
+    tracing::debug!(mean_ms = means.trim_end(), "dstorage: stages");
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn stage_means_line(_requests: u64) {}
+
+/// The stages' nanoseconds since the counters were last read, and how many
+/// requests they were for: the bench prints the split, and the 5 s line
+/// reports the mean per stage.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_stages() -> [u64; STAGE_COUNT] {
+    let mut out = [0; STAGE_COUNT];
+    for (out, counter) in out.iter_mut().zip(&STAGE_NS) {
+        *out = counter.swap(0, Ordering::Relaxed);
+    }
+    out
+}
 
 /// The scheduler, with its workers started on first use; `None` if not
 /// even one worker could start.
@@ -458,7 +565,11 @@ fn work(scheduler: &'static Scheduler) {
         drop(lanes);
         let started = std::time::Instant::now();
         let result = execute(&job.request);
+        // The lock's wait, with 16 workers queueing for a request each: the
+        // scheduler's own cost shows up here, not in a read.
+        let mark = Mark::begin();
         lanes = scheduler.lock();
+        mark.end(Stage::Lock);
         lanes.finish(&job, result);
         lanes.count(&job, started);
         if std::mem::take(&mut lanes.starved) {
@@ -479,6 +590,8 @@ impl Lanes {
             self.bcpack.0 += u64::from(job.request.destination_size);
             self.bcpack.1 += started.elapsed();
         }
+        // Its enqueue to its start, charged to the queue stage.
+        charged(Stage::Queue, started.saturating_duration_since(job.submitted));
         let since = *self.since.get_or_insert(started);
         let elapsed = since.elapsed();
         if elapsed.as_secs() >= 5 {
@@ -496,6 +609,7 @@ impl Lanes {
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
             );
+            stage_means_line(*requests);
             self.done = Default::default();
             self.bcpack = Default::default();
             self.since = None;
@@ -513,7 +627,7 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
+        let &(seq, request, submitted) = lane.reads.front()?;
         let staging = staging_bytes(&request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
@@ -533,6 +647,7 @@ impl Lanes {
             seq,
             request,
             staging,
+            submitted,
         })
     }
 
@@ -571,7 +686,9 @@ impl Lanes {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
-                Command::Read(request) => lane.reads.push_back((seq, request)),
+                Command::Read(request, enqueued) => {
+                    lane.reads.push_back((seq, request, enqueued));
+                }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
@@ -692,7 +809,9 @@ const MEMORY_SOURCE: u64 = 1 << 22;
 const PAGE: usize = 64 * 1024;
 
 enum Command {
-    Read(Request),
+    /// A read, and when the title enqueued it: the queue stage runs from
+    /// there, not from the submission that moved it to the workers.
+    Read(Request, std::time::Instant),
     Status(Status),
 }
 
@@ -721,7 +840,7 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
-    queue(this, Command::Read(request));
+    queue(this, Command::Read(request, std::time::Instant::now()));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -825,21 +944,35 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
+    // The file read charges `Stage::Read` itself (`read_into`); a memory
+    // source reads nothing, so there is nothing to charge here.
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
         let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
+        let mark = Mark::begin();
+        let result = inflate(&source, &mut packed);
+        mark.end(Stage::Inflate);
+        let n = result.map_err(|hr| fail(hr, "zlib"))?;
         packed.truncate(n);
         Cow::Owned(packed)
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+    into_destination(request, size, |out| {
+        let mark = Mark::begin();
+        let result = match tables {
+            Some(tables) => bcpack::decode(bc, &source, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+            None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        };
+        mark.end(if tables.is_some() {
+            Stage::Bcpack
+        } else {
+            Stage::Inflate
+        });
+        result
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -965,6 +1098,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     let file = &unsafe { &*request.source.cast::<Instance<File>>() }
         .state
         .file;
+    let mark = Mark::begin();
     let started = std::time::Instant::now();
     let mut done = 0;
     let result = loop {
@@ -978,6 +1112,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         }
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    mark.end(Stage::Read);
     result
 }
 
@@ -994,7 +1129,9 @@ fn into_destination(
     if request.options & PAGE_DESTINATION == 0 {
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first.
+        let mark = Mark::begin();
         victory_gpu::kernel_will_write(request.destination as usize, len);
+        mark.end(Stage::Destination);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
@@ -1011,7 +1148,10 @@ fn into_destination(
     };
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+    let mark = Mark::begin();
+    let window = super::xmem::page_window(pages, offset, len);
+    mark.end(Stage::Destination);
+    if let Some(mut window) = window {
         return fill(window.bytes()).map(drop);
     }
     let mut data = vec![0; len];
@@ -1024,12 +1164,16 @@ fn into_destination(
     let retries = *RETRIES.get_or_init(|| {
         std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(12)
     });
+    let mark = Mark::begin();
     let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
+    mark.end(Stage::Destination);
     let mut tries = 0;
     while !written && tries < retries {
         std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
         tries += 1;
+        let mark = Mark::begin();
         written = super::xmem::write_physical(pages, offset, &data[..n]);
+        mark.end(Stage::Destination);
     }
     if written {
         if tries > 0 {
@@ -1050,6 +1194,133 @@ fn into_destination(
             "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
         );
         Err(E_INVALIDARG)
+    }
+}
+
+/// The offline bench (`crate::dstorage_bench`): it drives the same
+/// `execute` the title's requests take, over the title's own files (opened
+/// read-only) or memory standing in for them, so the split it reports is
+/// the one a load has. No title, no display, no Vulkan.
+#[cfg(feature = "diagnostics")]
+pub(crate) mod bench {
+    use super::*;
+
+    /// The stages' names, in the order [`super::take_stages`] returns.
+    pub(crate) const STAGES: [&str; STAGE_COUNT] = STAGE_NAMES;
+
+    /// A file opened through the same `open_file` the title uses.
+    pub(crate) struct File(*const c_void);
+
+    // SAFETY: one file per worker, read through by one thread at a time.
+    unsafe impl Send for File {}
+    unsafe impl Sync for File {}
+
+    impl File {
+        /// Opens `path` for reading, as a title's request would.
+        pub(crate) fn open(path: &str) -> Result<File, String> {
+            let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut out: *mut c_void = std::ptr::null_mut();
+            // SAFETY: `open_file` writes the file object it created to
+            // `out`, and the interface id is only logged.
+            let hr = open_file(
+                std::ptr::from_ref(&FACTORY_OBJECT),
+                wide.as_ptr(),
+                std::ptr::null(),
+                &mut out,
+            );
+            if hr != S_OK || out.is_null() {
+                return Err(format!("{path}: {:#010x}", hr as u32));
+            }
+            Ok(File(out))
+        }
+    }
+
+    /// 64 KiB physical pages of one allocation, the destination form a
+    /// title's requests name.
+    pub(crate) struct Pages(Vec<usize>);
+
+    impl Pages {
+        pub(crate) fn new(count: usize) -> Result<Pages, String> {
+            let mut pages = vec![0; count.max(1)];
+            let mut given = pages.len();
+            // SAFETY: `pages` holds `given` entries.
+            if super::super::xmem::XMemAllocatePhysicalPages(0, &mut given, pages.as_mut_ptr()) == 0
+                || given != pages.len()
+            {
+                return Err("no physical pages".to_owned());
+            }
+            Ok(Pages(pages))
+        }
+
+        pub(crate) fn numbers(&self) -> &[usize] {
+            &self.0
+        }
+    }
+
+    impl Drop for Pages {
+        fn drop(&mut self) {
+            super::super::xmem::XMemFreePhysicalPages(self.0.len(), self.0.as_ptr());
+        }
+    }
+
+    /// Where a request's bytes come from.
+    pub(crate) enum Source<'a> {
+        /// An offset in a file the bench opened.
+        File { file: &'a File, offset: u64 },
+        /// Memory standing in for the title's (a deflated chunk).
+        Memory(&'a [u8]),
+    }
+
+    /// Where they go.
+    pub(crate) enum Target<'a> {
+        /// A title buffer, named by its address.
+        Address(&'a mut [u8]),
+        /// 64 KiB page numbers, as the title names a destination.
+        Pages(&'a [usize]),
+    }
+
+    /// One request through `execute`: `source_size` bytes from the source,
+    /// as zlib when `zlib` (into `len` bytes), to `target`.
+    pub(crate) fn request(
+        source: Source<'_>,
+        source_size: usize,
+        zlib: bool,
+        len: usize,
+        target: Target<'_>,
+    ) -> Result<(), String> {
+        let (source_ptr, offset, memory) = match source {
+            Source::File { file, offset } => (file.0, offset, false),
+            Source::Memory(bytes) => (bytes.as_ptr().cast(), 0, true),
+        };
+        let (destination, options) = match target {
+            Target::Address(out) => (out.as_mut_ptr().cast::<c_void>(), 0),
+            Target::Pages(pages) => (pages.as_ptr().cast_mut().cast::<c_void>(), PAGE_DESTINATION),
+        };
+        let request = Request {
+            options: options
+                | if zlib { ZLIB } else { 0 }
+                | if memory { MEMORY_SOURCE } else { 0 },
+            destination,
+            page_offset: 0,
+            destination_size: len as u32,
+            source: source_ptr,
+            offset,
+            source_size: source_size as u32,
+            intermediate_size: 0,
+            tag: 0,
+            name: std::ptr::null(),
+        };
+        execute(&request).map_err(|hr| format!("{:#010x}", hr as u32))
+    }
+
+    /// `len` bytes of physical pages, through a view of our own (the tests
+    /// check a request landed with it).
+    #[cfg(test)]
+    pub(crate) fn page_bytes(pages: &[usize], len: usize) -> Vec<u8> {
+        match super::super::xmem::page_window(pages, 0, len) {
+            Some(mut window) => window.bytes().to_vec(),
+            None => Vec::new(),
+        }
     }
 }
 
@@ -1355,7 +1626,7 @@ mod tests {
         let mut r = request(options, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
-        lane.unsubmitted.push(Command::Read(r));
+        lane.unsubmitted.push(Command::Read(r, std::time::Instant::now()));
     }
 
     #[test]
@@ -1689,5 +1960,68 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    /// The bench drives `execute` itself: a raw read into physical pages
+    /// (the title's destination form) lands there byte for byte, and the
+    /// zlib form inflates into them.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn bench_requests_write_their_destinations() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("chunk.bin");
+        let raw: Vec<u8> = (0..PAGE + 1234).map(|i| (i * 7 % 251) as u8).collect();
+        std::fs::write(&path, &raw).expect("writing the source file");
+        let file = bench::File::open(&path.to_string_lossy()).expect("opening the source file");
+
+        // Raw into an address: the piece is the file's own bytes.
+        let mut out = vec![0u8; raw.len()];
+        bench::request(
+            bench::Source::File {
+                file: &file,
+                offset: 0,
+            },
+            raw.len(),
+            false,
+            raw.len(),
+            bench::Target::Address(&mut out),
+        )
+        .expect("a raw request");
+        assert_eq!(out, raw);
+
+        // Raw into three physical pages, from the second byte in.
+        let pages = bench::Pages::new(3).expect("physical pages");
+        bench::request(
+            bench::Source::File {
+                file: &file,
+                offset: 1,
+            },
+            raw.len() - 1,
+            false,
+            raw.len() - 1,
+            bench::Target::Pages(pages.numbers()),
+        )
+        .expect("a paged request");
+        assert_eq!(
+            bench::page_bytes(pages.numbers(), raw.len() - 1),
+            raw[1..]
+        );
+
+        // The zlib form: a deflated stream out of memory into pages.
+        let mut packed = vec![0u8; zlib_rs::compress_bound(raw.len())];
+        let (packed, code) =
+            zlib_rs::compress_slice(&mut packed, &raw, zlib_rs::DeflateConfig::default());
+        assert_eq!(code, zlib_rs::ReturnCode::Ok);
+        let packed = packed.to_vec();
+        let pages = bench::Pages::new((raw.len()).div_ceil(PAGE)).expect("physical pages");
+        bench::request(
+            bench::Source::Memory(&packed),
+            packed.len(),
+            true,
+            raw.len(),
+            bench::Target::Pages(pages.numbers()),
+        )
+        .expect("a zlib request");
+        assert_eq!(bench::page_bytes(pages.numbers(), raw.len()), raw);
     }
 }
