@@ -660,6 +660,12 @@ fn create() -> windows::core::Result<Host> {
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
         tracing::info!("host D3D12 device ready");
+        // Before any title memory is asked for: a host heap on pages of our
+        // own really is those pages, or the driver fell back without a word
+        // (`inplace::check`, one line either way).
+        if crate::inplace::level() > 0 {
+            crate::inplace::check_at_startup(&device);
+        }
         Ok(Host {
             device,
             queue,
@@ -5513,6 +5519,22 @@ impl Batch {
                 .map(|r| (r.1, r.2))
                 .collect();
             crate::watch::ask_ahead(&ranges);
+            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        // Copies nothing wrote since they were last brought up to date gain
+        // nothing from their refresh: the flush leaves them out, their bytes
+        // where the check would have left them ([`crate::shadow::skip_clean`]).
+        if crate::shadow::skip_clean() {
+            let started = std::time::Instant::now();
+            self.refreshes.retain(|(shadow, from, to)| {
+                let clean = shadow.clean(*from, *to);
+                #[cfg(feature = "diagnostics")]
+                if clean {
+                    crate::copystat::add(crate::copystat::C::Skipped, 1);
+                    crate::copystat::add(crate::copystat::C::SkippedBytes, (to - from) as u64);
+                }
+                !clean
+            });
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
