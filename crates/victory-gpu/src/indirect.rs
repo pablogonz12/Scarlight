@@ -2105,12 +2105,29 @@ void main() {
         }
         let _once = crate::warptest::lock();
         use windows::core::Interface;
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "MARK3 locked");
+        }
         let Some(host) = super::host() else {
             return;
         };
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "MARK3 host");
+        }
         let list = host.new_list().unwrap();
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "MARK3 list");
+        }
         let (src_a, ptr_a) = host.shared_buffer(4096).unwrap();
         let (src_b, ptr_b) = host.shared_buffer(4096).unwrap();
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "MARK3 buffers");
+        }
+
         // SAFETY: mapped 4096-byte shared buffers; live buffers.
         let (gpu_a, gpu_b) = unsafe {
             let write = |p: *mut u8, off: usize, count: u32, inst: u32, tag: u32| {
@@ -2126,6 +2143,10 @@ void main() {
             write(ptr_b, 32, 1 << 22, 4, 0x2222); // BUDGET / 8
             (src_a.GetGPUVirtualAddress(), src_b.GetGPUVirtualAddress())
         };
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "MARK3 written");
+        }
 
         for cycle in 0..2u32 {
             let mut probes = Vec::new();
