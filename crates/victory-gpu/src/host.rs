@@ -6140,9 +6140,12 @@ impl Meter {
         {
             let [own, asking, still, all] =
                 [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            // Taken every interval, logged when there is a refresh to price:
+            // a counter left to accumulate would be divided by a single
+            // interval's frames when the line comes back.
+            let [ph_watch, ph_holes, ph_bytes] = [0, 1, 2]
+                .map(|i| crate::inplace::PLACEHOLDER_HITS[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if all >= 1.0 {
-                let [ph_watch, ph_holes, ph_bytes] = [0, 1, 2]
-                    .map(|i| crate::inplace::PLACEHOLDER_HITS[i].swap(0, Ordering::Relaxed) as f64 / frames);
                 tracing::info!(
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
                      is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \

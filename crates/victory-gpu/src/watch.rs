@@ -1324,9 +1324,14 @@ mod tests {
         let started = std::time::Instant::now();
         for _ in 0..ROUNDS {
             {
+                // Only this range: other tests' blocks are not this test's to
+                // forget, and tests run in threads of their own.
+                let (from, to) = (base as usize / BLOCK, (base as usize + len) / BLOCK);
                 let mut g = guards();
-                (g.protected, g.clean, g.absent, g.mapped) =
-                    (BlockSet::new(), BlockSet::new(), BlockSet::new(), BlockSet::new());
+                g.protected.remove_range(from, to);
+                g.clean.remove_range(from, to);
+                g.absent.remove_range(from, to);
+                g.mapped.remove_range(from, to);
             }
             let written = guard(base as usize, base as usize + len).expect("a placeholder is view memory");
             assert_eq!(written.len(), blocks * BLOCK / PAGE, "every block of it is asked about");
