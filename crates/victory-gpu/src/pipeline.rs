@@ -475,21 +475,72 @@ pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }
 
-/// Counts a draw or dispatch of `this` intentionally skipped or dropped
-/// for want of a host pipeline (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// Why a draw or dispatch had no host pipeline to run ([`absent`]).
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Absent {
+    /// Refused, or no pipeline set at all: nothing will make a host pipeline
+    /// for it, so every draw that binds it is lost to the end of the run.
+    Refused,
+    /// Still being made: it may be there in a later frame.
+    Waiting,
+}
+
+/// Draws and dispatches recorded without a host pipeline since the last
+/// [`take_dropped_split`]: `[refused, waiting]`.
+#[cfg(windows)]
+static DROPPED_SPLIT: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The draws and dispatches counted by [`note_drop`] since the last call:
+/// `[refused, waiting]`, which adds up to the draws and dispatches without a
+/// host pipeline. A refused pipeline costs its draws every frame
+/// (JMAN730/victory#589); one still being made costs them one frame.
+#[cfg(windows)]
+pub(crate) fn take_dropped_split() -> [u64; 2] {
+    [&DROPPED_SPLIT[0], &DROPPED_SPLIT[1]]
+        .map(|count| count.swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Why pipeline `this` has no host pipeline, `None` when it has one.
+#[cfg(windows)]
+pub(crate) fn absent(this: This) -> Option<Absent> {
+    if this.is_null() {
+        return Some(Absent::Refused);
+    }
+    match pipeline(this).host.made() {
+        Some(true) => None,
+        Some(false) => Some(Absent::Refused),
+        None => Some(Absent::Waiting),
+    }
+}
+
+/// Counts a draw or dispatch of `this` that had no host pipeline, split by
+/// whether one can still arrive ([`take_dropped_split`]); under the
+/// diagnostics feature it also counts the reason, for the frame lines.
+#[cfg(windows)]
 pub(crate) fn note_drop(this: This) {
-    let why = if this.is_null() {
-        Some("no pipeline set".to_owned())
-    } else {
-        let p = pipeline(this);
-        skipped_shader(p)
-            .map(|hash| format!("skipped shader {hash}"))
-            .or_else(|| make::missing(&p.host))
-    };
-    if let Some(why) = why {
+    if let Some(absent) = absent(this) {
+        let waiting = usize::from(absent == Absent::Waiting);
+        DROPPED_SPLIT[waiting].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(feature = "diagnostics")]
+    if let Some(why) = reason(this) {
         note_why(why);
     }
+}
+
+/// Why pipeline `this` has no host pipeline, named for the drop reasons
+/// (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn reason(this: This) -> Option<String> {
+    if this.is_null() {
+        return Some("no pipeline set".to_owned());
+    }
+    let p = pipeline(this);
+    skipped_shader(p)
+        .map(|hash| format!("skipped shader {hash}"))
+        .or_else(|| make::missing(&p.host))
 }
 
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
@@ -832,6 +883,54 @@ mod tests {
             &pipeline(q).shaders[1]
         ));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+    }
+
+    /// A pipeline whose shaders do not translate keeps every draw that binds
+    /// it without a host pipeline for the rest of the run; one still being
+    /// made costs its draws a frame. The two are counted apart
+    /// (JMAN730/victory#589).
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_pipeline_counts_its_drops_apart_from_one_still_being_made() {
+        let (vs, ps) = ([1u8, 2, 3], [4u8; 5]);
+        let none = || Bytecode {
+            code: std::ptr::null(),
+            size: 0,
+        };
+        let desc = GraphicsHead {
+            root: std::ptr::null(),
+            stages: [
+                Bytecode {
+                    code: vs.as_ptr(),
+                    size: vs.len(),
+                },
+                Bytecode {
+                    code: ps.as_ptr(),
+                    size: ps.len(),
+                },
+                none(),
+                none(),
+                none(),
+            ],
+        };
+        let mut p = std::ptr::null();
+        assert_eq!(
+            create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+            S_OK
+        );
+        // Queued and not made: a draw recorded now waits for one.
+        assert_eq!(super::absent(p), Some(super::Absent::Waiting));
+        let _ = super::take_dropped_split();
+        super::note_drop(p);
+        assert_eq!(super::take_dropped_split(), [0, 1]);
+        // Its shaders are not shader containers: making it is refused.
+        assert!(!make::now(&pipeline(p).host));
+        assert_eq!(super::absent(p), Some(super::Absent::Refused));
+        // A refused pipeline and no pipeline set at all are refused; both
+        // are counted on the refused side.
+        super::note_drop(p);
+        super::note_drop(std::ptr::null());
+        assert_eq!(super::take_dropped_split(), [2, 0]);
     }
 
     /// The stream layout the title builds (title+0x86f090): root
