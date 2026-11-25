@@ -1141,7 +1141,7 @@ mod tests {
     /// thread per group, so `MSInvocations` is the number of groups.
     #[test]
     fn a_mesh_dispatch_forwards_all_group_counts() {
-        use crate::object::{S_OK, guid, slot};
+        use crate::object::{S_OK, This, guid, slot};
 
         let Some(host) = host() else {
             return; // no host GPU here
@@ -1184,8 +1184,10 @@ mod tests {
                 }))
                 .is_ok()
         );
-        let mut g = GraphicsState::default();
-        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        let mut g = GraphicsState {
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ..Default::default()
+        };
         // This pipeline has one color target, with no depth buffer.
         g.depth.DepthEnable = false.into();
         g.targets.NumRenderTargets = 1;
@@ -1243,7 +1245,7 @@ mod tests {
                 &mut queries,
             )
         };
-        let Some(queries) = made.ok().and_then(|()| queries) else {
+        let Some(queries) = made.ok().and(queries) else {
             eprintln!("mesh pipeline statistics unavailable; skipped");
             return;
         };
