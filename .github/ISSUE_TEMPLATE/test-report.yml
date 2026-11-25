@@ -101,7 +101,7 @@ body:
       render: shell
       placeholder: 'INFO victory_gpu::host: host device features adapter=... shader_model=6.8
 
-        mesh_tier=1 raytracing_tier=1.1 int64_atomics=true'
+        mesh_tier=1 raytracing_tier=1.1 int64_shader_ops=true'
   - type: dropdown
     id: progress
     attributes:

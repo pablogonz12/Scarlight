@@ -3030,7 +3030,7 @@ impl Host {
                     },
                     mesh_tier = %tier(o7.MeshShaderTier.0),
                     raytracing_tier = %tier(o5.RaytracingTier.0),
-                    int64_atomics = o1.Int64ShaderOps.as_bool(),
+                    int64_shader_ops = o1.Int64ShaderOps.as_bool(),
                     shared_import_tier = o4.SharedResourceCompatibilityTier.0,
                     "host device features"
                 );
