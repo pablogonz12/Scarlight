@@ -56,6 +56,12 @@ BlueKaiman, kais7654, pushkarreddyy, shh.
   the range scan as the reference (`crates/victory-formats/src/bcpack.rs`, `VICTORY_BCPACK_WINDOWS=0`). Ported
   whole, including its BC7 endpoint and index packing in `bc7_pack`.
 
+- **fxceless/victory-fork [PR #905](https://github.com/fxceless/victory-fork/pull/905)** (staronthehorizon,
+  from [PR #814](https://github.com/fxceless/victory-fork/pull/814)), GPL-3.0: the node test's rules that a
+  child that is not there is a miss whatever its box holds, and that an empty or inverted box and any NaN
+  coordinate miss in both node widths, with the reference's own tests
+  (`crates/victory-shader/src/bvh.rs`, `crates/victory-shader/src/emit/intersect.rs`).
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
