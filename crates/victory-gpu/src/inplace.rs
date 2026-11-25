@@ -602,7 +602,13 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     // (left mapped: nothing reads it any more) and the next store through
     // a view of ours maps this section.
     let gone = OWN.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|own| own.remove(&section)).flatten();
-    if gone.is_some() {
+    if let Some(gone) = gone {
+        // The earlier section's view is not reachable any more: unmap it, or
+        // its pages stay resident for the rest of the process (a handle's
+        // number coming round again is what puts another section there).
+        // SAFETY: our own view, made by `MapViewOfFile` in `write_own`, and
+        // nothing reads it since it left the map above.
+        unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: gone.base as *mut c_void }) };
         tracing::info!(section, "a section handle's number came round again: our own view of the earlier section is forgotten");
     }
 }
