@@ -59,6 +59,10 @@ pub(crate) struct Lowered {
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
+    /// Whether the program compares floats for equality (the omod
+    /// signed-zero flush).
+    #[cfg(test)]
+    pub has_fcmp_oeq: bool,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -84,6 +88,15 @@ enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
     Fail(ShaderError),
+}
+
+/// Whether the RDNA2 arithmetic fidelity fixes are on: an `omod` flushes
+/// -0.0 to +0.0 after the scale, and each `s_buffer_load` address term is
+/// truncated to a dword before the terms are summed.
+/// `VICTORY_SHADER_RDNA2=0` turns both off.
+fn rdna2_fixes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SHADER_RDNA2").as_deref() != Ok("0"))
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
@@ -2274,6 +2287,8 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        #[cfg(test)]
+        let has_fcmp_oeq = self.s.m.has_cmp(pred::OEQ);
         Ok(Lowered {
             wave_size,
             cmp_samplers,
@@ -2287,6 +2302,8 @@ impl<'a> Lower<'a> {
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
+            #[cfg(test)]
+            has_fcmp_oeq,
         })
     }
 
@@ -4057,8 +4074,16 @@ impl<'a> Lower<'a> {
             0 => {}
             k => {
                 let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(k)];
-                let c = self.s.m.f32(factor.to_bits());
-                f = self.s.m.bin(self.cur, Bin::Mul, f, c);
+                let c = self.cur;
+                let scale = self.s.m.f32(factor.to_bits());
+                f = self.s.m.bin(c, Bin::Mul, f, scale);
+                // RDNA2 omod (mul:2/mul:4/div:2) flushes -0.0 to +0.0;
+                // IEEE FMul keeps the sign of zero.
+                if rdna2_fixes() {
+                    let zero = self.s.m.f32(0);
+                    let is_zero = self.s.m.cmp(c, pred::OEQ, f, zero);
+                    f = self.s.m.select(c, is_zero, zero, f);
+                }
             }
         }
         if v.clamp {
@@ -11577,6 +11602,35 @@ mod tests {
         })
     }
 
+
+    /// VOP2 `v_add_f32` (0x003) with its `omod` in bits 28:27 of the
+    /// second word, encoded as VOP3 0x103.
+    fn v_add_f32_omod(omod: u8) -> [u32; 3] {
+        let (src0, src1) = (256 + 1u32, 256 + 2u32);
+        [
+            0x35 << 26 | 0x103u32 << 16,
+            (u32::from(omod) & 3) << 27 | src0 | src1 << 9,
+            S_ENDPGM,
+        ]
+    }
+
+    #[test]
+    fn write_f_omod_flushes_neg_zero_with_fcmp_oeq() {
+        // A plain add has no signed-zero flush; an omod compares against +0
+        // because RDNA2 flushes -0.0 there and IEEE FMul keeps it.
+        let plain = lower_with(&v_add_f32_omod(0), vec![], vec![]).unwrap();
+        assert!(
+            !plain.has_fcmp_oeq,
+            "v_add_f32 without omod must not emit fcmp oeq"
+        );
+        for omod in 1..=3 {
+            let lowered = lower_with(&v_add_f32_omod(omod), vec![], vec![]).unwrap();
+            assert!(
+                lowered.has_fcmp_oeq,
+                "v_add_f32 omod={omod} must emit fcmp oeq to flush -0.0"
+            );
+        }
+    }
 
     /// Lowers a compute program with the root parameters `layout` (in user
     /// SGPRs from s0 on) and the used resources `used`.

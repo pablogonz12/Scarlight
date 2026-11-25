@@ -728,6 +728,19 @@ mod tests {
             one(&[0xD54B_8004, 0x2BC0_0501], true),
             "v_fma_f32 v4, -v1, s2, 0.5 mul:2 clamp"
         );
+        // VOP3 v_add_f32 (VOP2-in-VOP3 opcode 0x103) with each omod.
+        assert_eq!(
+            one(&[0xD503_0000, 0x0802_0501], true),
+            "v_add_f32 v0, v1, v2 mul:2"
+        );
+        assert_eq!(
+            one(&[0xD503_0000, 0x1002_0501], true),
+            "v_add_f32 v0, v1, v2 mul:4"
+        );
+        assert_eq!(
+            one(&[0xD503_0000, 0x1802_0501], true),
+            "v_add_f32 v0, v1, v2 div:2"
+        );
         assert_eq!(
             one(&[0x7E02_16F9, 0x0605_0602], true),
             "v_cvt_f32_f16 v1, v2 src0_sel:WORD_1"
