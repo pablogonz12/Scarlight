@@ -1462,11 +1462,24 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
     }
 
-    /// Tests that move the page-number counter run one at a time.
-    static PHYSICAL_TESTS: Mutex<()> = Mutex::new(());
+    /// An owned allocator, so the page-number tests touch no shared state and
+    /// no other test can hand out or free numbers under them.
+    fn owned_physical(next_page: usize) -> Physical {
+        Physical {
+            next_page,
+            ..Default::default()
+        }
+    }
 
-    fn free_pages(pages: &[usize]) -> BOOL {
-        XMemFreePhysicalPages(pages.len(), pages.as_ptr())
+    /// A section that owns nothing: the number bookkeeping under test never
+    /// looks inside it (`Drop` closes a null handle, which does nothing).
+    fn empty_section() -> Arc<Section> {
+        Arc::new(Section(std::ptr::null_mut()))
+    }
+
+    fn take(numbers: &[MaybeUninit<usize>]) -> Vec<usize> {
+        // SAFETY: `allocate` wrote every entry.
+        numbers.iter().map(|n| unsafe { n.assume_init() }).collect()
     }
 
     /// Streaming allocate/free must reuse page numbers: without a free list
@@ -1474,56 +1487,44 @@ mod tests {
     /// the title's 21-bit `number >> 4` field, after which allocation fails.
     #[test]
     fn freed_page_numbers_are_handed_out_again() {
-        let _one_at_a_time = PHYSICAL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        let pages = allocate(2);
-        let ceiling = physical().next_page;
-        assert_eq!(free_pages(&pages), 1);
-        for _ in 0..1024 {
-            let again = allocate(2);
-            {
-                let phys = physical();
-                assert_eq!(phys.next_page, ceiling, "next_page must not grow");
-            }
+        let section = empty_section();
+        let mut physical = owned_physical(FIRST_PAGE_NUMBER);
+        let mut numbers = [MaybeUninit::<usize>::uninit(); 2];
+        assert!(physical.allocate(&section, &mut numbers));
+        let first = take(&numbers);
+        let ceiling = physical.next_page;
+        for &n in &first {
+            physical.free(n);
+        }
+        for round in 0..1024 {
+            assert!(physical.allocate(&section, &mut numbers), "round {round}");
+            let again = take(&numbers);
+            assert_eq!(physical.next_page, ceiling, "round {round}: next_page grew");
             let mut got = again.clone();
             got.sort_unstable();
-            let mut want = pages.clone();
+            let mut want = first.clone();
             want.sort_unstable();
-            assert_eq!(got, want, "the same numbers come back");
-            assert_eq!(free_pages(&again), 1);
+            assert_eq!(got, want, "round {round}: the same numbers come back");
+            for &n in &again {
+                physical.free(n);
+            }
         }
     }
 
     /// A page number at the top of the title's 21-bit field still allocates;
-    /// one round past it is refused and the title is told it got none.
+    /// one round past it is refused, which the caller turns into "no pages".
     #[test]
     fn page_numbers_stop_at_the_title_field() {
-        let _one_at_a_time = PHYSICAL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        let (saved_next, saved_free) = {
-            let phys = physical();
-            (phys.next_page, phys.free_pages.clone())
-        };
-        {
-            let mut phys = physical();
-            phys.next_page = PAGE_NUMBER_LIMIT - FRAMES;
-            phys.free_pages.clear();
-        }
-        let last = allocate(1);
+        let section = empty_section();
+        let mut physical = owned_physical(PAGE_NUMBER_LIMIT - FRAMES);
+        let mut numbers = [MaybeUninit::<usize>::uninit(); 1];
+        assert!(physical.allocate(&section, &mut numbers));
+        let last = take(&numbers)[0];
         // The title keeps `number >> 4` in 21 bits.
-        assert!(last[0] >> 4 < 1 << 21, "{:#x}", last[0]);
-        let (mut given, mut out) = (1usize, [0usize; 1]);
-        assert_eq!(
-            XMemAllocatePhysicalPages(0, &mut given, out.as_mut_ptr()),
-            0
+        assert!(last >> 4 < 1 << 21, "{last:#x}");
+        assert!(
+            !physical.allocate(&section, &mut numbers),
+            "one round past the field must be refused"
         );
-        assert_eq!(given, 0, "the title is told it got no pages");
-        {
-            let mut phys = physical();
-            phys.next_page = saved_next;
-            phys.free_pages = saved_free;
-            for &n in &last {
-                phys.pages.remove(&n);
-            }
-        }
     }
-
 }
