@@ -735,18 +735,19 @@ void main() {
             assert_eq!(run(&mut warp, 2), [0, 1, 0], "offset {offset}, changed back");
         }
         // A copy that does not start on a piece boundary, hashed from a span
-        // that does not start at its piece 0.
+        // that does not start at its piece 0: the two pieces of the span have
+        // a result each, and the piece after them is not touched (7).
         const SKEW: u32 = 1000;
         let run_skewed = |warp: &mut WarpHarness, mode: u32| run_with(warp, mode, (1, SKEW, 2));
         assert_eq!(run_skewed(&mut warp, 0), [7, 7, 7]);
-        assert_eq!(run_skewed(&mut warp, 1), [0, 0, 0]);
+        assert_eq!(run_skewed(&mut warp, 1), [0, 0, 7]);
         let skewed = 2 * PIECE + 5000;
         // SAFETY: inside the mapping.
         unsafe { now_ptr.add(skewed).write_volatile(content[skewed] ^ 0x10) };
-        assert_eq!(run_skewed(&mut warp, 2), [0, 1, 0]);
-        assert_eq!(run_skewed(&mut warp, 2), [0, 0, 0]);
+        assert_eq!(run_skewed(&mut warp, 2), [0, 1, 7]);
+        assert_eq!(run_skewed(&mut warp, 2), [0, 0, 7]);
         unsafe { now_ptr.add(skewed).write_volatile(content[skewed]) };
-        assert_eq!(run_skewed(&mut warp, 2), [0, 1, 0]);
+        assert_eq!(run_skewed(&mut warp, 2), [0, 1, 7]);
     }
 
     /// The last record's span is its payload: a tight title buffer asks for
