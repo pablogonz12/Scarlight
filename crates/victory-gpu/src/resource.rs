@@ -2327,6 +2327,56 @@ static RESOURCE_FUNCTIONS: Table<32> = {
     Table(f)
 };
 
+/// Scratch: which module a fault comes from.
+#[cfg(windows)]
+#[allow(dead_code)]
+mod crash_module {
+    #[repr(C)]
+    pub struct ExceptionRecord {
+        pub code: u32,
+        pub flags: u32,
+        pub record: *mut core::ffi::c_void,
+        pub address: *mut core::ffi::c_void,
+        pub number: u32,
+        pub information: [usize; 15],
+    }
+
+    #[repr(C)]
+    pub struct ExceptionPointers {
+        pub record: *mut ExceptionRecord,
+        pub context: *mut core::ffi::c_void,
+    }
+
+    unsafe extern "system" {
+        fn AddVectoredExceptionHandler(
+            first: u32,
+            handler: Option<unsafe extern "system" fn(*mut ExceptionPointers) -> i32>,
+        ) -> *mut core::ffi::c_void;
+        fn GetModuleHandleExW(flags: u32, name: *const u16, out: *mut *mut core::ffi::c_void) -> i32;
+        fn GetModuleFileNameW(module: *mut core::ffi::c_void, buf: *mut u16, size: u32) -> u32;
+    }
+
+    pub fn install() {
+        // SAFETY: a plain vectored handler.
+        unsafe { AddVectoredExceptionHandler(1, Some(crash)) };
+    }
+
+    unsafe extern "system" fn crash(info: *mut ExceptionPointers) -> i32 {
+        // SAFETY: the runtime passes the record for the fault.
+        let record = unsafe { (*info).record };
+        let (code, at) = unsafe { ((*record).code, (*record).address) };
+        let mut module = std::ptr::null_mut();
+        let found = unsafe { GetModuleHandleExW(4 | 2, at.cast(), &mut module) };
+        let mut name = [0u16; 260];
+        let n = unsafe { GetModuleFileNameW(module, name.as_mut_ptr(), name.len() as u32) };
+        println!(
+            "CRASH code={code:#x} at={at:?} found={found} module={}",
+            String::from_utf16_lossy(&name[..n as usize])
+        );
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3061,7 +3111,6 @@ void main() {
             }
         }
 
-        println!("STEP tiled");
         let allocator_iid = guid(
             0x6102dee4,
             0xaf59,
@@ -3210,10 +3259,9 @@ void main() {
             actual
         };
 
-        println!("STEP submit");
+        crate::resource::crash_module::install();
         submit();
         let actual = sample();
-        println!("STEP sample");
         for (i, want) in depth.iter().enumerate() {
             assert_eq!(&actual[i], want, "depth subresource {i}");
         }
@@ -3228,10 +3276,8 @@ void main() {
         stencil[3][0] = 53;
         // SAFETY: one byte of the texture's memory, ours and mapped.
         unsafe { memory.as_mut_ptr().add(at as usize).write_volatile(53) };
-        println!("STEP submit2");
         submit();
         let refreshed = sample();
-        println!("STEP sample2");
         for (i, want) in depth.iter().enumerate() {
             assert_eq!(&refreshed[i], want, "depth subresource {i} survives a stencil write");
         }
