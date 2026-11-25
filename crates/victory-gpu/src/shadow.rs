@@ -2320,9 +2320,10 @@ impl Shadow {
             // SAFETY: `writing` set the snapshot's bytes of every declared
             // range, at the copy's offsets; the merge below, under the same
             // lock, brings the bytes the copy takes from title memory into
-            // them too.
+            // them too. Every read of them ends before its piece is written:
+            // one slice per use, no borrow of the snapshot kept across the
+            // merge.
             let base = snapshot.as_mut().unwrap().as_mut_ptr();
-            let before = unsafe { std::slice::from_raw_parts(base.add(from), to - from) };
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission (on several threads: gigabytes a frame, bound by
             // memory speed), title memory read only where the GPU wrote.
@@ -2330,7 +2331,10 @@ impl Shadow {
             let scanning = std::time::Instant::now();
             let differing = match found {
                 Some(found) => found,
-                None => self.differing(from, to, before),
+                None => {
+                    let before = unsafe { std::slice::from_raw_parts(base.add(from), to - from) };
+                    self.differing(from, to, before)
+                }
             };
             #[cfg(feature = "diagnostics")]
             let syncing = {
@@ -2349,15 +2353,21 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
                 // From the first byte that differs to the last: title
                 // memory is read and written there only (a shader that sets
                 // a few words of a piece cost a read, a walk and a write of
-                // all 64 KiB of it).
-                let Some(first) = first_difference(host, old) else {
+                // all 64 KiB of it). The snapshot's bytes are read here and
+                // nowhere else before they are written below.
+                let found = {
+                    // SAFETY: inside the snapshot's allocation (`writing`),
+                    // read only for this comparison.
+                    let old = unsafe { std::slice::from_raw_parts(base.add(at), n) };
+                    first_difference(host, old)
+                        .map(|first| (first, last_difference(host, old).unwrap_or(first)))
+                };
+                let Some((first, last)) = found else {
                     continue;
                 };
-                let last = last_difference(host, old).unwrap_or(first);
                 let (at, n) = (at + first, last + 1 - first);
                 let host = &mut host[first..=last];
                 let title = &mut title[..n];
