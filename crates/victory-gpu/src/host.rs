@@ -778,6 +778,68 @@ mod tests {
     }
 
     #[test]
+    fn a_read_only_title_destination_is_written_through_the_kernel() {
+        use windows_sys::Win32::System::Memory::*;
+        const N: usize = 2 << 16;
+        // SAFETY: a private region committed whole, accessed directly.
+        unsafe {
+            let dst = VirtualAlloc(std::ptr::null(), N, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+                .cast::<u8>();
+            assert!(!dst.is_null());
+            // The layer has taken this memory whole before: its blocks are
+            // "there", which was all `plain` asked before #138.
+            crate::watch::copied(dst as usize, N);
+            crate::watch::writing(dst as usize, N);
+            let first = vec![0x5au8; N];
+            super::write_mapped(dst, first.as_ptr(), N);
+            assert_eq!(std::slice::from_raw_parts(dst, N), &first[..]);
+            // The title makes the second block read-only and tells us: a
+            // copy into it must go through the kernel (which fails) rather
+            // than fault on the bytes. The writable half is still written,
+            // piece by piece, as the kernel path has always done.
+            let mut old = 0;
+            assert_ne!(
+                VirtualProtect(dst.add(N / 2).cast(), N / 2, PAGE_READONLY, &mut old),
+                0
+            );
+            crate::watch::title_memory_remapped(dst as usize + N / 2, N / 2);
+            let second = vec![0xa5u8; N];
+            super::write_mapped(dst, second.as_ptr(), N);
+            assert!(
+                std::slice::from_raw_parts(dst, N / 2).iter().all(|&b| b == 0xa5),
+                "the writable half took the copy"
+            );
+            assert!(
+                std::slice::from_raw_parts(dst.add(N / 2), N / 2).iter().all(|&b| b == 0x5a),
+                "the read-only half is left alone"
+            );
+            // The same for title memory as the source, with mapped evidence
+            // of its own (so `plain` passes for the source): the fallback
+            // pieces must not copy into the read-only destination either.
+            // SAFETY: a fresh allocation of ours, freed at the end.
+            let src = VirtualAlloc(std::ptr::null(), N, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+                .cast::<u8>();
+            assert!(!src.is_null());
+            src.write_bytes(0xa5, N);
+            crate::watch::copied(src as usize, N);
+            super::copy_mapped(dst, src, N, true);
+            assert!(
+                std::slice::from_raw_parts(dst, N / 2).iter().all(|&b| b == 0xa5),
+                "the writable half took the copy"
+            );
+            assert!(
+                std::slice::from_raw_parts(dst.add(N / 2), N / 2).iter().all(|&b| b == 0x5a),
+                "the read-only half is left alone"
+            );
+            // SAFETY: the regions allocated above.
+            crate::watch::title_memory_remapped(src as usize, N);
+            assert_ne!(VirtualFree(src.cast(), 0, MEM_RELEASE), 0);
+            crate::watch::title_memory_remapped(dst as usize, N);
+            assert_ne!(VirtualFree(dst.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
     fn a_copy_of_title_memory_the_layer_has_seen_goes_at_the_bytes() {
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 2 << 16;
@@ -888,6 +950,9 @@ pub(crate) struct HostList {
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
+    /// Set by [`HostList::pass_plane`] when it binds its own graphics state
+    /// mid-list so [`crate::draw::State`] replays title state before drawing.
+    plane_clobbered: std::sync::atomic::AtomicBool,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -954,7 +1019,8 @@ struct TwinUse {
     /// The draw or dispatch being prepared writes the twin.
     writing: bool,
     /// The depth plane's twin holds what the plane lacks although the list
-    /// copied the twins since: the plane's pass waits for the list's close.
+    /// copied the twins since: the plane's pass waits for the list's close
+    /// (`VICTORY_PLANE_INLINE=0`).
     late: bool,
 }
 
@@ -3077,6 +3143,7 @@ impl Host {
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 _alive: Counted::new(),
+                plane_clobbered: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -4761,6 +4828,7 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.plane_clobbered.store(false, Ordering::Relaxed);
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -4840,6 +4908,20 @@ impl HostList {
         }
     }
 
+    /// Whether the depth plane's pass draws inline, in the list that wrote its
+    /// twin, instead of when the list closes. On by default;
+    /// `VICTORY_PLANE_INLINE=0` waits for the close, as before.
+    fn plane_inline() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_PLANE_INLINE").is_none_or(|v| v != "0"))
+    }
+
+    /// Returns and clears whether [`HostList::pass_plane`] replaced graphics
+    /// pipeline/target state mid-list.
+    pub(crate) fn take_plane_clobbered(&self) -> bool {
+        self.plane_clobbered.swap(false, Ordering::Relaxed)
+    }
+
     /// A use of title texture `resource` about to be recorded, if it is a
     /// depth texture with a colour twin (false if it is not): of the twin
     /// (`colour`: unordered access) or of the depth texture (depth target,
@@ -4850,10 +4932,10 @@ impl HostList {
     /// unordered access state; the caller moves the depth texture to the
     /// state its use needs, as for any texture. A twin still ahead when the
     /// list closes is copied then (`twins_to_depth`).
-    /// shortcut: every depth target bound for a draw counts as written
-    /// (also when the draw only tests), and every unordered access view a
-    /// shader names as written; views a shader picks from the heap by a
-    /// computed index are not seen here at all.
+    /// shortcut: every depth target bound for a draw writes as noted by
+    /// `write`, and every unordered access view a shader names as written;
+    /// views a shader picks from the heap by a computed index are not seen
+    /// here at all.
     pub(crate) fn twin_use(
         &self,
         resource: crate::object::This,
@@ -4896,18 +4978,23 @@ impl HostList {
             (true, false) => u.behind[1] = Some(true),
             (false, _) => {}
         }
-        // shortcut: the depth plane's twin is not drawn into the plane
-        // here: the pass sets a pipeline and a target of ours, which a list
-        // still recording the title's commands cannot take. This use sees
-        // the plane as it was; the pass runs when the list closes
-        // (`twins_to_depth`). Counted.
-        if copy && !colour && twin.plane.is_some() {
+        // The depth plane's pass draws into the depth texture with a pipeline
+        // and target of ours: a list still recording the title's commands
+        // replays its state after it (crate::draw::State). With
+        // `VICTORY_PLANE_INLINE=0` the pass waits for the list's close
+        // (`twins_to_depth`), as before, and a use in the same list sees the
+        // plane as it was.
+        let late = copy && !colour && twin.plane.is_some() && !Self::plane_inline();
+        if late {
             u.late = true;
             crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed);
         }
         drop(twins);
         if copy {
             self.twin_copy(&depth, &twin, colour);
+            if !colour && !late {
+                self.pass_plane(&depth, &twin);
+            }
         } else if colour {
             self.settle(&twin.colour, UNORDERED_ACCESS);
         }
@@ -4920,9 +5007,9 @@ impl HostList {
 
     /// Records the pass that draws the twin of the depth plane of `depth`
     /// into the plane, if `twin` has one, with the moves to the states the
-    /// pass needs; the twin is left in the unordered access state. Only
-    /// for a list that records nothing of the title's afterwards
-    /// (`record_plane_pass`).
+    /// pass needs; the twin is left in the unordered access state. Callers
+    /// recording more title commands afterward check [`take_plane_clobbered`]
+    /// to replay state (`record_plane_pass`).
     fn pass_plane(
         &self,
         depth: &std::sync::Arc<crate::resource::HostTexture>,
@@ -4935,6 +5022,7 @@ impl HostList {
         self.settle(depth, DEPTH_WRITE);
         self.settle(plane, PIXEL_SHADER_RESOURCE);
         record_plane_pass(&self.list, &depth.texture, &plane.texture);
+        self.plane_clobbered.store(true, Ordering::Relaxed);
         self.settle(plane, UNORDERED_ACCESS);
     }
 
@@ -5040,6 +5128,8 @@ impl HostList {
     fn prelude(&self) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
+        const DEPTH_WRITE: u32 = 0x10;
+        const PIXEL_SHADER_RESOURCE: u32 = 0x80;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         // The copies (depth texture, twin, whether into the twin); the
@@ -5061,11 +5151,15 @@ impl HostList {
         }
         drop(twins);
         // A copy runs with its textures in the copy states: each moves
-        // there from its real state, and from there to the state the list
-        // starts with (back to its real state if the list does not use it).
+        // there from its real state, any depth-plane pass draws from its
+        // plane twin to `DEPTH_WRITE`, and then everything moves to the state
+        // the list starts with (back to its real state if unused by the list).
         let mut to_copy = Vec::new();
+        let mut to_plane = Vec::new();
         let mut barriers = Vec::new();
         let mut copying = std::collections::HashMap::new();
+        let mut plane_syncs = Vec::new();
+        let mut touched = Vec::new();
         for (depth, twin, colour) in &syncs {
             let (from, to) = if *colour {
                 (depth, &twin.colour)
@@ -5076,20 +5170,62 @@ impl HostList {
                 let key = std::sync::Arc::as_ptr(texture) as usize;
                 let real = texture.state.load(Ordering::Relaxed);
                 copying.insert(key, state);
+                touched.push(texture);
                 if real != state {
                     to_copy.push(transition(
                         &texture.texture,
                         host_state(real),
                         host_state(state),
                     ));
-                    if !states.contains_key(&key) {
-                        barriers.push(transition(
-                            &texture.texture,
-                            host_state(state),
-                            host_state(real),
-                        ));
-                    }
                 }
+            }
+            if !*colour && let Some(plane) = &twin.plane {
+                let depth_key = std::sync::Arc::as_ptr(depth) as usize;
+                let depth_from = copying.get(&depth_key).copied().unwrap_or(COPY_DEST);
+                let plane_key = std::sync::Arc::as_ptr(plane) as usize;
+                let plane_from = copying
+                    .get(&plane_key)
+                    .copied()
+                    .unwrap_or_else(|| plane.state.load(Ordering::Relaxed));
+                let depth_to = legal_state(&depth.texture, DEPTH_WRITE);
+                let plane_to = legal_state(&plane.texture, PIXEL_SHADER_RESOURCE);
+                if depth_from != depth_to {
+                    to_plane.push(transition(
+                        &depth.texture,
+                        host_state(depth_from),
+                        host_state(depth_to),
+                    ));
+                }
+                if plane_from != plane_to {
+                    to_plane.push(transition(
+                        &plane.texture,
+                        host_state(plane_from),
+                        host_state(plane_to),
+                    ));
+                }
+                copying.insert(depth_key, depth_to);
+                copying.insert(plane_key, plane_to);
+                touched.push(plane);
+                plane_syncs.push((depth, plane));
+            }
+        }
+        for texture in touched {
+            let key = std::sync::Arc::as_ptr(texture) as usize;
+            if !states.contains_key(&key)
+                && let Some(at_end) = copying.remove(&key)
+            {
+                let real = texture.state.load(Ordering::Relaxed);
+                if at_end != real {
+                    barriers.push(transition(
+                        &texture.texture,
+                        host_state(at_end),
+                        host_state(real),
+                    ));
+                }
+            } else if !states.contains_key(&key) {
+                // Already handled above if deduplicated.
+            } else {
+                // Handled in `states` loop below using `copying`.
             }
         }
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
@@ -5118,6 +5254,12 @@ impl HostList {
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
+                }
+                if !to_plane.is_empty() {
+                    list.ResourceBarrier(&to_plane);
+                }
+                for (depth, plane) in &plane_syncs {
+                    record_plane_pass(list, &depth.texture, &plane.texture);
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -5736,7 +5878,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let whole = read(src, dst, len, title_dst);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -5755,7 +5897,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if !title_dst && len >= 64 << 10 {
         read_sparse(src, dst, len);
     } else {
-        read_pieces(src, dst, len);
+        read_pieces(src, dst, len, title_dst);
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
@@ -5778,7 +5920,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);
         if size != size_of_val(&info) || n == 0 {
-            read_pieces(at, to, remaining);
+            read_pieces(at, to, remaining, false);
             break;
         }
         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
@@ -5786,26 +5928,32 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
             unsafe { to.write_bytes(0, n) };
-        } else if !read_piece(at, to, n) {
+        } else if !read_piece(at, to, n, false) {
             // A mapping may change between query and read.
-            read_pieces(at, to, n);
+            read_pieces(at, to, n, false);
         }
         offset += n;
     }
 }
 
-fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
+/// Page by page (64 KiB, then 4 KiB in a piece that fails), zeros for what
+/// cannot be read. A title destination (`title_dst`) is zeroed only where it
+/// is committed read-write: a direct write into a page the title made
+/// read-only would fault, where the kernel's read there only failed.
+fn read_pieces(src: *const u8, dst: *mut u8, len: usize, title_dst: bool) {
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
-        if !read_piece(at as *const u8, to, n) {
+        if !read_piece(at as *const u8, to, n, title_dst) {
             for_pieces(at, n, 4 << 10, |at, n| {
                 let to = dst.wrapping_add(at - src as usize);
-                if !read_piece(at as *const u8, to, n) {
+                if !read_piece(at as *const u8, to, n, title_dst) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
+                    if title_dst && !crate::watch::writable(to as usize, n) {
+                        return;
+                    }
+                    // SAFETY: inside the destination, which is mapped and
+                    // writable (asked above for title memory).
                     unsafe { to.write_bytes(0, n) };
                 }
             });
@@ -5816,26 +5964,32 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
-    read(src, dst.as_mut_ptr(), dst.len())
+    read_mark(src, dst.as_mut_ptr(), dst.len(), true, false)
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
-fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
-    read_mark(src, dst, len, true)
+fn read(src: *const u8, dst: *mut u8, len: usize, title_dst: bool) -> bool {
+    read_mark(src, dst, len, true, title_dst)
 }
 
 /// [`read`] for a piece of a range: a piece that reads marks nothing, so a
 /// block the title only has pages of is never taken for one it has whole
 /// (see [`crate::watch::copied`]).
-fn read_piece(src: *const u8, dst: *mut u8, len: usize) -> bool {
-    read_mark(src, dst, len, false)
+fn read_piece(src: *const u8, dst: *mut u8, len: usize, title_dst: bool) -> bool {
+    read_mark(src, dst, len, false, title_dst)
 }
 
-fn read_mark(src: *const u8, dst: *mut u8, len: usize, mark: bool) -> bool {
+fn read_mark(src: *const u8, dst: *mut u8, len: usize, mark: bool, title_dst: bool) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    if plain(src as usize, len) && !overlaps(src as usize, dst as usize, len) {
+    // A title destination is written plainly only if it is committed
+    // read-write now: the kernel path below fails per page where a plain
+    // write would fault.
+    if plain(src as usize, len)
+        && (!title_dst || plain_dst(dst as usize, len))
+        && !overlaps(src as usize, dst as usize, len)
+    {
         // SAFETY: the layer has copied this whole range before and its first
         // and last pages read just now; the destination is mapped writable
         // memory of `len` bytes and does not overlap the source.
@@ -5885,6 +6039,15 @@ fn plain(at: usize, len: usize) -> bool {
     }
     let last = at + len - 1;
     probe(at) && (last == at || probe(last))
+}
+
+/// Whether `[at, at + len)` may be written as bytes: [`plain`]'s evidence
+/// plus the destination's being committed read-write now
+/// ([`crate::watch::writable`], answered from its per-region cache). A write
+/// into a page the title has since made read-only or unmapped would fault;
+/// the kernel's write only fails, and the copy falls back to it.
+fn plain_dst(at: usize, len: usize) -> bool {
+    plain(at, len) && crate::watch::writable(at, len)
 }
 
 /// Whether `[a, a + len)` and `[b, b + len)` share a byte: the plain copy
@@ -5941,11 +6104,11 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     let direct = direct_writes();
     let write = |at: usize, n: usize, mark: bool| {
         let from = src.wrapping_add(at - dst as usize);
-        if plain(at, n) {
+        if plain_dst(at, n) {
             // SAFETY: the layer knows the whole range is mapped (its first and
-            // last pages read just now) and its guards are open for this
-            // write (`crate::watch::writing`): a plain write is the title's
-            // own, which the watch sees as one.
+            // last pages read just now) and is committed read-write now, and
+            // its guards are open for this write (`crate::watch::writing`): a
+            // plain write is the title's own, which the watch sees as one.
             unsafe { std::ptr::copy_nonoverlapping(from, at as *mut u8, n) };
             #[cfg(feature = "diagnostics")]
             {
@@ -5970,6 +6133,10 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         if written && mark {
             // The kernel wrote all of it: it is there.
             crate::watch::copied(at, n);
+        } else if !written {
+            // A page there is not writable (or not there): what the
+            // destination check knew of the range is stale.
+            crate::watch::write_failed(at, n);
         }
         written
     };
