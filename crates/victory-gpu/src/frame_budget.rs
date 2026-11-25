@@ -22,7 +22,7 @@
 //! `VICTORY_FRAME_BUDGET=0` turns it off: nothing is read at a present and
 //! nothing is said, so the report costs nothing when it is not wanted.
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// Frames longer than this are reported: a frame at 30 a second is 33.3 ms,
@@ -34,8 +34,8 @@ pub(crate) const REPORT: Duration = Duration::from_millis(50);
 const SAY_EVERY: Duration = Duration::from_secs(1);
 
 /// Whether the report is on. `VICTORY_FRAME_BUDGET=0` turns it off; read
-/// once, at the first frame.
-fn enabled() -> bool {
+/// once, at the first present, and asked before anything is measured.
+pub(crate) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_FRAME_BUDGET").is_none_or(|v| v != "0"))
 }
@@ -111,23 +111,25 @@ fn ms(d: Duration) -> f64 {
 }
 
 /// Says what a frame past the budget was bound by, at most once a second.
-/// `None` when the frame kept to it, when the report is off, or when a line
-/// was said within the last second.
-pub(crate) fn say(frame: Duration, phases: &Phases) -> Option<String> {
+/// `None` when the frame kept to it, when the report is off
+/// ([`enabled`]), or when a line was said within the last second.
+///
+/// `said` is the caller's own (`host::Meter`, which counts the presents and
+/// has it to itself): the throttle needs no lock, so a present takes none.
+pub(crate) fn say(
+    frame: Duration,
+    phases: &Phases,
+    said: &mut Option<Instant>,
+) -> Option<String> {
     if !enabled() {
         return None;
     }
     let line = phases.line(frame)?;
-    static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
-    let mut last = LAST
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
-    if last.is_some_and(|last| now.duration_since(last) < SAY_EVERY) {
+    if said.is_some_and(|last| now.duration_since(last) < SAY_EVERY) {
         return None;
     }
-    *last = Some(now);
+    *said = Some(now);
     Some(line)
 }
 

@@ -6058,6 +6058,12 @@ struct Meter {
     /// frame is ours and its card's, taken off the sums the line above uses.
     shown: std::time::Instant,
     counters: [u64; 5],
+    /// What the one-second line consumed after the last frame's sample (see
+    /// `budget`): the next frame's delta starts with it, so no increment is
+    /// in neither report nor in both.
+    carry: [u64; 5],
+    /// When the frame budget last said a line (a present holds the meter).
+    said: Option<std::time::Instant>,
 }
 
 impl Meter {
@@ -6073,12 +6079,19 @@ impl Meter {
             caption: None,
             shown: now,
             counters: [0; 5],
+            carry: [0; 5],
+            said: None,
         }
     }
 
     /// Says what a frame past the budget was bound by
     /// ([`crate::frame_budget`]): its parts, the largest named.
     fn budget(&mut self) {
+        // With the report off nothing is measured: not the clock, not the
+        // counters (`VICTORY_FRAME_BUDGET=0`).
+        if !crate::frame_budget::enabled() {
+            return;
+        }
         let now = std::time::Instant::now();
         let frame = now.saturating_duration_since(self.shown);
         self.shown = now;
@@ -6090,7 +6103,9 @@ impl Meter {
             PREPARING[2].load(Ordering::Relaxed),
         ];
         let part = |i: usize| {
-            std::time::Duration::from_micros(counters[i].saturating_sub(self.counters[i]))
+            std::time::Duration::from_micros(
+                self.carry[i].saturating_add(counters[i].saturating_sub(self.counters[i])),
+            )
         };
         let phases = crate::frame_budget::Phases {
             preparing: part(0),
@@ -6100,7 +6115,8 @@ impl Meter {
             textures: part(4),
         };
         self.counters = counters;
-        if let Some(text) = crate::frame_budget::say(frame, &phases) {
+        self.carry = [0; 5];
+        if let Some(text) = crate::frame_budget::say(frame, &phases, &mut self.said) {
             tracing::warn!("{text}");
         }
     }
@@ -6128,17 +6144,28 @@ impl Meter {
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
-        let [cpu, gpu] = [0, 1].map(|i| {
-            SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
-        });
-        let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
-            let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
-            PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
-        });
-        let [back_ms, back_mb] = [0, 1].map(|i| {
-            COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
-        });
-        // The sums above are from zero again: so is the frame budget's.
+        let cpu_gpu = [0, 1].map(|i| SUBMISSION_US[i].swap(0, Ordering::Relaxed));
+        let preparing = [0, 1, 2, 3].map(|i| PREPARING[i].swap(0, Ordering::Relaxed));
+        let back = [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed));
+        let [cpu, gpu] = cpu_gpu.map(|us| us as f64 / 1000.0 / frames);
+        let [copy_ms, copy_mb, texture_ms, texture_mb] = [
+            preparing[0] as f64 / 1e3 / frames,
+            preparing[1] as f64 / 1e6 / frames,
+            preparing[2] as f64 / 1e3 / frames,
+            preparing[3] as f64 / 1e6 / frames,
+        ];
+        let [back_ms, back_mb] = [back[0] as f64 / 1e3 / frames, back[1] as f64 / 1e6 / frames];
+        // The sums above are from zero again. What landed between the frame
+        // budget's last sample and these swaps was taken here and not there,
+        // so the next frame's delta starts with it: every increment is in
+        // exactly one of the two.
+        self.carry = [
+            cpu_gpu[0].saturating_sub(self.counters[0]),
+            cpu_gpu[1].saturating_sub(self.counters[1]),
+            back[0].saturating_sub(self.counters[2]),
+            preparing[0].saturating_sub(self.counters[3]),
+            preparing[2].saturating_sub(self.counters[4]),
+        ];
         self.counters = [0; 5];
         let dropped = crate::draw::take_dropped() as f64 / frames;
         // Of those, the ones whose pipeline was refused (lost every frame)
