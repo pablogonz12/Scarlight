@@ -2478,12 +2478,30 @@ impl State {
             return false;
         };
         let rects = u64::from(count / 3);
+        // Where the `POSITION` element is read from, if the layout has one:
+        // every slot of a rectangle takes its right angle from there, so that
+        // the vertices it completes line up between buffers. Found once, read
+        // at submission like the vertices themselves.
+        let position = p
+            .inputs
+            .iter()
+            .find(|e| e.position && !e.per_instance)
+            .map(|e| (e.slot, e.offset, e.format));
+        let position_src = position.and_then(|(slot, offset, format)| {
+            let v = self.vertex[slot as usize];
+            let stride = u64::from(v.stride);
+            (v.address != 0
+                && stride != 0
+                && u64::from(first + count) * stride <= u64::from(v.size))
+            .then(|| (v.address + u64::from(first) * stride, stride, offset, format))
+        });
+        let corners = std::sync::Arc::new(std::sync::OnceLock::new());
         for slot in 0..32 {
-            let elements: Vec<(u32, u32, bool)> = p
+            let elements: Vec<(u32, u32)> = p
                 .inputs
                 .iter()
                 .filter(|e| e.slot == slot && !e.per_instance)
-                .map(|e| (e.offset, e.format, e.position))
+                .map(|e| (e.offset, e.format))
                 .collect();
             if elements.is_empty() {
                 continue;
@@ -2504,6 +2522,7 @@ impl State {
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
             let n = rects as usize;
+            let corners = corners.clone();
             list.defer_host(move || {
                 // The vertices are read in place, at submission: no change
                 // of mapping under the read (see
@@ -2517,7 +2536,24 @@ impl State {
                         std::slice::from_raw_parts_mut(to as *mut u8, n * 6 * stride),
                     )
                 };
-                crate::primitive::expand_rects(src, dst, stride, &elements);
+                // Once for the whole draw, whichever slot runs first: the
+                // `POSITION` buffer's bytes are the rectangle's corners.
+                let corners = corners.get_or_init(|| match position_src {
+                    // SAFETY: the `POSITION` element's buffer was checked
+                    // the same way as this slot's, and it is read under the
+                    // same guard.
+                    Some((at, pstride, offset, format)) => unsafe {
+                        let src = std::slice::from_raw_parts(at as *const u8, n * 3 * pstride as usize);
+                        crate::primitive::right_corners(
+                            src,
+                            pstride as usize,
+                            n,
+                            (offset, format),
+                        )
+                    },
+                    None => Vec::new(),
+                });
+                crate::primitive::expand_rects(src, dst, stride, &elements, corners);
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
