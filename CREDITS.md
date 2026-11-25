@@ -26,7 +26,7 @@ wrothgaril, Yaekai.
 
 ## Co-authors
 
-BlueKaiman.
+BlueKaiman, r4 (r4tedx).
 
 ## Design notes
 

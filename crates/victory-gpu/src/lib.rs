@@ -55,6 +55,8 @@ mod memory;
 mod shadow;
 pub mod signature;
 #[cfg(windows)]
+mod stand_in;
+#[cfg(windows)]
 mod texture;
 #[cfg(windows)]
 mod watch;

@@ -260,6 +260,13 @@ pub(crate) struct State {
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    /// The clears a stand-in made in this list: (view heap, the title
+    /// address of the view, the resource it views) → dynamic slot, one per
+    /// view a program names, however many dispatches of it do not run.
+    stand_in_slots: std::collections::HashMap<(usize, u64, usize), u32>,
+    /// The bound dispatch ran ([`State::dispatch`]); its stand-ins take its
+    /// place when it did not.
+    dispatch_ran: bool,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
 }
@@ -294,6 +301,7 @@ impl State {
         self.fresh_tables.clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
+        self.stand_in_slots.clear();
         self.tables_gone = true;
     }
 }
@@ -454,6 +462,10 @@ fn dropped(pipeline: usize) {
 
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
+
+/// Stand-ins that took a dispatch's place (tests).
+#[cfg(test)]
+static INSTEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
@@ -1937,8 +1949,19 @@ impl State {
         });
     }
 
-    /// Runs a dispatch on the host.
+    /// Runs a dispatch on the host; if it does not run (held back, dropped,
+    /// or without a host pipeline), the stand-ins `VICTORY_STAND_IN` names
+    /// for its program take its place ([`Self::instead`]).
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        self.dispatch_ran = false;
+        self.run_dispatch(list, x, y, z);
+        if !self.dispatch_ran {
+            self.instead(list, None);
+        }
+    }
+
+    /// [`Self::dispatch`] itself; `dispatch_ran` says whether it ran.
+    fn run_dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
@@ -1987,7 +2010,185 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        self.dispatch_ran = true;
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The stand-ins that took a dispatch's place (tests): a clear needs a
+    /// bound view heap and a title texture, which the hook's test does not.
+    #[cfg(test)]
+    pub(crate) fn instead_count() -> u64 {
+        INSTEAD.load(Ordering::Relaxed)
+    }
+
+    /// In place of a dispatch that did not run (held back, dropped, or
+    /// without a host pipeline): the stand-ins `VICTORY_STAND_IN` sets for
+    /// its program (`crate::stand_in`). Nothing of the program runs. Its
+    /// translation is not asked for: it may have none. `indirect`: for an
+    /// indirect dispatch, its most records and the title address of its
+    /// record count, if it has one.
+    fn instead(&mut self, list: &HostList, indirect: Option<(u32, Option<u64>)>) {
+        let rules = crate::stand_in::rules();
+        if rules.is_empty() {
+            return;
+        }
+        let Some(program) = crate::pipeline::compute_hash(self.pipeline as This) else {
+            return;
+        };
+        if let Some((max, count)) = indirect {
+            // The stand-in takes the place of the records the dispatch
+            // would have run: none at most, nothing.
+            if max == 0 {
+                return;
+            }
+            // shortcut: a record count is read by the GPU, which would have
+            // predicated its work on it; the clears here are not predicated,
+            // so a count of zero does not keep the stand-in from writing.
+            if count.is_some() {
+                once!(
+                    program,
+                    "a stand-in in place of an indirect dispatch with a record count: its views are cleared whatever the count says"
+                );
+            }
+        }
+        #[cfg(test)]
+        INSTEAD.fetch_add(1, Ordering::Relaxed);
+        self.stand_in(list, program, rules);
+    }
+
+    /// The views of `rules` for `program` (not known, as for a program that
+    /// did not run), cleared to their values: how many were.
+    fn stand_in(
+        &mut self,
+        list: &HostList,
+        program: &str,
+        rules: &[crate::stand_in::Rule],
+    ) -> usize {
+        const UNORDERED_ACCESS: u32 = 0x8;
+        let heap = match self.heaps[0] {
+            0 => None,
+            h => Some(crate::descriptor::heap(h as This)),
+        };
+        let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
+            once!("a stand-in without a bound view heap: skipped");
+            return 0;
+        };
+        let mut filled = 0;
+        for rule in rules.iter().filter(|r| r.program == program) {
+            let first = !rule.seen.swap(true, Ordering::Relaxed);
+            let at = match self.roots_ref(true).get(usize::from(rule.slot)) {
+                Some(&Root::Table(table)) => table + u64::from(rule.offset) * 4,
+                _ => {
+                    if first {
+                        tracing::warn!(
+                            program,
+                            view = %rule.view(),
+                            "stand-in: no descriptor table at the view's root parameter"
+                        );
+                    }
+                    crate::stand_in::note(false);
+                    continue;
+                }
+            };
+            // The formats of the view and of the texture it views, the
+            // title's; the size, for the log.
+            let Some(View::Unordered(resource, _, words)) = crate::descriptor::view(at) else {
+                if first {
+                    tracing::warn!(program, view = %rule.view(), "stand-in: no unordered view of a texture there");
+                }
+                crate::stand_in::note(false);
+                continue;
+            };
+            let format = words.map_or(0, |w| w[0]);
+            let desc = crate::resource::host_resource(resource as This)
+                // SAFETY: a live resource.
+                .map(|t| unsafe { t.GetDesc() });
+            let own = desc.map_or(0, |d| d.Format.0);
+            let size = desc.map(|d| (d.Width, d.Height));
+            let fill = crate::stand_in::fill(format, rule.value);
+            if first {
+                tracing::info!(
+                    program,
+                    view = %rule.view(),
+                    format,
+                    ?own,
+                    ?size,
+                    value = ?rule.value,
+                    ?fill,
+                    ran = false,
+                    "stand-in: first dispatch of the program"
+                );
+            }
+            let fill = match fill {
+                Ok(fill) => fill,
+                Err(why) => {
+                    if first {
+                        tracing::warn!(program, view = %rule.view(), format, ?own, "stand-in: {why}");
+                    }
+                    crate::stand_in::note(false);
+                    continue;
+                }
+            };
+            // The view of the resource it clears. shortcut: a depth
+            // texture's unordered access is its colour twin's, which the
+            // stand-in does not reach.
+            let Some(target) = crate::resource::host_resource(resource as This) else {
+                crate::stand_in::note(false);
+                continue;
+            };
+            if crate::resource::twin_resource(resource as This).is_some() {
+                if first {
+                    tracing::warn!(program, view = %rule.view(), "stand-in: the view is of a depth texture, whose twin it would clear: skipped");
+                }
+                crate::stand_in::note(false);
+                continue;
+            }
+            let key = (std::ptr::from_ref(heap) as usize, at, resource);
+            let index = match self.stand_in_slots.get(&key) {
+                Some(&index) => index,
+                None => {
+                    let Some(index) = host.dynamic(1) else {
+                        once!("a stand-in without a free view slot: skipped");
+                        crate::stand_in::note(false);
+                        continue;
+                    };
+                    if !host.uav_at(index, &View::Unordered(resource, 0, words)) {
+                        host.release(index, 1);
+                        crate::stand_in::note(false);
+                        continue;
+                    }
+                    self.dynamic
+                        .push((std::ptr::from_ref(heap) as usize, index, 1));
+                    self.stand_in_slots.insert(key, index);
+                    index
+                }
+            };
+            // What the program would have written it in: unordered access.
+            crate::list::ensure_state(list, resource as This, UNORDERED_ACCESS);
+            // SAFETY: an open list, a live resource in unordered access
+            // state, and the view of it just made in the bound heap.
+            unsafe {
+                match fill {
+                    crate::stand_in::Fill::Float(values) => list.list.ClearUnorderedAccessViewFloat(
+                        host.gpu_handle(index),
+                        host.cpu(index),
+                        target,
+                        &values,
+                        &[],
+                    ),
+                    crate::stand_in::Fill::Uint(values) => list.list.ClearUnorderedAccessViewUint(
+                        host.gpu_handle(index),
+                        host.cpu(index),
+                        target,
+                        &values,
+                        &[],
+                    ),
+                }
+            }
+            crate::stand_in::note(true);
+            filled += 1;
+        }
+        filled
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -2559,8 +2760,27 @@ impl State {
     /// records `stride` bytes apart at title address `arguments`, and the
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
-    /// written them. False if it cannot run on the host.
+    /// written them. False if it cannot run on the host. If an indirect
+    /// dispatch does not run, the stand-ins `VICTORY_STAND_IN` names for its
+    /// program take the place of the records it would have run
+    /// ([`Self::instead`]).
     pub(crate) fn execute_indirect(
+        &mut self,
+        list: &HostList,
+        (kind, stride, max): (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
+        const DISPATCH: u32 = 2;
+        let ran = self.run_indirect(list, (kind, stride, max), arguments, count);
+        if !ran && kind == DISPATCH {
+            self.instead(list, Some((max, count)));
+        }
+        ran
+    }
+
+    /// [`Self::execute_indirect`] itself.
+    fn run_indirect(
         &mut self,
         list: &HostList,
         (kind, stride, max): (u32, u32, u32),
@@ -3017,7 +3237,96 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::staging_budget_per_frame;
+    use super::{dispatched, staging_budget_per_frame, State};
+    use crate::object::S_OK;
+
+    /// A compute pipeline of `bytes` that cannot run on the host: they do
+    /// not translate, so it gets no host pipeline, the gate a held-back
+    /// program meets too. Its hash, as logged.
+    fn gated_compute(bytes: &'static [u8]) -> (crate::object::This, String) {
+        #[repr(C)]
+        struct ComputeDesc {
+            root: crate::object::This,
+            code: *const u8,
+            size: usize,
+        }
+        let desc = ComputeDesc {
+            root: std::ptr::null(),
+            code: bytes.as_ptr(),
+            size: bytes.len(),
+        };
+        let mut out = std::ptr::null();
+        let made = crate::pipeline::create_compute(
+            std::ptr::null(),
+            std::ptr::from_ref(&desc).cast(),
+            &crate::resource::PAGEABLE_IIDS[0],
+            &mut out,
+        );
+        assert_eq!(made, S_OK);
+        let hash = blake3::hash(bytes).to_hex()[..16].to_owned();
+        (out, hash)
+    }
+
+    /// `VICTORY_STAND_IN` (`crate::stand_in`): every way a dispatch of a
+    /// named program does not run reaches its stand-in, direct and
+    /// indirect; an indirect draw and a program no rule names do not, and
+    /// nothing of the gated programs runs. (The clears themselves need a
+    /// bound view heap and a title texture, and are tested by their fill
+    /// alone: `stand_in.rs`.)
+    #[test]
+    fn stand_ins_take_the_place_of_dispatches_that_do_not_run() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let (direct, direct_hash) = gated_compute(b"stand-in test: a program that does not translate");
+        let (indirect, indirect_hash) = gated_compute(b"stand-in test: an indirect one");
+        let (unnamed, _) = gated_compute(b"stand-in test: a program no rule names");
+        for p in [direct, indirect, unnamed] {
+            assert!(
+                crate::pipeline::host_pipeline(p).is_none(),
+                "the gate"
+            );
+        }
+        let rules: &'static [crate::stand_in::Rule] = Vec::leak(
+            crate::stand_in::parse(&format!(
+                "{direct_hash}:s1+0:1,1,1; {direct_hash}:s1+8:mask; {indirect_hash}:s1+16:0.5,0.5,0.5"
+            ))
+            .unwrap(),
+        );
+        crate::stand_in::TEST_RULES.with(|t| t.set(Some(rules)));
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        let instead = State::instead_count();
+        let ran = dispatched();
+        state.set_pipeline(direct);
+        state.dispatch(&list, 1, 1, 1);
+        assert_eq!(State::instead_count() - instead, 1, "the direct program's stand-in");
+        state.set_pipeline(indirect);
+        assert!(
+            !state.execute_indirect(&list, (2, 12, 1), 0, None),
+            "the indirect dispatch does not run"
+        );
+        assert_eq!(State::instead_count() - instead, 2, "the indirect program's stand-in");
+        // No records at most: nothing would have run, so nothing stands in.
+        state.set_pipeline(indirect);
+        assert!(!state.execute_indirect(&list, (2, 12, 0), 0, None));
+        assert_eq!(State::instead_count() - instead, 2, "no records at most");
+        // An indirect draw is left alone.
+        state.set_pipeline(direct);
+        assert!(!state.execute_indirect(&list, (0, 16, 1), 0, None));
+        state.set_pipeline(unnamed);
+        state.dispatch(&list, 1, 1, 1);
+        assert_eq!(
+            State::instead_count() - instead,
+            2,
+            "nothing for an indirect draw or a program no rule names"
+        );
+        assert_eq!(dispatched(), ran, "nothing of the programs ran");
+        crate::stand_in::TEST_RULES.with(|t| t.set(None));
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {
