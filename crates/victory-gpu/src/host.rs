@@ -5755,10 +5755,15 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
         return true;
     }
     let mut done = 0;
+    // The kernel read must not run across a remap, and a mark it makes must
+    // not outlive one: both are held under the runtime's remapping guard.
+    // The guard is taken only if it is free (a caller that holds it keeps
+    // it), and a read without it still reads, just without marking.
+    let reading = crate::watch::title_memory_reading_now();
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
     let whole = unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 };
-    if whole {
+    if whole && reading.is_some() {
         // The kernel read all of it: it is there.
         crate::watch::copied(src as usize, len);
     }
