@@ -143,6 +143,44 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// With the `diagnostics` feature, `VICTORY_SHADER_LOOP_LIMIT_CS` (same
+/// form) sets the limit for compute programs alone, in place of
+/// [`loop_limit`]; unset, they follow it. A low `VICTORY_SHADER_LOOP_LIMIT`
+/// that keeps the card alive in pixel and mesh loops also cuts genuine
+/// compute loops short: a lane that reaches the limit leaves the program
+/// without its writes. A hair simulation's per-vertex constraint pass loops
+/// once per vertex of a strand, more than 32 times, so with a limit of 32
+/// its lanes never store and the strands drawn from the simulation buffers
+/// scatter around the head; 128 here keeps them in place.
+/// Part of the translation like the other limit (the shader cache keys on it).
+pub fn compute_loop_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        if cfg!(feature = "diagnostics") {
+            parse_compute_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT_CS").ok().as_deref(), loop_limit())
+        } else {
+            loop_limit()
+        }
+    })
+}
+
+/// `VICTORY_SHADER_LOOP_LIMIT_CS`'s value; `fallback` (the general limit)
+/// when it is unset, unreadable or 0. Pure, for testing.
+fn parse_compute_loop_limit(value: Option<&str>, fallback: u32) -> u32 {
+    parse_count(value).unwrap_or(fallback)
+}
+
+/// A count at least 1, decimal or `0x` hex, surrounding blanks ignored.
+fn parse_count(value: Option<&str>) -> Option<u32> {
+    value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        })
+        .filter(|&n| n > 0)
+}
+
 /// Which of a translated program's group barriers wait for the whole
 /// group (`GroupMemoryBarrierWithGroupSync`); the others keep their memory
 /// fence and lose the wait. A wait that some thread of the group never
@@ -205,16 +243,7 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
-    let parsed = value
-        .map(str::trim)
-        .and_then(|v| match v.strip_prefix("0x") {
-            Some(hex) => u32::from_str_radix(hex, 16).ok(),
-            None => v.parse().ok(),
-        });
-    match parsed {
-        Some(n) if n > 0 => n,
-        _ => lower::LOOP_LIMIT,
-    }
+    parse_count(value).unwrap_or(lower::LOOP_LIMIT)
 }
 
 /// A translated shader and what the host binds for it.
@@ -760,7 +789,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
-    use super::parse_loop_limit;
+    use super::{parse_compute_loop_limit, parse_loop_limit};
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
@@ -781,6 +810,18 @@ mod tests {
         assert_eq!(parse_loop_limit(Some("1")), 1);
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_compute_loop_limit_follows_the_general_one_unless_set() {
+        assert_eq!(parse_compute_loop_limit(None, 32), 32);
+        assert_eq!(parse_compute_loop_limit(Some("1024"), 32), 1024);
+        assert_eq!(parse_compute_loop_limit(Some(" 0x400 "), 32), 1024);
+        let full = LOOP_LIMIT.to_string();
+        assert_eq!(parse_compute_loop_limit(Some(&full), 32), LOOP_LIMIT);
+        for bad in ["", "0", "-5", "lots"] {
+            assert_eq!(parse_compute_loop_limit(Some(bad), 32), 32, "{bad:?}");
         }
     }
     use super::container::SigElement;
