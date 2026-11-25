@@ -38,7 +38,8 @@ Mesa updates where the key does not change, and across machines.
 RADV's on-disk shader cache on the test machine held **1.2 GB in 312,556 files** against Mesa's
 1 GiB default, so it was evicting entries and recompiling them later. Sizing `MESA_SHADER_CACHE_MAX_SIZE`
 and keeping our own entries out of the eviction path is a cheap, driver-side win that no closed
-driver would let us see.
+driver would let us see. What a user sets today — the directory, the size, and why it
+is per prefix — is in [linux.md](linux.md#mesa-shader-cache).
 
 ### Faster asset streaming
 

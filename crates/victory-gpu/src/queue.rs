@@ -837,12 +837,16 @@ extern "system" fn present(
         && !plane.resources.is_null()
         // SAFETY: the plane lists `count` resources.
         && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
+        && let Some(source) = crate::resource::host_copy(resource)
         && let Some(host) = crate::host::host()
     {
-        const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
+        // Diagnostics: the state the title left the texture in, for `blinks`.
+        // The present's list takes it from there (and moves nothing of its
+        // own when it is already in `COPY_SOURCE`); the title's state is not
+        // written here, so a list submitted meanwhile never records a move
+        // from a state the card is not in.
+        #[cfg(feature = "diagnostics")]
+        let state = source.state.load(Ordering::Relaxed);
         // Diagnostics: whether the frame shown is our copy as the title left
         // it, or one whose newest bytes no submitted list uploaded yet.
         #[cfg(feature = "diagnostics")]
@@ -859,7 +863,7 @@ extern "system" fn present(
         // behind, and two textures taking turns then show frames out of
         // order.
         let fill = crate::texture::present_fill_pending(resource);
-        let shown = host.present(resource, texture, state, frame, fill);
+        let shown = host.present(resource, &source, frame, fill);
         #[cfg(feature = "diagnostics")]
         if let Some(o) = crate::texture::present_order(resource, fill) {
             use crate::copystat::{C, add};
@@ -889,7 +893,7 @@ extern "system" fn present(
                 );
             }
         }
-        crate::resource::host_transition(resource, state);
+        // Diagnostics: whether the frame shown is black or skipped.
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]

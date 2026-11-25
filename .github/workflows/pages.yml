@@ -1,0 +1,71 @@
+name: Pages
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Daily, so the history chart gets a point even on days main is quiet.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      # main only takes pull requests, so the job never commits. The history
+      # lives on the published page: fetch the last deployed points, append
+      # today's, publish again. A missing page (first run) starts a new chart.
+      - name: Restore the published history
+        run: |
+          url="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/progress/progress-history.json"
+          # Only an absent page (404: the first publication) falls back to the
+          # repository copy. Any other failure fails the job: publishing the
+          # shorter repository series would drop the points on the live page.
+          code=$(curl -sSL --max-time 30 -o /tmp/history.json -w '%{http_code}' "$url" || echo 000)
+          case "$code" in
+            200)
+              python3 -I -c "import json,sys; json.load(open(sys.argv[1]))['points']" /tmp/history.json \
+                || { echo "the published history was fetched but is not readable: not publishing" >&2; exit 1; }
+              cp /tmp/history.json docs/progress/progress-history.json
+              ;;
+            404)
+              echo "no published history yet; keeping the one in the repository"
+              ;;
+            *)
+              echo "the published history could not be fetched (HTTP $code): not publishing a shorter series" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Regenerate the source-counted progress
+        run: |
+          python3 -I tools/progress/shader_scan.py
+          python3 -I tools/progress/render.py
+
+      - name: Upload the page
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: docs
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4

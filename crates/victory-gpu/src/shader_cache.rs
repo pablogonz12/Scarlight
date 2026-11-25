@@ -1,9 +1,12 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
-//! cache folder, keyed by the container's content and by the VIctory build
-//! that translated it (the BLAKE3 of our executable), so a rebuilt
-//! translator never serves an old translation. Entries go through
-//! `victory-pipeline`'s content-addressed cache, which writes them
-//! atomically; an entry that does not read back is translated again.
+//! cache folder, keyed by the container's content, by the VIctory build
+//! that translated it (the BLAKE3 of our executable), by every translation
+//! switch that build runs with and by what it learned about the host GPU
+//! (see [`build`] and [`entry_key`]), so neither a rebuilt translator nor
+//! one run with other switches nor another card is served an old
+//! translation. Entries go through `victory-pipeline`'s content-addressed
+//! cache, which writes them atomically; an entry that does not read back is
+//! translated again.
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
 //! must be added to `encode` and `decode` too (entries of older builds
@@ -62,12 +65,22 @@ pub(crate) fn build_name() -> Option<String> {
 }
 
 /// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// the translation settings it runs with (every switch `victory-shader`'s
+/// [`translate`] reads, its loop limits, its barrier mode, its clean-up
+/// passes: `victory_shader::emit::settings_bytes`). One place lists them, so
+/// a switch that picks the form of a program cannot be left out of the key
+/// again: a run with `VICTORY_WAVE_LOCAL=0` or `VICTORY_F16_SUM_WIDE=0` was
+/// served the translations an earlier run of the same executable had cached
+/// with them unset, and the water it drew was flat.
+///
+/// The inputs the host GPU provides (the null slot view indices are clamped
+/// to, the widest wave it runs) are *not* here: they are known only once the
+/// device exists, which is after this is first asked for (the pipeline
+/// library and `shader-meta.bin` are opened before it). [`entry_key`] adds
+/// them when a translation is looked up.
 pub(crate) fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -75,9 +88,7 @@ pub(crate) fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        // The compute programs' own limit is part of their translation too: a
-        // run with only `VICTORY_SHADER_LOOP_LIMIT_CS` changed must not be
-        // served the compute translations an earlier run cached.
+        // The compute programs' own limit is part of their translation too.
         let compute = victory_shader::emit::compute_loop_limit();
         if compute != limit {
             tracing::warn!(
@@ -85,37 +96,9 @@ pub(crate) fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT_CS: translated compute loops stop sooner"
             );
         }
-        match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                bytes.extend_from_slice(&compute.to_le_bytes());
-                // So is the view heap's null slot (it differs by host GPU):
-                // a translation cached without the clamp must not be served.
-                crate::descriptor::host::probe_view_limit();
-                bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
-                // Which group barriers wait is part of the translation too.
-                bytes.push(victory_shader::emit::group_sync());
-                // So are the switches that pick the form of a wave64 program:
-                // without them here a run with `VICTORY_WAVE_WIDE=0` was
-                // served the translations an earlier run of the same
-                // executable had cached with the switch unset.
-                for name in [
-                    "VICTORY_WAVE_WIDE",
-                    "VICTORY_WAVE_DEEP_SKIPS",
-                    "VICTORY_WAVE_OWN_BITS",
-                    "VICTORY_F16_NEAREST",
-                ] {
-                    bytes.extend_from_slice(name.as_bytes());
-                    bytes.push(b'=');
-                    if let Some(value) = std::env::var_os(name) {
-                        bytes.extend_from_slice(value.as_encoded_bytes());
-                    }
-                    bytes.push(0);
-                }
-                // And which clean-up passes ran over the translated code.
-                bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
-                *blake3::hash(&bytes).as_bytes()
-            }
+        let settings = victory_shader::emit::settings_bytes();
+        match std::env::current_exe().and_then(std::fs::read) {
+            Ok(exe) => build_key(&exe, &settings),
             Err(e) => {
                 // Without it no entry can be trusted: a fresh key per run.
                 tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
@@ -128,12 +111,33 @@ pub(crate) fn build() -> &'static [u8; 32] {
     })
 }
 
+/// The key of one translation: the build (executable and switches) and the
+/// inputs the host GPU supplies ([`victory_shader::emit::device_bytes`]).
+/// Read at translation time, never cached: the device's limits are probed
+/// after the caches are opened, and a translation made on one host must
+/// never be served to a run of another (its clamp and its wave size are in
+/// the DXIL).
+fn entry_key() -> [u8; 32] {
+    let mut bytes = build().to_vec();
+    bytes.extend_from_slice(&victory_shader::emit::device_bytes());
+    *blake3::hash(&bytes).as_bytes()
+}
+
+/// The key for `exe`'s translation with `settings` (see [`build`]): pure, so
+/// a test can ask what a switch set would key without touching the process's
+/// executable or environment.
+fn build_key(exe: &[u8], settings: &[u8]) -> [u8; 32] {
+    let mut bytes = exe.to_vec();
+    bytes.extend_from_slice(settings);
+    *blake3::hash(&bytes).as_bytes()
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, &entry_key(), container, translate),
         None => translate(container),
     }
 }
@@ -431,6 +435,61 @@ mod tests {
         assert!(cached(&cache, &build, b"other", fail).is_err());
     }
 
+    /// What this fix was for. The key before it named four switches
+    /// (`VICTORY_WAVE_WIDE`, `VICTORY_WAVE_DEEP_SKIPS`, `VICTORY_WAVE_OWN_BITS`,
+    /// `VICTORY_F16_NEAREST`) and nothing else, so a run with any other one
+    /// changed was served the translation the earlier run had cached: 106 of
+    /// the 751 dumped programs translate to different DXIL with
+    /// `VICTORY_FIRST_HALF=0`, `VICTORY_F16_SUM_WIDE=0` and
+    /// `VICTORY_STRICT_JOINS=1` change or refuse one each. A key that ignores
+    /// the switch is shown here serving that stale entry; the key built from
+    /// `settings_bytes` misses it.
+    #[test]
+    fn a_switch_outside_the_old_key_served_a_stale_translation() {
+        use std::ffi::OsString;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let container = b"a console container";
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        // The old key's settings: the four switches it named, all unset, so
+        // the same bytes whatever any other switch says.
+        let old_settings = victory_shader::emit::settings_bytes_of(|name| {
+            let four = [
+                "VICTORY_WAVE_WIDE",
+                "VICTORY_WAVE_DEEP_SKIPS",
+                "VICTORY_WAVE_OWN_BITS",
+                "VICTORY_F16_NEAREST",
+            ];
+            four.contains(&name).then(|| OsString::from("0"))
+        });
+        let old = build_key(b"our executable", &old_settings);
+        assert_eq!(cached(&cache, &old, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+
+        let half = victory_shader::emit::settings_bytes_of(|name| match name {
+            "VICTORY_FIRST_HALF" => Some(OsString::from("0")),
+            _ => None,
+        });
+        assert_ne!(
+            victory_shader::emit::settings_bytes_of(|_| None),
+            half,
+            "VICTORY_FIRST_HALF=0 does not change the settings"
+        );
+        // The old key cannot tell the two runs apart: the stale entry is served.
+        assert_eq!(cached(&cache, &old, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 1, "the old key served it");
+        // The new one does: it translates again.
+        let new = build_key(b"our executable", &half);
+        assert_ne!(old, new);
+        assert_eq!(cached(&cache, &new, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 2, "the new key translated");
+    }
+
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
         let mut files = Vec::new();
         for e in std::fs::read_dir(dir).unwrap().flatten() {
@@ -441,6 +500,48 @@ mod tests {
             }
         }
         files
+    }
+
+    /// Toggling any switch the translation reads must translate again: the
+    /// entry an earlier run cached with the switch unset is not served.
+    #[test]
+    fn a_switch_toggle_misses_the_cache() {
+        use std::ffi::OsString;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let container = b"a console container";
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        fn keyed(switches: impl Fn(&str) -> Option<OsString>) -> [u8; 32] {
+            build_key(b"our executable", &victory_shader::emit::settings_bytes_of(switches))
+        }
+        let unset = keyed(|_| None);
+        assert_eq!(cached(&cache, &unset, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        // The same switches again is the entry just written.
+        assert_eq!(cached(&cache, &unset, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 1, "a warm key is a hit");
+
+        for name in victory_shader::emit::SWITCHES {
+            for value in ["0", "1"] {
+                let toggled = keyed(|asked| match asked == *name {
+                    true => Some(OsString::from(value)),
+                    false => None,
+                });
+                assert_ne!(unset, toggled, "{name}={value} keys like unset");
+                let before = runs.load(Ordering::Relaxed);
+                assert_eq!(cached(&cache, &toggled, container, translate), Ok(shader()));
+                assert_eq!(
+                    runs.load(Ordering::Relaxed),
+                    before + 1,
+                    "{name}={value} was served a translation cached without it"
+                );
+            }
+        }
     }
 
     #[test]
