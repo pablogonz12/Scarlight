@@ -2033,6 +2033,9 @@ impl Shadow {
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
+        // Before the snapshot's bytes are read: a remap this does not see
+        // stays marked, so the copy-back leaves those bytes alone.
+        let generation = crate::watch::remap_generation();
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
         if keeps() {
@@ -2067,7 +2070,7 @@ impl Shadow {
                         std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
                     }
                     kept.0[piece] = whole;
-                    crate::watch::remapped_taken(self.start as usize + lo, hi - lo);
+                    crate::watch::remapped_taken(generation, self.start as usize + lo, hi - lo);
                 }
             }
             return;
@@ -2076,7 +2079,7 @@ impl Shadow {
         // the snapshot now, so a copy-back may put the GPU's bytes back.
         for &(from, to) in &parts {
             if from < to {
-                crate::watch::remapped_taken(self.start as usize + from, to - from);
+                crate::watch::remapped_taken(generation, self.start as usize + from, to - from);
             }
         }
         if wide_back() {
@@ -2199,8 +2202,14 @@ impl Shadow {
                     // Only the bytes the runtime did not unmap or remap
                     // while the submission was pending: what it shows there
                     // is someone else's now, so the copy's bytes stay out
-                    // (FIND-14).
+                    // (FIND-14). The reading holds the runtime's remapping
+                    // off from the test to the last byte written; a remap
+                    // already under way is waited for 2 ms only, since a
+                    // remap could itself be waiting for this copy-back's
+                    // blocks (the writes go on as before without it).
                     let base = start + at;
+                    let reading =
+                        crate::watch::title_memory_reading_within(std::time::Duration::from_millis(2));
                     if !crate::watch::remapped_any(base, n) {
                         crate::watch::writing(base, n);
                         crate::host::write_mapped(base as *mut u8, title.as_ptr(), n);
@@ -2209,13 +2218,13 @@ impl Shadow {
                         for (from, to) in crate::watch::unremapped_runs(base, n) {
                             let (at, n) = (from - base, to - from);
                             crate::watch::writing(from, n);
-                            // SAFETY: inside the bytes just merged above.
                             // SAFETY: `at` is inside the bytes merged above.
                             let bytes = unsafe { title.as_ptr().add(at) };
                             crate::host::write_mapped(from as *mut u8, bytes, n);
                             written += n;
                         }
                     }
+                    drop(reading);
                 }
             }
             // Our write shows as a title write at the copy's next refresh,

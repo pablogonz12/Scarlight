@@ -373,14 +373,20 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
-/// Title memory the runtime unmapped or remapped, as ranges (start, end),
-/// since a copy took its bytes: the copy's snapshot of them is stale, so its
-/// copy-back leaves them alone ([`copy_back_skips_remapped`]). A copy that
-/// takes a range afresh clears it ([`remapped_taken`]); a range no copy takes
-/// again costs nothing beyond one entry.
-static REMAPPED: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+/// Title memory the runtime unmapped or remapped, as ranges (start, (end,
+/// generation)), since a copy took its bytes: the copy's snapshot of them is
+/// stale, so its copy-back leaves them alone ([`copy_back_skips_remapped`]).
+/// A copy that takes a range afresh clears it ([`remapped_taken`]), but only
+/// where the mark is no newer than the generation it saw before reading
+/// ([`remap_generation`]); a range no copy takes again costs one entry.
+static REMAPPED: Mutex<BTreeMap<usize, (usize, u64)>> = Mutex::new(BTreeMap::new());
 
-fn remapped() -> std::sync::MutexGuard<'static, BTreeMap<usize, usize>> {
+/// Numbers the remappings: a copy that sees the same number before and after
+/// reading title memory read it after every remapping recorded (see
+/// [`remapped_taken`]).
+static REMAP_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn remapped() -> std::sync::MutexGuard<'static, BTreeMap<usize, (usize, u64)>> {
     REMAPPED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -389,6 +395,13 @@ fn remapped() -> std::sync::MutexGuard<'static, BTreeMap<usize, usize>> {
 pub(crate) fn copy_back_skips_remapped() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_REMAPPED").is_none_or(|v| v != "0"))
+}
+
+/// The remappings recorded so far: a copy takes this before it reads title
+/// memory and gives it to [`remapped_taken`], which clears only marks no
+/// newer than it (a remap that landed during the read stays marked).
+pub(crate) fn remap_generation() -> u64 {
+    REMAP_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Notes that title memory `[at, at + len)` was unmapped or remapped: what a
@@ -402,24 +415,28 @@ fn remapped_range(at: usize, len: usize) {
         return;
     }
     let mut map = remapped();
-    let (mut start, mut end) = (from, to);
-    if let Some((&s, &e)) = map.range(..=from).next_back()
+    // Under the map's lock, so a copy that reads the generation next sees
+    // this mark (or does not, if it cleared first).
+    let generation = REMAP_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let (mut start, mut end, mut generation) = (from, to, generation);
+    if let Some((&s, &(e, g))) = map.range(..=from).next_back()
         && e >= from
     {
-        (start, end) = (s, end.max(e));
+        (start, end, generation) = (s, end.max(e), generation.min(g));
         map.remove(&s);
     }
     loop {
-        let next = map.range(start..).next().map(|(&s, &e)| (s, e));
+        let next = map.range(start..).next().map(|(&s, &(e, g))| (s, e, g));
         match next {
-            Some((s, e)) if s <= end => {
+            Some((s, e, g)) if s <= end => {
                 end = end.max(e);
+                generation = generation.min(g);
                 map.remove(&s);
             }
             _ => break,
         }
     }
-    map.insert(start, end);
+    map.insert(start, (end, generation));
 }
 
 /// Whether any byte of `[at, at + len)` was unmapped or remapped by the
@@ -430,7 +447,7 @@ pub(crate) fn remapped_any(at: usize, len: usize) -> bool {
         return false;
     }
     let map = remapped();
-    map.range(..at + len).next_back().is_some_and(|(_, &e)| e > at)
+    map.range(..at + len).next_back().is_some_and(|(_, &(e, _))| e > at)
 }
 
 /// The runs of `[at, at + len)` no byte of which was remapped since a copy
@@ -447,7 +464,7 @@ pub(crate) fn unremapped_runs(at: usize, len: usize) -> Vec<(usize, usize)> {
     let map = remapped();
     let mut runs = Vec::new();
     let mut run = at;
-    for (&s, &e) in map.range(..to) {
+    for (&s, &(e, _)) in map.range(..to) {
         if e <= run {
             continue;
         }
@@ -465,26 +482,35 @@ pub(crate) fn unremapped_runs(at: usize, len: usize) -> Vec<(usize, usize)> {
     runs
 }
 
-/// Takes `[from, to)` out of the marks.
-fn clear_marks(map: &mut BTreeMap<usize, usize>, from: usize, to: usize) {
+/// Takes the marks of `[from, to)` no newer than `generation` out of the
+/// map; the newer ones stay (a remap a copy did not read).
+fn clear_marks(map: &mut BTreeMap<usize, (usize, u64)>, from: usize, to: usize, generation: u64) {
     if to <= from {
         return;
     }
-    let covered: Vec<(usize, usize)> = map.range(..to).filter(|&(_, &e)| e > from).map(|(&s, &e)| (s, e)).collect();
-    for (s, e) in covered {
+    let covered: Vec<(usize, usize, u64)> = map
+        .range(..to)
+        .filter(|&(_, &(e, _))| e > from)
+        .map(|(&s, &(e, g))| (s, e, g))
+        .collect();
+    for (s, e, g) in covered {
+        if g > generation {
+            continue;
+        }
         map.remove(&s);
         if s < from {
-            map.insert(s, from);
+            map.insert(s, (from, g));
         }
         if e > to {
-            map.insert(to, e);
+            map.insert(to, (e, g));
         }
     }
 }
 
 /// A copy took the bytes of `[at, at + len)` afresh: what the runtime did to
-/// them before is in its snapshot now.
-pub(crate) fn remapped_taken(at: usize, len: usize) {
+/// them before `generation` (taken with [`remap_generation`] before the read)
+/// is in its snapshot now; a remap after it is not.
+pub(crate) fn remapped_taken(generation: u64, at: usize, len: usize) {
     if !copy_back_skips_remapped() {
         return;
     }
@@ -511,12 +537,12 @@ pub(crate) fn remapped_taken(at: usize, len: usize) {
             break;
         }
         if held_from > run {
-            clear_marks(&mut map, run, held_from.min(to));
+            clear_marks(&mut map, run, held_from.min(to), generation);
         }
         run = run.max(held_to);
     }
     if run < to {
-        clear_marks(&mut map, run, to);
+        clear_marks(&mut map, run, to, generation);
     }
 }
 
@@ -1615,7 +1641,7 @@ mod mapping_tests {
         // Counted over this allocation only: other tests remap memory of
         // their own, and the runner may have them in the air.
         let marks = |at: usize| {
-            remapped().range(..at + 2 * BLOCK).filter(|&(&s, &e)| e > at && s < at + 2 * BLOCK).count()
+            remapped().range(..at + 2 * BLOCK).filter(|&(&s, &(e, _))| e > at && s < at + 2 * BLOCK).count()
         };
         let saved = remapped().clone();
         remapped().clear();
@@ -1623,20 +1649,28 @@ mod mapping_tests {
         assert!(remapped_any(at, BLOCK), "a remapped range is marked");
         assert!(!remapped_any(at + BLOCK, BLOCK), "the range after it is not");
         assert_eq!(marks(at), 1, "one range holds both blocks");
-        remapped_taken(at, BLOCK);
+        remapped_taken(crate::watch::remap_generation(), at, BLOCK);
         assert!(!remapped_any(at, BLOCK), "a copy that takes it clears the mark");
         // Two ranges remapped apart join; a copy taking one leaves the other.
         title_memory_remapped(at + BLOCK, BLOCK);
         title_memory_remapped(at, BLOCK);
         assert_eq!(marks(at), 1, "the marks next to each other join");
         assert!(remapped_any(at, 2 * BLOCK));
-        remapped_taken(at + BLOCK, BLOCK);
+        remapped_taken(crate::watch::remap_generation(), at + BLOCK, BLOCK);
         assert!(!remapped_any(at + BLOCK, BLOCK), "the taken bytes are current");
         assert!(remapped_any(at, BLOCK), "the range no copy took stays marked");
         assert_eq!(crate::watch::unremapped_runs(at, 2 * BLOCK), [(at + BLOCK, at + 2 * BLOCK)]);
-        remapped_taken(at, 2 * BLOCK);
+        remapped_taken(u64::MAX, at, 2 * BLOCK);
         assert!(!remapped_any(at, 2 * BLOCK));
         assert_eq!(crate::watch::unremapped_runs(at, 2 * BLOCK), [(at, at + 2 * BLOCK)]);
+        // A remap that lands after the copy read its bytes stays marked: the
+        // snapshot holds the old mapping's bytes.
+        let generation = crate::watch::remap_generation();
+        title_memory_remapped(at, BLOCK);
+        remapped_taken(generation, at, BLOCK);
+        assert!(remapped_any(at, BLOCK), "a mark the copy did not read stands");
+        remapped_taken(crate::watch::remap_generation(), at, BLOCK);
+        assert!(!remapped_any(at, BLOCK), "a copy that read it clears it");
         *remapped() = saved;
         // SAFETY: our allocation.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
