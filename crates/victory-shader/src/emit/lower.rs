@@ -5682,7 +5682,8 @@ impl<'a> Lower<'a> {
         };
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
             let so = self.operand(inst, soffset)?;
-            let so = align(self, so);
+            // Without the fix the soffset is used as it is.
+            let so = if rdna2_fixes() { align(self, so) } else { so };
             addr = add(self, addr, so);
         }
         #[cfg(test)]
