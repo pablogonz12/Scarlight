@@ -45,7 +45,8 @@
 //! library run 77 saved from such pages was refused by run 78). Measured
 //! with a 64 MB file written past the system's cache, mapped and replaced:
 //! 16,352 of 16,384 pages read zeros with the handle closed, none with it
-//! open (the test below). `VICTORY_LIBRARY_HANDLE=0`: closed, as before.//!
+//! open (the test below). `VICTORY_LIBRARY_HANDLE=0`: closed, as before.
+//!
 //! The list has a cap ([`EARLY_MAX`] keys). A run that finds more goes to
 //! a title with more pipelines than the cap: the extra keys are dropped,
 //! not put in the place of older ones, so the list keeps the pipelines
@@ -53,9 +54,14 @@
 //! tail of a title's creation order is left to its own workers. Both
 //! [`save`] and the first read of the list say how many keys were listed,
 //! the cap, and how many were dropped, so a run never truncates in silence.
+//!
+//! Each build keeps its own library, in `dir/<build>` ([`KEPT`] of them;
+//! `VICTORY_LIBRARY_PRUNE=0` keeps every one): the entries are named after
+//! translated shaders, so the first run of a new build used to write its
+//! few pipelines over the library the build before it had warmed.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 
@@ -65,8 +71,113 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Keeps the pipeline library and the early list in `dir` from now on.
+///
+/// The library's pipelines are named after the shaders they were made from,
+/// so a rebuild of VIctory makes every name in it useless (the shader cache
+/// keys its translations on the same executable,
+/// [`crate::shader_cache::build_name`]). The first run after one used to
+/// write the few pipelines it made over the old library: measured on the
+/// title, a 926 MB library (27 160 pipelines, a 7.5 minute warm-up) became
+/// 612 KB, and bisecting between two builds paid that warm-up for each of
+/// them, in turn, every time. So each build keeps its library beside the
+/// others, in `dir/<build>`, and a run only ever writes its own; [`KEPT`]
+/// of the newest are kept (`VICTORY_LIBRARY_PRUNE=0`: every one of them).
 pub fn use_pipeline_cache(dir: PathBuf) {
-    let _ = DIR.set(dir);
+    // The metadata store is keyed by the build's own fingerprint
+    // (`shader_meta`), so it stays in the shared directory beside the
+    // libraries, one per build.
+    crate::shader_meta::init(&dir);
+    let path = match crate::shader_cache::build_name() {
+        Some(build) => keyed(&dir, &build, prune()),
+        // No name for this build: a directory nothing else writes, and
+        // nothing pruned (the ones there are other builds').
+        None => dir.join(unnamed()),
+    };
+    let _ = DIR.set(path);
+}
+
+/// Whether libraries of other builds are removed; `VICTORY_LIBRARY_PRUNE=0`
+/// leaves every one of them where it is.
+fn prune() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_PRUNE").is_none_or(|v| v != "0"))
+}
+
+/// A library directory's name for a run that cannot name its build: the
+/// time, so that no other run shares it.
+fn unnamed() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    blake3::hash(&now.as_nanos().to_le_bytes()).to_hex()[..16].to_owned()
+}
+
+/// Whether `dir` is a library directory this wrote: a name that is 16
+/// lowercase hex digits (a build's name,
+/// [`crate::shader_cache::build_name`]) holding [`LIBRARY_FILE`].
+fn is_translation(dir: &Path) -> bool {
+    let ours = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.len() == 16
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+    ours && dir.is_dir() && dir.join(LIBRARY_FILE).is_file()
+}
+
+/// How many libraries are kept: this build's and the previous build's,
+/// which is what a bisection between two builds needs.
+const KEPT: usize = 2;
+
+/// The file a run leaves in its own library directory: pruning keeps the
+/// library *used* most recently, and a warm run that adds no pipelines
+/// writes nothing else (its directory's modification time is then as old as
+/// the library it loaded, and it would be pruned in place of a stale one).
+const USED_FILE: &str = "used.txt";
+
+/// Marks `path` as the library in use now, so pruning keeps it.
+fn mark_used(path: &Path) {
+    let _ = std::fs::create_dir_all(path);
+    // Removed and written again: writing over a file leaves the directory's
+    // own modification time alone.
+    let used = path.join(USED_FILE);
+    let _ = std::fs::remove_file(&used);
+    let _ = std::fs::write(&used, b"");
+}
+
+/// `dir`'s library for `build`, with older libraries pruned to [`KEPT`] (by
+/// modification time) when `prune` is set.
+fn keyed(dir: &Path, build: &str, prune: bool) -> PathBuf {
+    let path = dir.join(build);
+    mark_used(&path);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return path;
+    };
+    if !prune {
+        return path;
+    }
+    let mut others: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        // Only a directory this wrote: named like a translation and holding
+        // a library. Anything else in the cache directory (`backup/`, a
+        // copy of one) is not ours to delete.
+        .filter(|other| *other != path && is_translation(other))
+        .filter_map(|other| {
+            let at = other.metadata().ok()?.modified().ok()?;
+            Some((at, other))
+        })
+        .collect();
+    others.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    for (_, older) in others.into_iter().skip(KEPT - 1) {
+        // A library and a list or two: gone with the build that made them.
+        // Nothing this run reads is ever one of them.
+        let _ = std::fs::remove_dir_all(&older);
+    }
+    path
 }
 
 pub(crate) fn dir() -> Option<&'static std::path::Path> {
@@ -472,15 +583,41 @@ fn library() -> Option<&'static Library> {
         .as_ref()
 }
 
+/// The host's pipeline library over `bytes`, which the caller keeps alive
+/// for as long as the library.
+///
+/// No bytes at all asks for an empty library, and there the blob is passed
+/// as a null pointer: D3D12 reads the bytes' length alone, but vkd3d-proton
+/// (the host of every run) refuses a blob that points at nothing and has no
+/// length with `E_INVALIDARG`, where Windows (CI's WARP) takes either. The
+/// interface's own `CreatePipelineLibrary` turns an empty slice into a
+/// pointer at nothing, so the call is made here with the pointer the host
+/// asks for.
+fn create(device: &ID3D12Device1, bytes: &[u8]) -> windows::core::Result<ID3D12PipelineLibrary1> {
+    let mut library: *mut core::ffi::c_void = std::ptr::null_mut();
+    let blob: *const core::ffi::c_void =
+        if bytes.is_empty() { std::ptr::null() } else { bytes.as_ptr().cast() };
+    // SAFETY: a live device, the interface `ID3D12PipelineLibrary` asks for
+    // by its IID, and `blob` either null with a length of 0 or a view of
+    // `bytes.len()` bytes. What it returns is a reference this call owns.
+    unsafe {
+        (Interface::vtable(device).CreatePipelineLibrary)(
+            Interface::as_raw(device),
+            blob,
+            bytes.len(),
+            &ID3D12PipelineLibrary::IID,
+            &mut library,
+        )
+        .ok()?;
+        let library: ID3D12PipelineLibrary = Interface::from_raw(library);
+        library.cast()
+    }
+}
+
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
-    let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // SAFETY: the bytes outlive the library (kept beside it).
-        unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
-        }
-    };
+    let make = |bytes: &[u8]| create(device, bytes);
     if !blob.bytes().is_empty() {
         match make(blob.bytes()) {
             Ok(library) => {
@@ -589,7 +726,7 @@ pub(crate) fn pipeline(
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -597,6 +734,11 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    // Metadata first: it is kept even when no pipeline library was opened
+    // this run (`VICTORY_LIBRARY=0`, or a library the host refused), so the
+    // parses it holds are not repeated on the next launch.
+    crate::shader_meta::save(dir);
+    let Some(library) = library() else { return };
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
@@ -823,6 +965,17 @@ mod tests {
         let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
         };
+        // No library yet (the first run): an empty one, with a size to
+        // serialise, and nothing kept as its blob. The host could refuse
+        // this (vkd3d-proton does, for a blob that points at nothing while
+        // claiming no length), which would leave no library to store
+        // pipelines in at all.
+        let fresh = open(&device, Blob::None).expect("an empty library");
+        // SAFETY: a plain query on a live library.
+        assert!(unsafe { fresh.library.GetSerializedSize() } > 0);
+        assert!(matches!(fresh._blob, Blob::None));
+        // A blob the host rejects (another adapter or driver, damage) is let
+        // go and an empty library takes its place.
         let library = open(&device, Blob::Held(b"not a pipeline library".repeat(16))).expect("an empty library");
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
@@ -929,5 +1082,123 @@ mod tests {
             pattern(page * 4096, &mut expected);
             assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
         }
+    }
+}
+
+#[cfg(test)]
+mod keyed_tests {
+    use super::*;
+
+    /// A cache directory of its own for one test.
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("victory-keyed-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A library a build saved in `dir`.
+    fn saved(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(LIBRARY_FILE), b"library").unwrap();
+        dir.join(LIBRARY_FILE)
+    }
+
+    /// Two builds never look at each other's pipelines: each has its own
+    /// directory under the cache directory, and what one saved is not
+    /// found where the other looks.
+    #[test]
+    fn builds_do_not_share_a_library() {
+        let dir = temp("separate");
+        let one = keyed(&dir, "00112233aabbccdd", true);
+        let two = keyed(&dir, "00112233aabbccde", true);
+        assert_ne!(one, two, "two builds share a directory");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::write(one.join(LIBRARY_FILE), b"one").unwrap();
+        assert!(!two.join(LIBRARY_FILE).exists(), "one build found the other's library");
+        // Each is a library directory of ours, so a later run of either
+        // reads its own again, and what one saved stays where it left it.
+        assert!(is_translation(&one));
+        std::fs::create_dir_all(&two).unwrap();
+        std::fs::write(two.join(LIBRARY_FILE), b"two").unwrap();
+        assert!(is_translation(&two));
+        assert_eq!(std::fs::read(one.join(LIBRARY_FILE)).unwrap(), b"one");
+        assert_eq!(std::fs::read(two.join(LIBRARY_FILE)).unwrap(), b"two");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same build looks in the same place every run, so a restart reads
+    /// what the run before it saved.
+    #[test]
+    fn the_same_build_reuses_its_library() {
+        let dir = temp("reuse");
+        let first = keyed(&dir, "00112233aabbccdd", true);
+        saved(&first);
+        std::fs::write(first.join(EARLY_FILE), b"early").unwrap();
+        let again = keyed(&dir, "00112233aabbccdd", true);
+        assert_eq!(first, again);
+        assert_eq!(std::fs::read(first.join(LIBRARY_FILE)).unwrap(), b"library");
+        assert_eq!(std::fs::read(first.join(EARLY_FILE)).unwrap(), b"early");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A warm run of the previous build keeps its library: pruning keeps
+    /// the one used most recently, not the one written most recently.
+    #[test]
+    fn the_library_used_last_is_kept() {
+        let dir = temp("used");
+        // The build used last is the one saved first, so only the warm run
+        // can make it the newest.
+        let previous = keyed(&dir, "1111222233334444", false);
+        saved(&previous);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let stale = saved(&keyed(&dir, "00112233aabbccdd", false));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // The previous build runs again and adds nothing to its library.
+        assert_eq!(keyed(&dir, "1111222233334444", false), previous);
+
+        // A new build prunes: the stale library goes, the one just used
+        // stays.
+        let current = keyed(&dir, "ffffffffffffffff", true);
+        assert!(current.join(USED_FILE).is_file(), "this run did not mark its own library");
+        assert!(previous.join(LIBRARY_FILE).is_file(), "the library used last was pruned");
+        assert!(!stale.exists(), "the stale library was kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pruning keeps only directories this wrote: a `backup/` (or any
+    /// directory without a hash name) in the cache directory survives,
+    /// with what is in it, even when it is the oldest thing there.
+    #[test]
+    fn pruning_leaves_foreign_directories_alone() {
+        let dir = temp("prune");
+        // Two old libraries of ours, an old one of someone else's, and the
+        // one this build uses.
+        for (name, own) in [
+            ("00112233aabbccdd", true),
+            ("1111222233334444", true),
+            ("backup", false),
+        ] {
+            let at = dir.join(name);
+            std::fs::create_dir_all(&at).unwrap();
+            std::fs::write(at.join("sentinel"), b"keep me").unwrap();
+            if own {
+                std::fs::write(at.join(LIBRARY_FILE), b"library").unwrap();
+            }
+        }
+        let current = saved(&dir.join("ffffffffffffffff"));
+
+        assert_eq!(keyed(&dir, "ffffffffffffffff", true).join(LIBRARY_FILE), current);
+        assert!(dir.join("backup").join("sentinel").is_file(), "a foreign directory was deleted");
+        // [KEPT] libraries of ours are left: this build's and the newest
+        // other one.
+        let kept = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|at| is_translation(at))
+            .count();
+        assert_eq!(kept, KEPT);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
