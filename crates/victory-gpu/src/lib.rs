@@ -56,6 +56,8 @@ mod shadow;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
+#[cfg(all(test, windows))]
+mod warptest;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]
