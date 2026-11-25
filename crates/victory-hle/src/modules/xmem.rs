@@ -1200,6 +1200,84 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
+    /// A scatter of pages at consecutive addresses maps them in one call:
+    /// each address shows its own page, pages asked for in a different order
+    /// still land where they are asked for, a zero page in the middle unmaps
+    /// only its own address, and an unmap run goes in one call
+    /// (idea from ivall/xcl#254).
+    #[test]
+    fn scatter_maps_runs_of_consecutive_addresses() {
+        let pages = allocate(3);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            3 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        let at = |k: usize| a.wrapping_byte_add(k * PAGE);
+        for k in 0..3 {
+            assert!(write_physical(&pages[k..], 0, &[b'0' + k as u8]));
+        }
+
+        // Three pages, three consecutive addresses: one call.
+        let addresses = [at(0), at(1), at(2)];
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addresses.as_ptr(), 3, pages.as_ptr()),
+            1
+        );
+        for k in 0..3 {
+            assert_eq!(
+                // SAFETY: mapped read-write.
+                unsafe { at(k).cast::<u8>().read() },
+                b'0' + k as u8,
+                "page {k} at its address"
+            );
+        }
+
+        // Ask for them out of order: each still lands where it is named.
+        let addresses = [at(2), at(0)];
+        let swapped = [pages[0], pages[2]];
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addresses.as_ptr(), 2, swapped.as_ptr()),
+            1
+        );
+        assert_eq!(
+            // SAFETY: mapped read-write.
+            unsafe { at(2).cast::<u8>().read() },
+            b'0'
+        );
+        assert_eq!(
+            // SAFETY: mapped read-write.
+            unsafe { at(0).cast::<u8>().read() },
+            b'2'
+        );
+
+        // A zero page ends the run it is in: its address is unmapped, the
+        // page after it still maps.
+        let addresses = [at(1), at(2)];
+        let mixed = [0usize, pages[1]];
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addresses.as_ptr(), 2, mixed.as_ptr()),
+            1
+        );
+        assert_eq!(query(at(1)).host.State, MEM_RESERVE);
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { at(2).cast::<u8>().read() }, b'1');
+
+        // Three consecutive addresses without pages unmap as one run.
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addresses.as_ptr(), 2, std::ptr::null()),
+            1
+        );
+        assert_eq!(query(at(1)).host.State, MEM_RESERVE);
+        assert_eq!(query(at(2)).host.State, MEM_RESERVE);
+        assert_eq!(XMemMapPhysicalPagesScatter([at(0)].as_ptr(), 1, std::ptr::null()), 1);
+        assert_eq!(query(at(0)).host.State, MEM_RESERVE);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
     #[test]
     fn mapping_no_pages_changes_nothing() {
         let pages = allocate(2);

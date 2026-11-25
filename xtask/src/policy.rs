@@ -15,7 +15,16 @@ const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    "env", "py",
 ];
+/// Two-part extensions, matched as a suffix of the name including the dot
+/// (`x.desktop.in` is not an `.in` file we can judge by extension alone, and
+/// `notdesktop.in` must stay refused).
+const ALLOWED_NAME_SUFFIXES: &[&str] = &[".desktop.in"];
+/// Extensionless files are accepted only here, and only when they are scripts:
+/// a `#!` first line is a text file we wrote, not a blob.
+const SCRIPT_DIR_PREFIX: &str = "tools/";
+const SCRIPT_SHEBANG: &[u8] = b"#!";
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
     ".gitattributes",
@@ -28,10 +37,40 @@ const ALLOWED_NAMES: &[&str] = &[
 ];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
-const EXCEPTIONS: &[(&str, &str)] = &[(
-    "crates/victory-formats/src/bcpack-tables.bin",
-    "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
-)];
+const EXCEPTIONS: &[(&str, &str)] = &[
+    (
+        "crates/victory-formats/src/bcpack-tables.bin",
+        "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
+    ),
+];
+
+/// Files whose type is not on the allowlist but which still get every other
+/// check (size, forbidden signatures, NUL bytes, encoded-data runs).
+const EXTENSION_EXCEPTIONS: &[(&str, &str)] = &[
+    (
+        "docs/brand/logo.svg",
+        "the project logo: a hand-written vector drawing of our own, text only",
+    ),
+    (
+        "docs/brand/logo-mark.svg",
+        "the project mark: a hand-written vector drawing of our own, text only",
+    ),
+    (
+        "docs/brand/divider.svg",
+        "the README section divider: a hand-written vector drawing of our own, text only",
+    ),
+    (
+        "NOTICE",
+        "third-party notices for the ports we carry: plain text, no extension to judge",
+    ),
+];
+
+/// Path prefixes holding our own terminal recordings: screencast GIFs of our
+/// tools, made on our machines with a throwaway profile. A GIF is binary by
+/// construction, so files here skip the type allowlist and the text/NUL check;
+/// the size limit and the forbidden signatures still apply, and so does every
+/// other file in the tree. See docs/asset-policy.md.
+const RECORDING_PREFIXES: &[&str] = &["docs/img/"];
 
 /// Signatures of formats that must never be committed.
 const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
@@ -70,7 +109,7 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
                 Err(_) => continue,
             }
         };
-        for problem in check(path, &content) {
+        for problem in check_with(path, &content, policy_flags(path)) {
             violations.push(format!("{path}: {problem}"));
         }
     }
@@ -143,15 +182,35 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
 }
 
 /// All problems with one file. Pure, for testing.
+#[cfg(test)]
 pub fn check(path: &str, content: &[u8]) -> Vec<String> {
+    check_with(path, content, policy_flags(path))
+}
+
+/// The two escapes a path is granted: skip the type allowlist, and (recordings
+/// only) allow binary content.
+fn policy_flags(path: &str) -> (bool, bool) {
+    let recording = RECORDING_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(*prefix));
+    let skip_extension = recording || EXTENSION_EXCEPTIONS.iter().any(|(p, _)| *p == path);
+    (skip_extension, recording)
+}
+
+/// `check`, optionally skipping only the file-type allowlist, and (for our own
+/// recordings) the text/NUL-byte check.
+fn check_with(path: &str, content: &[u8], flags: (bool, bool)) -> Vec<String> {
+    let (skip_extension, binary_ok) = flags;
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
     let allowed = ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
-            .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));
-    if !allowed {
+            .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e))
+        || ALLOWED_NAME_SUFFIXES.iter().any(|s| name.ends_with(s))
+        || (ext.is_none() && is_tool_script(path, content));
+    if !allowed && !skip_extension {
         problems.push("file type not on the allowlist".to_owned());
     }
     if content.len() > MAX_FILE_SIZE {
@@ -165,14 +224,22 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
             problems.push(format!("looks like a {what}"));
         }
     }
-    if content.contains(&0) {
+    if content.contains(&0) && !binary_ok {
         problems.push("binary content (NUL bytes)".to_owned());
-    } else if let Some(run) = longest_encoded_run(content)
+    } else if !binary_ok
+        && let Some(run) = longest_encoded_run(content)
         && run > MAX_ENCODED_RUN
     {
         problems.push(format!("{run}-character hex/base64 run (embedded data?)"));
     }
     problems
+}
+
+/// An extensionless file is allowed only under `tools/` and only when it starts
+/// with a `#!` line: the launcher scripts we ship there are text, but the name
+/// carries no extension the allowlist could judge.
+fn is_tool_script(path: &str, content: &[u8]) -> bool {
+    path.starts_with(SCRIPT_DIR_PREFIX) && content.starts_with(SCRIPT_SHEBANG)
 }
 
 /// Longest run of characters that could be hex or base64 payload.
@@ -183,7 +250,7 @@ fn longest_encoded_run(content: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::check;
+    use super::{check, check_with};
 
     /// Enforces the policy wherever tests run, even in clones without the hook.
     #[test]
@@ -216,8 +283,64 @@ mod tests {
     }
 
     #[test]
+    fn accepts_our_recordings() {
+        // A minimal GIF: header, logical screen, one pixel, trailer.
+        let gif = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
+        assert!(check("docs/img/launcher.gif", gif).is_empty());
+        assert!(
+            !check("assets/launcher.gif", gif).is_empty(),
+            "outside docs/img/ a GIF is still refused"
+        );
+        assert!(
+            !check("docs/img/launcher.gif", b"MZ\x90\0").is_empty(),
+            "magic still wins over the recording exemption"
+        );
+        assert!(
+            !check("docs/img/launcher.gif", &vec![b'a'; 600 * 1024]).is_empty(),
+            "recordings are still size-limited"
+        );
+    }
+
+    #[test]
     fn rejects_data_smuggled_into_text() {
         let blob = format!("const DATA: &str = \"{}\";", "A1".repeat(400));
         assert!(!check("src/blob.rs", blob.as_bytes()).is_empty());
+    }
+
+    #[test]
+    fn accepts_tool_scripts() {
+        assert!(check("tools/scarlight-launcher/scarlight", b"#!/usr/bin/env bash\n").is_empty());
+        assert!(
+            !check("tools/scarlight-launcher/scarlight", b"no shebang here\n").is_empty(),
+            "an extensionless file under tools/ must be a script"
+        );
+        assert!(
+            !check("scripts/thing", b"#!/bin/sh\n").is_empty(),
+            "extensionless scripts outside tools/ stay refused"
+        );
+    }
+
+    #[test]
+    fn accepts_env_profiles_and_desktop_templates() {
+        assert!(check("tools/x/examples/profile.env", b"PRESET='play'\n").is_empty());
+        assert!(check("tools/x/scarlight.desktop.in", b"[Desktop Entry]\n").is_empty());
+        assert!(
+            !check("tools/x/notdesktop.in", b"[Desktop Entry]\n").is_empty(),
+            "the dot is part of the suffix"
+        );
+        assert!(
+            !check("tools/x/scarlight.desktop.in", b"MZ\x90\0").is_empty(),
+            "magic still wins"
+        );
+    }
+
+    #[test]
+    fn extension_exception_still_runs_other_checks() {
+        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>";
+        assert!(check_with("docs/brand/logo.svg", svg, (true, false)).is_empty());
+        let embedded = format!("<svg><image href=\"data:image/png;base64,{}\"/></svg>", "A1".repeat(400));
+        assert!(!check_with("docs/brand/logo.svg", embedded.as_bytes(), (true, false)).is_empty());
+        assert!(!check_with("docs/brand/logo.svg", &vec![b'a'; 600 * 1024], (true, false)).is_empty());
+        assert!(!check_with("docs/brand/logo.svg", b"MZ\x90\0", (true, false)).is_empty());
     }
 }

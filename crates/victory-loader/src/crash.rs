@@ -147,19 +147,14 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         if record.ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION {
             return false;
         }
-        let code = context.Rip as *const u8;
-        match code.cast::<[u8; 3]>().read_unaligned() {
-            [0x0f, 0x01, 0xfc] => ((context.Rax & !63) as *mut u8).write_bytes(0, 64),
-            [0x0f, 0x01, 0xfa] => {}
-            [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
+        let (bytes, n) = code_at(context.Rip as usize);
+        let bytes = &bytes[..n];
+        match bytes.get(..3) {
+            Some([0x0f, 0x01, 0xfc]) => ((context.Rax & !63) as *mut u8).write_bytes(0, 64),
+            Some([0x0f, 0x01, 0xfa]) => {}
+            Some([0x0f, 0x01, 0xfb]) => std::thread::yield_now(),
             _ => {
-                // Only bytes inside the faulting instruction's page are read: the next page may
-                // not be mapped.
-                let room = 0x1000 - (context.Rip as usize & 0xfff);
-                let mut bytes = [0u8; 32];
-                let n = room.min(bytes.len());
-                std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
-                if let Some(pass) = clwb_loop(&bytes[..n]) {
+                if let Some(pass) = clwb_loop(bytes) {
                     // A whole write-back loop in one exception (see `clwb_loop`).
                     let limit = *gpr(context, pass.limit);
                     let base = gpr(context, pass.base);
@@ -173,14 +168,12 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                     context.Rip += pass.len as u64;
                     return true;
                 }
-                if n >= 15
-                    && let Some(len) = clwb_len(bytes[..15].try_into().unwrap_or([0; 15]))
-                {
+                if let Some(len) = clwb_len(bytes) {
                     // A write-back hint: the PC's memory is coherent, so it has nothing to do.
                     context.Rip += len as u64;
                     return true;
                 }
-                let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters) else {
+                let Some(len) = sse4a(bytes, &mut context.Anonymous.FltSave.XmmRegisters) else {
                     return false;
                 };
                 context.Rip += len as u64;
@@ -192,14 +185,53 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
     true
 }
 
+/// Up to 32 code bytes from `rip` and how many there are: those left in its
+/// page, and the next page's when that page can be read. The faulting
+/// instruction's own bytes are always there (the CPU fetched them), but
+/// reading past a short instruction at the end of a page into an unmapped
+/// one would fault inside this handler.
+///
+/// # Safety
+///
+/// `rip`'s page is readable.
+unsafe fn code_at(rip: usize) -> ([u8; 32], usize) {
+    let mut bytes = [0u8; 32];
+    let room = 0x1000 - (rip & 0xfff);
+    let n = if room < bytes.len() && readable(rip + room) {
+        bytes.len()
+    } else {
+        room.min(bytes.len())
+    };
+    // SAFETY: `n` bytes from `rip` are readable, as above.
+    unsafe { std::ptr::copy_nonoverlapping(rip as *const u8, bytes.as_mut_ptr(), n) };
+    (bytes, n)
+}
+
+/// Whether the page at `address` is committed and can be read.
+fn readable(address: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_GUARD, PAGE_NOACCESS,
+        VirtualQuery,
+    };
+    // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: reads the address space's bookkeeping, not `address` itself.
+    let n = unsafe { VirtualQuery(address as *const _, &mut info, size_of_val(&info)) };
+    n != 0
+        && info.State == MEM_COMMIT
+        && info.Protect & (PAGE_GUARD | PAGE_NOACCESS) == 0
+        && info.Protect & 0xff != PAGE_EXECUTE
+}
+
 /// `clwb m8` (`66 [rex] 0f ae /6`, a memory operand), which Intel CPUs before
-/// Ice Lake lack: its length, or `None` for any other instruction.
-fn clwb_len(code: [u8; 15]) -> Option<usize> {
-    let at = if code[1] & 0xf0 == 0x40 { 2 } else { 1 };
-    if code[0] != 0x66 || code[at] != 0x0f || code[at + 1] != 0xae {
+/// Ice Lake lack: its length, or `None` for any other instruction, or one
+/// `code` does not hold whole.
+fn clwb_len(code: &[u8]) -> Option<usize> {
+    let at = if *code.get(1)? & 0xf0 == 0x40 { 2 } else { 1 };
+    if *code.first()? != 0x66 || code.get(at..at + 2)? != [0x0f, 0xae] {
         return None;
     }
-    let modrm = code[at + 2];
+    let modrm = *code.get(at + 2)?;
     let (mode, rm) = (modrm >> 6, modrm & 7);
     if mode == 3 || (modrm >> 3) & 7 != 6 {
         return None;
@@ -207,7 +239,7 @@ fn clwb_len(code: [u8; 15]) -> Option<usize> {
     let mut len = at + 3;
     let mut base = rm;
     if rm == 4 {
-        base = code[len] & 7;
+        base = *code.get(len)? & 7;
         len += 1;
     }
     len += match mode {
@@ -216,7 +248,7 @@ fn clwb_len(code: [u8; 15]) -> Option<usize> {
         2 => 4,
         _ => 0,
     };
-    Some(len)
+    (len <= code.len()).then_some(len)
 }
 
 /// A `clwb` write-back loop as the title's compilers build it, one cache line a
@@ -312,10 +344,12 @@ fn cmp_flags(a: u64, b: u64) -> u32 {
 const CMP_FLAGS: u32 = 0x8d5;
 
 /// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
-/// the saved XMM registers; returns the instruction's length.
-unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
-    // SAFETY: the caller's code bytes are readable up to the instruction's end.
-    let b = |i: usize| unsafe { code.add(i).read() };
+/// the saved XMM registers; returns the instruction's length, or `None` for
+/// any other instruction, or one `code` does not hold whole.
+fn sse4a(code: &[u8], xmm: &mut [M128A; 16]) -> Option<usize> {
+    // Past `code`, a byte no prefix or opcode checked here matches; a
+    // length past it is refused below, before any register changes.
+    let b = |i: usize| code.get(i).copied().unwrap_or(0);
     let prefix = b(0);
     let (rex, at) = if b(1) & 0xf0 == 0x40 {
         (b(1), 2)
@@ -339,6 +373,9 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
         let f = if prefix == 0x66 { xmm[src].Low } else { xmm[src].High as u64 };
         ((f as u8, (f >> 8) as u8), at + 3)
     };
+    if len > code.len() {
+        return None;
+    }
     let (n, at_bit) = (u32::from(fields.0 & 63), u32::from(fields.1 & 63));
     let bits = if n == 0 { 64 } else { n };
     let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
@@ -357,15 +394,6 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
-    // an instruction of the console's CPU this one lacks: emulated, the title goes on
-    // SAFETY: the system passes valid exception pointers.
-    if unsafe { (*(*info).ExceptionRecord).ExceptionCode } == EXCEPTION_ILLEGAL_INSTRUCTION {
-        // SAFETY: the faulting thread's context, for the exception being dispatched.
-        let r = unsafe { crate::console_insn::emulate(&mut *(*info).ContextRecord) };
-        if r != 0 {
-            return r;
-        }
-    }
     // SAFETY: the system passes valid exception pointers.
     if unsafe { emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
@@ -766,6 +794,69 @@ mod tests {
         assert_eq!(cmp_flags(0x1000, 0x1000) & 0x40, 0x40);
     }
 
+    /// Gives the bytes at `rip` to the emulation as an illegal instruction
+    /// there, as [`emulate_as`] does; the bytes are not copied, so what
+    /// follows them in memory is what the emulation sees.
+    fn emulate_in_place(rip: *const u8) -> Option<u64> {
+        // SAFETY: as in `emulate_as`; `rip`'s page is readable.
+        unsafe {
+            let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+            record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rip = rip as u64;
+            let mut pointers = EXCEPTION_POINTERS {
+                ExceptionRecord: &mut record,
+                ContextRecord: &mut context,
+            };
+            let emulated = emulate_amd_only(&mut pointers);
+            emulated.then(|| context.Rip - rip as u64)
+        }
+    }
+
+    /// Instructions at the end of a page, before one that cannot be read and
+    /// before one that can (#924): `clwb` there is emulated, a short
+    /// instruction there is read no further than it reaches, and a `clwb`
+    /// running on into a readable page is emulated whole.
+    #[test]
+    fn instructions_at_a_page_end_are_read_only_as_far_as_memory_allows() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: a fresh reservation of two pages, the first committed;
+        // freed at the end.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE, PAGE_READWRITE);
+            assert!(!base.is_null());
+            let page = VirtualAlloc(base, 0x1000, MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!page.is_null());
+            let put = |at: usize, code: &[u8]| {
+                std::ptr::copy_nonoverlapping(code.as_ptr(), page.add(at), code.len());
+                page.add(at).cast_const()
+            };
+
+            // The next page reserved only: any read of it would fault.
+            let clwb = put(0xffc, &[0x66, 0x0f, 0xae, 0x30]); // clwb [rax]
+            assert_eq!(emulate_in_place(clwb), Some(4));
+            let ud2 = put(0xffe, &[0x0f, 0x0b]);
+            assert_eq!(emulate_in_place(ud2), None);
+            let last = put(0xfff, &[0x90]);
+            assert_eq!(emulate_in_place(last), None);
+            // A clwb [rax+disp32] cut off by the page end is not one.
+            let cut = put(0xffc, &[0x66, 0x0f, 0xae, 0xb0]);
+            assert_eq!(emulate_in_place(cut), None);
+
+            // The next page readable: an instruction across the boundary is
+            // read whole.
+            let next = base.cast::<u8>().add(0x1000);
+            let next = VirtualAlloc(next.cast(), 0x1000, MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!next.is_null());
+            next.copy_from_nonoverlapping([0, 1, 0, 0].as_ptr(), 4);
+            assert_eq!(emulate_in_place(cut), Some(8)); // clwb [rax+0x100]
+
+            assert_ne!(VirtualFree(base, 0, MEM_RELEASE), 0);
+        }
+    }
+
     #[test]
     fn clwb_lengths() {
         let pad = |b: &[u8]| {
@@ -773,21 +864,21 @@ mod tests {
             c[..b.len()].copy_from_slice(b);
             c
         };
-        assert_eq!(clwb_len(pad(&[0x66, 0x41, 0x0f, 0xae, 0x31])), Some(5)); // clwb [r9]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x30])), Some(4)); // clwb [rax]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x70, 0x40])), Some(5)); // clwb [rax+0x40]
+        assert_eq!(clwb_len(&pad(&[0x66, 0x41, 0x0f, 0xae, 0x31])), Some(5)); // clwb [r9]
+        assert_eq!(clwb_len(&pad(&[0x66, 0x0f, 0xae, 0x30])), Some(4)); // clwb [rax]
+        assert_eq!(clwb_len(&pad(&[0x66, 0x0f, 0xae, 0x70, 0x40])), Some(5)); // clwb [rax+0x40]
         assert_eq!(
-            clwb_len(pad(&[0x66, 0x0f, 0xae, 0xb0, 0, 1, 0, 0])),
+            clwb_len(&pad(&[0x66, 0x0f, 0xae, 0xb0, 0, 1, 0, 0])),
             Some(8)
         ); // [rax+disp32]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x34, 0x24])), Some(5)); // clwb [rsp]
+        assert_eq!(clwb_len(&pad(&[0x66, 0x0f, 0xae, 0x34, 0x24])), Some(5)); // clwb [rsp]
         assert_eq!(
-            clwb_len(pad(&[0x66, 0x0f, 0xae, 0x35, 0, 0, 0, 0])),
+            clwb_len(&pad(&[0x66, 0x0f, 0xae, 0x35, 0, 0, 0, 0])),
             Some(8)
         ); // [rip+disp32]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x38])), None); // clflushopt, /7
-        assert_eq!(clwb_len(pad(&[0x0f, 0xae, 0x30])), None); // xsaveopt, no 66
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0xf0])), None); // register form
+        assert_eq!(clwb_len(&pad(&[0x66, 0x0f, 0xae, 0x38])), None); // clflushopt, /7
+        assert_eq!(clwb_len(&pad(&[0x0f, 0xae, 0x30])), None); // xsaveopt, no 66
+        assert_eq!(clwb_len(&pad(&[0x66, 0x0f, 0xae, 0xf0])), None); // register form
     }
 
     #[test]

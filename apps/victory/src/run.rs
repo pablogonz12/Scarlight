@@ -22,10 +22,34 @@ pub fn run(
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    match victory_game::identify(&hash) {
-        Some(build) => println!("build          {} ({hash})", build.label),
-        None => println!("build          unknown ({hash})"),
+    // The user's profile for this build, if there is one: it decides which
+    // hooks are placed and which work the GPU layer leaves out. Selected by
+    // the image's own hash, before any title code runs.
+    let profile = cfg.title_profile(&hash);
+    match &profile {
+        Some(found) => {
+            let file = found
+                .file()
+                .map_or_else(|| "<inline>".to_owned(), |path| path.display().to_string());
+            println!("build          {} ({hash})", found.label());
+            tracing::info!("title profile: {file} matched, {} hooks", found.hooks.len());
+            tracing::debug!("title profile: image {hash}");
+        }
+        None => {
+            println!("build          unknown ({hash})");
+            // No image hash in the info line: users paste logs into issues,
+            // and the asset policy keeps hashes of game files out of them.
+            // `victory title-id <exe>` prints it on request.
+            tracing::info!("title profile: none matched");
+            let dirs: Vec<String> = cfg
+                .profile_dirs
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect();
+            tracing::debug!("title profile: image {hash}, searched {}", dirs.join(", "));
+        }
     }
+    victory_core::profile::set_current(profile);
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
@@ -222,7 +246,7 @@ fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
 }
 
 /// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports,
-/// e.g. The title's upscaler behind its FidelityFX loader.
+/// e.g. the title's upscaler behind its FidelityFX loader.
 #[cfg(windows)]
 struct LateDlls {
     host: victory_hle::HostPolicy,

@@ -1,229 +1,206 @@
-# VIctory fork (work in progress)
+<div align="center">
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
-compatibility layer that runs an Xbox Series title natively on Windows from
-files the user supplies. This fork follows upstream
-`main` and adds fixes aimed at one goal: getting the game's world to render
-correctly and playably on one particular PC.
+<img src="docs/brand/logo.svg" alt="Scarlight" width="420">
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's
-developer or publisher.
+<br>
+
+[![CI](https://img.shields.io/github/actions/workflow/status/pablogonz12/Scarlight/ci.yml?branch=main&style=flat-square&labelColor=14072c&label=CI&color=ff2e63)](https://github.com/pablogonz12/Scarlight/actions/workflows/ci.yml)
+[![Linux: builds on it](https://img.shields.io/github/actions/workflow/status/pablogonz12/Scarlight/linux.yml?branch=main&style=flat-square&labelColor=14072c&label=linux%20build&color=19d8ff)](https://github.com/pablogonz12/Scarlight/actions/workflows/linux.yml)
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-ff7a3d?style=flat-square&labelColor=14072c)](LICENSE)
+[![Stars](https://img.shields.io/github/stars/pablogonz12/Scarlight?style=flat-square&labelColor=14072c&color=ffb347)](https://github.com/pablogonz12/Scarlight/stargazers)
+
+# Scarlight
+
+**Play Xbox Series games on your Linux PC, from Steam.**
+
+Scarlight is a Steam compatibility tool. Proton lets Steam run Windows games on Linux; Scarlight does
+the same job for games built for Xbox Series. Install it once, choose it for the game in Steam, press
+Play.
+
+<sub>[What it is](#what-it-is) · [What you need](#what-you-need) · [Install](#install) ·
+[Status](#status) · [How it works](#how-it-works) · [Roadmap](#roadmap) · [Help wanted](#help-wanted) ·
+[Credits](#credits) · [Licence](#licence)</sub>
+
+</div>
+
+> **25 November 2026 — Scarlight is now a Steam compatibility tool.** Until today it was a program you
+> started by hand; from today it is one install, one entry in Steam's Compatibility list, and Play.
+> The code is the same code; the development setup of the previous line is preserved on branch
+> `legacy/amd-hub`. Why, and what moved where: [ANNOUNCEMENT.md](ANNOUNCEMENT.md).
+
+## What it is
+
+Games made for an Xbox Series console do not run on a PC by themselves: they expect the console's
+system software, its graphics commands and its shaders. Scarlight supplies the missing console side,
+so the game starts and draws on your machine instead. The Windows side it needs — files, memory,
+threads, the window — comes from Proton, the same Proton Steam already uses for Windows games; your
+graphics driver does the drawing.
+
+You do not run anything from a terminal: Steam launches the game, the way it does with Proton.
+
+Scarlight ships no game files. It runs a copy of a game you legally own, on your own PC.
+
+## What you need
+
+- **Linux with Steam**, native or Flatpak.
+- **A graphics card with a Mesa Vulkan driver**: AMD (RADV) is the one tested; Intel (ANV) is checked
+  offline; NVIDIA's open NVK is planned and untried.
+  Vulkan 1.3 or newer. A proprietary driver is not a target of this project.
+- **A Proton you already have**: GE-Proton or Valve's Proton. Scarlight uses its Wine; we neither
+  ship nor fork Proton.
+- **The game's files**, from a copy you own.
+
+## Install
+
+Three steps. Full detail — every option, logs, uninstall, troubleshooting — in
+**[docs/steam.md](docs/steam.md)**.
+
+1. **Put Scarlight in Steam's compatibility tools folder.** Download `Scarlight-<version>.tar.gz`
+   from [Releases](https://github.com/pablogonz12/Scarlight/releases), then run this in the folder you
+   downloaded it to (or give `tar` the archive's full path, e.g.
+   `~/Downloads/Scarlight-0.1.0.tar.gz`):
+
+   ```bash
+   cd ~/Downloads
+   mkdir -p ~/.local/share/Steam/compatibilitytools.d/
+   tar -xzf Scarlight-<version>.tar.gz -C ~/.local/share/Steam/compatibilitytools.d/
+   ```
+
+   Flatpak Steam uses `~/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d/`.
+   From a source checkout instead, `tools/steam-compat/install.sh` does the same.
+2. **Restart Steam.**
+3. **Choose it for the game.** If the game is not in your library yet, add it first: *Steam → Games →
+   Add a Non-Steam Game to My Library → Browse…* and pick its `.exe`. Then *Library → right-click the
+   game → Properties → Compatibility →* tick
+   **Force the use of a specific Steam Play compatibility tool** and pick **Scarlight (Xbox Series)**.
+   Press Play.
+
+Two things a release leaves to you, both one step: if Steam cannot find the Proton Scarlight should run
+on, name yours in `compatibilitytools.d/Scarlight/scarlight.conf` (`PROTON=`); and put your own copy of
+DXC's `dxil.dll` and `dxcompiler.dll` in `Scarlight/files/` (Microsoft's binaries are not redistributed
+by a Linux release). [docs/steam.md](docs/steam.md) has both.
+
+## Status
+
+**Not playable yet.** This is early work, and it is better to say so plainly: the game starts, its
+menus work, and its world appears — but the picture is incomplete and dark in places, and it runs at
+a few frames per second. One game has been tried, on one graphics card.
+
+| What | Today |
+|---|---|
+| Starting the game, menus, sound, controller | Works; menus at 30 fps |
+| The game's world | Shows, but only partly: lit and textured in places, much of the scene dark |
+| Speed | **0.1–3 fps**: 1.5–3 in the fixed scene we measure, down to 0.1 in busy scenes while the game's copies and textures queue up |
+| Shaders | **751 / 751** of the game's world shaders translate; 749 / 751 build a real pipeline on the driver |
+| Time to the world | 133–218 s |
+| Stability | Some builds hang at start or when the world loads |
+| **Playable** | **No** |
+
+Measured 25 Nov 2026 on one machine: **AMD RX 9070 XT**, Mesa 26.3.1 (RADV), CachyOS, GE-Proton11-14.
+No other card and no other game have been tried, so nothing here promises anything about yours.
+
+<!-- progress:start -->
+Progress in detail — what is measured, how, and where each number comes from: [docs/PROGRESS.md](docs/PROGRESS.md).
+<!-- progress:end -->
+
+## How Scarlight differs from other Xbox Series projects
+
+Several projects take on Xbox Series games on a PC. They aim at different platforms, so the rows below
+are about fit, not quality.
+
+| | Scarlight | Other Xbox Series projects (Windows-first layers) |
+|---|---|---|
+| Target platform | Linux, through Steam | Windows 10/11 x64; no Linux target documented |
+| How a game is started | Picked in Steam's Compatibility list, then Play; Steam launches it | The project's own program on Windows; on Linux you would set up a Wine prefix by hand |
+| What you install | A release tarball into `compatibilitytools.d`, or one `install.sh`, plus a Proton you already have | Build from source with the project's toolchain on Windows, then supply the D3D12 and DXC files yourself |
+| Graphics driver focus | Built and tuned for Mesa's open Vulkan drivers: RADV first, ANV next, NVK planned | Any Direct3D 12 driver with shader model 6.6 (mesh shaders for the world) |
+| Shader route | The console's RDNA2 shaders are recompiled to DXIL today, then drawn through vkd3d-proton and Vulkan; direct SPIR-V is in progress | The console's RDNA2 shaders are recompiled to DXIL and drawn through Direct3D 12 |
+| Linux test coverage | One game on one card: RX 9070 XT, Mesa 26.3.1 RADV | None documented; their READMEs require Windows |
+
+<sub>Facts as the public READMEs of those projects stated them on 25 Nov 2026; check them yourself for
+anything that has changed since.</sub>
+
+## How it works
+
+```mermaid
+flowchart TB
+    S["Steam: you press Play"] --> T["Scarlight compatibility tool<br/>picks your Proton, sets up the prefix"]
+    T --> P
+    subgraph P["Proton (Wine): the operating-system side"]
+        direction TB
+        G["The game's own x86-64 code"] <-->|"console API calls"| R["Scarlight runtime<br/>console APIs · GPU command decoder · RDNA2 shader recompiler"]
+    end
+    R -->|"Direct3D 12 + DXIL"| V["vkd3d-proton"]
+    V -->|"Vulkan + SPIR-V"| M["Mesa: RADV (tested) · ANV · NVK (planned)"]
+    M --> K["Linux kernel GPU driver<br/>amdgpu · xe / i915 · nouveau"]
+```
+
+[![Mesa: built for it](https://img.shields.io/badge/Mesa-built%20for%20it-ff2e63?style=flat-square&labelColor=14072c)](https://docs.mesa3d.org/)
+[![Drivers: RADV · ANV](https://img.shields.io/badge/drivers-RADV%20%C2%B7%20ANV-ff7a3d?style=flat-square&labelColor=14072c)](docs/hardware.md)
+[![Vulkan 1.3](https://img.shields.io/badge/Vulkan-1.3%2B-19d8ff?style=flat-square&labelColor=14072c)](https://www.vulkan.org/)
+
+- **Steam starts it.** The game's `.exe` is a Non-Steam Game whose compatibility tool is Scarlight.
+  The tool finds your Proton, prepares the game's prefix and shader cache, and asks Steam for the same
+  runtime container Proton gets.
+- **Proton does the operating-system side.** The game's file, thread, memory and window calls are
+  Wine's job, through the Proton you installed.
+- **Scarlight does the console side.** It runs inside that Wine process next to the game: it answers
+  the console system APIs the game calls, decodes its GPU command streams, and recompiles its RDNA2
+  shaders and pipelines for your card.
+- **vkd3d-proton and Mesa draw it.** Scarlight hands Direct3D 12 and DXIL to vkd3d-proton, which turns
+  them into Vulkan and SPIR-V for Mesa's RADV (AMD) or ANV (Intel); NVK (NVIDIA) is planned. Mesa is open source,
+  so the driver is ours to read, tune and fix — that is why the project is built around it. RADV on
+  RDNA4 is the only one tested in a game so far; ANV's pipelines are checked offline.
+
+Design notes: [docs/architecture.md](docs/architecture.md).
+
+## Roadmap
+
+| Stage | Goal | Where it stands |
+|---|---|---|
+| **Now** | One core, every shader | The best translator and GPU code of the related projects merged into one core: 751 of 751 world shaders and 2,907 of 2,912 recorded shaders translate offline |
+| **Now** | Speed: stop copying the game's memory every frame | Most of a slow frame is copies of the game's memory. In progress: copies on the graphics card, the game's private memory shared with the card instead of copied, and copies that avoid a slow path in Wine |
+| **Now** | Loading and pop-in | Files are read at a small fraction of what the disk can do; the reader is being measured stage by stage |
+| **Next** | Dark areas lit | The game traces rays in its own compute shaders, and that part is switched off today; turning it on (or using the card's ray tracing on RADV) is the way to light shadowed areas |
+| **Next** | Faces and missing geometry | Specific shaders and copies that are dropped; each has a named cause |
+| **Later** | Talk to Vulkan directly | Shaders straight from the console's instructions to SPIR-V, with no DXIL in between: an experimental translator already covers about half of the compute shaders |
+
+No dates; these are goals, not results. Every number above is from offline checks on one machine.
+
+## Help wanted
+
+The missing pieces are specific, and **people who know Wine, Proton or Mesa are the most useful of
+all** — this project spends its time where those three meet:
+
+- **Wine / Proton:** the OS-side behaviour a console game expects (threads, timing, file layout), and
+  how a compatibility tool should hand work to a Proton build.
+- **Mesa (RADV, ANV):** why a pipeline that builds fine still stalls on first use, shader cache
+  behaviour, and what our command stream costs on the driver side.
+- **vkd3d-proton:** the Direct3D 12 features a console-shaped workload leans on.
+- **Rust, and the formats:** command-stream decoding, the shader translator, the RDNA2 instruction set.
+- **Anyone with another Mesa card** (RDNA1-3, Vega, Arc, Xe, NVK): a run on your machine is as useful
+  as a patch.
+
+Send a [test report](https://github.com/pablogonz12/Scarlight/issues/new?template=test-report.yml) or
+[bug report](https://github.com/pablogonz12/Scarlight/issues/new?template=bug-report.yml) with your
+card, driver and Mesa version, kernel, distribution, Proton build, and the last ~50 lines of
+`scarlight.log`. Text and logs only: no game files, no screenshots. Pull requests are welcome;
+[CONTRIBUTING.md](CONTRIBUTING.md) has the build, test and asset rules, and
+[Discussions](https://github.com/pablogonz12/Scarlight/discussions) is where questions go.
 
 ## Credits
 
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors is the base of everything here: the loader, the runtime
-  services, the Direct3D 12 back end and the shader recompiler. Licensed
-  GPL-3.0-or-later; so is this fork. Upstream's history is kept intact below
-  the single commit that carries this fork's changes.
-- **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
-  (GPL-2.0-only) was used as a reference for how the same title behaves under
-  another layer. Fixes inspired by it were written anew in VIctory's code.
-- This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
+Scarlight is a port of the project named in [CREDITS.md](CREDITS.md) (GPL-3.0), whose history and
+authorship this tree keeps; every contributor is named there, along with the third-party licences a
+release ships.
 
-## Status of this fork (2026-11-25)
+## Licence
 
-**Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
-Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
-32 GB RAM. The Series X profile is used throughout.
+GPL-3.0-or-later; see [LICENSE](LICENSE).
 
-| Stage | State in this fork |
-|-------|--------------------|
-| Boot, menus, start screen | works, 30 fps (as upstream) |
-| Opening cutscene | plays from start to finish, in order, lit: title cards, credits cards, night and dusk shots |
-| Saves | the game autosaves a checkpoint and loads it again |
-| First gameplay scene (the prologue) | renders: characters, textures, sky, sunlit exterior; HUD, pause menu and pad input work |
-| Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
-| Frame rate in the world | 2-4 fps: 420-450 ms per frame by default, 240-350 ms with the newer switches (`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024`); it started at 3-6 seconds per frame |
-| Stability | no driver hang or device loss in normal runs (a hang introduced by the wave64 update was found and fixed: its barrier form for 64-lane programs is now off unless `VICTORY_WAVE_WIDE=1`) |
+Not affiliated with or endorsed by Microsoft. Xbox and Xbox Series are trademarks of Microsoft.
 
-### What this fork changed (summary)
-
-Rendering:
-- Meshlet culling read its scene buffers as the wrong kind of view, so the world drew almost nothing; fixed.
-- Per-draw descriptor tables could run out, after which draws used slots never made for them and the card hung; fixed.
-- Light packed by the game's compute shaders was read back through empty copies (sky, probes, fog); fixed for every mip level and layer.
-- The fog reconstruction, shadow-mask, hair, blend-shape skinning, fire and several material programs did not translate; fixed.
-- Gathers at a named mip level (with and without an offset) read level 0; fixed.
-- Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
-- Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
-- Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. Nothing is lit by it yet. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
-- The host's own HLSL (the indirect-argument clamp, the compare of copies in the card's memory, the depth-plane twins, the in-place probe) falls back to DXC when the system compiler fails it: on the Wine and Proton builds that need it, `d3dcompiler_47` is vkd3d-shader, which rejects `RWByteAddressBuffer` methods, and also compiles the rest of this source but drops the root signature the shader asks for, so `CreateRootSignature` failed and the twins had no pipeline; either way the clamp, card buffers and twins then silently switched off. Wine 11.22 and Proton Experimental experimental-11.0-20261112 both reject the clamp (`E5005: InterlockedMax`), the card compare (`E5005: Load4`) and the in-place probe (`E5005: Load`), and accept the twins' pixel shader but drop its root signature; a run into the prologue took the fallback for the clamp, the card compare, the probe and the twins' pixel shader. `dxcompiler.dll` is looked for in `VICTORY_DXC` (the DLL or its folder), beside the `dxil.dll` that shader validation uses, then the executable's folder and System32; on Windows, where `D3DCompile` succeeds and keeps the root signature, nothing changes. This fixes the compiles only: a separate GPU execution fault/device removal under vkd3d-proton 3.2 is not addressed.
-
-Speed and memory:
-- Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
-- Large title buffers get a copy in card memory, with shader writes found by hashing on the card.
-- Submissions can be sent ahead of the wait for the card (`VICTORY_LATE_WAIT`), with a relay thread that lands results as the card finishes (`VICTORY_RELAY`): in a first five-minute run the card's idle time behind the submitting thread fell from about 136 to 30 ms per frame.
-- Independent host-copy refreshes run in parallel by default on systems with at least four logical CPUs (`VICTORY_WIDE_REFRESH=0` disables this; `=1` forces it). This targets the serial memory reads that previously cost about 45–50 ms per frame on the test run.
-- Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
-- The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
-- An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
-
-- Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
-
-Most of the newer speed changes sit behind environment switches that are off
-by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
-`VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
-Independent host-copy refreshes are the exception: they use parallel workers
-automatically on systems with at least four logical CPUs. Each switch is
-described in a comment where it is read.
-
-### Known problems
-
-- Everything in shadow is black (see above).
-- On Wine and Proton builds whose built-in `d3dcompiler_47` rejects this source (Wine 11.22, GE-Proton 11-12/11-14 and Proton Experimental experimental-11.0-20261112 do), the run-time HLSL compiles need DXC's `dxcompiler.dll` and `dxil.dll` (see the last rendering item above).
-- On GE-Proton11-14 / vkd3d-proton 3.2 the helper shaders compile with DXC, but a separate GPU/driver fault (NVRM `gpu_vaspace.c` assertions) still hangs the machine after a few minutes; this change does not address it.
-- The interior of the first gameplay room is sometimes not drawn after the cutscene hands over to gameplay.
-- Around 24 GB of memory is in use during play.
-- A few style lints are switched off for this fork in the workspace `Cargo.toml` until the newer code is tidied.
-- Many changes here are specific to this title and this GPU, and some are marked `shortcut:` in the code where they approximate what the console does.
-
-Everything below this line is upstream VIctory's own README, unchanged; its
-status section describes upstream, not this fork.
-
----
-
-# VIctory
-
-Runs the title (Xbox Series X|S) natively on Windows, from files
-the user supplies.
-
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
-the platform underneath it and converts the title's data, ahead of time where
-it can and on first use where it must (shaders). See
-[docs/architecture.md](docs/architecture.md).
-
-## Status (2026-11-23)
-
-**Not playable yet.** The title boots, runs its menus at its own 30 fps and
-loads the world, where rendering fails.
-
-| Stage | State |
-|-------|-------|
-| Boot, first-boot screens (accessibility, language, settings, legal) | works, 30 fps |
-| Intro video with sound | works |
-| Start screen, profile and saves | works |
-| Loading into the world (about 50 s) | works |
-| The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
-
-Tested on one machine: Windows 11, AMD RX 6700 XT.
-
-> **Warning.** Entering the world on a real GPU can currently hang it, and
-> Windows then resets the display driver (every monitor goes black for a
-> moment). To look further, use a diagnostics build with
-> `VICTORY_D3D12_WARP=1`, which renders on the software adapter.
-
-What each part does today and what it still needs:
-
-| Subsystem | Today | Needs |
-|-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
-| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
-| Network | Offline by design: the title cannot reach the network | – |
-| Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
-| Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
-| GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
-| Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode | Runs through the menus to the loading screen | The world, as above |
-
-## Getting started
-
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
-
-The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager → Performance → Memory**. If
-`crashes.log` reports Windows error 1455, close other applications or increase
-the Windows paging file size, then retry.
-
-```powershell
-cargo xtask install-hooks                # asset-policy check on every commit
-copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
-cargo run -p victory -- config           # check your paths
-```
-
-Run the title:
-
-```powershell
-cargo build --release -p victory
-target\release\victory.exe run <game dir>\<the title's exe> --execute
-```
-
-The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
-data under the cache folder.
-
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
-
-| Keys | Pad |
-|------|-----|
-| W A S D / I J K L | left / right stick |
-| arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
-| Q / E, Z / C | shoulders, triggers |
-| F / H | stick clicks |
-| Esc, Tab | Menu, View |
-
-## Commands
-
-```
-victory inspect <exe|dll> [--imports] [--exports]
-victory census [paths...] [--missing] [--strict]
-victory lib-exports <import.lib> [--list]
-victory shader-info [paths...] [--verbose] [--disasm]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
-            [--console series-x|series-s] [-- <title arguments>]
-victory config
-```
-
-Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
-info and above).
-
-## Debugging
-
-A release build has no debugging aids. Build them in with
-
-```powershell
-cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
-```
-
-| Variable | Effect |
-|----------|--------|
-| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
-| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
-| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
-| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
-| `VICTORY_WARMUP=0` | off: do not build the listed title pipelines before the title starts (on by default while `warm-pipelines-*.bin` holds a list) |
-| `VICTORY_WARMUP_THREADS=<n>` | warm-up workers (default: all processors, 2 to 16; no worker past the first is added while less than 4 GB is free) |
-| `VICTORY_WARMUP_MAX_SECS=<n>` | stop the warm-up after that long and start the title (default: no limit; closing its window does the same) |
-| `VICTORY_WARMUP_WINDOW=0` | no progress window (the log line every 2 s stays) |
-| `VICTORY_LIBRARY_COLD=1` | start as if there were no host pipeline library file (measurements; the run then writes a new one) |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
-| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
-| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
-
-Every build appends crashes and host GPU failures to `crashes.log` in the
-title's data folder.
-
-## License
-
-GPL-3.0-or-later. See [LICENSE](LICENSE).
-
+<sub>Development lab of the previous line (offline shader checks, GPU run queue, performance ledger,
+worker pipeline) lives on branch
+[`legacy/amd-hub`](https://github.com/pablogonz12/Scarlight/tree/legacy/amd-hub), with tag
+`legacy-amd-hub-2026-11-25`. Nothing is deleted; `main` continues from the same commit.</sub>

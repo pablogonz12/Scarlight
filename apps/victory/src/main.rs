@@ -11,7 +11,7 @@ mod translate;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
@@ -75,9 +75,15 @@ enum Command {
         /// else the newest Windows SDK's).
         #[arg(long)]
         validate: bool,
-        /// Also create a host D3D12 pipeline for each emitted shader.
+        /// Also create a host D3D12 pipeline for each emitted shader
+        /// (translated for this host's wave sizes unless --host-lanes says).
         #[arg(long)]
         pipelines: bool,
+        /// Translate for a host whose waves are MIN-MAX lanes (32-32 for
+        /// NVIDIA, 32-64 for AMD RDNA): shaders that need another wave size
+        /// are listed as failures. Default: any wave size.
+        #[arg(long, value_name = "MIN-MAX", value_parser = parse_lanes)]
+        host_lanes: Option<(u32, u32)>,
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
@@ -105,6 +111,12 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Print the identity the layer uses to pick a title profile (BLAKE3),
+    /// and whether a profile matches it. Prints only numbers of this build.
+    TitleId {
+        /// The title's executable.
+        exe: PathBuf,
+    },
     /// Make the title pipelines of earlier runs that the pipeline library
     /// lacks, without starting the title (`run` does it at its start;
     /// `VICTORY_WARMUP=0` turns that off).
@@ -123,6 +135,34 @@ enum Unimplemented {
 enum Console {
     SeriesX,
     SeriesS,
+}
+
+/// `victory title-id <exe>`: the BLAKE3 a profile matches, and the profile
+/// that matches it, if any. Run locally; do not paste the hash into a report.
+fn title_id(exe: &std::path::Path) -> Result<()> {
+    let data = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
+    let hash = blake3::hash(&data);
+    let cfg = victory_core::Config::load()?;
+    println!("image          {}", exe.display());
+    println!("blake3         {hash}");
+    match cfg.title_profile(&hash.to_hex()) {
+        Some(profile) => println!(
+            "profile        {} ({} hooks)",
+            profile
+                .file()
+                .map_or_else(|| "<inline>".to_owned(), |p| p.display().to_string()),
+            profile.hooks.len()
+        ),
+        None => {
+            let dirs: Vec<String> = cfg
+                .profile_dirs
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect();
+            println!("profile        none (searched {})", dirs.join(", "));
+        }
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -156,6 +196,7 @@ fn main() -> Result<()> {
             pipelines,
             list,
             jobs,
+            host_lanes,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
@@ -165,7 +206,7 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_max_wave(n);
             }
-            translate::run(paths, validate, pipelines, list, jobs)
+            translate::run(paths, validate, pipelines, list, jobs, host_lanes)
         }
         Command::Run {
             exe,
@@ -175,9 +216,27 @@ fn main() -> Result<()> {
             console,
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
+        Command::TitleId { exe } => title_id(&exe),
         Command::Warmup => run::warmup(),
         Command::Config => show_config(),
     }
+}
+
+/// `MIN-MAX` lanes per wave, or one size `N`.
+fn parse_lanes(s: &str) -> Result<(u32, u32), String> {
+    let (a, b) = s.split_once('-').unwrap_or((s, s));
+    let n = |x: &str| {
+        x.trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|n| n.is_power_of_two() && (4..=128).contains(n))
+            .ok_or_else(|| format!("{x:?} is not a wave size (4 to 128, a power of two)"))
+    };
+    let (a, b) = (n(a)?, n(b)?);
+    if a > b {
+        return Err(format!("{a} is more than {b}"));
+    }
+    Ok((a, b))
 }
 
 fn show_config() -> Result<()> {

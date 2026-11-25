@@ -71,6 +71,7 @@ pub(crate) struct Staging {
 /// queued with is noted when that list runs, and each present says which
 /// content its copy carries beside the newest one the staging buffer holds.
 #[derive(Default)]
+#[allow(dead_code)] // only the diagnostics-gated present line reads these
 struct Present {
     /// Contents found (one per detiling), and detilings.
     contents: std::sync::atomic::AtomicU64,
@@ -120,6 +121,7 @@ impl Present {
     const SHOWN: usize = 32;
 
     /// A new content was detiled into the staging buffer.
+    #[allow(dead_code)] // called from the diagnostics-gated path
     fn detiled(&self, tiled: &[u8]) {
         use std::sync::atomic::Ordering::Relaxed;
         self.contents.fetch_add(1, Relaxed);
@@ -142,6 +144,7 @@ impl Present {
     }
 
     /// A list queued a copy of the content now in the staging buffer.
+    #[allow(dead_code)] // called from the diagnostics-gated path
     fn queued(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         self.queued_writes.store(self.writes.load(Relaxed), Relaxed);
@@ -1508,6 +1511,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 /// present, which shows our copy of it either way: the run's
 /// "written behind the guard" and the present line say whether a movie's
 /// frames are ever a submission late.
+#[allow(dead_code)] // the diagnostics-gated present line
 pub(crate) fn present_pending(resource: This) -> Option<bool> {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let staging = map.as_ref()?.get(&(resource as usize))?;

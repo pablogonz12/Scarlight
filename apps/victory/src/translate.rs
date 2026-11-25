@@ -158,6 +158,7 @@ pub fn run(
     pipelines: bool,
     list: bool,
     jobs: Option<usize>,
+    host_lanes: Option<(u32, u32)>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
@@ -173,6 +174,12 @@ pub fn run(
             dll.as_ref()
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
+    }
+    if let Some((lanes_min, lanes_max)) = host_lanes {
+        // The fork's emitter takes one host wave size, so the widest lane
+        // count is the one to translate for.
+        victory_shader::emit::set_host_max_wave(lanes_max);
+        println!("host waves   {lanes_min}-{lanes_max} lanes");
     }
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
@@ -601,6 +608,9 @@ fn check(
                     let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
                 }
             }
+            // The fork's emitter keeps no module summary (main's
+            // `emit::last_module_summary` has no equivalent), so the
+            // validator's message stands alone here.
             t.fail(format!("validator: {first}"), label);
         }
     }
