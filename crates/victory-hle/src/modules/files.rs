@@ -294,11 +294,19 @@ pub extern "system" fn CreateFileW(
 /// change: `CreateFile2` keeps its flags (they sit in a structure of the
 /// caller's), and `CreateFileA` passes its flags on as given.
 fn dropped_flags(access: u32, flags: u32) -> u32 {
-    if access == GENERIC_READ && flags & FILE_FLAG_OVERLAPPED == 0 {
+    if file_cache() && access == GENERIC_READ && flags & FILE_FLAG_OVERLAPPED == 0 {
         FILE_FLAG_NO_BUFFERING
     } else {
         0
     }
+}
+
+/// Whether a read-only open loses `FILE_FLAG_NO_BUFFERING`, so that the host
+/// file cache keeps the title's packs in memory for a second launch:
+/// `VICTORY_FILE_CACHE=0` keeps what the title asked for (a start-up switch).
+fn file_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_FILE_CACHE").map_or(true, |v| v != "0"))
 }
 
 pub extern "system" fn CreateFileA(

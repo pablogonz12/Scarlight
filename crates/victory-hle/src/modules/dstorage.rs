@@ -343,6 +343,14 @@ const COST: [u64; 3] = [100, 10, 1];
 /// The console's default staging buffer.
 const STAGING: u64 = 32 << 20;
 
+/// Whether a queue that submits itself leaves its reads into physical pages
+/// for the title's Submit: `VICTORY_DSTORAGE_HELD=0` submits them at once, as
+/// the layer did before (a start-up switch).
+fn held_reads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DSTORAGE_HELD").map_or(true, |v| v != "0"))
+}
+
 struct Lanes {
     lanes: HashMap<u64, Lane>,
     next_id: u64,
@@ -672,6 +680,7 @@ impl Lanes {
     /// something else (a local profile names the title's addresses). A
     /// status entry behind a held read waits with it.
     fn submit_as(&mut self, id: u64, explicit: bool) -> usize {
+        let explicit = explicit || !held_reads();
         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
             return 0;
         };
