@@ -128,7 +128,7 @@ fn spans_on(picked: bool, id: u64, start: usize, from: usize, to: usize, keep: b
         COUNTS[0].fetch_add((to - from) as u64, Relaxed);
         return vec![(from, to)];
     }
-    let exams = {
+    let turn = {
         let mut sets = SETS.lock().unwrap_or_else(|e| e.into_inner());
         if sets.len() >= KEPT && !sets.contains_key(&id) {
             sets.clear();
@@ -136,10 +136,23 @@ fn spans_on(picked: bool, id: u64, start: usize, from: usize, to: usize, keep: b
         let sweep = sets.entry(id).or_default();
         let turn = sweep.turn;
         sweep.turn = turn.wrapping_add(1);
-        // (The page's turn is taken here, while the set is held: the loop
-        // below reads it many times.)
-        let exams: Vec<bool> = (first..=last).map(|page| sweep.examines(page, turn)).collect();
-        exams
+        turn
+    };
+    spans_turn(turn, id, first, last, base, start, from, to)
+}
+
+/// [`spans_on`] of a turn given rather than taken: the looks of a copy in
+/// the order a sweep runs them (the tests and the benchmark take them so).
+fn spans_turn(turn: u64, id: u64, first: usize, last: usize, base: usize, start: usize, from: usize, to: usize) -> Vec<(usize, usize)> {
+    let exams: Vec<bool> = {
+        let sets = SETS.lock().unwrap_or_else(|e| e.into_inner());
+        // (A copy no compare has had yet, or whose set went with the
+        // table's clear: nothing learned, its turn's page only.)
+        let exams = |page: usize| match sets.get(&id) {
+            Some(sweep) => sweep.examines(page, turn),
+            None => page % slice() == (turn as usize) % slice(),
+        };
+        (first..=last).map(exams).collect()
     };
     let mut out: Vec<(usize, usize)> = Vec::new();
     let mut run: Option<(usize, usize)> = None;
@@ -315,4 +328,74 @@ mod tests {
         assert!(covered[PAGE..].iter().all(|&c| c), "every byte gets its turn");
         assert_eq!(spans_on(true, 14, start, PAGE, PAGE, true), Vec::new(), "an empty range");
     }
+}
+
+/// What the compare of 4,096 pages (256 MB) costs whole and picked, with
+/// one page in 64 of them changed (the frame the switch is for: a declared
+/// range whose shaders set a few words). The picked path is the spans and
+/// the compares they leave out, as `find_pieces` runs them.
+///
+/// `cargo test --release -p victory-gpu --lib compare_of_4k_pages -- --nocapture`
+#[test]
+fn compare_of_4k_pages_whole_and_picked() {
+    use std::time::Instant;
+    let pages = 4096;
+    let len = pages * PAGE;
+    // The copy and its snapshot, page 0 of the run's title memory.
+    let start = 0x1_0000_0000usize;
+    let mut data = vec![0xa5u8; len];
+    let mut before = vec![0xa5u8; len];
+    // 1 page in 64 changed, as the shaders of a frame leave it.
+    let changed: Vec<usize> = (0..pages).filter(|page| page % 64 == 37).collect();
+    for &page in &changed {
+        for byte in &mut data[page * PAGE..(page + 1) * PAGE] {
+            *byte ^= 0x01;
+        }
+    }
+    // Whole: every page compared, as `find_pieces` does without the switch.
+    let whole = |data: &[u8], before: &[u8]| -> Vec<(usize, usize)> {
+        let mut pieces = Vec::new();
+        for page in 0..pages {
+            let (at, n) = (page * PAGE, PAGE);
+            if data[at..at + n] != before[at..at + n] {
+                pieces.push((at, n));
+            }
+        }
+        pieces
+    };
+    // Picked: the spans of a look, and only those pages compared.
+    let picked = |turn: u64, data: &[u8], before: &[u8]| -> Vec<(usize, usize)> {
+        let mut pieces = Vec::new();
+        // (The pages of the copy, counted from its first: 0..pages.)
+        for (a, e) in spans_turn(turn, 1, 0, pages - 1, start / PAGE, start, 0, len) {
+            let mut at = a;
+            while at < e {
+                let n = (PAGE - (start + at) % PAGE).min(e - at);
+                if data[at..at + n] != before[at..at + n] {
+                    pieces.push((at, n));
+                }
+                at += n;
+            }
+        }
+        pieces
+    };
+    let time = |mut f: Box<dyn FnMut()>| {
+        let started = Instant::now();
+        for _ in 0..4 {
+            f();
+        }
+        started.elapsed() / 4
+    };
+    let mut whole_found = Vec::new();
+    let whole_us = time(Box::new(|| whole_found = whole(&data, &before)));
+    let mut picked_found = Vec::new();
+    // The look whose turn's pages are the changed ones (page 37 in 64):
+    // it compares them and nothing else.
+    let picked_us = time(Box::new(|| picked_found = picked(37, &data, &before)));
+    assert_eq!(whole_found.len(), changed.len(), "a whole scan finds them all");
+    assert_eq!(picked_found.len(), changed.len(), "the look of their turn finds them all");
+    eprintln!(
+        "4,096 pages, {} changed: whole {whole_us:?}, picked {picked_us:?}",
+        changed.len()
+    );
 }
