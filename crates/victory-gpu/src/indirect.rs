@@ -1513,12 +1513,16 @@ void main() {
         );
         assert_eq!(after_src, initial_src, "src_args must remain untouched");
 
+        // Each record costs 2^26 and the budget is 2^27: the first two a group
+        // charges fit, and neither group is known to go first, so the pair
+        // kept is 1 and 2 (group 0) or 64 and 65 (group 1).
         let mut kept = 0usize;
         let mut zeroed = 0usize;
+        let mut first_kept: Option<usize> = None;
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
             if rec[0] == (1 << 22) && rec[1] == 16 {
-                assert!(i == 1 || i == 2, "the first two real draws fit the budget");
+                first_kept.get_or_insert(i);
                 kept += 1;
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
@@ -1536,6 +1540,10 @@ void main() {
             }
         }
         assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+        assert!(
+            matches!(first_kept, Some(1) | Some(64)),
+            "the two that fit are the first two records of the group that charged first, not {first_kept:?}"
+        );
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, the scratch buffer's

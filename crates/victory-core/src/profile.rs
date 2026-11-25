@@ -141,9 +141,15 @@ impl Profile {
     /// own `render_scale`. `None` when neither asks for one (or the value is
     /// outside what the title's scale can be, which is logged).
     pub fn render_scale(&self) -> Option<f32> {
-        match std::env::var(RENDER_SCALE_ENV).ok() {
+        self.render_scale_with(std::env::var(RENDER_SCALE_ENV).ok().as_deref())
+    }
+
+    /// [`Profile::render_scale`] for the environment value `asked` (`None`:
+    /// the variable is not set), so the answer can be asked without one.
+    pub fn render_scale_with(&self, asked: Option<&str>) -> Option<f32> {
+        match asked {
             Some(text) => {
-                let v = parse_scale(&text);
+                let v = parse_scale(text);
                 if v.is_none() {
                     tracing::warn!(text, "{RENDER_SCALE_ENV} wants a number in 0.2..=1.0");
                 }
@@ -156,7 +162,13 @@ impl Profile {
     /// Whether the title's own upscaler is asked for everywhere:
     /// `VICTORY_OWN_UPSCALER` (`0` meaning no), else the profile's field.
     pub fn own_upscaler(&self) -> bool {
-        match std::env::var_os(OWN_UPSCALER_ENV) {
+        self.own_upscaler_with(std::env::var(OWN_UPSCALER_ENV).ok().as_deref())
+    }
+
+    /// [`Profile::own_upscaler`] for the environment value `asked` (`None`:
+    /// the variable is not set).
+    pub fn own_upscaler_with(&self, asked: Option<&str>) -> bool {
+        match asked {
             Some(v) => v != "0",
             None => self.own_upscaler.unwrap_or(false),
         }
@@ -220,8 +232,9 @@ impl Hook {
             let on = match name {
                 "render_scale" => scale.is_some(),
                 "own_upscaler" => own,
-                // A switch we do not know is one the user meant to matter.
-                _ => false,
+                // A switch we do not know is one the user meant to matter:
+                // never place the hook, whatever its negation would say.
+                _ => return false,
             };
             on != negated
         })
@@ -411,8 +424,12 @@ mod tests {
             when = ["render_scale", "!own_upscaler"]
             "#,
         );
-        let scale = p.render_scale().unwrap();
+        let scale = p.render_scale_with(None).unwrap();
         assert_eq!(scale, 0.5);
+        assert_eq!(p.render_scale_with(Some("0.75")), Some(0.75), "the environment wins");
+        assert_eq!(p.render_scale_with(Some("2")), None, "and an invalid one is no scale");
+        assert!(p.own_upscaler_with(None));
+        assert!(!p.own_upscaler_with(Some("0")));
         assert_eq!(p.hooks[0].replacement_at(0, Some(scale)).unwrap(), 0.5f32.to_le_bytes());
         assert!(p.hooks[0].wanted(Some(scale), true));
         assert!(!p.hooks[1].wanted(Some(scale), true), "an own-upscaler build takes no FSR patch");
@@ -447,6 +464,25 @@ mod tests {
         assert_eq!(parse_scale("1.5"), None);
         assert_eq!(parse_scale("half"), None);
         assert_eq!(profile("render_scale = 1.5").render_scale(), None);
+    }
+
+    #[test]
+    fn a_switch_this_loader_does_not_know_keeps_the_hook_out() {
+        let p = profile(
+            r#"
+            [[hooks]]
+            what = "for a later loader"
+            rva = 0x10
+            expect = "00000000"
+            new = "11111111"
+            when = ["!future_switch"]
+            "#,
+        );
+        assert!(
+            !p.hooks[0].wanted(Some(0.5), true),
+            "an unknown switch is never on, negated or not"
+        );
+        assert!(!p.hooks[0].wanted(None, false));
     }
 
     #[test]
