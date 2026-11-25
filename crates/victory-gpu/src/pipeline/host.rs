@@ -933,7 +933,7 @@ fn integer_format(format: u32) -> bool {
             | 36 | 38 // R16G16
             | 42 | 43 // R32
             | 50 | 52 // R8G8
-            | 56 | 58 // R16
+            | 57 | 59 // R16
             | 62 | 64 // R8
     )
 }
@@ -1572,10 +1572,11 @@ mod tests {
     /// packed 10-bit one, and none of the float, unorm, snorm or typeless forms.
     #[test]
     fn the_integer_formats_are_the_typed_ones() {
-        for f in [3, 4, 7, 8, 12, 14, 17, 18, 25, 30, 32, 36, 38, 42, 43, 50, 52, 56, 58, 62, 64] {
+        // The values from the windows crate's DXGI_FORMAT constants.
+        for f in [3, 4, 7, 8, 12, 14, 17, 18, 25, 30, 32, 36, 38, 42, 43, 50, 52, 57, 59, 62, 64] {
             assert!(integer_format(f), "format {f} is integer");
         }
-        for f in [1, 2, 5, 6, 9, 10, 11, 13, 15, 16, 19, 21, 23, 24, 26, 27, 28, 29, 31, 33, 34, 35, 37, 39, 41, 48, 49, 51, 53, 54, 55, 57, 59, 60, 61, 63, 65, 66] {
+        for f in [1, 2, 5, 6, 9, 10, 11, 13, 15, 16, 19, 21, 23, 24, 26, 27, 28, 29, 31, 33, 34, 35, 37, 39, 41, 48, 49, 51, 53, 54, 55, 56, 58, 60, 61, 63, 65, 66] {
             assert!(!integer_format(f), "format {f} is not integer");
         }
     }

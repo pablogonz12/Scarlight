@@ -82,8 +82,8 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
 - **miatson/VIctory [#2801](https://github.com/miatson/VIctory/pull/2801)** (miatson), GPL-3.0: the idea that
   the console blends MIN/MAX into integer render targets, which the host refuses, so such a target is made to
   write unblended when the pipeline is built (`crates/victory-gpu/src/pipeline/host.rs`). Its twin pipeline
-  states did not come over, and its format list was corrected here: `R16_SNORM` and `R8_TYPELESS` are not
-  integer and `R16_UINT`/`R16_SINT` were missing.
+  states did not come over; the format list came across as it stands, now checked against the `DXGI_FORMAT`
+  constants by a test.
 
 - **fxceless/victory-fork [PR #979](https://github.com/fxceless/victory-fork/pull/979)** (gmanka), GPL-3.0: the
   guarded views' clean blocks kept as contiguous runs (`CleanBlocks`, `crates/victory-gpu/src/watch.rs`), so a
