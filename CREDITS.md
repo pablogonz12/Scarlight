@@ -37,6 +37,11 @@ BlueKaiman.
   GPL-3.0: narrowing a host shader resource view of a streamed texture to the mips whose memory is
   there, and remaking it when more levels arrive or a host copy fills the chain
   (`crates/victory-gpu/src/texture.rs`, `crates/victory-gpu/src/descriptor/host.rs`).
+- **shh** ([VIctory#2553](https://github.com/Marvisak/VIctory/pull/2553) and
+  [#2555](https://github.com/Marvisak/VIctory/pull/2555)), GPL-3.0: the checked offset, size and
+  page count of a DirectStorage read, its page list read volatile, and the checked end of an
+  emulated `clwb` write-back loop (`crates/victory-hle/src/modules/dstorage.rs`,
+  `crates/victory-loader/src/crash.rs`).
 
 ## Tools
 
