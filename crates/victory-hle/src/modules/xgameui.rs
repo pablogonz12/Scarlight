@@ -18,7 +18,7 @@ pub const PROVIDER: Guid = Guid::new(
     0x4043,
     [0xba, 0x07, 0x35, 0xd6, 0x07, 0xdf, 0x98, 0xb0],
 );
-/// As the title asks for it; the slots it calls (0x38,
+/// As the title (2026) asks for it; the slots it calls (0x38,
 /// 0x40, 0x88-0x98) take the public API's arguments in the 2020 order.
 pub const IID_2026: Guid = Guid::new(
     0xeaf6_69df,

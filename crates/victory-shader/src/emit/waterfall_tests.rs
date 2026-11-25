@@ -69,9 +69,6 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        target: super::Target::ANY,
-        console_cf: false,
-        per_lane_only: false,
     })
     .expect("lower");
     // One access with each lane's own heap index, no wave operation.
@@ -85,8 +82,8 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
-        stride_table: lowered.stride_table,
         root_uavs: lowered.root_uavs,
+        root_indexed_views: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -114,7 +111,9 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
     // One GPU test at a time, with the VALU tests: in parallel on the
     // hardware adapter and WARP the test process sometimes died of an
     // access violation (7 of 24 runs of these four tests).
-    let _one = super::valu_tests::one_at_a_time();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");

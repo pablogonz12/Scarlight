@@ -12,33 +12,29 @@
 //! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
 //! [`signature`] command signatures, [`pipeline`] pipeline states,
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
-//! share, [`console`] which console model the title sees. Planned:
-//! `present` (swap chain).
+//! share, [`console`] which console model the title sees. Planned: `present`
+//! (swap chain).
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
-/// Diagnostics: counters raised by this crate's callers (the title's page
-/// scatters), which ride the frame line with the copy statistics.
-#[cfg(all(windows, feature = "diagnostics"))]
-pub mod stats {
-    pub use super::copystat::{C, add};
-}
-#[cfg(all(windows, feature = "diagnostics"))]
-mod producers;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+mod dxc;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(windows)]
+mod inplace;
 pub mod list;
 pub mod object;
 pub mod pipeline;
@@ -50,9 +46,11 @@ pub mod resource;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
-mod scissor;
 #[cfg(windows)]
 pub mod shader_cache;
+mod switches;
+#[cfg(windows)]
+mod memory;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
@@ -66,4 +64,23 @@ mod writeback;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
-pub use watch::{title_memory_remapped, writing as kernel_will_write};
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
+pub use watch::{
+    title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
+};
+
+/// Total installed physical RAM in bytes, queried once from the OS.
+#[cfg(windows)]
+pub(crate) fn total_system_ram_bytes() -> Option<u64> {
+    static TOTAL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *TOTAL.get_or_init(|| {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        // SAFETY: plain data the call fills in.
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: a sized structure.
+        let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
+        (ok && m.ullTotalPhys > 0).then_some(m.ullTotalPhys)
+    })
+}

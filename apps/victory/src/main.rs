@@ -117,6 +117,10 @@ enum Command {
         /// The title's executable.
         exe: PathBuf,
     },
+    /// Make the title pipelines of earlier runs that the pipeline library
+    /// lacks, without starting the title (`run` does it at its start;
+    /// `VICTORY_WARMUP=0` turns that off).
+    Warmup,
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -193,7 +197,17 @@ fn main() -> Result<()> {
             list,
             jobs,
             host_lanes,
-        } => translate::run(paths, validate, pipelines, list, jobs, host_lanes),
+        } => {
+            // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
+            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+                victory_shader::emit::set_view_heap_limit(n);
+            }
+            // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
+            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+                victory_shader::emit::set_host_max_wave(n);
+            }
+            translate::run(paths, validate, pipelines, list, jobs, host_lanes)
+        }
         Command::Run {
             exe,
             unimplemented,
@@ -203,6 +217,7 @@ fn main() -> Result<()> {
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
         Command::TitleId { exe } => title_id(&exe),
+        Command::Warmup => run::warmup(),
         Command::Config => show_config(),
     }
 }

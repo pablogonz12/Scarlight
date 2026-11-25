@@ -7,257 +7,200 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/pablogonz12/Scarlight/ci.yml?branch=main&style=flat-square&labelColor=14072c&label=CI&color=ff2e63)](https://github.com/pablogonz12/Scarlight/actions/workflows/ci.yml)
 [![Linux: builds on it](https://img.shields.io/github/actions/workflow/status/pablogonz12/Scarlight/linux.yml?branch=main&style=flat-square&labelColor=14072c&label=linux%20build&color=19d8ff)](https://github.com/pablogonz12/Scarlight/actions/workflows/linux.yml)
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-ff7a3d?style=flat-square&labelColor=14072c)](LICENSE)
-[![Last commit](https://img.shields.io/github/last-commit/pablogonz12/Scarlight?style=flat-square&labelColor=14072c&color=19d8ff)](https://github.com/pablogonz12/Scarlight/commits/main)
-[![Mesa: built for it](https://img.shields.io/badge/Mesa-built%20for%20it-ff2e63?style=flat-square&labelColor=14072c)](https://docs.mesa3d.org/)
-[![Drivers: RADV · ANV](https://img.shields.io/badge/drivers-RADV%20%C2%B7%20ANV-ff7a3d?style=flat-square&labelColor=14072c)](docs/hardware.md)
-[![Vulkan 1.3](https://img.shields.io/badge/Vulkan-1.3%2B-19d8ff?style=flat-square&labelColor=14072c)](https://www.vulkan.org/)
 [![Stars](https://img.shields.io/github/stars/pablogonz12/Scarlight?style=flat-square&labelColor=14072c&color=ffb347)](https://github.com/pablogonz12/Scarlight/stargazers)
 
-# Scarlight: an Xbox Series compatibility layer for Linux, built and tuned for Mesa
+# Scarlight
 
-**It implements the console system APIs a title calls, decodes its GPU command streams and recompiles its RDNA2 shaders, and runs the result through Proton — Wine and vkd3d-proton — on Mesa's open Vulkan drivers.<br>RADV (AMD) is the reference and ANV (Intel) is next. Mesa is open source, so the driver is ours to read, tune and fix, and every part of this project is developed and measured on that stack.**
+**Play Xbox Series games on your Linux PC, from Steam.**
 
-<sub>[What it is](#what-it-is) · [Status](#status) · [Progress](#progress) · [Hardware](#hardware) · [Requirements](#requirements) · [Quick start](#quick-start) · [How it works](#how-it-works) · [Roadmap](#roadmap) · [Launcher](#launcher) · [Help us test](#help-us-test) · [Contribute](#contribute) · [Who is behind this](#who-is-behind-this) · [Credits](#credits) · [Licence](#licence)</sub>
+Scarlight is a Steam compatibility tool. Proton lets Steam run Windows games on Linux; Scarlight does
+the same job for games built for Xbox Series. Install it once, choose it for the game in Steam, press
+Play.
+
+<sub>[What it is](#what-it-is) · [What you need](#what-you-need) · [Install](#install) ·
+[Status](#status) · [How it works](#how-it-works) · [Roadmap](#roadmap) · [Help wanted](#help-wanted) ·
+[Credits](#credits) · [Licence](#licence)</sub>
 
 </div>
 
+> **25 November 2026 — Scarlight is now a Steam compatibility tool.** Until today it was a program you
+> started by hand; from today it is one install, one entry in Steam's Compatibility list, and Play.
+> The code is the same code; the development setup of the previous line is preserved on branch
+> `legacy/amd-hub`. Why, and what moved where: [ANNOUNCEMENT.md](ANNOUNCEMENT.md).
+
 ## What it is
 
-Scarlight is a compatibility layer for titles built against the Xbox Series GDK. It loads a title's
-own x86-64 code from files you supply, answers the console system API calls that code makes, decodes
-its GPU command stream and recompiles its RDNA2 shaders, and rebuilds its pipelines for the host. It is
-written in Rust, GPL-3.0, and contains no game files: bringing your own legally obtained copies is
-the only way to run it.
+Games made for an Xbox Series console do not run on a PC by themselves: they expect the console's
+system software, its graphics commands and its shaders. Scarlight supplies the missing console side,
+so the game starts and draws on your machine instead. The Windows side it needs — files, memory,
+threads, the window — comes from Proton, the same Proton Steam already uses for Windows games; your
+graphics driver does the drawing.
 
-Today it runs through Proton, built and tuned for Mesa. As far as we know it is among the
-furthest-along Xbox Series compatibility efforts running under Proton; we have not compared every
-project, and the scope here is deliberately different — Mesa is the target platform, not one card
-or one proprietary driver.
+You do not run anything from a terminal: Steam launches the game, the way it does with Proton.
 
-It is early. It has been built and run with one title so far, and that title's world renders lit and
-textured at a few frames per second on one card; the work now is picture and speed.
+Scarlight ships no game files. It runs a copy of a game you legally own, on your own PC.
+
+## What you need
+
+- **Linux with Steam**, native or Flatpak.
+- **A graphics card with a Mesa Vulkan driver**: AMD (RADV) is the one tested; Intel (ANV) is checked
+  offline; NVIDIA's open NVK is planned and untried.
+  Vulkan 1.3 or newer. A proprietary driver is not a target of this project.
+- **A Proton you already have**: GE-Proton or Valve's Proton. Scarlight uses its Wine; we neither
+  ship nor fork Proton.
+- **The game's files**, from a copy you own.
+
+## Install
+
+Three steps. Full detail — every option, logs, uninstall, troubleshooting — in
+**[docs/steam.md](docs/steam.md)**.
+
+1. **Put Scarlight in Steam's compatibility tools folder.** Download `Scarlight-<version>.tar.gz`
+   from [Releases](https://github.com/pablogonz12/Scarlight/releases), then run this in the folder you
+   downloaded it to (or give `tar` the archive's full path, e.g.
+   `~/Downloads/Scarlight-0.1.0.tar.gz`):
+
+   ```bash
+   cd ~/Downloads
+   mkdir -p ~/.local/share/Steam/compatibilitytools.d/
+   tar -xzf Scarlight-<version>.tar.gz -C ~/.local/share/Steam/compatibilitytools.d/
+   ```
+
+   Flatpak Steam uses `~/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d/`.
+   From a source checkout instead, `tools/steam-compat/install.sh` does the same.
+2. **Restart Steam.**
+3. **Choose it for the game.** If the game is not in your library yet, add it first: *Steam → Games →
+   Add a Non-Steam Game to My Library → Browse…* and pick its `.exe`. Then *Library → right-click the
+   game → Properties → Compatibility →* tick
+   **Force the use of a specific Steam Play compatibility tool** and pick **Scarlight (Xbox Series)**.
+   Press Play.
+
+Two things a release leaves to you, both one step: if Steam cannot find the Proton Scarlight should run
+on, name yours in `compatibilitytools.d/Scarlight/scarlight.conf` (`PROTON=`); and put your own copy of
+DXC's `dxil.dll` and `dxcompiler.dll` in `Scarlight/files/` (Microsoft's binaries are not redistributed
+by a Linux release). [docs/steam.md](docs/steam.md) has both.
 
 ## Status
 
-Measured on one machine, 25 Nov 2026: **RX 9070 XT (RDNA4) · Mesa 26.3.1 RADV** (Vulkan 1.4) ·
-CachyOS, kernel 7.3.6 · GE-Proton11-14 · vkd3d-proton master · 30 GB RAM. Diagnostics builds.
-Tested so far with **one title**; reports from other content are welcome, and no other GPU has been
-tried.
+**Not playable yet.** This is early work, and it is better to say so plainly: the game starts, its
+menus work, and its world appears — but the picture is incomplete and dark in places, and it runs at
+a few frames per second. One game has been tried, on one graphics card.
 
-| Area | State |
+| What | Today |
 |---|---|
-| Boot, menus, audio, gamepad | Work; menus at 30 fps |
-| World, fixed test scene | Lit and textured. **3.0 fps** on tag `keep/best-fx-578d459c` (one run, Microsoft's `d3dcompiler_47` beside the exe); **1.45-1.7 fps** on nine builds of the current base (one run each) |
-| Time to the world | 133-218 s (three builds) |
-| Shaders | **751 / 751** world programs of the test title translate, and **749 / 751** build a real RADV pipeline |
-| Faces | **Some characters' faces still fail to render** (regressed again on 25 Nov, under investigation) |
-| Picture | Close-up character detail and walls missing in some builds; shadowed areas dark |
-| Stability | Some builds hang at boot or at world entry; async write-back is experimental |
+| Starting the game, menus, sound, controller | Works; menus at 30 fps |
+| The game's world | Shows, but only partly: lit and textured in places, much of the scene dark |
+| Speed | **0.1–3 fps**: 1.5–3 in the fixed scene we measure, down to 0.1 in busy scenes while the game's copies and textures queue up |
+| Shaders | **751 / 751** of the game's world shaders translate; 749 / 751 build a real pipeline on the driver |
+| Time to the world | 133–218 s |
+| Stability | Some builds hang at start or when the world loads |
 | **Playable** | **No** |
 
-The frame rate is the median at one fixed scene, the only figure compared between builds; the method
-is in [docs/testing.md](docs/testing.md).
+Measured 25 Nov 2026 on one machine: **AMD RX 9070 XT**, Mesa 26.3.1 (RADV), CachyOS, GE-Proton11-14.
+No other card and no other game have been tried, so nothing here promises anything about yours.
 
-## Progress
+<!-- progress:start -->
+Progress in detail — what is measured, how, and where each number comes from: [docs/PROGRESS.md](docs/PROGRESS.md).
+<!-- progress:end -->
 
-Each row is a share of a set that was **counted on this machine** — an import table, a shader archive,
-a frame of recorded work — so the bars are measurements, not estimates. 100 % in every row is the
-target, not a promise: correctness is checked by runs. The System APIs row is the one to read twice:
-every import resolves, but only 15 % of them are code this project wrote — the rest is Wine (Proton)
-doing its job, and the title's own libraries. Per-row sources, the ISA and pipeline detail, and what
-each number means: [docs/PROGRESS.md](docs/PROGRESS.md).
+## How Scarlight differs from other Xbox Series projects
 
-| Area | Progress | Detail | Where |
-|---|---|---|---|
-| System APIs (HLE) | ████████████ 100 % resolved (0 missing) | ██░░░░░░░░░░ 15 % own HLE | [detail](docs/PROGRESS.md#system-apis-hle) |
-| Shaders | ███████████░ 99 % | ███████████░ 99 % real RADV pipeline | [detail](docs/PROGRESS.md#shaders) |
-| GPU command stream | ███████████░ 92 % | ███████████░ 92 % verified | [detail](docs/PROGRESS.md#gpu-command-stream) |
-| Pipelines | ████████░░░░ 69 % | ███████████░ 99 % built offline | [detail](docs/PROGRESS.md#pipelines) |
-| Features | status words | 2 of 10 shown | [detail](docs/PROGRESS.md#features) |
-| Mesa reach (compiled offline, not run) | ██████████░░ 80 % | compiled only, not run | [detail](docs/PROGRESS.md#mesa-reach) |
-| Performance | █░░░░░░░░░░░ 5 % | █░░░░░░░░░░░ 5 % of 30 fps | [detail](docs/PROGRESS.md#performance) |
+Several projects take on Xbox Series games on a PC. They aim at different platforms, so the rows below
+are about fit, not quality.
 
-Measured on 25 Nov 2026, build 5fca579b, RX 9070 XT (RDNA4) / Mesa 26.3.1 RADV. The gaps are the
-honest ones: 88 of 587 imports are our own HLE, the whole-archive shaders have translation but no
-validated pipeline column yet, and speed is a twentieth of the console's 30 fps. The world set does
-more than translate, though: **749 of 751** build a real RADV pipeline, and through Mesa's noop
-drm-shims the same set compiles for every AMD generation up to ours (Vega 669/751, no mesh shaders)
-and on Intel ANV for Arc B **751/751**, Arc A 750/751 and Xe-LPG 750/751; the single Intel miss is
-the stub's own query gap, not a compiler error. Only RDNA4 has actually been run. Per-family table:
-[docs/hardware.md](docs/hardware.md#compile-check-per-family). Regenerate with `tools/progress/collect.sh`
-and `tools/progress/render.py`.
-
-## Hardware
-
-| **Tested** | **Expected** | **Unknown** |
+| | Scarlight | Other Xbox Series projects (Windows-first layers) |
 |---|---|---|
-| **RX 9070 XT (RDNA4) · RADV**<br>Every number on this page comes from this one card | **RDNA1-3 (RX 5000-7000), Vega · RADV**<br>World pipelines compile offline for all four (Vega 669/751, no mesh); not yet run<br><br>**Arc A/B-series, Xe2 · ANV**<br>Not yet checked | **Older Intel, Polaris and older, AMD APUs**<br>Any Mesa older than ours<br>Not yet checked |
+| Target platform | Linux, through Steam | Windows 10/11 x64; no Linux target documented |
+| How a game is started | Picked in Steam's Compatibility list, then Play; Steam launches it | The project's own program on Windows; on Linux you would set up a Wine prefix by hand |
+| What you install | A release tarball into `compatibilitytools.d`, or one `install.sh`, plus a Proton you already have | Build from source with the project's toolchain on Windows, then supply the D3D12 and DXC files yourself |
+| Graphics driver focus | Built and tuned for Mesa's open Vulkan drivers: RADV first, ANV next, NVK planned | Any Direct3D 12 driver with shader model 6.6 (mesh shaders for the world) |
+| Shader route | The console's RDNA2 shaders are recompiled to DXIL today, then drawn through vkd3d-proton and Vulkan; direct SPIR-V is in progress | The console's RDNA2 shaders are recompiled to DXIL and drawn through Direct3D 12 |
+| Linux test coverage | One game on one card: RX 9070 XT, Mesa 26.3.1 RADV | None documented; their READMEs require Windows |
 
-Full table, what "Expected" means and how a card moves: [docs/hardware.md](docs/hardware.md). The
-world set also compiles for every family in the two right-hand columns through Mesa's noop drm-shim,
-RADV and ANV alike; that result, per family, is the
-[compile check](docs/hardware.md#compile-check-per-family). Native Windows and NVIDIA's proprietary
-driver are unsupported; NVK is a roadmap item, not a target yet.
-
-## Requirements
-
-| Need | Minimum | Tested here |
-|---|---|---|
-| **Linux kernel** | recent enough to drive your card (`amdgpu`, `i915`/`xe`); a hard minimum **to be confirmed** | 7.3.6 |
-| **Mesa** | a Mesa whose RADV or ANV driver exposes **Vulkan 1.3**; the oldest working version is **to be confirmed** | 26.3.1 |
-| **Vulkan** | **1.3**, which is what vkd3d-proton needs | 1.4.363 |
-| **Wine** | a Proton or GE-Proton build, called through its own `wine` binary | GE-Proton11-14 |
-| **Direct3D 12** | [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton) **master** — release 3.1 crashed at world entry | master |
-| **RAM** | 32 GB recommended | about 30 GB usable |
-
-You also supply, outside this repository: your own legally obtained copies of a title's files, 64-bit
-`dxcompiler.dll` and `dxil.dll`
-([DirectXShaderCompiler](https://github.com/microsoft/DirectXShaderCompiler/releases)), and — as a
-stop-gap — Microsoft's `d3dcompiler_47.dll`: Wine's built-in one rejects some runtime shaders.
-
-## Quick start
-
-Arch-family Linux, current Mesa. On other distributions install the equivalent packages (Mesa's
-Vulkan driver: `vulkan-radeon`, `vulkan-intel` or `mesa-vulkan-drivers`) and the same build tools.
-
-```bash
-sudo pacman -S --needed mesa vulkan-radeon vulkan-tools rustup git clang lld llvm   # vulkan-intel on Intel
-git clone https://github.com/pablogonz12/Scarlight && cd Scarlight
-rustup toolchain install 1.98.1                           # the version pinned in rust-toolchain.toml
-cargo install cargo-xwin                                  # once
-cargo xwin build --release -p victory --features diagnostics --target x86_64-pc-windows-msvc
-```
-
-Wine needs a graphical session (`DISPLAY` set; on a headless machine, run it under Xwayland or Xvfb),
-and the first `cargo xwin build` downloads Microsoft's CRT and Windows headers, so it needs network
-once.
-
-That produces a Windows binary; it runs here under Wine. Tags mark builds measured on the scene above,
-so a build of `main` can be ahead or behind the latest number. Copy the DLLs next to the exe and start
-it with GE-Proton's `wine` (not the `proton` script); edit the first five paths:
-
-```bash
-GE="$HOME/.local/share/Steam/compatibilitytools.d/GE-Proton11-14-x86_64"   # ls this folder: it usually ends in -x86_64
-VKD3D="$HOME/dlls/vkd3d-proton-master"   # d3d12.dll, d3d12core.dll (x64)
-DXC="$HOME/dlls/dxc"                     # dxcompiler.dll, dxil.dll (x64)
-D3DC="$HOME/dlls/d3dcompiler_47.dll"     # x64
-GAME="$HOME/victory-data/game/<the title's exe>"
-OUT="$PWD/target/x86_64-pc-windows-msvc/release"
-
-cp "$VKD3D"/d3d12.dll "$VKD3D"/d3d12core.dll "$DXC"/dxcompiler.dll "$DXC"/dxil.dll "$D3DC" "$OUT"/
-cp "$GE"/files/lib/wine/dxvk/x86_64-windows/dxgi.dll "$OUT"/
-
-WINEPREFIX="$HOME/.local/share/scarlight-prefix" \
-WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,d3d11,d3d10core,d3dcompiler_47=n,b" \
-VKD3D_CONFIG=ignore_shared_fence VICTORY_LOG=info \
-"$GE/files/bin/wine" "$OUT/victory.exe" run "$GAME" --execute
-```
-
-Check the stack first: `vulkaninfo --summary` should show `driverName` `radv`, `Intel open-source Mesa
-driver` (ANV) or `nvk`, with an `apiVersion` of at least 1.3. The first run creates the Wine prefix by
-itself, about 30 s. Play script, keyboard-as-gamepad map, switches and troubleshooting are in
-**[docs/linux.md](docs/linux.md)**.
-
-The build and the bind-only part above were run as written on a fresh clone and an empty prefix: the
-load prints `missing=0` for the title and its DLLs, and without `--execute` it only lists what it would
-load. A full in-game launch on a fresh prefix is still being verified, so treat the numbers above as
-coming from our test machines. If it fails, open an issue with the last 50 lines of the log.
+<sub>Facts as the public READMEs of those projects stated them on 25 Nov 2026; check them yourself for
+anything that has changed since.</sub>
 
 ## How it works
 
 ```mermaid
-flowchart LR
-    A["Console title<br/>x86-64 code + GPU work"] --> B["Scarlight<br/>console APIs · GPU commands · shader translation"]
-    B --> C["Direct3D 12"] --> D["vkd3d-proton"] --> E["Vulkan"] --> F["Mesa<br/>RADV · ANV"] --> G["Linux kernel<br/>amdgpu · i915 / xe"]
-    W["Wine (Proton)"] -.-> A
+flowchart TB
+    S["Steam: you press Play"] --> T["Scarlight compatibility tool<br/>picks your Proton, sets up the prefix"]
+    T --> P
+    subgraph P["Proton (Wine): the operating-system side"]
+        direction TB
+        G["The game's own x86-64 code"] <-->|"console API calls"| R["Scarlight runtime<br/>console APIs · GPU command decoder · RDNA2 shader recompiler"]
+    end
+    R -->|"Direct3D 12 + DXIL"| V["vkd3d-proton"]
+    V -->|"Vulkan + SPIR-V"| M["Mesa: RADV (tested) · ANV · NVK (planned)"]
+    M --> K["Linux kernel GPU driver<br/>amdgpu · xe / i915 · nouveau"]
 ```
 
-The title's code runs under Wine, started through Proton. Its console kernel calls are answered in
-user space; its GPU commands are re-emitted as Direct3D 12, with the console's shaders recompiled and
-pipelines rebuilt for the host. vkd3d-proton turns those calls into Vulkan, and Mesa submits them to
-the kernel. Four translations between the console's code and the GPU, and most of a measured frame is
-spent before the GPU draws at all: the title waits on pipelines that are still being compiled (457 ms
-of a 602 ms median frame). Crates and call flow: [docs/architecture.md](docs/architecture.md).
+[![Mesa: built for it](https://img.shields.io/badge/Mesa-built%20for%20it-ff2e63?style=flat-square&labelColor=14072c)](https://docs.mesa3d.org/)
+[![Drivers: RADV · ANV](https://img.shields.io/badge/drivers-RADV%20%C2%B7%20ANV-ff7a3d?style=flat-square&labelColor=14072c)](docs/hardware.md)
+[![Vulkan 1.3](https://img.shields.io/badge/Vulkan-1.3%2B-19d8ff?style=flat-square&labelColor=14072c)](https://www.vulkan.org/)
+
+- **Steam starts it.** The game's `.exe` is a Non-Steam Game whose compatibility tool is Scarlight.
+  The tool finds your Proton, prepares the game's prefix and shader cache, and asks Steam for the same
+  runtime container Proton gets.
+- **Proton does the operating-system side.** The game's file, thread, memory and window calls are
+  Wine's job, through the Proton you installed.
+- **Scarlight does the console side.** It runs inside that Wine process next to the game: it answers
+  the console system APIs the game calls, decodes its GPU command streams, and recompiles its RDNA2
+  shaders and pipelines for your card.
+- **vkd3d-proton and Mesa draw it.** Scarlight hands Direct3D 12 and DXIL to vkd3d-proton, which turns
+  them into Vulkan and SPIR-V for Mesa's RADV (AMD) or ANV (Intel); NVK (NVIDIA) is planned. Mesa is open source,
+  so the driver is ours to read, tune and fix — that is why the project is built around it. RADV on
+  RDNA4 is the only one tested in a game so far; ANV's pipelines are checked offline.
+
+Design notes: [docs/architecture.md](docs/architecture.md).
 
 ## Roadmap
 
-| Stage | Goal |
-|---|---|
-| **1. Now** | Picture parity on the fixed scene; every world pipeline pre-built like the console; cache keys that survive a rebuild; Mesa cache sizing; fewer copies per frame |
-| **2. Next** | A native Vulkan backend: copies and memory on Vulkan, then zero-copy title memory through Mesa's host-memory import, then SPIR-V straight from the console's shaders |
-| **Idea, not planned** | A native Linux host without Wine: most of the title's imports are the C/C++ runtime Wine provides today |
+| Stage | Goal | Where it stands |
+|---|---|---|
+| **Now** | One core, every shader | The best translator and GPU code of the related projects merged into one core: 751 of 751 world shaders and 2,907 of 2,912 recorded shaders translate offline |
+| **Now** | Speed: stop copying the game's memory every frame | Most of a slow frame is copies of the game's memory. In progress: copies on the graphics card, the game's private memory shared with the card instead of copied, and copies that avoid a slow path in Wine |
+| **Now** | Loading and pop-in | Files are read at a small fraction of what the disk can do; the reader is being measured stage by stage |
+| **Next** | Dark areas lit | The game traces rays in its own compute shaders, and that part is switched off today; turning it on (or using the card's ray tracing on RADV) is the way to light shadowed areas |
+| **Next** | Faces and missing geometry | Specific shaders and copies that are dropped; each has a named cause |
+| **Later** | Talk to Vulkan directly | Shaders straight from the console's instructions to SPIR-V, with no DXIL in between: an experimental translator already covers about half of the compute shaders |
 
-No dates, and targets are goals rather than results. Each stage's measured motivation, and the
-long-term idea, are in [docs/ROADMAP.md](docs/ROADMAP.md).
+No dates; these are goals, not results. Every number above is from offline checks on one machine.
 
-## Launcher
+## Help wanted
 
-**Available now** in [`tools/scarlight-launcher/`](tools/scarlight-launcher/README.md). A
-`scarlight` launcher that puts the whole stack in one place:
+The missing pieces are specific, and **people who know Wine, Proton or Mesa are the most useful of
+all** — this project spends its time where those three meet:
 
-- a **system check** before the first run: GPU, Mesa version, Vulkan, Proton build, and which parts
-  of the stack are missing;
-- **presets**: Play, Performance, Picture debug, and Developer (skip intros, start at the test
-  scene);
-- a **ray-tracing toggle** where the driver and build support it, the **Mesa options** that matter
-  here in one panel, and a **backend choice**: Proton today, native Vulkan when it exists.
+- **Wine / Proton:** the OS-side behaviour a console game expects (threads, timing, file layout), and
+  how a compatibility tool should hand work to a Proton build.
+- **Mesa (RADV, ANV):** why a pipeline that builds fine still stalls on first use, shader cache
+  behaviour, and what our command stream costs on the driver side.
+- **vkd3d-proton:** the Direct3D 12 features a console-shaped workload leans on.
+- **Rust, and the formats:** command-stream decoding, the shader translator, the RDNA2 instruction set.
+- **Anyone with another Mesa card** (RDNA1-3, Vega, Arc, Xe, NVK): a run on your machine is as useful
+  as a patch.
 
-It is one bash script (`scarlight`, plus a desktop entry template and an example profile), needs
-nothing but `vulkan-tools` for the check, and uses `gum`, `fzf`, `whiptail`/`dialog` or plain
-prompts, whichever is installed; [docs/linux.md](docs/linux.md) still has the manual setup.
-
-![The launcher: the system check, then the main menu](docs/img/launcher.gif)
-
-<sub>The check and the menu, recorded on our test machine against a throwaway profile
-([`tools/scarlight-launcher/demo/record.py`](tools/scarlight-launcher/demo/record.py) makes that
-recording again).</sub>
-
-<a id="help-us-test"></a>
-
-## Help us test
-
-**A run on another Mesa GPU is as useful as a patch.** AMD (RDNA1-3, Vega) and Intel (Arc, Xe) are
-both wanted; only an RX 9070 XT, with one title, has been tried so far. Send the GPU and driver, the
-Mesa version (`driverName`, `driverVersion`, `apiVersion`) and where it came from, kernel,
-distribution and session, Proton build, vkd3d-proton version, the commit you built, how far it got
-with the frame lines, what looked wrong, and the last ~50 lines of the log — text and logs only.
-
-Use the [test report form](https://github.com/pablogonz12/Scarlight/issues/new?template=test-report.yml)
-or the [bug report form](https://github.com/pablogonz12/Scarlight/issues/new?template=bug-report.yml);
-[docs/testing.md](docs/testing.md) explains what each number means. If Scarlight breaks on your card
-that is our bug, and if the fault is in the driver we take it to Mesa.
-
-## Contribute
-
-Pull requests target `main` and go in after CI and review. [CONTRIBUTING.md](CONTRIBUTING.md) has the
-build, test, naming and asset rules, and says which checks to run; [good first
-issues](https://github.com/pablogonz12/Scarlight/labels/good%20first%20issue) are written so a
-newcomer can finish one without guessing. Questions go to
-[Discussions](https://github.com/pablogonz12/Scarlight/discussions), and everyone here follows the
-[code of conduct](CODE_OF_CONDUCT.md). Docs, commits and PRs never name the title or its developer; no
-game files, screenshots or dumps are ever committed ([asset policy](docs/asset-policy.md)). Parts of
-the project, this page included, are written with AI coding tools. If you want a Linux-first project
-to keep moving, star the repository and tell us what your card does.
-
-## Who is behind this
-
-Scarlight is currently a one-person project. I write it and test it on one machine — the RX 9070 XT
-above — and I lean heavily on AI coding assistants for the code. Nothing goes in on trust: every
-change is checked by the test suite, an offline shader check of the whole 751-program world set, and
-runs on real hardware, with the picture looked at before the frame rate. I also work on mali-open, a
-from-scratch open-source Vulkan driver for Arm Mali GPUs that uses Mesa's compiler as a library.
-
-I cannot cover this alone, and the missing pieces are specific: people who know Mesa (RADV or ANV),
-Vulkan, vkd3d-proton, Wine or Rust, and people who own another Mesa GPU and can say what it does.
-Open an issue, send a test report, or take a roadmap item.
+Send a [test report](https://github.com/pablogonz12/Scarlight/issues/new?template=test-report.yml) or
+[bug report](https://github.com/pablogonz12/Scarlight/issues/new?template=bug-report.yml) with your
+card, driver and Mesa version, kernel, distribution, Proton build, and the last ~50 lines of
+`scarlight.log`. Text and logs only: no game files, no screenshots. Pull requests are welcome;
+[CONTRIBUTING.md](CONTRIBUTING.md) has the build, test and asset rules, and
+[Discussions](https://github.com/pablogonz12/Scarlight/discussions) is where questions go.
 
 ## Credits
 
-Built on the project named in [CREDITS.md](CREDITS.md) (GPL-3.0), whose history and authorship this
-tree keeps, plus work from its community — every contributor is named there.
+Scarlight is a port of the project named in [CREDITS.md](CREDITS.md) (GPL-3.0), whose history and
+authorship this tree keeps; every contributor is named there, along with the third-party licences a
+release ships.
 
 ## Licence
 
 GPL-3.0-or-later; see [LICENSE](LICENSE).
 
 Not affiliated with or endorsed by Microsoft. Xbox and Xbox Series are trademarks of Microsoft.
+
+<sub>Development lab of the previous line (offline shader checks, GPU run queue, performance ledger,
+worker pipeline) lives on branch
+[`legacy/amd-hub`](https://github.com/pablogonz12/Scarlight/tree/legacy/amd-hub), with tag
+`legacy-amd-hub-2026-11-25`. Nothing is deleted; `main` continues from the same commit.</sub>

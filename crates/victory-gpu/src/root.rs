@@ -27,15 +27,6 @@ const ROOT_SIGNATURE_IIDS: [Iid; 3] = [
 
 const CONSOLE_FLAGS: u32 = 0xff00_0000;
 
-/// Flags only a host with shader model 6.6 dynamic resources accepts:
-/// `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` (`0x400`) and
-/// `SAMPLER_HEAP_DIRECTLY_INDEXED` (`0x800`). An older runtime (the WARP that
-/// ships without the Agility SDK, vkd3d-proton under Wine) refuses the whole
-/// description with `E_INVALIDARG`, so a refusal is retried without them: the
-/// title keeps a usable root signature, and only shaders that index the heaps
-/// directly, which those hosts cannot run either way, lose the flag.
-const HEAP_FLAGS: u32 = 0xc00;
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Desc {
@@ -116,46 +107,15 @@ pub extern "system" fn serialize(
         tracing::warn!("no host d3d12.dll to serialize root signatures");
         return E_NOTIMPL;
     };
-    // SAFETY: the export has this signature.
-    let serialize = unsafe { std::mem::transmute::<usize, Serialize>(address) };
-    serialize_with(serialize, without_console_flags(desc), version, blob, error)
-}
-
-/// Serializes through `serialize`, and if the host refuses the description
-/// only because of the heap-directly-indexed flags, once more without them.
-fn serialize_with(
-    serialize: Serialize,
-    desc: Desc,
-    version: u32,
-    blob: *mut *mut c_void,
-    error: *mut *mut c_void,
-) -> HRESULT {
-    // SAFETY: the caller resolved the host export, which has this signature.
-    let result = unsafe { serialize(&desc, version, blob, error) };
-    if result >= 0 || desc.flags & HEAP_FLAGS == 0 {
-        return result;
+    // SAFETY: the export has this signature; it takes what the title passed.
+    unsafe {
+        std::mem::transmute::<usize, Serialize>(address)(
+            &without_console_flags(desc),
+            version,
+            blob,
+            error,
+        )
     }
-    tracing::debug!(
-        flags = format_args!("{:#x}", desc.flags),
-        "host refused the heap-directly-indexed root signature flags; retrying without them"
-    );
-    retry_without_heap_flags(serialize, &desc, version, blob, error)
-}
-
-/// The second attempt of [`serialize_with`], with [`HEAP_FLAGS`] cleared.
-fn retry_without_heap_flags(
-    serialize: Serialize,
-    desc: &Desc,
-    version: u32,
-    blob: *mut *mut c_void,
-    error: *mut *mut c_void,
-) -> HRESULT {
-    let stripped = Desc {
-        flags: desc.flags & !HEAP_FLAGS,
-        ..*desc
-    };
-    // SAFETY: as in [`serialize_with`]: the same host export.
-    unsafe { serialize(&stripped, version, blob, error) }
 }
 
 /// `d3d12_xs!D3D12SerializeVersionedRootSignature`.
@@ -177,37 +137,8 @@ pub extern "system" fn serialize_versioned(
         desc: without_console_flags(desc.desc),
         ..desc
     };
-    // SAFETY: the export has this signature.
-    let serialize = unsafe { std::mem::transmute::<usize, SerializeVersioned>(address) };
-    serialize_versioned_with(serialize, desc, blob, error)
-}
-
-/// [`serialize_with`] through the versioned entry point, whose description
-/// starts with the same [`Desc`].
-fn serialize_versioned_with(
-    serialize: SerializeVersioned,
-    desc: VersionedDesc,
-    blob: *mut *mut c_void,
-    error: *mut *mut c_void,
-) -> HRESULT {
-    // SAFETY: the caller resolved the host export, which has this signature.
-    let result = unsafe { serialize(&desc, blob, error) };
-    if result >= 0 || desc.desc.flags & HEAP_FLAGS == 0 {
-        return result;
-    }
-    tracing::debug!(
-        flags = format_args!("{:#x}", desc.desc.flags),
-        "host refused the heap-directly-indexed root signature flags; retrying without them"
-    );
-    let stripped = VersionedDesc {
-        desc: Desc {
-            flags: desc.desc.flags & !HEAP_FLAGS,
-            ..desc.desc
-        },
-        ..desc
-    };
-    // SAFETY: as above: the same host export.
-    unsafe { serialize(&stripped, blob, error) }
+    // SAFETY: the export has this signature; it takes what the title passed.
+    unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) }
 }
 
 type Deserialize =
@@ -388,108 +319,6 @@ mod tests {
         assert_eq!(
             serialize_versioned(std::ptr::null(), &mut blob.cast_mut().cast(), &mut error),
             E_INVALIDARG
-        );
-    }
-
-    /// The flags the fake host was asked to serialize, in order.
-    static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
-
-    fn plain(flags: u32) -> Desc {
-        Desc {
-            parameter_count: 0,
-            parameters: std::ptr::null(),
-            sampler_count: 0,
-            samplers: std::ptr::null(),
-            flags,
-        }
-    }
-
-    /// A host without shader model 6.6 dynamic resources: it refuses a
-    /// description that carries the heap-directly-indexed flags, as WARP
-    /// without the Agility SDK and vkd3d-proton under Wine do.
-    unsafe extern "system" fn refuses_heap_flags(
-        desc: *const Desc,
-        _: u32,
-        _: *mut *mut c_void,
-        _: *mut *mut c_void,
-    ) -> HRESULT {
-        // SAFETY: the tests pass a live description.
-        let flags = unsafe { (*desc).flags };
-        SEEN.lock().unwrap().push(flags);
-        if flags & HEAP_FLAGS == 0 {
-            S_OK
-        } else {
-            E_INVALIDARG
-        }
-    }
-
-    /// [`refuses_heap_flags`] for the versioned entry point.
-    unsafe extern "system" fn refuses_heap_flags_versioned(
-        desc: *const VersionedDesc,
-        _: *mut *mut c_void,
-        _: *mut *mut c_void,
-    ) -> HRESULT {
-        // SAFETY: the tests pass a live description.
-        let flags = unsafe { (*desc).desc.flags };
-        SEEN.lock().unwrap().push(flags);
-        if flags & HEAP_FLAGS == 0 {
-            S_OK
-        } else {
-            E_INVALIDARG
-        }
-    }
-
-    /// A host that refuses every description, for whatever reason.
-    unsafe extern "system" fn refuses_everything(
-        _: *const Desc,
-        _: u32,
-        _: *mut *mut c_void,
-        _: *mut *mut c_void,
-    ) -> HRESULT {
-        E_INVALIDARG
-    }
-
-    /// A refusal of the heap-directly-indexed flags is retried without them,
-    /// and nothing else is retried or changed.
-    #[test]
-    fn the_heap_flags_are_dropped_only_after_the_host_refuses_them() {
-        let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
-        let seen = || SEEN.lock().unwrap().clone();
-
-        SEEN.lock().unwrap().clear();
-        assert_eq!(
-            serialize_with(refuses_heap_flags, plain(0xc01), 1, &mut blob, &mut error),
-            S_OK
-        );
-        assert_eq!(seen(), [0xc01, 0x1], "the retry keeps every other flag");
-
-        SEEN.lock().unwrap().clear();
-        assert_eq!(
-            serialize_with(refuses_heap_flags, plain(0x41), 1, &mut blob, &mut error),
-            S_OK
-        );
-        assert_eq!(seen(), [0x41], "no heap flags, one attempt");
-
-        SEEN.lock().unwrap().clear();
-        assert_eq!(
-            serialize_versioned_with(
-                refuses_heap_flags_versioned,
-                VersionedDesc {
-                    version: 1,
-                    desc: plain(0xc03)
-                },
-                &mut blob,
-                &mut error
-            ),
-            S_OK
-        );
-        assert_eq!(seen(), [0xc03, 0x3]);
-
-        SEEN.lock().unwrap().clear();
-        assert_eq!(
-            serialize_with(refuses_everything, plain(0xc01), 1, &mut blob, &mut error),
-            E_INVALIDARG,
-            "a refusal that is not about the flags comes back unchanged"
         );
     }
 }
