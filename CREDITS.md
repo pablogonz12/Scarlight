@@ -43,6 +43,9 @@ BlueKaiman, kais7654, pushkarreddyy.
   GPL-3.0: narrowing a host shader resource view of a streamed texture to the mips whose memory is
   there, and remaking it when more levels arrive or a host copy fills the chain
   (`crates/victory-gpu/src/texture.rs`, `crates/victory-gpu/src/descriptor/host.rs`).
+- **JMAN730/project-flamingo** ([#666](https://github.com/JMAN730/project-flamingo/pull/666)), GPL-3.0: page
+  numbers of freed physical pages are handed out again instead of only ever growing, and allocation stops at the
+  title's 21-bit `number >> 4` field (`crates/victory-hle/src/modules/xmem.rs`).
 
 ## Tools
 

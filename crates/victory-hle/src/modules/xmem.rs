@@ -10,6 +10,7 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
@@ -367,15 +368,70 @@ struct Slice {
 #[derive(Default)]
 struct Physical {
     next_page: usize,
+    /// Page numbers whose pages the title freed; handed out again before
+    /// `next_page` grows (a long session must not walk off the number space).
+    free_pages: Vec<usize>,
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
 }
 
+/// Whether freed page numbers are handed out again (`VICTORY_PAGE_RECYCLE=0`
+/// keeps the old ever-growing counter).
+fn page_recycle() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PAGE_RECYCLE").as_deref() != Ok("0"))
+}
+
+impl Physical {
+    /// Reserves `numbers.len()` page numbers for `section`, reusing freed
+    /// ones first. False when the number space would run past the title's
+    /// 21-bit `number >> 4` field.
+    fn allocate(&mut self, section: &Arc<Section>, numbers: &mut [MaybeUninit<usize>]) -> bool {
+        let reuse = if page_recycle() {
+            self.free_pages.len()
+        } else {
+            0
+        };
+        let fresh = numbers.len().saturating_sub(reuse);
+        if fresh > (PAGE_NUMBER_LIMIT - self.next_page) / FRAMES {
+            return false;
+        }
+        for (index, out) in numbers.iter_mut().enumerate() {
+            let recycled = if page_recycle() {
+                self.free_pages.pop()
+            } else {
+                None
+            };
+            let number = recycled.unwrap_or_else(|| {
+                let number = self.next_page;
+                self.next_page += FRAMES;
+                number
+            });
+            self.pages.insert(
+                number,
+                Slice {
+                    section: section.clone(),
+                    index,
+                },
+            );
+            out.write(number);
+        }
+        true
+    }
+
+    /// Drops a page and keeps its number for reuse.
+    fn free(&mut self, number: usize) {
+        if self.pages.remove(&number).is_some() {
+            self.free_pages.push(number);
+        }
+    }
+}
+
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
     Mutex::new(Physical {
         // Page numbers are opaque to titles; 0 stays unused.
-        next_page: 0x10_0000,
+        next_page: FIRST_PAGE_NUMBER,
         ..Default::default()
     })
 });
@@ -433,17 +489,13 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
     let section = Arc::new(Section(handle));
     let mut physical = physical();
-    let first = physical.next_page;
-    physical.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
+    // SAFETY: the title passes room for `n` page numbers.
+    let numbers = unsafe { std::slice::from_raw_parts_mut(pages.cast::<MaybeUninit<usize>>(), n) };
+    if !physical.allocate(&section, numbers) {
+        tracing::warn!(n, "XMemAllocatePhysicalPages: page numbers exhausted");
+        // SAFETY: checked non-null.
+        unsafe { count.write(0) };
+        return 0;
     }
     1
 }
@@ -452,6 +504,10 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 /// 16: the title keeps them as 21-bit `number >> 4` and rebuilds
 /// them with `<< 4` (128 GiB of pages at most).
 const FRAMES: usize = PAGE >> 12;
+/// One past the largest page number the title's 21-bit `number >> 4` holds.
+const PAGE_NUMBER_LIMIT: usize = (1 << 21) * FRAMES;
+/// The first number handed out (0 stays unused).
+const FIRST_PAGE_NUMBER: usize = 0x10_0000;
 
 /// Pages still mapped stay readable through their views until unmapped.
 pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
@@ -461,7 +517,7 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     let mut physical = physical();
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+        physical.free(unsafe { *pages.add(i) });
     }
     1
 }
@@ -1405,4 +1461,69 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
     }
+
+    /// Tests that move the page-number counter run one at a time.
+    static PHYSICAL_TESTS: Mutex<()> = Mutex::new(());
+
+    fn free_pages(pages: &[usize]) -> BOOL {
+        XMemFreePhysicalPages(pages.len(), pages.as_ptr())
+    }
+
+    /// Streaming allocate/free must reuse page numbers: without a free list
+    /// `next_page` climbs by `FRAMES` a page, and a long session packs past
+    /// the title's 21-bit `number >> 4` field, after which allocation fails.
+    #[test]
+    fn freed_page_numbers_are_handed_out_again() {
+        let _one_at_a_time = PHYSICAL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let pages = allocate(2);
+        let ceiling = physical().next_page;
+        assert_eq!(free_pages(&pages), 1);
+        for _ in 0..1024 {
+            let again = allocate(2);
+            {
+                let phys = physical();
+                assert_eq!(phys.next_page, ceiling, "next_page must not grow");
+            }
+            let mut got = again.clone();
+            got.sort_unstable();
+            let mut want = pages.clone();
+            want.sort_unstable();
+            assert_eq!(got, want, "the same numbers come back");
+            assert_eq!(free_pages(&again), 1);
+        }
+    }
+
+    /// A page number at the top of the title's 21-bit field still allocates;
+    /// one round past it is refused and the title is told it got none.
+    #[test]
+    fn page_numbers_stop_at_the_title_field() {
+        let _one_at_a_time = PHYSICAL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let (saved_next, saved_free) = {
+            let phys = physical();
+            (phys.next_page, phys.free_pages.clone())
+        };
+        {
+            let mut phys = physical();
+            phys.next_page = PAGE_NUMBER_LIMIT - FRAMES;
+            phys.free_pages.clear();
+        }
+        let last = allocate(1);
+        // The title keeps `number >> 4` in 21 bits.
+        assert!(last[0] >> 4 < 1 << 21, "{:#x}", last[0]);
+        let (mut given, mut out) = (1usize, [0usize; 1]);
+        assert_eq!(
+            XMemAllocatePhysicalPages(0, &mut given, out.as_mut_ptr()),
+            0
+        );
+        assert_eq!(given, 0, "the title is told it got no pages");
+        {
+            let mut phys = physical();
+            phys.next_page = saved_next;
+            phys.free_pages = saved_free;
+            for &n in &last {
+                phys.pages.remove(&n);
+            }
+        }
+    }
+
 }
