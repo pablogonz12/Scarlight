@@ -974,6 +974,7 @@ void main() {
             let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
             let (readback_buf, readback_ptr, _) = warp.shared_buffer(total as u64);
             let dst_buf = warp.default_uav(total as u64);
+
             // SAFETY: mapped buffers of these sizes.
             unsafe {
                 std::ptr::copy_nonoverlapping(src.as_ptr(), src_ptr, total);
@@ -1022,7 +1023,19 @@ void main() {
             if ahead {
                 for i in filled.len()..RECORDS as usize {
                     assert_eq!(out[i * 8..i * 8 + 3], [0, 0, 0], "unfilled slot {i} must come out empty");
-                    assert_eq!(out[i * 8 + 3], u32::MAX, "the words after the record are copied as they are");
+                    if i + 1 == RECORDS as usize {
+                        // The scratch span ends at the last record's argument
+                        // payload (the title's buffers are tight): the words
+                        // past it are outside the scratch and nothing is said
+                        // about them (WARP hands out zeros there, RADV an
+                        // earlier test's bytes).
+                    } else {
+                        assert_eq!(
+                            out[i * 8 + 3..i * 8 + 8],
+                            [u32::MAX; 5],
+                            "the words after the record are copied as they are"
+                        );
+                    }
                 }
                 assert_eq!(spent, charged_filled, "unfilled slots charge nothing");
                 assert_eq!(largest, 519, "and are not counted as asked for");
@@ -1132,7 +1145,13 @@ void main() {
             assert_eq!(rec[2], 1000 + i as u32);
             assert_eq!(rec[3], (-200i32 + i as i32) as u32);
             assert_eq!(rec[4], 5000 + i as u32);
-            assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
+            // The scratch span ends at the last record's argument payload
+            // (the title's buffers are tight): the stride word past it is
+            // outside the scratch, so nothing is said about it (WARP hands
+            // out zeros there, RADV an earlier test's bytes).
+            if i + 1 < RECORDS as usize {
+                assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
+            }
         }
         assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
     }
