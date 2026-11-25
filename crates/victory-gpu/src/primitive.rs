@@ -111,8 +111,19 @@ fn right_angle(p: [[f32; 2]; 3]) -> usize {
         let (x, y) = (p[a][0] - p[b][0], p[a][1] - p[b][1]);
         x * x + y * y
     };
-    // The side opposite each corner: the one between the other two.
+    // The side opposite each corner: the one between the other two. A
+    // position that is not a number (or overflows a squared distance) keeps
+    // the second corner: `max` would pass over it and pick another.
     let opposite = [side(1, 2), side(0, 2), side(0, 1)];
+    if opposite.iter().any(|s| !s.is_finite()) {
+        return 1;
+    }
+    // Three points on a line are no rectangle's corners (both halves have no
+    // area whichever corner is taken): the second, as for a tie.
+    let cross = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) - (p[1][1] - p[0][1]) * (p[2][0] - p[0][0]);
+    if cross == 0.0 {
+        return 1;
+    }
     let longest = opposite[0].max(opposite[1]).max(opposite[2]);
     let mut found = [0, 1, 2].into_iter().filter(|&c| opposite[c] == longest);
     match (found.next(), found.next()) {
@@ -369,10 +380,13 @@ mod tests {
             let p = order.map(|i| square[i]);
             assert_eq!(right_angle(p), right, "{order:?}");
         }
-        assert_eq!(right_angle([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]), 1, "a line");
         // Two sides as long as each other and the longest: the second corner.
         assert_eq!(right_angle([[-1.0, 0.0], [0.0, 2.0], [1.0, 0.0]]), 1, "a tie");
         assert_eq!(right_angle([[0.0, 0.0], [f32::NAN, 0.0], [1.0, 1.0]]), 1, "NaN");
+        assert_eq!(right_angle([[f32::NAN, 0.0], [0.0, 0.0], [1.0, 0.0]]), 1, "NaN first");
+        // Collinear, whichever corner is between the other two: no corner.
+        assert_eq!(right_angle([[0.0, 0.0], [2.0, 0.0], [1.0, 0.0]]), 1, "collinear, sorted");
+        assert_eq!(right_angle([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]), 1, "collinear");
     }
 
     /// A tie for the longest side completes at the second corner's opposite,

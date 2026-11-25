@@ -2714,16 +2714,23 @@ impl State {
         let n = (count / 3) as usize;
         // Where the `POSITION` element is read from, if the layout has one:
         // every slot of a rectangle takes its right angle from there, so that
-        // the vertices it completes line up between buffers. Found once, read
-        // at submission like the vertices themselves.
-        let position_src = p
-            .inputs
-            .iter()
-            .find(|e| e.position && !e.per_instance)
-            .and_then(|e| {
-                let v = self.vertex[e.slot as usize];
-                rectangle_vertex_range(v, count, first).map(|(from, _, _)| (from, v.stride, e.offset, e.format))
-            });
+        // the vertices it completes line up between buffers. Found once per
+        // draw, read at submission like the vertices themselves.
+        let position = p.inputs.iter().find(|e| e.position && !e.per_instance);
+        let position_src = position.and_then(|e| {
+            let v = self.vertex[e.slot as usize];
+            rectangle_vertex_range(v, count, first)
+                .filter(|&(from, src_bytes, _)| crate::shadow::find(from, src_bytes).is_some())
+                .map(|(from, _, _)| (from, v.stride, e.offset, e.format))
+        });
+        // A `POSITION` range the checks refuse rejects the whole draw here,
+        // before any slot registers a callback that would read it: the slots'
+        // callbacks run at submission even when the draw is dropped after
+        // them.
+        if position.is_some() && position_src.is_none() {
+            once!("rectangle vertices outside their buffer");
+            return false;
+        }
         let corners = std::sync::Arc::new(std::sync::OnceLock::new());
         for slot in 0..32 {
             let elements: Vec<(u32, u32)> = p
