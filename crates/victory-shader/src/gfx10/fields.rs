@@ -300,7 +300,12 @@ impl Instruction {
                             | "ds_gws_sema_release_all"
                     ) {
                     0
-                } else if pair || name.contains("cmpst") || name.contains("mskor") {
+                } else if pair
+                    || name.contains("cmpst")
+                    || name.contains("mskor")
+                    || name == "ds_wrap_rtn_b32"
+                {
+                    // ds_wrap_rtn_b32: DATA0 is subtracted, DATA1 added.
                     2
                 } else {
                     1
