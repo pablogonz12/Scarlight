@@ -89,6 +89,10 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   refresh of a mostly clean view heap walks only its dirty gaps instead of collecting one entry per 64 KiB
   block under the guard mutex; the per-block set it replaces is the test's reference.
 
+- **DexNom/VIctory [4775e8aaf](https://github.com/DexNom/VIctory/commit/4775e8aaf0f45c316807d26202efb369f40ceea0)**,
+  GPL-3.0: one lock serializing the tests that set the global frame clock or read it across a wait
+  (`TEST_FRAME_LOCK`, `crates/victory-gpu/src/frame.rs`), so a test that retimes the clock cannot move
+  another's ticks under it when `cargo test` runs the crate's tests in parallel.
 - **AnyPS5** ([boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5)): the format of the
   source-counted progress page (reference instruction forms, history chart). No code taken.
 - **Mesa** ([aco_opcodes.py](https://gitlab.freedesktop.org/mesa/mesa)), MIT: the reference list of
