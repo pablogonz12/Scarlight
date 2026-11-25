@@ -100,3 +100,9 @@ Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT).
 responsible for the code they submit, whoever or whatever helped write it.
 
 Missing or wrong name? Open an issue.
+
+- **miatson/VIctory [28b7278f](https://github.com/miatson/VIctory/commit/28b7278f)** (miatson), GPL-3.0: the
+  finding that the console blends (MIN, MAX) into integer render targets while D3D12 refuses a pipeline that
+  enables blending on one, so those targets are made to write unblended, per target and with independent
+  blending turned on only where it was needed (`crates/victory-gpu/src/pipeline/host.rs`,
+  `VICTORY_HOST_BLEND=0`). Its host-pipeline device test used `D3DCompile`; ours checks the state itself.
