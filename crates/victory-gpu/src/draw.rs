@@ -44,6 +44,61 @@ pub(crate) struct VertexView {
     stride: u32,
 }
 
+/// Whether an overflowing rectangle vertex range drops the draw
+/// (`VICTORY_RECTANGLE_GUARD=0` keeps the old arithmetic, which wrapped).
+fn rectangle_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_RECTANGLE_GUARD").map_or(true, |v| v != "0"))
+}
+
+fn rectangle_vertex_range(v: VertexView, count: u32, first: u32) -> Option<(u64, u64, u32)> {
+    rectangle_vertex_range_guarded(v, count, first, rectangle_guard())
+}
+
+fn rectangle_vertex_range_guarded(
+    v: VertexView,
+    count: u32,
+    first: u32,
+    guarded: bool,
+) -> Option<(u64, u64, u32)> {
+    if v.address == 0 || v.stride == 0 {
+        return None;
+    }
+    if !guarded {
+        // The old arithmetic: the title's range wraps instead of being refused.
+        let stride = u64::from(v.stride);
+        let from = v
+            .address
+            .wrapping_add(u64::from(first).wrapping_mul(stride));
+        let rects = u64::from(count / 3);
+        let src = rects.wrapping_mul(3).wrapping_mul(stride);
+        let dst = rects.wrapping_mul(6).wrapping_mul(stride) as u32;
+        return Some((from, src, dst));
+    }
+    let stride = u64::from(v.stride);
+    let end_bytes = (u64::from(first) + u64::from(count)).checked_mul(stride)?;
+    if end_bytes > u64::from(v.size) {
+        return None;
+    }
+    let from = v.address.checked_add(u64::from(first) * stride)?;
+    let rects = u64::from(count / 3);
+    let src_bytes = rects.checked_mul(3)?.checked_mul(stride)?;
+    from.checked_add(src_bytes)?;
+    let dst_bytes = u32::try_from(rects.checked_mul(6)?.checked_mul(stride)?).ok()?;
+    Some((from, src_bytes, dst_bytes))
+}
+
+fn expanded_rectangle_vertices(vertices: u32) -> Option<u32> {
+    expanded_rectangle_vertices_guarded(vertices, rectangle_guard())
+}
+
+fn expanded_rectangle_vertices_guarded(vertices: u32, guarded: bool) -> Option<u32> {
+    if !guarded {
+        return Some((vertices / 3).wrapping_mul(6));
+    }
+    (vertices / 3).checked_mul(6)
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct IndexView {
@@ -114,9 +169,15 @@ fn early_budgets() -> (u64, u64) {
     static MS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *MS.get_or_init(|| {
         let ms = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(default)
         };
-        (ms("VICTORY_EARLY_TEXTURES_MS", 12), ms("VICTORY_BAKE_TEXTURES_MS", 1500))
+        (
+            ms("VICTORY_EARLY_TEXTURES_MS", 12),
+            ms("VICTORY_BAKE_TEXTURES_MS", 1500),
+        )
     })
 }
 
@@ -124,8 +185,12 @@ fn early_budgets() -> (u64, u64) {
 /// `PS_BakeDecorations_*`), by the first 16 hex digits of their hash as the
 /// frame listings print it. They draw into a 256x256 corner of 2048x2048
 /// targets and name no texture in a table.
-const BAKE_PIXEL_SHADERS: [&str; 4] =
-    ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
+const BAKE_PIXEL_SHADERS: [&str; 4] = [
+    "c0a7fe77b1862e10",
+    "0d1575a396dfe513",
+    "b7cfd8dda91ebb6b",
+    "280967ad158cee0b",
+];
 
 /// Since the start: early runs of the texture pass, and those of them
 /// made for a bake draw.
@@ -286,7 +351,9 @@ impl State {
         }
         if self.tables_gone {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
+            ONCE.call_once(|| {
+                tracing::warn!("a list ran again after its descriptor tables were given back")
+            });
         }
         for (heap, first, n) in self.dynamic.drain(..) {
             crate::descriptor::release_dynamic(heap, first, n);
@@ -341,7 +408,10 @@ fn mesh_kept(pipeline: usize) -> bool {
     let Some((last, before)) = KEEP.get_or_init(|| {
         let value = std::env::var("VICTORY_MESH_TEST").ok()?;
         let mut parts = value.strip_prefix("keep:")?.split(':');
-        Some((parts.next()?.to_owned(), parts.next().unwrap_or("").to_owned()))
+        Some((
+            parts.next()?.to_owned(),
+            parts.next().unwrap_or("").to_owned(),
+        ))
     }) else {
         return true;
     };
@@ -355,7 +425,8 @@ fn mesh_kept(pipeline: usize) -> bool {
     if hash.len() < 16 {
         return true;
     }
-    last.as_bytes().contains(&hash[15]) && (before.is_empty() || before.as_bytes().contains(&hash[14]))
+    last.as_bytes().contains(&hash[15])
+        && (before.is_empty() || before.as_bytes().contains(&hash[14]))
 }
 
 /// Draws recorded on the host GPU since the last frame line.
@@ -487,9 +558,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .map_or(u64::MAX, |mb| mb << 20)
     });
     let shadow = crate::shadow::find(address, 1)?;
-    let len = shadow
-        .left(address)
-        .min(if srv { limit } else { 1 << 16 });
+    let len = shadow.left(address).min(if srv { limit } else { 1 << 16 });
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
@@ -595,7 +664,12 @@ impl State {
     }
 
     pub(crate) fn clear_vertex_buffers(&mut self, start: u32, count: u32) {
-        for slot in self.vertex.iter_mut().skip(start as usize).take(count as usize) {
+        for slot in self
+            .vertex
+            .iter_mut()
+            .skip(start as usize)
+            .take(count as usize)
+        {
             *slot = VertexView::default();
         }
     }
@@ -824,7 +898,11 @@ impl State {
             _ => 0,
         };
         if address == 0 {
-            once!(slot, dword, "a shader takes the address of a buffer view that is not there: it reads 0");
+            once!(
+                slot,
+                dword,
+                "a shader takes the address of a buffer view that is not there: it reads 0"
+            );
         }
         if kind == USER_VIEW_ADDRESS {
             address as u32
@@ -836,7 +914,12 @@ impl State {
     /// For a shader that reads title memory by address
     /// ([`crate::memory`]): its directory, fault notes and view slots,
     /// with the pages of the root views the list has set made ready.
-    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
+    fn memory_ready(
+        &self,
+        list: &HostList,
+        compute: bool,
+        writes: bool,
+    ) -> Option<crate::memory::Ready> {
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
@@ -877,7 +960,10 @@ impl State {
             return false;
         };
         if p.compute || p.mesh != mesh {
-            once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+            once!(
+                mesh,
+                "a draw or mesh dispatch with another kind of pipeline"
+            );
             return false;
         }
         if p.rects && self.topology != RECTANGLES {
@@ -1053,10 +1139,16 @@ impl State {
             // below still copy back: that is a diff against the submission's
             // snapshot (`shadow::gpu_writes`), and a page only the map's copies
             // hold is unchanged there, so nothing is written over it.
-            let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
+            let memory = if t
+                .host
+                .root_srvs
+                .contains(&victory_shader::emit::SLOT_MEMORY)
+            {
                 let writes = writes && !crate::pipeline::builder_map_host(self.pipeline as This);
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
-                    once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
+                    once!(
+                        "a shader that reads title memory by address without a view heap to hold its views: the draw is dropped"
+                    );
                     return false;
                 };
                 Some(ready)
@@ -1118,7 +1210,9 @@ impl State {
                                     l.SetGraphicsRootShaderResourceView(param, gpu);
                                 }
                             },
-                            None => once!("a shader picks buffers from a view heap that is not set"),
+                            None => {
+                                once!("a shader picks buffers from a view heap that is not set")
+                            }
                         }
                         continue;
                     }
@@ -1186,7 +1280,10 @@ impl State {
                 let address = match self.roots_ref(compute).get(usize::from(slot)) {
                     Some(&Root::View(address)) => Some(address),
                     _ => {
-                        once!(slot, "a shader writes through a root view the title did not set");
+                        once!(
+                            slot,
+                            "a shader writes through a root view the title did not set"
+                        );
                         None
                     }
                 };
@@ -1292,7 +1389,12 @@ impl State {
                     // not on 16 bytes got a null view at first: the
                     // builder's counters are at such addresses.)
                     let bias = offset & 15;
-                    host.raw_uav_at(index, &s.buffer, offset - bias, s.left(*a).min(limit) + bias);
+                    host.raw_uav_at(
+                        index,
+                        &s.buffer,
+                        offset - bias,
+                        s.left(*a).min(limit) + bias,
+                    );
                 }
                 if shadow.is_none() {
                     host.null_raw_uav_at(index);
@@ -1446,7 +1548,8 @@ impl State {
         // at best); all of them every 16 passes, because a view of a
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+        type Ranges =
+            std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
         static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
@@ -1465,7 +1568,8 @@ impl State {
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        let mut alive =
+            !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         for (n, &index) in slots.iter().enumerate() {
             ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
@@ -1483,10 +1587,16 @@ impl State {
                 GONE.store(true, Ordering::Relaxed);
                 let last: Vec<String> = slots[n - 63..=n]
                     .iter()
-                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
+                    .filter_map(|&i| {
+                        crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}"))
+                    })
                     .map(|s| s.chars().take(200).collect())
                     .collect();
-                tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
+                tracing::error!(
+                    why,
+                    slot = index,
+                    "the host device went while buffer views of the heap were made; one of: {last:#?}"
+                );
                 crate::host::log_removal_context();
             }
             // The copy the slot shows (`buffer_copy`), not the one the
@@ -1502,11 +1612,15 @@ impl State {
         }
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
+        let mut spans: std::collections::HashMap<
+            usize,
+            (std::sync::Arc<crate::shadow::Shadow>, u64, u64),
+        > = std::collections::HashMap::new();
         for (shadow, from, to) in ranges.values() {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+            let span = spans
+                .entry(key)
+                .or_insert_with(|| (shadow.clone(), *from, *to));
             span.1 = span.1.min(*from);
             span.2 = span.2.max(*to);
         }
@@ -1519,7 +1633,8 @@ impl State {
         // the garbage ended runs (the card stopped answering 14-90 frames
         // into the opening cutscene; with every frame it ran on). The pass
         // costs some 30 ms a frame this way.
-        static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
+        static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> =
+            std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
         for (shadow, from, to) in spans.values() {
@@ -1577,7 +1692,9 @@ impl State {
             return;
         }
         let bake = bake_ms > 0
-            && p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
+            && p.stages
+                .iter()
+                .any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         // The milliseconds this frame's bake draws have taken so far: a
         // frame has several, and together they get `bake_ms`.
@@ -1611,7 +1728,9 @@ impl State {
         let bake = bake && left > 0;
         let n = EARLY_TEXTURE_PASSES[usize::from(bake)].fetch_add(1, Ordering::Relaxed) + 1;
         if bake && n.is_power_of_two() {
-            let [slots, due, ..] = HEAP_TEXTURES_QUEUE.each_ref().map(|c| c.load(Ordering::Relaxed));
+            let [slots, due, ..] = HEAP_TEXTURES_QUEUE
+                .each_ref()
+                .map(|c| c.load(Ordering::Relaxed));
             tracing::info!(
                 frame,
                 bakes = n,
@@ -1662,7 +1781,9 @@ impl State {
         // drains in fewer frames; or lowers it).
         static PER_FRAME_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
         let per_frame: u64 = match *PER_FRAME_MB.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MB").ok().and_then(|v| v.trim().parse().ok())
+            std::env::var("VICTORY_TEXTURE_STAGE_MB")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
         }) {
             Some(mb) => mb << 20,
             None => staging_budget_per_frame(memory.map(|[budget, ..]| budget)),
@@ -1702,7 +1823,9 @@ impl State {
         // the looks are now only for what that does not tell.)
         static PASSED: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
-        let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
+        let took = now
+            .saturating_sub(PASSED.swap(now, Ordering::Relaxed))
+            .max(1);
         let most = (4000 / took).clamp(16, 256);
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
@@ -1721,21 +1844,30 @@ impl State {
         // The rest waits for the next frames, as it does past the bytes.
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
+            std::env::var("VICTORY_TEXTURE_STAGE_MS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(250)
         }));
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
         // surfaces at 192 MB a frame) gets three times the bytes and the time until it
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let catchup = *CATCHUP
+            .get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
+        let (per_frame, span) = if catchup && due.len() >= 1024 {
+            (per_frame * 3, span * 3)
+        } else {
+            (per_frame, span)
+        };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
         let (span, bytes_at_most) = match PASS_BUDGET.get() {
-            Some((ms, bytes)) => {
-                (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
-            }
+            Some((ms, bytes)) => (
+                std::time::Duration::from_millis(ms),
+                SPENT.load(Ordering::Relaxed).saturating_add(bytes),
+            ),
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
@@ -1766,9 +1898,15 @@ impl State {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
-                        }
+                        Some(wait) => host.texture_slot_recheck(
+                            index,
+                            write,
+                            frame + wait,
+                            (at, len),
+                            print,
+                            looks + 1,
+                            uploaded,
+                        ),
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;
@@ -1787,7 +1925,9 @@ impl State {
                 }
             }
             let mut partly = None;
-            if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
+            if let Some(View::Placed(false, resource, desc)) =
+                heap.handle(index).and_then(crate::descriptor::view)
+            {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
@@ -1825,7 +1965,8 @@ impl State {
             // host's own contents: nothing to bring up to date, and this
             // pass is no use of it (its host copy is made when something
             // uses it, and its slots then: `descriptor::make_waiting`).
-            if let Some(View::Shader(object, _)) = heap.handle(index).and_then(crate::descriptor::view)
+            if let Some(View::Shader(object, _)) =
+                heap.handle(index).and_then(crate::descriptor::view)
                 && crate::resource::buffer_bytes(object as This).is_none()
                 && !crate::resource::title_fills(object as This)
             {
@@ -1841,8 +1982,12 @@ impl State {
                 }
                 continue;
             }
-            let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
-            let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
+            let view = heap
+                .handle(index)
+                .and_then(|handle| host.mirror(index, handle, true));
+            let placed = view
+                .as_ref()
+                .and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
                 _ => {
@@ -1850,7 +1995,8 @@ impl State {
                     continue;
                 }
             };
-            let title_fills = crate::resource::host_resource(resource).is_some_and(crate::texture::title_written);
+            let title_fills =
+                crate::resource::host_resource(resource).is_some_and(crate::texture::title_written);
             if !title_fills {
                 // a render target, a depth or unordered access texture: the host's own
                 host.texture_slot_done(index, write, None);
@@ -1870,7 +2016,11 @@ impl State {
             {
                 GONE.store(true, Ordering::Relaxed);
                 let text: String = format!("{view:?}").chars().take(300).collect();
-                tracing::error!(why, slot = index, "the host device went while textures picked by index were made ready; last: {text}");
+                tracing::error!(
+                    why,
+                    slot = index,
+                    "the host device went while textures picked by index were made ready; last: {text}"
+                );
                 crate::host::log_removal_context();
                 return;
             }
@@ -1916,7 +2066,15 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+                    host.texture_slot_recheck(
+                        index,
+                        write,
+                        frame + RECHECK_FRAMES[0],
+                        (at, len),
+                        print,
+                        0,
+                        frame,
+                    );
                 }
                 None => host.texture_slot_done(index, write, again),
             }
@@ -2012,7 +2170,9 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
-                crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
+                crate::pipeline::note_why(
+                    "a stage of the ray-tracing structure builder, which is off".to_owned(),
+                );
                 self.list_dropped_roots([x, y, z]);
             }
             return;
@@ -2082,6 +2242,42 @@ impl State {
             }
         }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.reflection(list, p);
+    }
+
+    /// After a dispatch of `p`: the stand-in for ray-traced reflections
+    /// ([`crate::reflection`]), if it is on and `p` is its program.
+    /// What it records binds nothing (a transition and a render target
+    /// clear): the title's bindings stay.
+    fn reflection(&self, list: &HostList, p: &HostPipeline) {
+        let Some(stage) = p.stages.first().filter(|_| p.compute) else {
+            return;
+        };
+        let Some(mode) = crate::reflection::pass(&stage.shader.hash) else {
+            return;
+        };
+        // Every table UAV the program names is kept, a null one included:
+        // which image is the program's radiance image is decided by its own
+        // table (see `reflection::target_of`), never by what happens to be bound.
+        let uavs: Vec<crate::reflection::Uav> = stage
+            .translated()
+            .used
+            .iter()
+            .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table)
+            .map(|u| {
+                let view = match self.roots_ref(true).get(usize::from(u.slot)) {
+                    Some(Root::Table(table)) => {
+                        crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+                    }
+                    _ => None,
+                };
+                match view {
+                    Some(View::Unordered(r, _, desc)) => (u.slot, u.table_offset_dwords, r, desc),
+                    _ => (u.slot, u.table_offset_dwords, 0, None),
+                }
+            })
+            .collect();
+        crate::reflection::after(list, mode, &stage.shader.hash, &uavs);
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -2105,13 +2301,22 @@ impl State {
                 })
             };
             let targets: Vec<String> = self.targets.iter().filter_map(|&t| described(t)).collect();
-            let _ = write!(text, " targets {targets:?} depth {:?} state [{}]", described(self.depth), p.state);
+            let _ = write!(
+                text,
+                " targets {targets:?} depth {:?} state [{}]",
+                described(self.depth),
+                p.state
+            );
             // The title's scissor and viewport at this draw (the first of
             // each): the title draws what it sees through a
             // portal (a window, from inside a room) under the portal's
             // rectangle, and the listing did not say which draws those are.
             if let Some(r) = self.scissors.first() {
-                let _ = write!(text, " scissor [{} {} {} {}]", r.left, r.top, r.right, r.bottom);
+                let _ = write!(
+                    text,
+                    " scissor [{} {} {} {}]",
+                    r.left, r.top, r.right, r.bottom
+                );
             }
             if let Some(v) = self.viewports.first() {
                 let _ = write!(
@@ -2138,7 +2343,12 @@ impl State {
                     let _ = write!(text, " [heap {index}: {slot}]");
                 }
             }
-            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs).chain(&stage.root_uavs) {
+            for &(slot, _) in stage
+                .root_cbvs
+                .iter()
+                .chain(&stage.root_srvs)
+                .chain(&stage.root_uavs)
+            {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));
@@ -2157,7 +2367,12 @@ impl State {
             return;
         }
         if on {
-            let one = RECT { left: 0, top: 0, right: 1, bottom: 1 };
+            let one = RECT {
+                left: 0,
+                top: 0,
+                right: 1,
+                bottom: 1,
+            };
             crate::draw::scissors(list, &vec![one; self.scissors.len().max(1)]);
         } else if !self.scissors.is_empty() {
             crate::draw::scissors(list, &self.scissors);
@@ -2436,14 +2651,17 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        let aliased = table_aliases
-                            .iter()
-                            .any(|a| a.entry == k && host.make_structured_at(index, &view, a.stride));
+                        let aliased = table_aliases.iter().any(|a| {
+                            a.entry == k && host.make_structured_at(index, &view, a.stride)
+                        });
                         if !aliased {
                             host.make_at(index, &view);
                         }
                         let kind = used.map(|u| u.kind).or_else(|| {
-                            selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
+                            selected
+                                .binary_search(&k)
+                                .ok()
+                                .and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
                             readable(list, kind, &view);
@@ -2556,14 +2774,17 @@ impl State {
         // A pipeline with the rectangle geometry stage draws the title's
         // vertices as they are; any other gets its rectangles expanded.
         let rects = self.topology == RECTANGLES && !self.completes_rects();
-        let ran = ready && (!rects || self.rectangles(list, vertices, first));
-        if ran {
+        // Rectangles are expanded into six vertices each, a count that can
+        // overflow as the title's vertex count is not checked beforehand.
+        let count = if rects {
+            expanded_rectangle_vertices(vertices)
+        } else {
+            Some(vertices)
+        };
+        let ran = ready && (!rects || (count.is_some() && self.rectangles(list, vertices, first)));
+        if let Some(count) = count.filter(|_| ran) {
             // Rectangles were expanded into their own vertex buffers.
-            let (count, from) = if rects {
-                (vertices / 3 * 6, 0)
-            } else {
-                (vertices, first)
-            };
+            let from = if rects { 0 } else { first };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             // SAFETY: an open list with everything set.
@@ -2591,7 +2812,6 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
-        let rects = u64::from(count / 3);
         for slot in 0..32 {
             let elements: Vec<(u32, u32)> = p
                 .inputs
@@ -2603,21 +2823,16 @@ impl State {
                 continue;
             }
             let v = self.vertex[slot as usize];
-            let stride = u64::from(v.stride);
-            let from = v.address + u64::from(first) * stride;
-            if v.address == 0
-                || stride == 0
-                || u64::from(first + count) * stride > u64::from(v.size)
-                || crate::shadow::find(from, rects * 3 * stride).is_none()
-            {
+            let Some((from, src_bytes, dst_bytes)) = rectangle_vertex_range(v, count, first)
+                .filter(|&(from, src_bytes, _)| crate::shadow::find(from, src_bytes).is_some())
+            else {
                 once!(slot, "rectangle vertices outside their buffer");
                 return false;
-            }
-            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
+            };
+            let Some((gpu, to)) = list.scratch(u64::from(dst_bytes)) else {
                 return false;
             };
-            let (from, to, stride) = (from as usize, to as usize, stride as usize);
-            let n = rects as usize;
+            let (from, to, stride) = (from as usize, to as usize, v.stride as usize);
             list.defer_host(move || {
                 // The vertices are read in place, at submission: no change
                 // of mapping under the read (see
@@ -2627,15 +2842,15 @@ impl State {
                 // recorded) and the scratch memory is the list's.
                 let (src, dst) = unsafe {
                     (
-                        std::slice::from_raw_parts(from as *const u8, n * 3 * stride),
-                        std::slice::from_raw_parts_mut(to as *mut u8, n * 6 * stride),
+                        std::slice::from_raw_parts(from as *const u8, src_bytes as usize),
+                        std::slice::from_raw_parts_mut(to as *mut u8, dst_bytes as usize),
                     )
                 };
                 crate::primitive::expand_rects(src, dst, stride, &elements);
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
-                SizeInBytes: (rects * 6 * stride as u64) as u32,
+                SizeInBytes: dst_bytes,
                 StrideInBytes: v.stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
@@ -2793,7 +3008,10 @@ impl State {
             .window
             .as_ref()
             .filter(|w| same(w) && offset >= w.base)
-            .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
+            .filter(|w| {
+                (offset - w.base) % u64::from(w.step) == 0
+                    && (offset - w.base) / u64::from(w.step) < u64::from(w.records)
+            })
             .map(|w| (w.scratch.clone(), offset - w.base));
         let (bounded, at) = match hit {
             Some(hit) => hit,
@@ -2812,14 +3030,23 @@ impl State {
                             && (w.records == 1 || step == u64::from(w.step));
                         if walks {
                             let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
-                            (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
+                            (
+                                step as u32,
+                                (if w.records == 1 { 16 } else { w.records * 2 })
+                                    .min(fit)
+                                    .max(1),
+                            )
                         } else {
                             (stride, max)
                         }
                     }
                     _ => (stride, max),
                 };
-                args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
+                args.refresh(
+                    list,
+                    arguments,
+                    len.max(u64::from(step) * u64::from(records)),
+                );
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);
                 }
@@ -2830,9 +3057,18 @@ impl State {
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
                 let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                    crate::indirect::bound_ahead(
+                        list,
+                        (&args.buffer, offset),
+                        (kind, step, records),
+                    )
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    crate::indirect::bound(
+                        list,
+                        (&args.buffer, offset),
+                        count_arg,
+                        (kind, step, records),
+                    )
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
@@ -2866,7 +3102,10 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+            self.op_text(
+                format!("indirect kind {kind} max {max} at {arguments:#x}"),
+                kind == DISPATCH,
+            )
         });
         if kind == MESH {
             self.mesh_scissor(list, true);
@@ -2889,6 +3128,7 @@ impl State {
         crate::indirect::done(list, &bounded);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            self.reflection(list, p);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -3035,6 +3275,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            // Some compute-written textures are also read by the title CPU.
+            list.texture_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
@@ -3051,7 +3293,10 @@ fn describe(view: Option<&View>) -> String {
         crate::resource::host_made(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
-            format!("{}x{} f{} flags {:#x} of {r:?}", d.Width, d.Height, d.Format.0, d.Flags.0)
+            format!(
+                "{}x{} f{} flags {:#x} of {r:?}",
+                d.Width, d.Height, d.Format.0, d.Flags.0
+            )
         })
     };
     match view {
@@ -3111,7 +3356,9 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     #[cfg(feature = "diagnostics")]
-    crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
+    crate::capture::op(std::ptr::from_ref(list) as usize, || {
+        format!("STENCIL REF {reference:#x}")
+    });
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
 }
@@ -3144,7 +3391,103 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::staging_budget_per_frame;
+    use super::{
+        VertexView, expanded_rectangle_vertices_guarded, rectangle_vertex_range_guarded,
+        staging_budget_per_frame,
+    };
+
+    /// What a rectangle draw asks of the tile's vertex buffer with the guard
+    /// on, which is what the environment gives unless `VICTORY_RECTANGLE_GUARD`
+    /// is `0`; the tests do not read the switch.
+    fn range(v: VertexView, count: u32, first: u32) -> Option<(u64, u64, u32)> {
+        rectangle_vertex_range_guarded(v, count, first, true)
+    }
+
+    fn expanded(vertices: u32) -> Option<u32> {
+        expanded_rectangle_vertices_guarded(vertices, true)
+    }
+
+    const RECTANGLE_VIEW: VertexView = VertexView {
+        address: 0x1000_0000,
+        size: 96,
+        stride: 16,
+    };
+
+    #[test]
+    fn rectangle_vertex_range_valid() {
+        assert_eq!(range(RECTANGLE_VIEW, 3, 1), Some((0x1000_0010, 48, 96)));
+    }
+
+    #[test]
+    fn rectangle_vertex_range_rejects_vertex_index_overflow() {
+        assert_eq!(range(RECTANGLE_VIEW, 3, u32::MAX - 2), None);
+        assert_eq!(range(RECTANGLE_VIEW, u32::MAX, 1), None);
+    }
+
+    #[test]
+    fn rectangle_vertex_range_rejects_address_overflow() {
+        let view = VertexView {
+            address: u64::MAX - 15,
+            ..RECTANGLE_VIEW
+        };
+        assert_eq!(range(view, 3, 1), None);
+        assert_eq!(range(view, 3, 0), None);
+    }
+
+    #[test]
+    fn rectangle_vertex_range_rejects_byte_offset_overflow() {
+        let view = VertexView {
+            size: u32::MAX,
+            stride: u32::MAX,
+            ..RECTANGLE_VIEW
+        };
+        assert_eq!(range(view, u32::MAX, u32::MAX), None);
+    }
+
+    #[test]
+    fn rectangle_vertex_range_rejects_oversized_buffers() {
+        for stride in [0x8000_0000, 0x4000_0000] {
+            let view = VertexView {
+                size: u32::MAX,
+                stride,
+                ..RECTANGLE_VIEW
+            };
+            assert_eq!(range(view, 3, 0), None);
+        }
+    }
+
+    /// `VICTORY_RECTANGLE_GUARD=0`: the old arithmetic, whose range wraps.
+    #[test]
+    fn the_guard_switched_off_keeps_the_old_wrapping() {
+        assert_eq!(
+            rectangle_vertex_range_guarded(RECTANGLE_VIEW, 3, u32::MAX - 2, false),
+            Some((
+                0x1000_0000u64.wrapping_add(u64::from(u32::MAX - 2) * 16),
+                48,
+                96
+            ))
+        );
+        let view = VertexView {
+            address: u64::MAX - 15,
+            ..RECTANGLE_VIEW
+        };
+        assert_eq!(
+            rectangle_vertex_range_guarded(view, 3, 1, false).map(|r| r.0),
+            Some(0u64)
+        );
+        assert_eq!(
+            expanded_rectangle_vertices_guarded(u32::MAX, false),
+            Some((u32::MAX / 3).wrapping_mul(6))
+        );
+    }
+
+    #[test]
+    fn expanded_rectangle_vertices_rejects_overflow() {
+        let max_rects = u32::MAX / 6;
+        assert_eq!(expanded(max_rects * 3), Some(max_rects * 6));
+        assert_eq!(expanded((max_rects + 1) * 3), None);
+        assert_eq!(expanded(u32::MAX), None);
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {
@@ -3163,4 +3506,3 @@ mod tests {
         assert_eq!(staging_budget_per_frame(Some(32 * GIB)), 384 * MIB);
     }
 }
-
