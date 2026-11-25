@@ -165,12 +165,13 @@ pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, b
     let scale = (height / 360).clamp(2, 12);
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
     let made = made.get_or_insert_with(HashMap::new);
-    if made.len() > 2048 {
-        // (Every text is a buffer of a few hundred KiB; a rate that wanders
-        // over thousands of values is not expected.)
-        made.clear();
-    }
     let key = (tenths, format.0, scale);
+    if made.len() > 2048 && !made.contains_key(&key) {
+        // (Every text is a buffer of a few hundred KiB; a rate that wanders
+        // over thousands of values is not expected.) Nothing is ever freed:
+        // the list that was given a box may still be copying from it.
+        return;
+    }
     if let std::collections::hash_map::Entry::Vacant(slot) = made.entry(key) {
         let (w, h, lit) = bitmap(&text(tenths), scale);
         let pitch = (w as usize * bytes).next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize);
