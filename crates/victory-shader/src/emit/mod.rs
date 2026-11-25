@@ -591,17 +591,45 @@ pub fn emit(
         }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
-    // trace programs): right once the wave takes that skip together ([`widen`]; the
-    // lowering has named the skipped blocks).
+    // trace programs) or cross-lane code in a shader that could not run with local waves alone:
+    // retry `widen` allowing loop-adjacent branches cleanly now that `local_waves` was tried.
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
             if native.stage == HwStage::Cs
-                && what == lower::LANE_MASK
+                && (what == lower::LANE_MASK || lower::needs_every_lane(what))
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+            let deep = native.wave64
+                && lower::host_max_wave() == 32
+                && std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+            let base = if deep {
+                ir::without_skips(p, true)
+                    .or_else(|| ir::without_skips(p, false))
+                    .or_else(|| ir::without_early_outs(p))
+            } else {
+                None
+            };
+            let log = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
+                if why {
+                    match r {
+                        Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
+                        Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
+                    }
+                }
+            };
+            let again = widen(c, native, base.as_ref().unwrap_or(p), why);
+            log("wave-wide branches (retry)", &again);
             match again {
                 Ok(_) => again,
+                Err(_) if base.is_some() => {
+                    let fallback = widen(c, native, p, why);
+                    log("wave-wide branches (fallback)", &fallback);
+                    match fallback {
+                        Ok(_) => fallback,
+                        Err(_) => emit_program(c, native, p, st, io, res),
+                    }
+                }
                 Err(_) => emit_program(c, native, p, st, io, res),
             }
         }
@@ -644,7 +672,11 @@ fn widen(
     match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
-        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        crate::native::StageIo::Cs(cs)
+            if {
+                let g = cs.threads.iter().product::<u32>();
+                g > 0 && g <= 1024 && (g <= 32 || g.is_multiple_of(64))
+            } => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
