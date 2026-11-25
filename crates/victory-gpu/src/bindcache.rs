@@ -129,8 +129,9 @@ mod tests {
             }
         }
         let each = began.elapsed().as_nanos() as f64 / draws as f64;
+        // Only the count is gated: a runner that pauses mid-loop must not
+        // fail the suite over a measurement (CodeRabbit, PR #226).
         assert_eq!(hits, draws);
         println!("a set of four targets compared: {each:.1} ns (one box, no device)");
-        assert!(each < 1000.0, "a comparison is not a driver call: {each} ns");
     }
 }
