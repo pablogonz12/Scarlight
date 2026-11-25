@@ -2980,6 +2980,93 @@ void main() {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_stencil_plane_probe() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let desc = ResourceDesc {
+            depth_or_array_size: 2,
+            ..texture(2, 2, 19, 2)
+        };
+        let mut dst = null;
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut dst),
+            S_OK
+        );
+        let image = host_resource(dst).expect("the host texture");
+        let hd = unsafe { image.GetDesc() };
+        let probe = |label: &str, d: &D3D12_RESOURCE_DESC| {
+            let mut info = D3D12_FEATURE_DATA_FORMAT_INFO {
+                Format: d.Format,
+                ..Default::default()
+            };
+            let q = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_INFO,
+                    (&raw mut info).cast(),
+                    size_of_val(&info) as u32,
+                )
+            };
+            println!(
+                "PROBE {label}: format={:?} mips={} slices={} flags={:?} plane_count={} query_ok={}",
+                d.Format, d.MipLevels, d.DepthOrArraySize, d.Flags, info.PlaneCount, q.is_ok()
+            );
+            for n in [4u32, 8u32] {
+                let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n as usize];
+                let mut rows = vec![0u32; n as usize];
+                let mut sizes = vec![0u64; n as usize];
+                let mut total = 0u64;
+                unsafe {
+                    host.device.GetCopyableFootprints(
+                        d,
+                        0,
+                        n,
+                        0,
+                        Some(footprints.as_mut_ptr()),
+                        Some(rows.as_mut_ptr()),
+                        Some(sizes.as_mut_ptr()),
+                        Some(&mut total),
+                    );
+                }
+                println!(
+                    "PROBE {label} n={n}: total={total} rows={rows:?} sizes={sizes:?} pitches={:?} offsets={:?}",
+                    footprints.iter().map(|f| f.Footprint.RowPitch).collect::<Vec<_>>(),
+                    footprints.iter().map(|f| f.Offset).collect::<Vec<_>>()
+                );
+            }
+        };
+        probe("host of fmt19", &hd);
+        // The same texture with the typed depth-stencil format.
+        let typed = D3D12_RESOURCE_DESC {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(20),
+            ..hd
+        };
+        let mut t: Option<ID3D12Resource> = None;
+        let made = unsafe {
+            host.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &typed,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut t,
+            )
+        };
+        println!("PROBE typed format 20 create ok={}", made.is_ok());
+        if let Some(t) = t {
+            let td = unsafe { t.GetDesc() };
+            probe("typed 20", &td);
+        }
+        slot::<Release>(dst, 0x10)(dst);
+    }
+
     /// A depth-stencil texture the title fills itself uploads both of its
     /// planes: a VIctory `CopyResource` of a 2 × 2 R32G8X24_TYPELESS texture
     /// with two mips and two array slices comes back with its depth plane and
