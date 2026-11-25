@@ -781,6 +781,7 @@ mod tests {
 
     #[test]
     fn warp_adapter_accepts_only_software() {
+        let _once = crate::warptest::lock();
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
         let raw = unsafe {
