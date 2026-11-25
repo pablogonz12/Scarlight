@@ -147,3 +147,7 @@ Missing or wrong name? Open an issue.
   enables blending on one, so those targets are made to write unblended, per target and with independent
   blending turned on only where it was needed (`crates/victory-gpu/src/pipeline/host.rs`,
   `VICTORY_HOST_BLEND=0`). Its host-pipeline device test used `D3DCompile`; ours checks the state itself.
+- **avatarmanz/VIctory-7900XTX [17c4717b](https://github.com/avatarmanz/VIctory-7900XTX/commit/17c4717b4)**
+  (after fxceless/victory-fork [c36971b2](https://github.com/fxceless/victory-fork/commit/c36971b2)), GPL-3.0:
+  `VICTORY_CARD_BUFFERS_MIN_KB`, so that title buffers' copies under the MiB floor can go into the card's memory
+  (unset: the floor of before) (`crates/victory-gpu/src/shadow.rs`).
