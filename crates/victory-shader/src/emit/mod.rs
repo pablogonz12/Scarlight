@@ -95,6 +95,8 @@ mod own_bits;
 mod rect;
 mod sampler;
 mod shader;
+#[cfg(test)]
+mod key_tests;
 mod threading;
 #[cfg(windows)]
 pub mod validator;
@@ -141,6 +143,44 @@ pub fn loop_limit() -> u32 {
             lower::LOOP_LIMIT
         }
     })
+}
+
+/// With the `diagnostics` feature, `VICTORY_SHADER_LOOP_LIMIT_CS` (same
+/// form) sets the limit for compute programs alone, in place of
+/// [`loop_limit`]; unset, they follow it. A low `VICTORY_SHADER_LOOP_LIMIT`
+/// that keeps the card alive in pixel and mesh loops also cuts genuine
+/// compute loops short: a lane that reaches the limit leaves the program
+/// without its writes. A hair simulation's per-vertex constraint pass loops
+/// once per vertex of a strand, more than 32 times, so with a limit of 32
+/// its lanes never store and the strands drawn from the simulation buffers
+/// scatter around the head; 128 here keeps them in place.
+/// Part of the translation like the other limit (the shader cache keys on it).
+pub fn compute_loop_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        if cfg!(feature = "diagnostics") {
+            parse_compute_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT_CS").ok().as_deref(), loop_limit())
+        } else {
+            loop_limit()
+        }
+    })
+}
+
+/// `VICTORY_SHADER_LOOP_LIMIT_CS`'s value; `fallback` (the general limit)
+/// when it is unset, unreadable or 0. Pure, for testing.
+fn parse_compute_loop_limit(value: Option<&str>, fallback: u32) -> u32 {
+    parse_count(value).unwrap_or(fallback)
+}
+
+/// A count at least 1, decimal or `0x` hex, surrounding blanks ignored.
+fn parse_count(value: Option<&str>) -> Option<u32> {
+    value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        })
+        .filter(|&n| n > 0)
 }
 
 /// Which of a translated program's group barriers wait for the whole
@@ -205,16 +245,102 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
-    let parsed = value
-        .map(str::trim)
-        .and_then(|v| match v.strip_prefix("0x") {
-            Some(hex) => u32::from_str_radix(hex, 16).ok(),
-            None => v.parse().ok(),
-        });
-    match parsed {
-        Some(n) if n > 0 => n,
-        _ => lower::LOOP_LIMIT,
+    parse_count(value).unwrap_or(lower::LOOP_LIMIT)
+}
+
+/// Every `VICTORY_*` variable [`translate`] reads whose value changes the
+/// DXIL it writes. A translation cached with one set of these must never be
+/// served to a run with another, so `victory-gpu`'s shader cache hashes
+/// [`settings_bytes`] into its entry key; a switch added here is covered
+/// from then on, and the test in `key_tests` fails if the sources read one
+/// that is in none of the three lists.
+pub const SWITCHES: &[&str] = &[
+    "VICTORY_F16_NEAREST",
+    "VICTORY_F16_SUM_WIDE",
+    "VICTORY_FIRSTLANE_OWN",
+    "VICTORY_FIRST_HALF",
+    "VICTORY_GROUP_SYNC",
+    "VICTORY_MESH_OUTPUT_STRICT",
+    "VICTORY_SHADER_LOOP_LIMIT",
+    "VICTORY_SHADER_LOOP_LIMIT_CS",
+    "VICTORY_SHADER_OPT",
+    "VICTORY_STRICT_JOINS",
+    "VICTORY_WAVE_DEEP_SKIPS",
+    "VICTORY_WAVE_LOCAL",
+    "VICTORY_WAVE_OWN_BITS",
+    "VICTORY_WAVE_WIDE",
+];
+
+/// Switches the translation reads that only change what it reports (traces,
+/// counters, the device a program is checked on): left out of
+/// [`settings_bytes`], so a run with one of them on still finds the
+/// translations an earlier run cached.
+pub const DIAGNOSTIC_SWITCHES: &[&str] = &[
+    "VICTORY_D3D12_DEBUG",
+    "VICTORY_DESC_WHY",
+    "VICTORY_SHADER_CENSUS",
+    "VICTORY_WARP",
+    "VICTORY_WAVE_WHY",
+];
+
+/// Variables read only by tests and the dump harnesses: never part of a
+/// shipped translation, so never part of its key.
+pub const TEST_SWITCHES: &[&str] = &[
+    "VICTORY_CONSOLE_DXC",
+    "VICTORY_DIFF_ONLY",
+    "VICTORY_DUMP_ALL",
+    "VICTORY_DXIL",
+    "VICTORY_EMIT_DUMP",
+    "VICTORY_PC_DXC",
+    "VICTORY_REF_PS",
+    "VICTORY_REF_VS",
+];
+
+/// What a translation depends on besides the container: every switch in
+/// [`SWITCHES`] with its value, the effective loop limits, the group-barrier
+/// mode and the clean-up passes. `victory-gpu`'s shader cache hashes this
+/// into the key of every entry, so a run that changes any of them translates
+/// again instead of serving the form an earlier run cached (`VICTORY_WAVE_LOCAL`
+/// and `VICTORY_F16_SUM_WIDE` among them: neither was in the key, and a warm
+/// cache kept the form it was warmed with).
+pub fn settings_bytes() -> Vec<u8> {
+    settings_bytes_of(|name| std::env::var_os(name))
+}
+
+/// As [`settings_bytes`], with `lookup` in place of the environment: pure,
+/// so a test can ask what a switch set would key, without touching the
+/// process's environment.
+pub fn settings_bytes_of(lookup: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<u8> {
+    let mut out = b"victory-shader settings 1".to_vec();
+    out.push(u8::from(cfg!(feature = "diagnostics")));
+    for value in [loop_limit(), compute_loop_limit(), shader_opt(), u32::from(group_sync())] {
+        out.extend_from_slice(&value.to_le_bytes());
     }
+    let mut names = SWITCHES.to_vec();
+    names.sort_unstable();
+    for name in names {
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'=');
+        match lookup(name) {
+            Some(value) => out.extend_from_slice(value.as_encoded_bytes()),
+            None => out.extend_from_slice(b"unset"),
+        }
+        out.push(0);
+    }
+    out
+}
+
+/// What a translation takes from the host GPU rather than from the container
+/// or a switch: the null slot view indices are clamped to
+/// ([`set_view_heap_limit`], probed on the device) and the widest wave it
+/// runs ([`set_host_max_wave`], from `WaveLaneCountMax`). Both are known only
+/// once the device exists, so a cache must read this when it translates, not
+/// once at start: its key takes this too.
+pub fn device_bytes() -> Vec<u8> {
+    let mut out = b"victory-shader host 1".to_vec();
+    out.extend_from_slice(&view_heap_limit().to_le_bytes());
+    out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
+    out
 }
 
 /// A translated shader and what the host binds for it.
@@ -465,17 +591,45 @@ pub fn emit(
         }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
-    // trace programs): right once the wave takes that skip together ([`widen`]; the
-    // lowering has named the skipped blocks).
+    // trace programs) or cross-lane code in a shader that could not run with local waves alone:
+    // retry `widen` allowing loop-adjacent branches cleanly now that `local_waves` was tried.
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
             if native.stage == HwStage::Cs
-                && what == lower::LANE_MASK
+                && (what == lower::LANE_MASK || lower::needs_every_lane(what))
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+            let deep = native.wave64
+                && lower::host_max_wave() == 32
+                && std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+            let base = if deep {
+                ir::without_skips(p, true)
+                    .or_else(|| ir::without_skips(p, false))
+                    .or_else(|| ir::without_early_outs(p))
+            } else {
+                None
+            };
+            let log = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
+                if why {
+                    match r {
+                        Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
+                        Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
+                    }
+                }
+            };
+            let again = widen(c, native, base.as_ref().unwrap_or(p), why);
+            log("wave-wide branches (retry)", &again);
             match again {
                 Ok(_) => again,
+                Err(_) if base.is_some() => {
+                    let fallback = widen(c, native, p, why);
+                    log("wave-wide branches (fallback)", &fallback);
+                    match fallback {
+                        Ok(_) => fallback,
+                        Err(_) => emit_program(c, native, p, st, io, res),
+                    }
+                }
                 Err(_) => emit_program(c, native, p, st, io, res),
             }
         }
@@ -518,7 +672,11 @@ fn widen(
     match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
-        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        crate::native::StageIo::Cs(cs)
+            if {
+                let g = cs.threads.iter().product::<u32>();
+                g > 0 && g <= 1024 && (g <= 32 || g.is_multiple_of(64))
+            } => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -760,7 +918,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
-    use super::parse_loop_limit;
+    use super::{parse_compute_loop_limit, parse_loop_limit};
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
@@ -781,6 +939,18 @@ mod tests {
         assert_eq!(parse_loop_limit(Some("1")), 1);
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_compute_loop_limit_follows_the_general_one_unless_set() {
+        assert_eq!(parse_compute_loop_limit(None, 32), 32);
+        assert_eq!(parse_compute_loop_limit(Some("1024"), 32), 1024);
+        assert_eq!(parse_compute_loop_limit(Some(" 0x400 "), 32), 1024);
+        let full = LOOP_LIMIT.to_string();
+        assert_eq!(parse_compute_loop_limit(Some(&full), 32), LOOP_LIMIT);
+        for bad in ["", "0", "-5", "lots"] {
+            assert_eq!(parse_compute_loop_limit(Some(bad), 32), 32, "{bad:?}");
         }
     }
     use super::container::SigElement;
@@ -913,6 +1083,106 @@ mod tests {
         ) {
             v.validate(&mut out.dxil.clone()).unwrap();
         }
+    }
+
+    /// Emits a pixel program of `words` (wave32 unless `wave64`) with one TEXCOORD input and
+    /// SV_Depth/SV_StencilRef out: translated, or refused with a reason.
+    fn pixel_emits(words: &[u32], wave64: bool) -> Result<(), crate::ShaderError> {
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![crate::native::PsInput {
+                    usage: crate::native::Usage::Generic,
+                    row: 0,
+                    mask: 0b1000,
+                    attr: 0,
+                    flat: false,
+                    fp16: false,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let el = |name: &str, kind, comp| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp,
+            interp: 0,
+            row: Some(0),
+            col: 3,
+            cols: 1,
+            usage: 1,
+            half: false,
+        };
+        let isg1 = container::signature(&[el("TEXCOORD", 0, 9)], true);
+        let osg1 =
+            container::signature(&[el("SV_Depth", 17, 9), el("SV_StencilRef", 20, 5)], false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        emit(&c, &native, &p, &st, &io, &res).map(|_| ())
+    }
+
+    /// A pixel program whose one register holds a lane mask on one path and a number on the
+    /// other, counted after the join (`s_bcnt1_i32_b32`): a use that means the same on any
+    /// wave, so the host wave's ballot stands in for the mask, taken at the end of the phi's
+    /// predecessor.
+    #[test]
+    fn a_lane_mask_joined_with_a_number_lowers_for_a_wave_independent_reader() {
+        let words = [
+            0x7E00_0283, // v_mov_b32 v0, 3
+            0x7E02_0285, // v_mov_b32 v1, 5
+            0x7D88_0101, // v_cmp_gt_u32 vcc_lo, v1, v0 (every lane)
+            0xBE94_036A, // s_mov_b32 s20, vcc_lo
+            0xBE95_0F14, // s_bcnt1_i32_b32 s21, s20
+            0xBF06_8015, // s_cmp_eq_u32 s21, 0
+            0xBF85_0001, // s_cbranch_scc1 over the next word
+            0xBE94_0385, // s_mov_b32 s20, 5 (the number path)
+            0xBE96_0F14, // s_bcnt1_i32_b32 s22, s20 (the join, read as a number)
+            0x7E00_0216, // v_mov_b32 v0, s22
+            0x7E02_0300, // v_mov_b32 v1, v0
+            0xF800_1883, // exp mrtz v0, v1, off, off done vm
+            0x0000_0100,
+            0xBF81_0000, // s_endpgm
+        ];
+        pixel_emits(&words, false).expect("a lane mask counted after a join");
+    }
+
+    /// The same join read by anything else: the ballot's bit n is host lane n, which a
+    /// 64-lane host numbers differently from the console's 32, so the number the register
+    /// holds is not the console's. Refused rather than silently different.
+    #[test]
+    fn a_lane_mask_joined_with_a_number_is_refused_for_other_readers() {
+        let words = [
+            0x7E00_0283, // v_mov_b32 v0, 3
+            0x7E02_0285, // v_mov_b32 v1, 5
+            0x7D88_0101, // v_cmp_gt_u32 vcc_lo, v1, v0
+            0xBE94_036A, // s_mov_b32 s20, vcc_lo
+            0xBE95_0F14, // s_bcnt1_i32_b32 s21, s20
+            0xBF06_8015, // s_cmp_eq_u32 s21, 0
+            0xBF85_0001, // s_cbranch_scc1 over the next word
+            0xBE94_0385, // s_mov_b32 s20, 5
+            0xBE96_0314, // s_mov_b32 s22, s20 (the join, copied as a whole number)
+            0x7E00_0216, // v_mov_b32 v0, s22
+            0x7E02_0300, // v_mov_b32 v1, v0
+            0xF800_1883, // exp mrtz v0, v1, off, off done vm
+            0x0000_0100,
+            0xBF81_0000, // s_endpgm
+        ];
+        let r = pixel_emits(&words, false);
+        assert!(r.is_err(), "a joined mask copied as a number must be refused");
     }
 
     /// A wave64 compute program that writes only EXEC's high dword

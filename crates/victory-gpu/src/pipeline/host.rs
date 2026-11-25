@@ -359,6 +359,33 @@ impl GraphicsState {
         }
     }
 
+    /// The blend state the host pipeline is made with. D3D12 refuses a
+    /// pipeline that enables blending on an integer render target, though the
+    /// console blends into one (MIN, MAX), so those targets write unblended.
+    fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let mut blend = self.blend;
+        if !host_blend_on() {
+            return blend;
+        }
+        let count = (self.targets.NumRenderTargets as usize).min(8);
+        let independent = blend.IndependentBlendEnable.as_bool();
+        // Without independent blending, target 0's description is every target's.
+        let blended =
+            |i: usize| blend.RenderTarget[if independent { i } else { 0 }].BlendEnable.as_bool();
+        let integer = |i: usize| integer_format(self.targets.RTFormats[i].0 as u32);
+        if !(0..count).any(|i| integer(i) && blended(i)) {
+            return blend;
+        }
+        if !independent {
+            blend.RenderTarget = [blend.RenderTarget[0]; 8];
+            blend.IndependentBlendEnable = true.into();
+        }
+        for i in (0..count).filter(|&i| integer(i)) {
+            blend.RenderTarget[i].BlendEnable = false.into();
+        }
+        blend
+    }
+
     /// The vertex buffer slots the input layout reads.
     fn slots(&self) -> u32 {
         self.inputs
@@ -771,7 +798,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -895,6 +922,25 @@ impl HostPipeline {
 #[repr(C, align(8))]
 struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
 
+/// Whether a `DXGI_FORMAT` value is an integer one (`*_UINT`, `*_SINT`, and the
+/// packed 10-bit `R10G10B10A2_UINT`), which the host cannot blend into.
+fn integer_format(format: u32) -> bool {
+    matches!(
+        format,
+        3 | 4 // R32G32B32A32
+            | 7 | 8 // R32G32B32
+            | 12 | 14 // R16G16B16A16
+            | 17 | 18 // R32G32
+            | 25 // R10G10B10A2_UINT
+            | 30 | 32 // R8G8B8A8
+            | 36 | 38 // R16G16
+            | 42 | 43 // R32
+            | 50 | 52 // R8G8
+            | 57 | 59 // R16
+            | 62 | 64 // R8
+    )
+}
+
 fn stream_pipeline<S>(
     device: &ID3D12Device,
     stream: &mut S,
@@ -978,6 +1024,14 @@ fn graphics_depth_bounds_pipeline(
     }
 }
 
+/// `VICTORY_HOST_BLEND=0` keeps the title's blend state on integer targets,
+/// which the host then refuses (the pipeline is dropped, as it was before).
+fn host_blend_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOST_BLEND").is_none_or(|v| v != "0"))
+}
+
+
 /// A mesh pipeline from the title's graphics state: the pipeline-state
 /// stream form (no input layout).
 ///
@@ -1013,12 +1067,13 @@ fn mesh_pipeline(
         samples: Sub<DXGI_SAMPLE_DESC>,
         topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
     }
+    let blend = g.host_blend();
     let build = |depth: Sub<_>| {
         let mut stream = Stream {
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth,
@@ -1037,7 +1092,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
@@ -1064,17 +1119,66 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
+/// The flags our programs ask the host for: heaps directly indexed (SM 6.6
+/// `ResourceDescriptorHeap[]`, which every translated shader binds through),
+/// and the input assembler for a graphics signature. A host that predates
+/// them refuses the whole signature (`flags c01`, `E_INVALIDARG`), and every
+/// pipeline is then dropped: `root_signature` says so once.
+fn root_flags(compute: bool, heaps: bool) -> u32 {
+    let input = if compute {
+        0
+    } else {
+        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT.0 as u32
+    };
+    let heaps = if heaps {
+        D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED.0 as u32
+            | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED.0 as u32
+    } else {
+        0
+    };
+    input | heaps
+}
+
 fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
     compute: bool,
 ) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
-    let input = if compute {
-        D3D12_ROOT_SIGNATURE_FLAG_NONE
-    } else {
-        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
-    };
+    match root_signature_with(device, params, samplers, root_flags(compute, true)) {
+        Ok(made) => Ok(made),
+        Err(e) => {
+            // A host without SM 6.6 dynamic resources (Windows 10 21H2's own
+            // D3D12, a driver below SM 6.6) refuses the whole description
+            // instead of the one bit it cannot honour, so the refusal alone
+            // does not say what is missing. A signature without the heaps
+            // tells the two apart: one that is taken names the requirement
+            // once, and the title's pipelines stay refused (without the
+            // flags a translated shader cannot bind a descriptor at all).
+            if root_signature_with(device, params, samplers, root_flags(compute, false)).is_ok() {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    tracing::warn!(
+                        flags = format_args!("{:#x}", root_flags(compute, true)),
+                        "the host refuses root signatures with heaps directly indexed (SM 6.6): \
+                         every translated shader binds its descriptors through \
+                         ResourceDescriptorHeap[], so no host pipeline can be created on this \
+                         runtime or driver"
+                    );
+                });
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Serializes a description with exactly these flags and creates it.
+fn root_signature_with(
+    device: &ID3D12Device,
+    params: &[D3D12_ROOT_PARAMETER1],
+    samplers: &[D3D12_STATIC_SAMPLER_DESC],
+    flags: u32,
+) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
     let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
         Version: windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1_1,
         Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
@@ -1083,9 +1187,7 @@ fn root_signature(
                 pParameters: params.as_ptr(),
                 NumStaticSamplers: samplers.len() as u32,
                 pStaticSamplers: samplers.as_ptr(),
-                Flags: input
-                    | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                    | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                Flags: D3D12_ROOT_SIGNATURE_FLAGS(flags as i32),
             },
         },
     };
@@ -1189,6 +1291,7 @@ mod tests {
         let shader = Shader {
             stage: "mesh",
             hash: "mesh grid".to_owned(),
+            full_hash: *blake3::hash(&ms).as_bytes(),
             container: ms.clone(),
             translated: std::sync::OnceLock::new(),
         };
@@ -1433,6 +1536,63 @@ mod tests {
         assert!(GraphicsState::from_bytes(&[bytes.as_slice(), &[0]].concat()).is_none());
     }
 
+    /// A title's graphics state blending (MAX, which the console allows on
+    /// integer formats) into three targets, the last `R8_UINT`; with
+    /// `independent` false, target 0's description stands for all three and
+    /// the others keep their defaults (unblended), as a title's need not match.
+    fn blending_into_an_integer_target(independent: bool) -> GraphicsState {
+        let mut g = GraphicsState::default();
+        g.blend.IndependentBlendEnable = independent.into();
+        let described = if independent { 8 } else { 1 };
+        for t in &mut g.blend.RenderTarget[..described] {
+            t.BlendEnable = true.into();
+            t.BlendOp = D3D12_BLEND_OP_MAX;
+            t.BlendOpAlpha = D3D12_BLEND_OP_MAX;
+        }
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8_UINT;
+        g
+    }
+
+    /// The host refuses a pipeline that blends into an integer target, so such
+    /// a target writes unblended and the others keep the title's description.
+    #[test]
+    fn integer_targets_write_unblended() {
+        for independent in [true, false] {
+            let blend = blending_into_an_integer_target(independent).host_blend();
+            assert!(blend.IndependentBlendEnable.as_bool(), "independent: {independent}");
+            assert!(blend.RenderTarget[0].BlendEnable.as_bool());
+            assert!(blend.RenderTarget[1].BlendEnable.as_bool());
+            assert_eq!(blend.RenderTarget[1].BlendOp, D3D12_BLEND_OP_MAX);
+            assert!(!blend.RenderTarget[2].BlendEnable.as_bool(), "independent: {independent}");
+            // Every target in the count: blended unless integer.
+            for i in 0..3 {
+                assert_eq!(blend.RenderTarget[i].BlendEnable.as_bool(), i < 2, "target {i}");
+            }
+        }
+        // No integer target: the title's description as it was, not expanded.
+        let mut g = blending_into_an_integer_target(false);
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let blend = g.host_blend();
+        assert!(!blend.IndependentBlendEnable.as_bool());
+        assert!(blend.RenderTarget[0].BlendEnable.as_bool());
+    }
+
+    /// The integer format list: every typed `*_UINT`/`*_SINT` form and the
+    /// packed 10-bit one, and none of the float, unorm, snorm or typeless forms.
+    #[test]
+    fn the_integer_formats_are_the_typed_ones() {
+        // The values from the windows crate's DXGI_FORMAT constants.
+        for f in [3, 4, 7, 8, 12, 14, 17, 18, 25, 30, 32, 36, 38, 42, 43, 50, 52, 57, 59, 62, 64] {
+            assert!(integer_format(f), "format {f} is integer");
+        }
+        for f in [1, 2, 5, 6, 9, 10, 11, 13, 15, 16, 19, 21, 23, 24, 26, 27, 28, 29, 31, 33, 34, 35, 37, 39, 41, 48, 49, 51, 53, 54, 55, 56, 58, 60, 61, 63, 65, 66] {
+            assert!(!integer_format(f), "format {f} is not integer");
+        }
+    }
+
     const VS: &str = "float4 main(uint i : SV_VertexID) : SV_Position {
         float2 p = float2((i << 1) & 2, i & 2);
         return float4(p * 2.0 - 1.0, 0.5, 1.0);
@@ -1488,7 +1648,7 @@ mod tests {
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(&vs),
             PS: code(&ps),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -1747,5 +1907,141 @@ mod tests {
 
         g.inputs.push(D3D12_INPUT_ELEMENT_DESC::default());
         assert!(!g.screen_pass());
+    }
+
+    /// A D3D12 device on the first adapter DXGI lists (the host's own: under
+    /// Wine, vkd3d-proton on the real GPU), if the host makes one.
+    #[cfg(windows)]
+    fn device() -> Option<ID3D12Device> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+        // SAFETY: plain DXGI/D3D12 calls with out pointers of ours.
+        unsafe {
+            let mut device: Option<ID3D12Device> = None;
+            if let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() {
+                let mut i = 0;
+                while let Ok(adapter) = factory.EnumAdapters1(i) {
+                    i += 1;
+                    if let Ok(desc) = adapter.GetDesc1() {
+                        let end = desc
+                            .Description
+                            .iter()
+                            .position(|&c| c == 0)
+                            .unwrap_or(desc.Description.len());
+                        eprintln!(
+                            "host adapter: {} vendor {:#x} device {:#x}",
+                            String::from_utf16_lossy(&desc.Description[..end]),
+                            desc.VendorId,
+                            desc.DeviceId
+                        );
+                    }
+                    if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok() {
+                        return device;
+                    }
+                }
+            }
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok() {
+                return device;
+            }
+            eprintln!("root signature: no host device");
+            None
+        }
+    }
+
+    /// Serializes and creates a signature with exactly these flags; the error
+    /// keeps the host's own message.
+    #[cfg(windows)]
+    fn root_signature_with(device: &ID3D12Device, flags: u32) -> Result<(), String> {
+        let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+            Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+            Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                    NumParameters: 0,
+                    pParameters: std::ptr::null(),
+                    NumStaticSamplers: 0,
+                    pStaticSamplers: std::ptr::null(),
+                    Flags: D3D12_ROOT_SIGNATURE_FLAGS(flags as i32),
+                },
+            },
+        };
+        // SAFETY: the description points at no arrays; both blobs are read
+        // through their own interfaces.
+        unsafe {
+            let mut blob: Option<ID3DBlob> = None;
+            let mut error: Option<ID3DBlob> = None;
+            if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error))
+            {
+                let text = error.map_or_else(String::new, |error| {
+                    let text = std::slice::from_raw_parts(
+                        error.GetBufferPointer().cast::<u8>(),
+                        error.GetBufferSize(),
+                    );
+                    String::from_utf8_lossy(text).trim().to_string()
+                });
+                return Err(format!("{e}: {text}"));
+            }
+            let blob = blob.ok_or("no blob")?;
+            let bytes =
+                std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+            device
+                .CreateRootSignature::<ID3D12RootSignature>(0, bytes)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    /// The flags the numbers in a host refusal (`flags c01`) name: the
+    /// translated shaders bind every descriptor through
+    /// `ResourceDescriptorHeap[]`, so a graphics signature asks for heaps
+    /// directly indexed on top of the input assembler, a compute one for the
+    /// heaps alone.
+    #[test]
+    fn root_signature_flags_are_the_ones_for_directly_indexed_heaps() {
+        assert_eq!(root_flags(false, true), 0xc01);
+        assert_eq!(root_flags(true, true), 0xc00);
+        // Without the heaps: the standard signature every runtime takes.
+        assert_eq!(root_flags(false, false), 0x1);
+        assert_eq!(root_flags(true, false), 0x0);
+    }
+
+    /// The same two flags on the host's own adapter: through vkd3d-proton
+    /// (Wine) it takes both, and `root_signature` hands back a signature for
+    /// graphics and compute programs. A host that refuses `0xc01`
+    /// (`E_INVALIDARG`, Windows 10 21H2's D3D12 or a driver below SM 6.6)
+    /// cannot run a translated shader at all, which is what the warning in
+    /// `root_signature` says: such a host is reported and skipped, since the
+    /// refusal is its limitation and not a fault of this tree.
+    #[cfg(windows)]
+    #[test]
+    fn root_signature_flags_end_in_a_usable_signature() {
+        let Some(device) = device() else { return };
+        let mut taken = true;
+        for (compute, what) in [(false, "graphics"), (true, "compute")] {
+            let flags = root_flags(compute, true);
+            let made = root_signature_with(&device, flags);
+            taken &= made.is_ok();
+            eprintln!(
+                "{what} root signature flags {flags:#x}: {}",
+                match made {
+                    Ok(()) => "accepted".to_string(),
+                    Err(e) => format!("refused ({e})"),
+                }
+            );
+        }
+        if !taken {
+            eprintln!(
+                "skipped: this host refuses the directly indexed heap flags, so it has no SM 6.6 \
+                 dynamic resources and cannot run a translated shader"
+            );
+            return;
+        }
+        assert!(
+            root_signature(&device, &[], &[], false).is_ok(),
+            "no root signature for a graphics pipeline"
+        );
+        assert!(
+            root_signature(&device, &[], &[], true).is_ok(),
+            "no root signature for a compute pipeline"
+        );
     }
 }
