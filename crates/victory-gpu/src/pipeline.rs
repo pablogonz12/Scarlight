@@ -400,6 +400,11 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Pipelines a draw or dispatch asked for, since the last call.
+pub(crate) fn take_demanded() -> u64 {
+    make::take_demanded()
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

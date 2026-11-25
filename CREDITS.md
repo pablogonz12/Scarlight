@@ -26,7 +26,7 @@ wrothgaril, Yaekai.
 
 ## Co-authors
 
-BlueKaiman.
+andrewpozdnakov7-jpg, BlueKaiman.
 
 ## Design notes
 

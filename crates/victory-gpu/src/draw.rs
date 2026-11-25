@@ -8,6 +8,7 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::resource::RootIndexedView;
@@ -356,6 +357,31 @@ static DRAWN: AtomicU64 = AtomicU64::new(0);
 /// Draws run on the host so far.
 pub(crate) fn drawn() -> u64 {
     DRAWN.load(Ordering::Relaxed)
+}
+
+/// Draws with no vertices or indices, or no instances, skipped before
+/// their state was prepared, since the last call.
+static EMPTY: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn take_empty() -> u64 {
+    EMPTY.swap(0, Ordering::Relaxed)
+}
+
+/// Whether a draw of `items` vertices or indices in `instances` instances
+/// draws nothing and is skipped: counted, and returned before its state is
+/// prepared, so it asks for no host pipeline and spends none of the frame's
+/// pipeline wait budget (upstream Marvisak/VIctory #2654).
+/// On by default; `VICTORY_EMPTY_DRAW_SKIP=0` prepares empty draws as before.
+fn empty_draw(items: u32, instances: u32) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_EMPTY_DRAW_SKIP").is_none_or(|v| v != "0")
+    });
+    if !(on && (items == 0 || instances == 0)) {
+        return false;
+    }
+    EMPTY.fetch_add(1, Ordering::Relaxed);
+    true
 }
 
 /// The draws traced since the last present (diagnostics builds, with
@@ -2421,6 +2447,11 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
+        // Nothing to draw: preparing it would ask for its host pipeline and
+        // spend the frame's pipeline wait budget on it.
+        if empty_draw(vertices, instances) {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -2526,6 +2557,10 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
+        // As an empty draw: nothing to draw, and no pipeline to ask for.
+        if empty_draw(indices, instances) {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3017,7 +3052,22 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::staging_budget_per_frame;
+    use super::{empty_draw, staging_budget_per_frame, take_empty};
+
+    /// An empty draw is skipped and counted, a draw with work is not: the
+    /// check sits above the state preparation, so nothing asks for its host
+    /// pipeline (upstream Marvisak/VIctory #2654).
+    #[test]
+    fn empty_draws_are_skipped_and_counted() {
+        let _ = take_empty();
+        for (items, instances) in [(0, 1), (3, 0), (0, 0)] {
+            assert!(empty_draw(items, instances), "{items} items {instances} instances");
+        }
+        assert_eq!(take_empty(), 3);
+        assert!(!empty_draw(3, 1));
+        assert!(!empty_draw(1, 1));
+        assert_eq!(take_empty(), 0);
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {
