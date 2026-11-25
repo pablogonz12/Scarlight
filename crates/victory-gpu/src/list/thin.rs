@@ -355,14 +355,22 @@ pub(crate) struct Submitted {
     recordings: Vec<Arc<Recording>>,
 }
 
+// SAFETY: D3D12 objects are free-threaded, and the recordings are behind their
+// own locks.
+unsafe impl Send for Submitted {}
+
 impl Submitted {
-    /// The lists of ours to execute, once every recording is translated.
-    pub(crate) fn backs(&self) -> &[This] {
+    /// The lists of ours to execute: every recording is translated first.
+    pub(crate) fn ready(&self) -> &[This] {
+        for recording in &self.recordings {
+            recording.wait();
+        }
         &self.backs
     }
 }
 
-/// Closes the submitted lists' recordings and waits until they are translated.
+/// Closes the submitted lists' recordings (on the title's thread: it may reset
+/// its lists at once) and hands them to whoever submits them.
 pub(crate) fn submitted(lists: &[This]) -> Submitted {
     let recordings: Vec<Arc<Recording>> = lists
         .iter()
@@ -375,9 +383,6 @@ pub(crate) fn submitted(lists: &[This]) -> Submitted {
             front.recording.clone()
         })
         .collect();
-    for recording in &recordings {
-        recording.wait();
-    }
     let backs = recordings.iter().map(|r| r.back()).collect();
     Submitted { backs, recordings }
 }

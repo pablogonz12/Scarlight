@@ -76,6 +76,11 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
 pub(crate) extern "system" fn completed(this: This) -> u64 {
+    // With submissions in the line of a thread of ours (`VICTORY_ASYNC_SUBMIT`),
+    // a value not set yet is behind work the reading thread may be waiting
+    // for: the read takes the line in, as a wait does.
+    #[cfg(windows)]
+    crate::queue::before_sync();
     fence(this).value.load(Ordering::Acquire)
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {

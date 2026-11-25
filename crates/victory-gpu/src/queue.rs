@@ -7,6 +7,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
+/// Submissions made by a thread of ours (`VICTORY_ASYNC_SUBMIT=1`).
+#[cfg(windows)]
+mod behind;
+
 const QUEUE_IIDS: [Iid; 4] = [
     guid(
         0x0ec870a6,
@@ -291,6 +295,26 @@ fn submit_split(this: This, lists: &[This]) {
     release_held(false);
 }
 
+/// Before a submission of ours that is waited for, or a wait for flights by a
+/// thread of the title's: what the title gave its queues before goes to the
+/// card first ([`behind`]).
+#[cfg(windows)]
+pub(crate) fn before_sync() {
+    behind::drain();
+}
+
+/// Submissions the title made that the host has not begun ([`behind`]).
+#[cfg(windows)]
+pub(crate) fn queued() -> u64 {
+    if behind::on() { behind::queued() } else { 0 }
+}
+
+/// For the frame line.
+#[cfg(windows)]
+pub(crate) fn behind_line(frames: f64) {
+    behind::log(frames);
+}
+
 /// Adds `what()` to what the queue holds, if it holds anything (it waits
 /// for a fence): whether it was added.
 #[cfg(windows)]
@@ -531,8 +555,13 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         // translated into lists of ours first, and those are submitted as any
         // other (where a wait for a memory value cuts them, they are cut then).
         if crate::list::thin::on() {
+            if behind::on() {
+                // The line translates them and submits them; the title goes on.
+                behind::submit(this, lists);
+                return;
+            }
             let recordings = crate::list::thin::submitted(lists);
-            let backs = recordings.backs().to_vec();
+            let backs = recordings.ready().to_vec();
             submit_list(host, this, &backs);
             return;
         }
@@ -568,7 +597,14 @@ pub(crate) struct Plane {
 /// Runs submitted lists on the queue: cut at their waits, split, held behind
 /// what the queue holds, and submitted to the host.
 #[cfg(windows)]
-fn submit_list(host: &crate::host::Host, this: This, lists: &[This]) {
+/// One submission at a time, whichever thread makes it: what a submission
+/// takes in (the flights of earlier ones, the pool of lists they give back) is
+/// not made for two threads at once.
+#[cfg(windows)]
+static SUBMITTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) fn submit_list(host: &crate::host::Host, this: This, lists: &[This]) {
+    let _one_at_a_time = SUBMITTING.lock().unwrap_or_else(|e| e.into_inner());
     // A list that waits for a memory value not there yet: the queue
     // holds the submission, as it does behind a fence.
     if waits() && !this.is_null() {
@@ -640,6 +676,13 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     }
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
+    if behind::on() {
+        // After the submissions the queue was given before it (the line's
+        // thread keeps the order).
+        behind::signal(fence, value);
+        return S_OK;
+    }
+    #[cfg(windows)]
     if hold(this, || Held::Signal(fence as usize, value)) {
         return S_OK;
     }
@@ -662,6 +705,11 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
 extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
+    }
+    // What the queue was given before it has run by the time this is looked at.
+    #[cfg(windows)]
+    if behind::on() {
+        behind::drain();
     }
     #[cfg(windows)]
     if !this.is_null() {
@@ -786,6 +834,10 @@ extern "system" fn present(
 ) -> HRESULT {
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
+    // The frame's end is where the title meets the card again: everything its
+    // queues were given has run (`VICTORY_ASYNC_SUBMIT=1`).
+    #[cfg(windows)]
+    behind::drain();
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
