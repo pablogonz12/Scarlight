@@ -1212,9 +1212,14 @@ impl<'a> Lanes<'a> {
                         self.scc_lane.insert(scc, m);
                     }
                 }
-                // `s_cmp_eq/lg` of a mask: "no lane differs" per lane.
+                // `s_cmp_eq/lg` of a mask: hardware sets a wave-wide SCC
+                // (eq iff no bit differs, lg iff one does), not a per-lane
+                // XNOR/XOR, so by default it stays out of `scc_lane` and the
+                // branch is the uniform compare of the two masks that
+                // lowering emits (`VICTORY_MASK_SCC_LANES=0`: per lane).
                 let width = if self.p.wave64 { "64" } else { "32" };
-                if takes_mask
+                if !crate::emit::switches::mask_scc_wave()
+                    && takes_mask
                     && let (Some(rest), Some(scc)) =
                         (name.strip_prefix("s_cmp_"), inst.write(Reg::Scc))
                     && rest
@@ -1844,5 +1849,65 @@ mod tests {
                 .any(|&e| matches!(s.bools.support(e)[..], [Atom::Lane(_)])),
             "{edges:?}"
         );
+    }
+
+    /// `s_cmp_eq/lg` of two lane masks sets a wave-wide SCC`s_cmp_eq/lg` of two lane masks sets a wave-wide SCC
+    /// (masks equal iff no bit differs), not a per-lane XNOR/XOR.
+    #[test]
+    fn mask_s_cmp_eq_lg_leaves_scc_uniform() {
+        for (words, wave64) in [
+            (
+                [
+                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                    0xBF06_7E6A, // s_cmp_eq_u32 vcc_lo, exec_lo
+                    0xBF84_0001, // s_cbranch_scc0 -> end
+                    0x7E02_0280, // v_mov_b32 v1, 0
+                    S_ENDPGM,
+                ],
+                false,
+            ),
+            (
+                [
+                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                    0xBF07_7E6A, // s_cmp_lg_u32 vcc_lo, exec_lo
+                    0xBF85_0001, // s_cbranch_scc1 -> end
+                    0x7E02_0280, // v_mov_b32 v1, 0
+                    S_ENDPGM,
+                ],
+                false,
+            ),
+            (
+                [
+                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                    0xBF12_7E6A, // s_cmp_eq_u64 vcc, exec
+                    0xBF84_0001, // s_cbranch_scc0 -> end
+                    0x7E02_0280, // v_mov_b32 v1, 0
+                    S_ENDPGM,
+                ],
+                true,
+            ),
+            (
+                [
+                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                    0xBF13_7E6A, // s_cmp_lg_u64 vcc, exec
+                    0xBF85_0001, // s_cbranch_scc1 -> end
+                    0x7E02_0280, // v_mov_b32 v1, 0
+                    S_ENDPGM,
+                ],
+                true,
+            ),
+        ] {
+            let p = build(&words, wave64);
+            let s = structure(&p).unwrap();
+            let LaneExit::Branch { when, .. } = s.exits[0] else {
+                panic!("{words:x?} wave64={wave64}: {:?}", s.exits)
+            };
+            assert!(
+                matches!(s.bools.support(when)[..], [Atom::Uniform(_)]),
+                "{words:x?} wave64={wave64}: {:?}",
+                s.bools.support(when)
+            );
+            assert_eq!(guarded(&s), 0, "{words:x?} wave64={wave64}");
+        }
     }
 }

@@ -95,6 +95,7 @@ mod own_bits;
 mod rect;
 mod sampler;
 mod shader;
+pub mod switches;
 mod threading;
 #[cfg(windows)]
 pub mod validator;
