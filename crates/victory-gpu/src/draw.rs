@@ -2003,6 +2003,36 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.reflection(list, p);
+    }
+
+    /// After a dispatch of `p`: the stand-in for ray-traced reflections
+    /// ([`crate::reflection`]), if it is on and `p` is its program.
+    /// What it records binds nothing (a transition and a render target
+    /// clear): the title's bindings stay.
+    fn reflection(&self, list: &HostList, p: &HostPipeline) {
+        let Some(stage) = p.stages.first().filter(|_| p.compute) else {
+            return;
+        };
+        let Some(mode) = crate::reflection::pass(&stage.shader.hash) else {
+            return;
+        };
+        let uavs: Vec<crate::reflection::Uav> = stage
+            .translated()
+            .used
+            .iter()
+            .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table)
+            .filter_map(|u| {
+                let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+                    return None;
+                };
+                match crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) {
+                    Some(View::Unordered(r, _, desc)) if r != 0 => Some((u.slot, u.table_offset_dwords, r, desc)),
+                    _ => None,
+                }
+            })
+            .collect();
+        crate::reflection::after(list, mode, &stage.shader.hash, &uavs);
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -2775,6 +2805,7 @@ impl State {
         crate::indirect::done(list, &bounded);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            self.reflection(list, p);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
