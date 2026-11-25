@@ -26,7 +26,7 @@ wrothgaril, Yaekai.
 
 ## Co-authors
 
-BlueKaiman, kais7654, pushkarreddyy.
+BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shader metadata cache, VIctory #2614).
 
 ## Design notes
 
@@ -49,6 +49,24 @@ BlueKaiman, kais7654, pushkarreddyy.
   renaming (an unreachable predecessor left `NONE` in a phi argument), the RDNA2 `omod` signed-zero flush after
   `write_f`, and each `s_buffer_load` address term dword-truncated before the terms are summed
   (`crates/victory-shader/src/ir.rs`, `crates/victory-shader/src/emit/lower.rs`).
+- **Marvisak/VIctory [#2736](https://github.com/Marvisak/VIctory/pull/2736)** (brainbudt), GPL-3.0: copying
+  tiled textures as runs of whole micro-tile columns (one call per row and depth slice, 4-32 bytes at a
+  time) instead of one closure call per span, its `detile_throughput` benchmark, and its idea of keeping
+  the span walk as the reference (`crates/victory-formats/src/texture.rs`, `VICTORY_TEXTURE_RUNS=0`).
+  Reimplemented on this tree's pattern tables: the depth-pitch overlap check its fast path dropped is
+  kept, and a column-by-column fallback replaces its `unreachable!` for any pattern whose run width is
+  not 4-32 bytes.
+- **Marvisak/VIctory [#2735](https://github.com/Marvisak/VIctory/pull/2735)** (brainbudt), GPL-3.0: resolving a
+  BCPack slot through a 256-slot window table (one bit per transition, ranked inside its 64-bit word) instead
+  of a bucket search and an exact-division reciprocal, its `bcpack_decode_throughput` benchmark, and keeping
+  the range scan as the reference (`crates/victory-formats/src/bcpack.rs`, `VICTORY_BCPACK_WINDOWS=0`). Ported
+  whole, including its BC7 endpoint and index packing in `bc7_pack`.
+
+- **fxceless/victory-fork [PR #905](https://github.com/fxceless/victory-fork/pull/905)** (staronthehorizon,
+  from [PR #814](https://github.com/fxceless/victory-fork/pull/814)), GPL-3.0: the node test's rules that a
+  child that is not there is a miss whatever its box holds, and that an empty or inverted box and any NaN
+  coordinate miss in both node widths, with the reference's own tests
+  (`crates/victory-shader/src/bvh.rs`, `crates/victory-shader/src/emit/intersect.rs`).
 
 ## Tools
 

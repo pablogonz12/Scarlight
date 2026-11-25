@@ -464,6 +464,9 @@
     // Descriptor words read as numbers: kept in their own file (lower.rs is at the size limit).
     #[path = "lower/tests/desc_data.rs"]
     mod desc_data;
+    // The 16-bit multiply-add and lerp tests, in their own file as well.
+    #[path = "lower/tests/mad_u16_lerp.rs"]
+    mod mad_u16_lerp;
 
     /// Tables of 2D textures at s0 and samplers at s1.
     fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {

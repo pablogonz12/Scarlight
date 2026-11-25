@@ -4,6 +4,35 @@ Scarlight is a compatibility layer, so "it looks right" and "it is faster" are s
 both have to be shown. The rule is simple: nothing is published on the strength of one run, and the
 cheapest check that can answer a question runs first.
 
+## Running the tests on Linux
+
+Step 1 is two commands on the machine we build on, and both run without a game:
+
+```bash
+cargo test --workspace        # the platform crates, natively: 340 tests, no Wine
+cargo xtask test-wine         # victory-gpu, victory-hle, victory-loader, under Wine
+```
+
+The first compiles and passes off Windows, so the shader translator, the formats, the PE reader and
+the HLE logic are tested on the host. The crates that reach the host's D3D12 or clean up a real
+image keep those tests `#[cfg(windows)]`, and the second command builds them for the Windows target
+and runs each test executable with `--test-threads=1` (a host device per test thread either fails or
+stalls the driver). It takes `-p <crate>` and `-- <filter>`, and finds Wine at `$VICTORY_WINE`, else
+the newest GE-Proton under Steam's `compatibilitytools.d`, else `wine` on the PATH, in the prefix
+`$VICTORY_WINEPREFIX` or `~/.local/share/scarlight-prefix`.
+
+Both are jobs in [.github/workflows/linux.yml](../.github/workflows/linux.yml). Clippy stays a
+Windows-target gate (`cargo xwin clippy --target x86_64-pc-windows-msvc`), because what the layer
+*ships* is that build.
+
+Two things the Wine run needs, both of them the setup a run needs anyway: a prefix with
+vkd3d-proton's `d3d12.dll` and `d3d12core.dll` installed (without them the test executable does not
+start: `import_dll ... failed, status c0000135`), and your desktop session, because two lifecycle
+tests create a window. `net::tests::only_loopback_is_reachable` asks `ws2_32` for
+`WSAConnectByList`, which Wine's does not have: it fails there and passes on Windows. Add
+`--integration` to run the end-to-end tests too (they build a fixture with `cargo`, so they need a
+Windows cargo).
+
 ## The ladder
 
 Each step is cheaper than the one below it, and a change stops at the first step that fails.
