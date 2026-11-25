@@ -5647,8 +5647,9 @@ impl Batch {
 
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
-/// them (tiled memory, page mappings), which read as zeros here; a title
-/// destination (`title_dst`) that is not all mapped is left alone.
+/// them (tiled memory, page mappings), which read as zeros here, and a title
+/// destination (`title_dst`) may have pages the title has taken away, which
+/// are left alone.
 ///
 /// The source is read through the kernel (`ReadProcessMemory`), which
 /// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
@@ -5694,9 +5695,14 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         return;
     }
     // The copy failed: a source page is not there, or the destination is
-    // not all mapped. Then the destination stays as it is (the kernel may
-    // have written its first pages).
+    // not all mapped. One direction of a copy the title asked for is its
+    // destination: a page it has taken away holds nothing to write, but the
+    // rest must be written. Dropping the copy because *one* page of the
+    // destination went away left the title's copy undone and the
+    // destination's previous contents in place (a stale surface, not a
+    // missing one).
     if title_dst && !ask_first && !crate::texture::committed(dst, len) {
+        write_regions(dst, src, len);
         return;
     }
     #[cfg(feature = "diagnostics")]
@@ -5710,6 +5716,46 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
+}
+
+/// Writes into title memory the regions of `[dst, dst + len)` the title still
+/// has, and leaves the pages it has taken away alone (counted as
+/// `DestGone`): the destination of a copy the title asked for is written
+/// wherever it can be, not dropped whole for one hole.
+fn write_regions(dst: *mut u8, src: *const u8, len: usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let mut offset = 0;
+    while offset < len {
+        let to = dst.wrapping_add(offset);
+        let remaining = len - offset;
+        // SAFETY: the query inspects an address and fills a local structure.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let size = unsafe { VirtualQuery(to.cast(), &mut info, size_of_val(&info)) };
+        let n = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            .saturating_sub(to as usize)
+            .min(remaining);
+        if size != size_of_val(&info) || n == 0 {
+            break;
+        }
+        let there = info.State == MEM_COMMIT
+            && (info.Protect & PAGE_GUARD) == 0
+            && (info.Protect & 0xff) != PAGE_NOACCESS;
+        if there {
+            let from = src.wrapping_add(offset);
+            if !read(from, to, n) {
+                // A mapping may change between query and read, and the
+                // source may have a hole of its own.
+                read_pieces(from, to, n);
+            }
+        } else {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::DestGone, n as u64);
+        }
+        offset += n;
+    }
 }
 
 /// After a failed bulk read into host memory, skip contiguous holes. Never
@@ -7133,6 +7179,52 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
     }
 
+    /// A copy into title memory writes the destination's committed regions
+    /// and leaves the pages the title has taken away alone: one missing page
+    /// must not drop the rest of the copy.
+    #[test]
+    fn a_copy_into_title_memory_writes_the_regions_the_title_still_has() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        const TOTAL: usize = 2 << 20;
+        const CHUNK: usize = 512 << 10;
+        // SAFETY: reserving a 2 MiB private virtual range for the title's side.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), TOTAL, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        let base = base.cast::<u8>();
+        // SAFETY: committing the first and third 512 KiB, zeroed.
+        unsafe {
+            assert!(!VirtualAlloc(base.cast(), CHUNK, MEM_COMMIT, PAGE_READWRITE).is_null());
+            assert!(
+                !VirtualAlloc(base.add(2 * CHUNK).cast(), CHUNK, MEM_COMMIT, PAGE_READWRITE)
+                    .is_null()
+            );
+            base.write_bytes(0, CHUNK);
+            base.add(2 * CHUNK).write_bytes(0, CHUNK);
+        }
+        let src = vec![0x6Du8; TOTAL];
+        super::copy_mapped(base, src.as_ptr(), TOTAL, true);
+        // SAFETY: both slices are committed and readable; then release the range.
+        unsafe {
+            assert!(std::slice::from_raw_parts(base, CHUNK).iter().all(|&b| b == 0x6D));
+            assert!(
+                std::slice::from_raw_parts(base.add(2 * CHUNK), CHUNK)
+                    .iter()
+                    .all(|&b| b == 0x6D)
+            );
+            VirtualFree(base.cast(), 0, MEM_RELEASE);
+        }
+        // A destination with no page left is nothing to write, not a fault.
+        // SAFETY: reserving and releasing a range with nothing committed.
+        unsafe {
+            let none = VirtualAlloc(std::ptr::null(), CHUNK, MEM_RESERVE, PAGE_NOACCESS);
+            assert!(!none.is_null());
+            super::copy_mapped(none.cast(), src.as_ptr(), CHUNK, true);
+            VirtualFree(none.cast(), 0, MEM_RELEASE);
+        }
+    }
     #[test]
     fn ram_idle_ms_scales_with_pressure() {
         use super::ram_idle_ms;
