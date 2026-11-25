@@ -54,6 +54,8 @@ mod memory;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+#[cfg(all(windows, test))]
+mod test_device;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]

@@ -1493,32 +1493,20 @@ mod tests {
         }
     }
 
-    pub(crate) fn warp() -> Option<ID3D12Device> {
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
-        use windows::Win32::Graphics::Dxgi::*;
-        // SAFETY: plain DXGI queries and device creation on the software
-        // adapter; a card is never opened.
-        unsafe {
-            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
-            let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
-            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
-                return None;
-            }
-            let mut device: Option<ID3D12Device> = None;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
-            device
-        }
+    /// The device these tests run on (`VICTORY_TEST_ADAPTER`): WARP where DXGI
+    /// has it, the card otherwise. `skipped: no device` when there is none.
+    fn device() -> Option<ID3D12Device> {
+        crate::test_device::device(windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0)
     }
 
-    /// The probe, whole, on the software adapter: the same calls the card
-    /// gets. The runtime's and the kernel's rules hold there; the card's
-    /// driver is what a run with `VICTORY_INPLACE_PROBE=1` adds.
+    /// The probe, whole, on the test device: the same calls the card gets. The
+    /// runtime's and the kernel's rules hold there; the card's driver is what a
+    /// run with `VICTORY_INPLACE_PROBE=1` adds.
     #[test]
-    fn warp_probe_opens_title_like_memory_and_the_gpu_sees_its_bytes() {
-        let Some(device) = warp() else { return };
+    fn probe_opens_title_like_memory_and_the_gpu_sees_its_bytes() {
+        let Some(device) = device() else { return };
         if device.cast::<ID3D12Device13>().is_err() {
-            eprintln!("no ID3D12Device13 here: parts of an allocation cannot be opened");
+            eprintln!("skipped: no device: no ID3D12Device13, a part of an allocation cannot be opened");
             return;
         }
         let probe = probe(&device, &|| None, 4);
@@ -1527,9 +1515,40 @@ mod tests {
         }
         assert!(probe.part_reads, "the GPU reads private memory in place");
         assert!(probe.part_writes, "GPU writes land in private memory");
+        // A section through a view is not a promise of a card's driver:
+        // vkd3d-proton maps the section again and unmaps it before the GPU
+        // uses the heap (`device.c:7637`), so the page pool cannot be opened
+        // that way there (module docs, pablogonz12/Scarlight#144). The rule
+        // itself is asserted where the runtime's answer is all there is
+        // (`a_committed_section_in_place_on_the_software_adapter`).
+        eprintln!(
+            "in place probe: a committed section in place: reads {} writes {}, outlives views {}",
+            probe.section_reads, probe.section_writes, probe.section_outlives_views
+        );
+        assert!(probe.reserved_section_refused, "a reserved section is refused");
+    }
+
+    /// The committed section's rule, on the software adapter only: the rules
+    /// the runtime and the kernel keep (module docs). A card's driver is free
+    /// to answer otherwise (`pablogonz12/Scarlight#144`), so this half does not
+    /// follow it.
+    #[test]
+    fn a_committed_section_in_place_on_the_software_adapter() {
+        let Some(device) = device() else { return };
+        if device.cast::<ID3D12Device13>().is_err() {
+            eprintln!("skipped: no device: no ID3D12Device13, a part of an allocation cannot be opened");
+            return;
+        }
+        if !crate::test_device::is_software(&device) {
+            eprintln!("skipped: not the software adapter (a card's driver is free to answer otherwise)");
+            return;
+        }
+        let probe = probe(&device, &|| None, 4);
+        for line in &probe.lines {
+            eprintln!("in place probe: {line}");
+        }
         assert!(probe.section_reads && probe.section_writes, "a committed section in place");
         assert!(probe.section_outlives_views, "the section's heap does not depend on views");
-        assert!(probe.reserved_section_refused, "a reserved section is refused");
     }
 
     /// Stage 1's own call on the software adapter: a title buffer that
@@ -1538,9 +1557,10 @@ mod tests {
     /// write lands at the title's address. Memory that is not committed
     /// whole is turned down without asking the host.
     #[test]
-    fn warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset() {
-        let Some(device) = warp() else { return };
+    fn a_title_buffer_in_place_shows_its_bytes_at_its_offset() {
+        let Some(device) = device() else { return };
         if device.cast::<ID3D12Device13>().is_err() {
+            eprintln!("skipped: no device: no ID3D12Device13, a part of an allocation cannot be opened");
             return;
         }
         // SAFETY: an allocation of the test's own.
@@ -1565,17 +1585,17 @@ mod tests {
         }
     }
 
-    /// The self-check on the software adapter: the same calls the card gets,
-    /// so the answer there is that our own page is the GPU's page too.
+    /// The self-check on the test device: the same calls the card gets, so the
+    /// answer there is that our own page is the GPU's page too.
     #[test]
-    fn warp_the_self_check_reads_and_writes_our_own_page() {
-        let Some(device) = warp() else { return };
+    fn the_self_check_reads_and_writes_our_own_page() {
+        let Some(device) = device() else { return };
         if device.cast::<ID3D12Device13>().is_err() {
-            eprintln!("no ID3D12Device13 here: a part of an allocation cannot be opened");
+            eprintln!("skipped: no device: no ID3D12Device13, a part of an allocation cannot be opened");
             return;
         }
         let (found, detail) = ask(&device);
-        assert_eq!(found, Health::Sound, "the software adapter reads and writes a page we hand it: {detail}");
+        assert_eq!(found, Health::Sound, "the test device reads and writes a page we hand it: {detail}");
     }
 
     /// The census names each kind of memory.
