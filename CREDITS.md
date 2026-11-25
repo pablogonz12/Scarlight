@@ -67,6 +67,34 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   child that is not there is a miss whatever its box holds, and that an empty or inverted box and any NaN
   coordinate miss in both node widths, with the reference's own tests
   (`crates/victory-shader/src/bvh.rs`, `crates/victory-shader/src/emit/intersect.rs`).
+- **Marvisak/VIctory [#2706](https://github.com/Marvisak/VIctory/pull/2706)** (pes7), GPL-3.0: keeping a
+  pipeline library per build in `pipelines/<hash>`, so a rebuild never writes its few new pipelines over a
+  library the build before it warmed, with the newest two kept and only directories that hold a library
+  pruned. Reimplemented against this tree's library, which has no `victory_shader::SOURCE_HASH`: the key is
+  the executable's BLAKE3, the same bytes the shader cache keys its translations on
+  (`crates/victory-gpu/src/shader_cache.rs`), and `VICTORY_LIBRARY_PRUNE=0` keeps every library.
+
+- **fxceless/victory-fork [PR #1117](https://github.com/fxceless/victory-fork/pull/1117)** (Azemed),
+  GPL-3.0: the title's views behind an `RwLock` (`views_read`/`views_write`, `crates/victory-gpu/src/inplace.rs`)
+  and the lock-free hit path of `HostHeap::mirror` (`VICTORY_MIRROR_FAST=0` off,
+  `crates/victory-gpu/src/descriptor/host.rs`, with `widen_due` kept on the hit path). Its section-heap windows
+  did not come over: measured under Wine + vkd3d-proton + RADV, a committed section opens and the import under it
+  is refused, silently substituting the driver's own memory (`xcl-bin/notes/zero-copy.md` 6).
+- **Marvisak/VIctory [#2721](https://github.com/Marvisak/VIctory/pull/2721)** (0xkn0wh3r3), GPL-3.0: the idea
+  that a frame past a budget says what bound it and why, split into our work around submissions, the GPU,
+  the copy-back and the rest, the largest named (`crates/victory-gpu/src/frame_budget.rs`,
+  `VICTORY_FRAME_BUDGET=0`). Reimplemented on this tree's counters and its own 50 ms budget: its
+  per-command timestamps, memory-trait breakdown and slow-pipeline guard are not taken.
+
+- **fxceless/victory-fork [PR #979](https://github.com/fxceless/victory-fork/pull/979)** (gmanka), GPL-3.0: the
+  guarded views' clean blocks kept as contiguous runs (`CleanBlocks`, `crates/victory-gpu/src/watch.rs`), so a
+  refresh of a mostly clean view heap walks only its dirty gaps instead of collecting one entry per 64 KiB
+  block under the guard mutex; the per-block set it replaces is the test's reference.
+
+- **AnyPS5** ([boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5)): the format of the
+  source-counted progress page (reference instruction forms, history chart). No code taken.
+- **Mesa** ([aco_opcodes.py](https://gitlab.freedesktop.org/mesa/mesa)), MIT: the reference list of
+  RDNA2 instruction forms in `tools/progress/rdna2_isa_forms.txt` is generated from it.
 
 ## Tools
 
