@@ -736,6 +736,21 @@ pub fn writing(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
 }
 
+/// The title's memory at these addresses was written through another view of
+/// the same physical pages (xmem's `write_physical`, DirectStorage's page
+/// destinations), so it did not fault into our handler. What guards those
+/// blocks is still in place, and is not lifted here: they are only noted
+/// written, that a host copy of the same memory refreshes.
+pub fn mapped_pages_written(addresses: impl Iterator<Item = usize>) {
+    let mut g = guards();
+    for at in addresses {
+        let block = at / BLOCK;
+        if g.protected.contains(&block) {
+            g.clean.remove(&block);
+        }
+    }
+}
+
 /// Held shared by a read of title memory in place, and alone by the runtime
 /// while it changes what title memory shows.
 ///
@@ -832,6 +847,21 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         g.protected.remove(&block);
         g.clean.remove(&block);
     }
+}
+
+/// The pages of `[start, end)` (whole pages) as last written, and whether
+/// any block there is guarded (read-only, its writes ours to notice): for
+/// other crates' tests of what the watch was told (feature `test-hooks`).
+#[cfg(feature = "test-hooks")]
+pub fn written_pages(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes(start, end, true)
+}
+
+/// Whether the block holding `at` is guarded: for other crates' tests of
+/// what the watch was told (feature `test-hooks`).
+#[cfg(feature = "test-hooks")]
+pub fn page_guarded(at: usize) -> bool {
+    guards().protected.contains(&(at / BLOCK))
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead

@@ -47,6 +47,7 @@ windows-core = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+victory-gpu = { workspace = true, features = ["test-hooks"] }
 
 [features]
 # Debugging switches (scripted keys and the like).

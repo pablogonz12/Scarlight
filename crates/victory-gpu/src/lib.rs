@@ -69,6 +69,15 @@ pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view}
 pub use watch::{
     title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
 };
+/// The title's memory was written through another view of the same physical
+/// pages: what guards them is still in place, the blocks are noted written.
+#[cfg(windows)]
+pub use watch::mapped_pages_written;
+/// What the write watch was told, for other crates' tests (feature
+/// `test-hooks`): the pages of a range as last written, and whether a block
+/// is guarded.
+#[cfg(all(windows, feature = "test-hooks"))]
+pub use watch::{page_guarded, written_pages};
 
 /// Total installed physical RAM in bytes, queried once from the OS.
 #[cfg(windows)]

@@ -33,6 +33,11 @@ BlueKaiman.
 - **xcl** ([ivall/xcl](https://github.com/ivall/xcl) and its fork Bathyal), GPL-2.0-only: the
   wave-pairing approach and the NVIDIA wave lane-assignment report used in
   [docs/wave64-on-wave32.md](docs/wave64-on-wave32.md). No code taken.
+- **JMAN730/victory** ([project-flamingo#671](https://github.com/JMAN730/project-flamingo/pull/671)),
+  GPL-3.0: telling the GPU side's write watch which of the title's views a write into physical
+  pages (DirectStorage's destinations) landed in, by section and slice rather than page number, and
+  noting the pages written without lifting what guards them
+  (`crates/victory-hle/src/modules/xmem.rs`, `crates/victory-gpu/src/watch.rs`).
 - **JMAN730/victory** ([project-flamingo#672](https://github.com/JMAN730/project-flamingo/pull/672)),
   GPL-3.0: narrowing a host shader resource view of a streamed texture to the mips whose memory is
   there, and remaking it when more levels arrive or a host copy fills the chain

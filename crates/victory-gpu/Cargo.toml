@@ -23,6 +23,8 @@ tempfile.workspace = true
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []
+# Exposes what the write watch was told to other crates' tests.
+test-hooks = []
 
 [lints]
 workspace = true
