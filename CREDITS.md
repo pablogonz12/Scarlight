@@ -107,6 +107,11 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   `crates/victory-gpu/src/shadow.rs`). Reimplemented: theirs changes `copy_back_marked`, which this tree has no
   equivalent of (its `copy_back` merges into the copy and keeps one snapshot per submission).
 
+- **DexNom/VIctory [76749ce5](https://github.com/DexNom/VIctory/commit/76749ce58da23a43a3500454a8b69c53f05aa477)** (DexNom), GPL-3.0: a
+  wave64 lane mask parked in two SGPRs and restored one `s_mov_b32` at a time is recognised as the mask it was
+  copied from when both words still trace back to the same known pair through scalar moves
+  (`crates/victory-shader/src/structure.rs`); `VICTORY_DX_LANE_MASK_MOVES=0` keeps the split pair opaque.
+
 - **Marvisak/VIctory [#2163](https://github.com/Marvisak/VIctory/pull/2163)** (0xkn0wh3r3), GPL-3.0: the
   built-in BCPack table's first BC7 dictionary entry has its 32 indices right after its width bytes, where
   every other entry repeats them first and holds 31 (`crates/victory-formats/src/bcpack.rs`).
@@ -122,11 +127,6 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   the container gets the same BLAKE3 as its standalone copy (`Container::as_bytes()`,
   `crates/victory-shader/src/dxbc.rs`; `Source::bytes()` for both the raw and the `SGD5` paths,
   `apps/victory/src/shader.rs`). Reimplemented on this tree's `victory translate`, which has no `warm` command.
-
-- **DexNom/VIctory [76749ce5](https://github.com/DexNom/VIctory/commit/76749ce58da23a43a3500454a8b69c53f05aa477)** (DexNom), GPL-3.0: a
-  wave64 lane mask parked in two SGPRs and restored one `s_mov_b32` at a time is recognised as the mask it was
-  copied from when both words still trace back to the same known pair through scalar moves
-  (`crates/victory-shader/src/structure.rs`); `VICTORY_DX_LANE_MASK_MOVES=0` keeps the split pair opaque.
 
 ## Tools
 
