@@ -434,8 +434,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     ))
 }
 
-/// Guarded blocks of view memory.
-const BLOCK: usize = PAGE;
+/// The unit a write-back job holds and a copy guards: one page.
+pub(crate) const BLOCK: usize = PAGE;
 
 struct Guards {
     /// Blocks we made read-only.
