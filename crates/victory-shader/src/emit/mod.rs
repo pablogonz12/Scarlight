@@ -256,6 +256,8 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
 /// from then on, and the test in `key_tests` fails if the sources read one
 /// that is in none of the three lists.
 pub const SWITCHES: &[&str] = &[
+    "VICTORY_ANISO_POINT_MIP",
+    "VICTORY_INTERP_F16_OMOD_CLAMP",
     "VICTORY_F16_NEAREST",
     "VICTORY_F16_SUM_WIDE",
     "VICTORY_FIRSTLANE_OWN",
