@@ -355,6 +355,27 @@ pub(crate) fn unordered_view_stored(
     uses_taken(named, report(named)) & TAKES_UNORDERED != 0
 }
 
+/// Whether the host copy `texture` was made with `unordered` (the unordered
+/// access use) or the render target one: a use the host does not take of
+/// its format is left out of the creation ([`taken_flags`]), and a view of
+/// it would be refused -- and, on NVIDIA, remove the device (#2725). Such a
+/// view is not made, and what it would write is dropped.
+#[cfg(windows)]
+pub(crate) fn host_use_allowed(
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    unordered: bool,
+) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    // SAFETY: a live resource.
+    let flags = unsafe { texture.GetDesc() }.Flags.0;
+    let use_flag = if unordered {
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0
+    } else {
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0
+    };
+    flags & use_flag != 0
+}
+
 /// What the host answers for the uses of `format`, asked once per format:
 /// its render target and its typed unordered access use, `None` where it
 /// answered nothing (or no host is there).
@@ -1800,14 +1821,6 @@ fn host_texture(
     if d.flags & (TARGET | UNORDERED) != 0 {
         d.format = target_format(d.format);
     }
-    // The host makes the resource with the uses its format takes: one it
-    // does not take is refused at creation, and that removed the device
-    // (B5G5R5A1 takes no typed unordered access on NVIDIA, B4G4R4A4
-    // neither use, #2725). Left away, shaders still read the texture and a
-    // view of the missing use is held back (`descriptor::host::fits`).
-    if d.flags & DEPTH == 0 && format_uses_on() {
-        d.flags = taken_flags(d.format, d.flags, host_uses(d.format));
-    }
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -1818,6 +1831,18 @@ fn host_texture(
     // their unordered access views plain UNORM.
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
+    }
+    // The host makes the resource with the uses the format it is made in
+    // takes: one it does not take is refused at creation, and that removed
+    // the device (B5G5R5A1 takes no typed unordered access on NVIDIA,
+    // B4G4R4A4 neither use, #2725). Asked of the format that is made, after
+    // the stand-in and the typeless ones above: a sRGB format (29) takes no
+    // typed unordered access itself, where the typeless one it is made in
+    // (27) names no format at all and keeps every use. Left away, shaders
+    // still read the texture and a view of the missing use is held back
+    // (`descriptor::host::fits`).
+    if d.flags & DEPTH == 0 && format_uses_on() {
+        d.flags = taken_flags(d.format, d.flags, host_uses(d.format));
     }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
@@ -2614,6 +2639,42 @@ mod tests {
                 "format {format}: its unordered views are made exactly where the device takes that use"
             );
         }
+    }
+
+    /// A texture the title makes both a target and unordered access in its
+    /// sRGB format (29) is made typeless (27) and keeps both uses: asked
+    /// before the typeless conversion, the device's answer for the sRGB
+    /// format -- which takes no typed unordered access itself -- would leave
+    /// the use out, and the texture would be made in 29 without it.
+    #[cfg(windows)]
+    #[test]
+    fn an_srgb_unordered_texture_keeps_its_uses() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let desc = ResourceDesc {
+            flags: 1 | 4,
+            ..texture(4, 4, 29, 1)
+        };
+        // SAFETY: a texture description of ours, and no clear value.
+        let texture = host_texture(&desc, 4, std::ptr::null()).expect("a texture the host makes");
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        assert_eq!(
+            d.Format.0 as u32, 27,
+            "a sRGB target's host copy is typeless"
+        );
+        assert_ne!(
+            d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0,
+            0,
+            "the render target use stays"
+        );
+        assert_ne!(
+            d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0,
+            0,
+            "the unordered access use stays"
+        );
     }
 
     type Release = extern "system" fn(This) -> u32;
