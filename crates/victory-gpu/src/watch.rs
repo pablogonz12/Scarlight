@@ -434,8 +434,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     ))
 }
 
-/// Guarded blocks of view memory.
-const BLOCK: usize = PAGE;
+/// The unit a write-back job holds and a copy guards: one page.
+pub(crate) const BLOCK: usize = PAGE;
 
 /// A set of 64 KiB block numbers as a bit per block: 64 blocks (4 MiB) to a
 /// `u64` word, in a `BTreeMap`. The guards hold a block per 64 KiB of every
@@ -443,140 +443,182 @@ const BLOCK: usize = PAGE;
 /// ([`guard`]) and takes back thousands ([`open`]): over words those are a
 /// few bitwise operations and a `trailing_zeros` a block, where a set of
 /// numbers walked a node a block.
-struct BlockSet(BTreeMap<usize, u64>);
-
-impl BlockSet {
-    const fn new() -> Self {
-        Self(BTreeMap::new())
-    }
-
-    /// The bits of blocks `lo_bit..hi_bit` of one word.
-    #[inline]
-    fn word_mask(lo_bit: usize, hi_bit: usize) -> u64 {
-        let count = hi_bit - lo_bit;
-        let bits = if count >= 64 { u64::MAX } else { (1u64 << count) - 1 };
-        bits << lo_bit
-    }
-
-    #[inline]
-    fn contains(&self, block: usize) -> bool {
-        self.0.get(&(block >> 6)).is_some_and(|&w| (w & (1u64 << (block & 63))) != 0)
-    }
-
-    #[inline]
-    fn word(&self, index: usize) -> u64 {
-        self.0.get(&index).copied().unwrap_or(0)
-    }
-
-    #[inline]
-    fn insert(&mut self, block: usize) {
-        *self.0.entry(block >> 6).or_insert(0) |= 1u64 << (block & 63);
-    }
-
-    #[inline]
-    fn remove(&mut self, block: usize) {
-        let key = block >> 6;
-        if let Some(w) = self.0.get_mut(&key) {
-            *w &= !(1u64 << (block & 63));
-            if *w == 0 {
-                self.0.remove(&key);
-            }
-        }
-    }
-
-    fn insert_range(&mut self, from: usize, to: usize) {
-        if from >= to {
-            return;
-        }
-        let (first, last) = (from >> 6, (to - 1) >> 6);
-        for w in first..=last {
-            let lo = if w == first { from & 63 } else { 0 };
-            let hi = if w == last { ((to - 1) & 63) + 1 } else { 64 };
-            *self.0.entry(w).or_insert(0) |= Self::word_mask(lo, hi);
-        }
-    }
-
-    fn remove_range(&mut self, from: usize, to: usize) {
-        if from >= to {
-            return;
-        }
-        let (first, last) = (from >> 6, (to - 1) >> 6);
-        let mut empty = Vec::new();
-        for (&w, bits) in self.0.range_mut(first..=last) {
-            let lo = if w == first { from & 63 } else { 0 };
-            let hi = if w == last { ((to - 1) & 63) + 1 } else { 64 };
-            *bits &= !Self::word_mask(lo, hi);
-            if *bits == 0 {
-                empty.push(w);
-            }
-        }
-        for w in empty {
-            self.0.remove(&w);
-        }
-    }
-
-    /// How many blocks of `from..to` are in the set.
-    fn count_range(&self, from: usize, to: usize) -> usize {
-        if from >= to {
-            return 0;
-        }
-        let (first, last) = (from >> 6, (to - 1) >> 6);
-        let mut n = 0;
-        for (&w, &bits) in self.0.range(first..=last) {
-            let lo = if w == first { from & 63 } else { 0 };
-            let hi = if w == last { ((to - 1) & 63) + 1 } else { 64 };
-            n += (bits & Self::word_mask(lo, hi)).count_ones() as usize;
-        }
-        n
-    }
-
-    /// The runs `(from, to)` of blocks of `from..to` that are in the set.
-    fn runs_in(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        if from >= to {
-            return runs;
-        }
-        let (first, last) = (from >> 6, (to - 1) >> 6);
-        for (&w, &bits) in self.0.range(first..=last) {
-            let lo = if w == first { from & 63 } else { 0 };
-            let hi = if w == last { ((to - 1) & 63) + 1 } else { 64 };
-            let mut m = bits & Self::word_mask(lo, hi);
-            while m != 0 {
-                let block = (w << 6) + m.trailing_zeros() as usize;
-                match runs.last_mut() {
-                    Some((_, end)) if *end == block => *end = block + 1,
-                    _ => runs.push((block, block + 1)),
-                }
-                m &= m - 1;
-            }
-        }
-        runs
-    }
-}
-
 struct Guards {
     /// Blocks we made read-only.
-    protected: BlockSet,
+    protected: std::collections::BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
-    clean: BlockSet,
+    clean: CleanBlocks,
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
-    absent: BlockSet,
+    absent: std::collections::BTreeSet<usize>,
     /// Blocks of title memory a copy has taken whole (or a guard has made
     /// read-only, which only committed memory allows): memory that is there,
     /// so a copy may go straight at its bytes ([`mapped`]).
-    mapped: BlockSet,
+    mapped: std::collections::BTreeSet<usize>,
+}
+
+/// Disjoint, non-touching half-open runs of clean blocks.
+struct CleanBlocks(BTreeMap<usize, usize>);
+
+impl CleanBlocks {
+    fn insert(&mut self, mut from: usize, mut to: usize) {
+        if from >= to {
+            return;
+        }
+        if let Some((&start, &end)) = self.0.range(..=from).next_back()
+            && end >= from
+        {
+            if end >= to {
+                return;
+            }
+            from = start;
+        }
+        while let Some((&start, &end)) = self.0.range(from..=to).next() {
+            self.0.remove(&start);
+            to = to.max(end);
+        }
+        self.0.insert(from, to);
+    }
+
+    fn remove(&mut self, block: usize) {
+        let Some((&from, &to)) = self.0.range(..=block).next_back() else {
+            return;
+        };
+        if block >= to {
+            return;
+        }
+        if from < block {
+            self.0.insert(from, block);
+        } else {
+            self.0.remove(&from);
+        }
+        if block + 1 < to {
+            self.0.insert(block + 1, to);
+        }
+    }
+
+    fn uncovered(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let mut next = self.0.range(..=from).next_back().map_or(from, |(_, &end)| from.max(end));
+        let mut missing = Vec::new();
+        if next >= to {
+            return missing;
+        }
+        for (&start, &end) in self.0.range(from + 1..to) {
+            if next < start {
+                missing.push((next, start));
+            }
+            next = end;
+        }
+        if next < to {
+            missing.push((next, to));
+        }
+        missing
+    }
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
-    protected: BlockSet::new(),
-    clean: BlockSet::new(),
-    absent: BlockSet::new(),
-    mapped: BlockSet::new(),
+    protected: BTreeSet::new(),
+    clean: CleanBlocks(BTreeMap::new()),
+    absent: BTreeSet::new(),
+    mapped: BTreeSet::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Regions of title memory the destination check ([`writable`]) has asked
+/// about: the first block it asked at → (the first block after the region,
+/// whether every page of it is committed read-write). A region's pages share
+/// their state and protection, so one answer covers every copy inside it;
+/// it is forgotten when the range's protection changes ([`title_memory_remapped`],
+/// our own guards and write-back jobs) or a kernel write into it fails.
+static DESTINATIONS: Mutex<BTreeMap<usize, (usize, bool)>> = Mutex::new(BTreeMap::new());
+
+/// Forgets the destination answers that overlap `[at, at + len)`: what was
+/// asked there no longer holds. Every answer whose region reaches into the
+/// range goes, not only the one asked at its first block: an answer asked at
+/// an earlier block (`[0, 4)` after one at `[2, 4)`) still covers blocks of
+/// the range and would otherwise stay positive for a page that changed.
+fn forget(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    let mut regions = DESTINATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let stale: Vec<usize> = regions
+        .range(..last)
+        .filter(|&(_, &(end, _))| end > first)
+        .map(|(&start, _)| start)
+        .collect();
+    for start in stale {
+        regions.remove(&start);
+    }
+}
+
+/// Whether every 64 KiB block of `[at, at + len)` is committed read-write
+/// now: the destination of a plain copy into title memory. `VirtualQuery`
+/// walks the page tables to the end of the region sharing `at`'s state
+/// (milliseconds in the title's big pools), so its answer is kept per region
+/// ([`DESTINATIONS`]) instead of being asked at every copy. A copy that
+/// cannot tell writes through the kernel instead, which fails per page
+/// rather than faulting.
+pub(crate) fn writable(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
+    };
+    if len == 0 {
+        return false;
+    }
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    // A block our own guard made read-only is not writable until it is
+    // opened for the write ([`writing`]).
+    if guards().protected.range(first..last).next().is_some() {
+        return false;
+    }
+    let mut regions = DESTINATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut block = first;
+    while block < last {
+        if let Some((_, &(end, ok))) = regions.range(..=block).next_back()
+            && end > block
+        {
+            if !ok {
+                return false;
+            }
+            block = end;
+            continue;
+        }
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            return false;
+        }
+        let end = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            / BLOCK;
+        // Only whole blocks are kept: a region that ends inside one says
+        // nothing about the block as a whole, and the copy asks again (a
+        // title whose protections differ inside a block is rare).
+        if end <= block {
+            return false;
+        }
+        let ok = info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE;
+        regions.insert(block, (end, ok));
+        if !ok {
+            return false;
+        }
+        block = end;
+    }
+    true
+}
+
+/// A kernel write into title memory `[at, at + len)` failed: a title may
+/// have made the range read-only without telling us, so what the destination
+/// check knew of it is not trusted and the next copy asks again.
+pub(crate) fn write_failed(at: usize, len: usize) {
+    forget(at, len);
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -614,78 +656,52 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     install();
     let mut g = guards();
     let mut written = Vec::new();
-    let mut run: Option<(usize, usize)> = None;
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // Large heaps are usually clean. Walk only gaps between clean runs.
     let mut uncommitted_until = first;
-    // The clean blocks are read a word at a time, and only the ones that are
-    // not clean are looked at: a frame asks about some 150,000 blocks,
-    // nearly all clean, and the lookups one at a time were most of the
-    // 60-90 ms a frame of "guards" (run 54).
-    let (first_w, last_w) = (first >> 6, (last - 1) >> 6);
-    for w in first_w..=last_w {
-        let lo = if w == first_w { first & 63 } else { 0 };
-        let hi = if w == last_w { ((last - 1) & 63) + 1 } else { 64 };
-        let mask = BlockSet::word_mask(lo, hi);
-        // In a placeholder, a block noted absent is a hole the runtime has
-        // not mapped since (a mapping clears the note): no `VirtualQuery` to
-        // find that out again (`PLACEHOLDER_HITS[1]`).
-        let mut open = if in_placeholder {
-            let holes = mask & g.absent.word(w) & !g.clean.word(w);
-            if holes != 0 {
-                crate::inplace::PLACEHOLDER_HITS[1]
-                    .fetch_add(holes.count_ones() as u64, std::sync::atomic::Ordering::Relaxed);
+    for (from, to) in g.clean.uncovered(first, last) {
+        let mut run = None;
+        for block in from..to {
+            let mut open = true;
+            if g.absent.contains(&block) {
+                if in_placeholder {
+                    // A hole the runtime has not mapped since (a mapping
+                    // clears the note): no `VirtualQuery` to find out again
+                    // (`PLACEHOLDER_HITS[1]`).
+                    crate::inplace::PLACEHOLDER_HITS[1]
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    open = false;
+                } else {
+                    // Ordinary commits need no runtime mapping notification.
+                    // Reuse this asking's query for the following blocks in
+                    // the same region.
+                    if block >= uncommitted_until {
+                        uncommitted_until = uncommitted_end(block);
+                    }
+                    open = block >= uncommitted_until;
+                    if open {
+                        g.absent.remove(&block);
+                    }
+                }
             }
-            mask & !(g.clean.word(w) | holes)
-        } else {
-            mask & !g.clean.word(w)
-        };
-        if open == 0 {
-            if let Some((r0, r1)) = run.take() {
-                protect(&mut g, r0, r1);
+            if open {
+                written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                if g.protected.contains(&block) {
+                    // Written through the runtime, still read-only.
+                    g.clean.insert(block, block + 1);
+                } else {
+                    run.get_or_insert(block);
+                    continue;
+                }
+            }
+            if let Some(begin) = run.take() {
+                protect(&mut g, begin, block);
             }
             continue;
         }
-        while open != 0 {
-            let block = (w << 6) + open.trailing_zeros() as usize;
-            open &= open - 1;
-            let mut due = true;
-            if g.absent.contains(block) {
-                // Ordinary commits need no runtime mapping notification. Reuse
-                // this asking's query for the following blocks in the same region.
-                if block >= uncommitted_until {
-                    uncommitted_until = uncommitted_end(block);
-                }
-                due = block >= uncommitted_until;
-                if due {
-                    g.absent.remove(block);
-                }
-            }
-            if !due {
-                if let Some((r0, r1)) = run.take() {
-                    protect(&mut g, r0, r1);
-                }
-                continue;
-            }
-            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.protected.contains(block) {
-                // Written through the runtime, still read-only.
-                if let Some((r0, r1)) = run.take() {
-                    protect(&mut g, r0, r1);
-                }
-                g.clean.insert(block);
-                continue;
-            }
-            match run {
-                Some((r0, r1)) if r1 == block => run = Some((r0, block + 1)),
-                Some((r0, r1)) => {
-                    protect(&mut g, r0, r1);
-                    run = Some((block, block + 1));
-                }
-                None => run = Some((block, block + 1)),
-            }
+        if let Some(begin) = run {
+            protect(&mut g, begin, to);
         }
-    }
-    if let Some((r0, r1)) = run.take() {
-        protect(&mut g, r0, r1);
     }
     Some(written)
 }
@@ -752,11 +768,13 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         }
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
-        g.protected.insert_range(from, to);
-        g.clean.insert_range(from, to);
+        g.protected.extend(from..to);
+        g.clean.insert(from, to);
         // The kernel only made committed memory read-only: it is there.
         g.mapped.insert_range(from, to);
     };
+    // Made read-only by our hand: not a plain copy's destination now.
+    forget(from * BLOCK, (to - from) * BLOCK);
     if set(from, to) {
         note(g, from, to);
         return;
@@ -824,29 +842,25 @@ fn uncommitted_end(block: usize) -> usize {
 /// notes them written; true if any was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    let runs = g.protected.runs_in(first, last);
-    if runs.is_empty() {
-        return false;
-    }
-    g.protected.remove_range(first, last);
-    g.clean.remove_range(first, last);
-    for (r0, r1) in runs {
-        let mut old = 0;
-        // SAFETY: blocks we made read-only. One call a run; a run crosses no
-        // view boundary, since views are mapped in whole blocks.
-        let ok = unsafe { VirtualProtect((r0 * BLOCK) as *const _, (r1 - r0) * BLOCK, PAGE_READWRITE, &mut old) } != 0;
+    let blocks: Vec<usize> = g
+        .protected
+        .range(start / BLOCK..end.div_ceil(BLOCK))
+        .copied()
+        .collect();
+    for &block in &blocks {
+        g.protected.remove(&block);
+        g.clean.remove(block);
         // It was read-only by our hand, so it is committed and mapped.
-        g.mapped.insert_range(r0, r1);
-        if !ok && r1 - r0 > 1 {
-            for block in r0..r1 {
-                let mut old = 0;
-                // SAFETY: a block we made read-only.
-                unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
-            }
-        }
+        g.mapped.insert(block);
+        let mut old = 0;
+        // SAFETY: a block we made read-only.
+        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
-    true
+    if let (Some(first), Some(last)) = (blocks.first(), blocks.last()) {
+        // Writable again by our hand.
+        forget(first * BLOCK, (last + 1 - first) * BLOCK);
+    }
+    !blocks.is_empty()
 }
 
 /// Whether every 64 KiB block of `[at, at + len)` is title memory the layer
@@ -925,6 +939,9 @@ pub(crate) fn back_begin(done: &std::sync::Arc<Done>, from: usize, to: usize) ->
                 map.insert(block, (done.clone(), old));
                 held.push(block);
             }
+            drop(map);
+            // Inaccessible now: not a plain copy's destination.
+            forget(a * BLOCK, (b - a) * BLOCK);
             return 0;
         }
         -1
@@ -992,9 +1009,14 @@ pub(crate) fn back_open(at: usize, len: usize) {
     // kernel's write did not fault into `open`.
     if !opened.is_empty() {
         let mut g = guards();
-        for block in opened {
+        for block in &opened {
             g.protected.remove(block);
-            g.clean.remove(block);
+            g.clean.remove(*block);
+        }
+        drop(g);
+        // Opened writable for a kernel write.
+        if let (Some(first), Some(last)) = (opened.first(), opened.last()) {
+            forget(first * BLOCK, (last + 1 - first) * BLOCK);
         }
     }
 }
@@ -1018,6 +1040,8 @@ pub(crate) fn back_release(blocks: &[usize], done: &std::sync::Arc<Done>) {
         let mut was = 0;
         // SAFETY: a block the job made inaccessible.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut was) };
+        // Its protection is the job's again: ask before a plain copy.
+        forget(block * BLOCK, BLOCK);
     }
 }
 
@@ -1112,6 +1136,7 @@ pub fn title_memory_reading_within(limit: std::time::Duration) -> Option<Reading
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::texback::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -1119,13 +1144,22 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
+    // What the destination check knew of the range (committed, writable)
+    // may be the old mapping's.
+    forget(at, len);
     let mut g = guards();
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     g.absent.remove_range(first, last);
     // What is there now is new: a copy must ask the kernel again.
-    g.mapped.remove_range(first, last);
-    g.protected.remove_range(first, last);
-    g.clean.remove_range(first, last);
+    let was: Vec<usize> = g.mapped.range(range.clone()).copied().collect();
+    for block in was {
+        g.mapped.remove(&block);
+    }
+    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
+    for block in blocks {
+        g.protected.remove(&block);
+        g.clean.remove(block);
+    }
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -1184,7 +1218,7 @@ fn install() {
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
-        if writable(at) {
+        if writable_now(at) {
             EXCEPTION_CONTINUE_EXECUTION
         } else {
             // Not a block we hold and not memory the title may write: say who
@@ -1223,8 +1257,8 @@ fn install() {
     });
 }
 
-/// Whether `at` is committed read-write memory now.
-fn writable(at: usize) -> bool {
+/// Whether `at` is committed read-write memory now (asked every time).
+fn writable_now(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
     };
@@ -1388,11 +1422,11 @@ mod tests {
         let done = std::sync::Arc::new(Done::default());
         let blocks = back_begin(&done, at, at + 2 * BLOCK);
         assert_eq!(blocks, [at / BLOCK, at / BLOCK + 1]);
-        assert!(!writable(at), "held inaccessible while the job runs");
+        assert!(!writable_now(at), "held inaccessible while the job runs");
         assert!(back_pending(at + BLOCK).is_some());
         done.finish();
         back_release(&blocks, &done);
-        assert!(writable(at), "given back after the job");
+        assert!(writable_now(at), "given back after the job");
         assert!(back_pending(at).is_none());
         // SAFETY: the memory allocated above.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
@@ -1420,10 +1454,10 @@ mod tests {
         assert_eq!(taken_again, [at / BLOCK], "the later job takes the block");
         first.finish();
         back_release(&taken, &first);
-        assert!(!writable(at), "still inaccessible: the later job's bytes are not in");
+        assert!(!writable_now(at), "still inaccessible: the later job's bytes are not in");
         second.finish();
         back_release(&taken_again, &second);
-        assert!(writable(at), "given back by the job that last held it");
+        assert!(writable_now(at), "given back by the job that last held it");
         // SAFETY: the memory allocated above.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
@@ -1448,7 +1482,7 @@ mod tests {
         let done = std::sync::Arc::new(Done::default());
         let held = back_begin(&done, at, at + 2 * BLOCK);
         assert_eq!(held, [at / BLOCK, at / BLOCK + 1]);
-        assert!(!writable(at), "held inaccessible while the job runs");
+        assert!(!writable_now(at), "held inaccessible while the job runs");
         // The job finishes while the title's store is on its way (as the
         // worker does: the blocks are given back, then the job is done).
         let job = {
@@ -1471,12 +1505,41 @@ mod tests {
             ((at + BLOCK - 4) as *mut u32).write_volatile(0x9abc_def0);
         }
         job.join().expect("the job's thread");
-        assert!(writable(at));
+        assert!(writable_now(at));
         assert!(back_pending(at).is_none());
         // SAFETY: our memory, written just above.
         assert_eq!(unsafe { ((at + BLOCK - 4) as *const u32).read() }, 0x9abc_def0);
         // SAFETY: the memory allocated above.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn clean_runs_match_per_block_tracking() {
+        let mut runs = CleanBlocks(BTreeMap::new());
+        let mut blocks = BTreeSet::new();
+        let check = |runs: &CleanBlocks, blocks: &BTreeSet<usize>| {
+            for from in 0..36 {
+                for to in from..36 {
+                    let actual: Vec<_> = runs.uncovered(from, to).into_iter().flat_map(|(a, b)| a..b).collect();
+                    let expected: Vec<_> = (from..to).filter(|block| !blocks.contains(block)).collect();
+                    assert_eq!(actual, expected, "{from}..{to}");
+                }
+            }
+        };
+
+        for (from, to) in [(5, 12), (1, 3), (3, 7), (23, 33), (17, 20), (9, 26), (2, 3)] {
+            runs.insert(from, to);
+            blocks.extend(from..to);
+            check(&runs, &blocks);
+        }
+        for block in [0, 1, 11, 14, 15, 32, 13, 12] {
+            runs.remove(block);
+            blocks.remove(&block);
+            check(&runs, &blocks);
+        }
+        runs.insert(11, 16);
+        blocks.extend(11..16);
+        check(&runs, &blocks);
     }
 
     #[test]
@@ -1746,7 +1809,7 @@ mod tests {
 
         commit(late, KERNEL_PAGE); // Ordinary commit, without a runtime mapping notification.
         for at in [early, late] {
-            assert!(writable(at));
+            assert!(writable_now(at));
             // SAFETY: each address is inside its committed read-write page.
             unsafe { (at as *mut u8).write_volatile(1) };
         }
@@ -1937,6 +2000,185 @@ mod tests {
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// The destination check's answers, from hand-built regions: committed
+    /// read-write is a destination, reserved or read-only is not, and a
+    /// runtime remap (or a failed kernel write) makes it ask again.
+    #[test]
+    fn a_destination_is_writable_only_where_the_region_is_committed_read_write() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        // SAFETY: a fresh allocation of ours, freed at the end.
+        let at = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * BLOCK,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(at, 0);
+        assert!(writable(at, 4 * BLOCK));
+        assert!(writable(at + BLOCK, BLOCK), "a range inside the region");
+        assert!(!writable(at, 0), "an empty range is never a destination");
+        // Reserved but not committed: no destination, and the copy falls
+        // back to the kernel (which fails) instead of faulting.
+        // SAFETY: a fresh reservation of ours, freed at the end.
+        let hole = unsafe {
+            VirtualAlloc(std::ptr::null(), BLOCK, MEM_RESERVE, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(hole, 0);
+        assert!(!writable(hole, BLOCK));
+        assert!(!writable(hole - BLOCK, 2 * BLOCK), "a range reaching into it");
+        // The title commits it with no notification: the old answer stands
+        // until a failed write says otherwise.
+        // SAFETY: committing our own reservation.
+        let committed = unsafe { VirtualAlloc(hole as *mut _, BLOCK, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(committed as usize, hole);
+        assert!(!writable(hole, BLOCK));
+        write_failed(hole, BLOCK);
+        assert!(writable(hole, BLOCK), "asked again after a failed write");
+        // The runtime makes a block of the first region read-only: it asks
+        // again and the block is no destination.
+        let mut old = 0;
+        assert_ne!(
+            unsafe { VirtualProtect((at + 2 * BLOCK) as *mut _, BLOCK, PAGE_READONLY, &mut old) },
+            0
+        );
+        title_memory_remapped(at + 2 * BLOCK, BLOCK);
+        assert!(writable(at, 2 * BLOCK), "the blocks before it are still so");
+        assert!(!writable(at, 3 * BLOCK), "a read-only block in the range");
+        assert!(!writable(at + 2 * BLOCK, BLOCK));
+        // SAFETY: the allocations above.
+        unsafe {
+            title_memory_remapped(at, 4 * BLOCK);
+            title_memory_remapped(hole, BLOCK);
+            VirtualFree(at as *mut _, 0, MEM_RELEASE);
+            VirtualFree(hole as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// An answer kept for a later block does not hide a change in a block
+    /// that an earlier answer also covers.
+    #[test]
+    fn a_change_forgets_every_answer_that_reaches_into_it() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        // SAFETY: a fresh allocation of ours, freed at the end.
+        let at = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * BLOCK,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(at, 0);
+        // An answer asked at the second block, then one asked at the first
+        // that covers it too: two entries, `[2, 4)` and `[0, 4)`.
+        assert!(writable(at + 2 * BLOCK, 2 * BLOCK));
+        assert!(writable(at, 4 * BLOCK));
+        // The title makes the last block read-only and tells us: both
+        // answers reach into it and must go.
+        let mut old = 0;
+        assert_ne!(
+            unsafe { VirtualProtect((at + 3 * BLOCK) as *mut _, BLOCK, PAGE_READONLY, &mut old) },
+            0
+        );
+        title_memory_remapped(at + 3 * BLOCK, BLOCK);
+        assert!(!writable(at + 3 * BLOCK, BLOCK), "the `[0, 4)` answer must go too");
+        assert!(writable(at, 3 * BLOCK), "what did not change is still known");
+        // SAFETY: the allocation above.
+        unsafe {
+            title_memory_remapped(at, 4 * BLOCK);
+            VirtualFree(at as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// A block our own guard made read-only is no destination until a write
+    /// opens it ([`writing`]).
+    #[test]
+    fn a_guarded_block_is_no_destination_until_the_write_opens_it() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        assert!(guard(view, view + 2 * BLOCK).is_some());
+        assert!(!writable(view, BLOCK), "read-only by our hand");
+        assert!(!writable(view, 2 * BLOCK));
+        // The kernel write's announcement opens it first.
+        writing(view, BLOCK);
+        assert!(writable(view, BLOCK));
+        assert!(!writable(view, 2 * BLOCK), "the other block stays guarded");
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ });
+        }
+        title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    /// The cached destination check costs well under 2 % of the copy it
+    /// guards (the perf ledger has the numbers): 64 cached answers against
+    /// copies of the same 16 MiB range.
+    #[test]
+    fn the_destination_check_costs_under_two_percent_of_the_copy() {
+        use std::time::Instant;
+        const N: usize = 16 << 20;
+        const ROUNDS: u32 = 64;
+        // SAFETY: two regions of ours, freed at the end.
+        let (src, dst) = unsafe {
+            (
+                VirtualAlloc(std::ptr::null(), N, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+                    .cast::<u8>(),
+                VirtualAlloc(std::ptr::null(), N, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+                    .cast::<u8>(),
+            )
+        };
+        assert!(!src.is_null() && !dst.is_null());
+        assert!(writable(dst as usize, N), "the first answer asks");
+        let started = Instant::now();
+        let mut all = true;
+        for _ in 0..ROUNDS {
+            all &= writable(dst as usize, N);
+        }
+        let check = started.elapsed();
+        let started = Instant::now();
+        for _ in 0..ROUNDS {
+            // SAFETY: two mapped regions of ours, apart; the source is read
+            // and the destination written.
+            unsafe { std::ptr::copy_nonoverlapping(src, dst, N) };
+        }
+        let copy = started.elapsed();
+        assert!(all);
+        println!(
+            "destination check {} ns a copy, {N} bytes copied in {} us, {:.4} % of the copy",
+            check.as_nanos() / ROUNDS as u128,
+            copy.as_micros() / ROUNDS as u128,
+            check.as_nanos() as f64 / copy.as_nanos() as f64 * 100.0,
+        );
+        assert!(
+            check * 50 < copy,
+            "the check costs {check:?} of {copy:?} in copies"
+        );
+        // SAFETY: the allocations above.
+        unsafe {
+            title_memory_remapped(dst as usize, N);
+            VirtualFree(src as *mut _, 0, MEM_RELEASE);
+            VirtualFree(dst as *mut _, 0, MEM_RELEASE);
+        }
     }
 }
 

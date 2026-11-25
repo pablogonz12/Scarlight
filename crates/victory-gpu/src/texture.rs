@@ -12,8 +12,9 @@
 //!
 //! shortcut: a change detiles the whole texture, not the pages written.
 //! Only textures read through descriptor tables are brought up to date
-//! (directly indexed views are not known per draw); plane 0 is uploaded
-//! (every mip and array slice), depth and stencil planes are not.
+//! (directly indexed views are not known per draw); uploads cover each
+//! compatible plane, mip and array slice (a depth-stencil texture's stencil
+//! plane too, where the host's layout is the console's).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -40,9 +41,11 @@ pub(crate) struct Staging {
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
-    layout: victory_formats::texture::Layout,
+    layout: victory_formats::texture::Texture,
     /// Mips per array slice.
     mips: u32,
+    /// Mips and array slices in one native plane.
+    subresources_per_plane: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     memory: *const u8,
@@ -1181,7 +1184,7 @@ impl Staging {
             // What of it is there, as a mip window: the views of it are
             // narrowed to it while it lasts (a streamed texture's mips
             // arrive from the smallest, at the start of each slice).
-            let window = resident_mips(self.memory, &self.layout);
+            let window = resident_mips(self.memory, &self.layout.planes[0].layout);
             if !self.released.load(std::sync::atomic::Ordering::Relaxed) {
                 note_resident(self.resource, window, false);
             }
@@ -1346,12 +1349,21 @@ impl Staging {
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
                 memory = ?self.memory,
-                desc = ?self.layout.desc,
+                desc = ?self.layout.planes[0].layout.desc,
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            // D3D12 orders mips first, then array slices, then planes.
+            let (plane_index, mip, slice) = plane_of(i as u32, self.mips, self.subresources_per_plane);
+            let Some(plane) = self.layout.planes.get(plane_index) else {
+                continue;
+            };
+            let start = plane.offset as usize;
+            let Some(tiled) = tiled.get(start..start + plane.layout.size as usize) else {
+                tracing::warn!(i, start, size = plane.layout.size, "a plane lies past the texture's memory");
+                return;
+            };
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
@@ -1360,7 +1372,7 @@ impl Staging {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
             if let Err(e) =
-                self.layout
+                plane.layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
@@ -1806,6 +1818,54 @@ pub(crate) fn narrowed(asked: (u32, u32), resident: (u32, u32), mips: u32) -> (u
     (start, count)
 }
 
+/// The plane, mip and array slice of native subresource `i`: D3D12 orders
+/// mips first, then array slices, then planes (`subresources_per_plane` =
+/// mips × slices).
+fn plane_of(i: u32, mips: u32, subresources_per_plane: u32) -> (usize, u32, u32) {
+    let subresource = i % subresources_per_plane;
+    ((i / subresources_per_plane) as usize, subresource % mips, subresource / mips)
+}
+
+/// Whether a depth-stencil texture's second plane is uploaded
+/// (`VICTORY_TEXTURE_PLANES=0`: the first plane alone, as before).
+fn planes_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_PLANES").is_none_or(|v| v != "0"))
+}
+
+/// The planes of `layout` the host takes, where the host takes more than
+/// one: the host format's plane count (`host_planes`, `None` if the host
+/// cannot say), for a format whose console planes the host lays out the
+/// same way (the stencil plane its second, one byte a texel).
+///
+/// One plane otherwise: the console's 16-bit depth with 8-bit stencil is
+/// three bytes a texel with the stencil alongside, where the host's depth
+/// plane (R32 float, four bytes) is not the console's, and converting it
+/// is not done here (the depth plane's twin carries its contents instead).
+fn planes_uploaded(
+    layout: &victory_formats::texture::Texture,
+    host_planes: Option<u32>,
+    format: u32,
+) -> usize {
+    if layout.planes.len() < 2 || !planes_on() {
+        return 1;
+    }
+    // The host format must be a typed depth-stencil one: a copy writes one
+    // plane of a texture at a time, and D3D12 refuses that for a TYPELESS
+    // format (the runtime faults where it would size the copy).
+    const TYPED: [u32; 2] = [20, 45]; // D32_FLOAT_S8X24_UINT, D24_UNORM_S8_UINT
+    let Some(host_planes) = host_planes.filter(|_| TYPED.contains(&format)) else {
+        return 1;
+    };
+    let matching = victory_formats::texture::format(format)
+        .is_some_and(|f| f.stencil && f.bytes == layout.planes[0].layout.desc.element_bytes);
+    if matching {
+        (host_planes.max(1) as usize).min(layout.planes.len())
+    } else {
+        1
+    }
+}
+
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -1814,42 +1874,89 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         return Some(s.clone());
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
-    let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
-    else {
+    let Some(mut layout) = crate::resource::texture_layout(&desc) else {
         once!(
             ?desc,
             "texture contents without a console layout not uploaded"
         );
         return None;
     };
-    if layout.desc.swizzle.xor() {
+    if layout.planes.iter().any(|plane| plane.layout.desc.swizzle.xor()) {
         once!(?desc, "texture contents in an XOR mode not uploaded");
         return None;
     }
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
-    let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+    let subresources_per_plane = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
         u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize)
     };
+    // The host's planes of a depth-stencil format, if it has any: asked
+    // only where the console has a second plane to upload.
+    let host_planes = if layout.planes.len() > 1 {
+        let mut info = D3D12_FEATURE_DATA_FORMAT_INFO {
+            Format: d.Format,
+            ..Default::default()
+        };
+        // SAFETY: a live device and a correctly sized format query.
+        unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_INFO,
+                (&raw mut info).cast(),
+                size_of_val(&info) as u32,
+            )
+        }
+        .ok()
+        .map(|()| u32::from(info.PlaneCount))
+    } else {
+        None
+    };
+    let planes = planes_uploaded(&layout, host_planes, d.Format.0 as u32);
+    if planes < layout.planes.len() {
+        // shortcut: the planes above the uploaded ones are not read: a
+        // console texture whose depth plane the host holds in another form
+        // (the console's 16-bit depth with 8-bit stencil, 3 bytes a texel)
+        // keeps its first plane, as it was.
+        layout.planes.truncate(planes);
+        let last = layout.planes.last()?;
+        layout.size = last.offset + last.layout.size;
+    }
+    let count = subresources_per_plane * layout.planes.len() as u32;
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
     let mut total = 0;
-    // SAFETY: outputs for `count` subresources.
-    unsafe {
-        host.device.GetCopyableFootprints(
-            &d,
-            0,
-            count,
-            0,
-            Some(footprints.as_mut_ptr()),
-            Some(rows.as_mut_ptr()),
-            None,
-            Some(&mut total),
-        );
+    // A plane at a time: D3D12 gives a depth-stencil plane's own copy format
+    // only when the subresources asked for are one plane's.
+    for (plane, _) in layout.planes.iter().enumerate() {
+        let first = (plane as u32 * subresources_per_plane) as usize;
+        let mut plane_total = 0;
+        // SAFETY: outputs for this plane's subresources.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &d,
+                first as u32,
+                subresources_per_plane,
+                total,
+                Some(footprints[first..].as_mut_ptr()),
+                Some(rows[first..].as_mut_ptr()),
+                None,
+                Some(&mut plane_total),
+            );
+        }
+        total = total.max(total + plane_total);
     }
+    // The buffer covers every footprint's whole rows: `GetCopyableFootprints`
+    // leaves the last row of the last footprint unpadded, and a placed copy
+    // names RowPitch × Height bytes.
+    let total = footprints
+        .iter()
+        .zip(&rows)
+        .map(|(f, &r)| {
+            f.Offset + u64::from(f.Footprint.RowPitch) * u64::from(r) * u64::from(f.Footprint.Depth)
+        })
+        .fold(total, u64::max);
     let (buffer, data) = host.upload_buffer(total)?;
     crate::host::name(&buffer, || {
         format!(
@@ -1869,6 +1976,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        subresources_per_plane,
         bytes: total,
         memory,
         resource,
@@ -2205,6 +2313,67 @@ mod present_tests {
         assert_eq!(o.content, 4);
         assert_eq!(o.staged, 4);
         assert!(!o.back);
+    }
+
+    /// A depth-stencil texture's stencil plane is uploaded where the host
+    /// lays it out as the console does, and the subresources of a plane are
+    /// its mips and array slices, plane after plane: a stencil-only write of
+    /// the title's then reaches the host's stencil plane.
+    #[test]
+    fn a_stencil_plane_is_uploaded_where_the_host_lays_it_out_the_same() {
+        use super::{plane_of, planes_uploaded};
+        use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+        let texture = |format| {
+            Texture::new(&TextureDesc {
+                dimension: Dimension::Tex2d,
+                width: 2,
+                height: 2,
+                depth_or_array: 2,
+                mips: 2,
+                format,
+                samples: 1,
+                swizzle: Swizzle::LINEAR,
+            })
+            .expect("a console layout")
+        };
+        // R32G8X24_TYPELESS: 32-bit depth, 8-bit stencil, one byte a texel,
+        // the host's own two planes.
+        let depth_stencil = texture(19);
+        let typed_20 = texture(20);
+        assert_eq!(depth_stencil.planes.len(), 2);
+        // Both planes only with the switch on and a typed host format the
+        // runtime can copy one plane of; one plane otherwise.
+        let both = if super::planes_on() { 2 } else { 1 };
+        assert_eq!(planes_uploaded(&typed_20, Some(2), 20), both, "depth and stencil");
+        assert_eq!(planes_uploaded(&typed_20, Some(0), 20), 1, "a host that names no plane");
+        assert_eq!(planes_uploaded(&typed_20, Some(1), 20), 1, "a host with one plane");
+        assert_eq!(planes_uploaded(&typed_20, None, 20), 1, "a host that cannot say");
+        assert_eq!(planes_uploaded(&depth_stencil, Some(2), 19), 1, "a TYPELESS host format");
+        let (depth, stencil) = (&depth_stencil.planes[0], &depth_stencil.planes[1]);
+        assert_eq!((depth.layout.desc.element_bytes, stencil.layout.desc.element_bytes), (4, 1));
+        assert_eq!(stencil.offset, depth.layout.size.next_multiple_of(stencil.layout.alignment));
+        // The console's 16-bit depth with stencil stands on a 32-bit depth
+        // plane on the host, not the same bytes: the depth plane alone, as
+        // before (its twin carries the contents).
+        let console_d16s8 = texture(118);
+        assert_eq!(console_d16s8.planes.len(), 2);
+        assert_eq!(console_d16s8.planes[0].layout.desc.element_bytes, 2);
+        assert_eq!(planes_uploaded(&console_d16s8, Some(2), 45), 1);
+        // Two mips and two slices a plane, plane after plane.
+        let names = (0..8u32).map(|i| plane_of(i, 2, 4)).collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                (0, 0, 0),
+                (0, 1, 0),
+                (0, 0, 1),
+                (0, 1, 1),
+                (1, 0, 0),
+                (1, 1, 0),
+                (1, 0, 1),
+                (1, 1, 1)
+            ]
+        );
     }
 }
 
