@@ -2090,8 +2090,6 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         })
         .fold(total, u64::max);
     let (buffer, data) = host.upload_buffer(total)?;
-    // Memory each subresource (mip plus slice times mips) occupies, for
-    // detiling only the pages that changed.
     // Memory each subresource (plane, then mip plus slice times mips)
     // occupies, for detiling only the pages that changed. 3D textures
     // interleave their depth slices, so they are detiled whole.
