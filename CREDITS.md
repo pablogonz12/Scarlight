@@ -80,6 +80,12 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   `VICTORY_FRAME_BUDGET=0`). Reimplemented on this tree's counters and its own 50 ms budget: its
   per-command timestamps, memory-trait breakdown and slow-pipeline guard are not taken.
 
+- **fxceless/victory-fork [PR #981](https://github.com/fxceless/victory-fork/pull/981)** (avt0m4t), GPL-3.0: an
+  embedded shader keys and translates on its declared DXBC bytes, so a packed record whose payload runs on past
+  the container gets the same BLAKE3 as its standalone copy (`Container::as_bytes()`,
+  `crates/victory-shader/src/dxbc.rs`; `Source::bytes()` for both the raw and the `SGD5` paths,
+  `apps/victory/src/shader.rs`). Reimplemented on this tree's `victory translate`, which has no `warm` command.
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
