@@ -13,6 +13,70 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+/// How the "title slot past the host heap" line reads (`VICTORY_SLOT_DIAG`,
+/// read once at start-up).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SlotDiag {
+    /// The first slot past the heap says it, and no other. The title walks
+    /// its slots in increasing order, so a line per new high-water mark is a
+    /// line per slot: 199 846 of the first 200 000 lines of a run, ~8 000 a
+    /// second, on the thread recording the frame - the whole of the first
+    /// frame's 21 s stall (Marvisak/VIctory#2634).
+    Once,
+    /// One line per slot, as before: for a run that has to count them.
+    All,
+    /// Silent.
+    Off,
+}
+
+impl SlotDiag {
+    /// `VICTORY_SLOT_DIAG`: unset or `once` reads once, `all` reads every
+    /// slot (the old way), `0` or `off` reads none.
+    fn parse(value: Option<&str>) -> Self {
+        match value {
+            None | Some("once") => Self::Once,
+            Some("all") => Self::All,
+            Some("0" | "off") => Self::Off,
+            Some(_) => Self::Once,
+        }
+    }
+
+    /// The mode this process runs with.
+    fn now() -> Self {
+        static MODE: std::sync::OnceLock<SlotDiag> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| Self::parse(std::env::var("VICTORY_SLOT_DIAG").ok().as_deref()))
+    }
+}
+
+/// Says the "slot past the host heap" line for `index` in `mode`, reusing
+/// `once` to say it once per process (a `static` at the call site; a value of
+/// its own in the tests).
+fn say_slot_past(
+    once: &std::sync::Once,
+    mode: SlotDiag,
+    index: u32,
+    count: u32,
+    for_draw: bool,
+) {
+    let says = match mode {
+        SlotDiag::Off => false,
+        SlotDiag::All => true,
+        SlotDiag::Once => {
+            let mut says = false;
+            once.call_once(|| says = true);
+            says
+        }
+    };
+    if says {
+        tracing::warn!(
+            index,
+            count,
+            for_draw,
+            "title slot past the host heap: slots above the host heap's count are not mirrored"
+        );
+    }
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -26,6 +90,15 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// The slots made from a view narrowed to a part-resident texture's mips
+    /// ([`narrow_to_resident`]): the texture, the mips the title asked for
+    /// and those the host view names. More levels arriving (or a host copy
+    /// filling the chain) wants a wider window than the slot shows, and the
+    /// title's descriptor does not change, so `mirror` remakes these itself
+    /// (JMAN730/victory#672). `narrowed_count` says whether any is (read
+    /// without the lock on the mirror of every slot).
+    narrowed: Mutex<std::collections::HashMap<u32, (Narrowed, (u32, u32))>>,
+    narrowed_count: std::sync::atomic::AtomicUsize,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -594,6 +667,22 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// A slot the host made from a view narrowed to a part-resident texture's
+/// mips ([`narrow_to_resident`]): the texture, the window the title asked
+/// for and the one the host view names.
+#[derive(Clone, Copy)]
+struct Narrowed {
+    resource: crate::object::This,
+    asked: (u32, u32),
+}
+
+thread_local! {
+    /// What the last [`make`] on this thread narrowed, if anything: taken by
+    /// the slot that made it ([`HostHeap::note_narrowed`]).
+    static LAST_NARROW: std::cell::Cell<Option<(Narrowed, (u32, u32))>> =
+        const { std::cell::Cell::new(None) };
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -689,6 +778,8 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            narrowed: Mutex::default(),
+            narrowed_count: std::sync::atomic::AtomicUsize::new(0),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
@@ -968,6 +1059,7 @@ impl HostHeap {
             Some(view) => null_for(&view, self.cpu(index)),
             None => null_view(self.cpu(index)),
         }
+        self.forget_narrowed(index);
         self.keep(index, None);
     }
 
@@ -1346,19 +1438,64 @@ impl HostHeap {
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
+    /// Whether host slot `index` shows a view narrowed to mips that more of
+    /// have arrived since (or whose chain a host copy has filled): the slot
+    /// has to be made again though the title's descriptor is unchanged.
+    fn widen_due(&self, index: u32) -> bool {
+        if self.narrowed_count.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return false;
+        }
+        let entry = {
+            let map = self.narrowed.lock().unwrap_or_else(|e| e.into_inner());
+            map.get(&index).copied()
+        };
+        let Some((n, host_mips)) = entry else {
+            return false;
+        };
+        let Some(texture) = crate::resource::host_resource(n.resource) else {
+            return false;
+        };
+        // SAFETY: a live resource while a slot still shows it.
+        let mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+        let want = crate::texture::wanted(
+            n.asked,
+            crate::texture::resident(n.resource),
+            mips,
+            crate::texture::is_host_written(n.resource),
+        );
+        want != host_mips
+    }
+
+    /// Records what the last [`make`] on this thread narrowed slot `index`
+    /// to: nothing when it is not a narrowed view any more.
+    fn note_narrowed(&self, index: u32) {
+        let n = LAST_NARROW.with(|c| c.take());
+        let mut map = self.narrowed.lock().unwrap_or_else(|e| e.into_inner());
+        match n {
+            Some(entry) => map.insert(index, entry),
+            None => map.remove(&index),
+        };
+        self.narrowed_count
+            .store(map.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Drops the narrowing of slot `index`: it shows something else now.
+    fn forget_narrowed(&self, index: u32) {
+        let mut map = self.narrowed.lock().unwrap_or_else(|e| e.into_inner());
+        if map.remove(&index).is_some() {
+            self.narrowed_count
+                .store(map.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
-            // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
-            static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
-                tracing::warn!(
-                    index,
-                    count = self.count,
-                    for_draw,
-                    "title slot past the host heap"
-                );
-            }
+            // Diagnostic (heap cap): slots above the host heap's count are not
+            // mirrored. The title walks them in increasing order, so a line per
+            // new high-water mark is one line per slot; `VICTORY_SLOT_DIAG`
+            // takes once (the default), every slot (the old way) or none.
+            static SAID: std::sync::Once = std::sync::Once::new();
+            say_slot_past(&SAID, SlotDiag::now(), index, self.count, for_draw);
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
@@ -1380,7 +1517,10 @@ impl HostHeap {
             }
             return None;
         };
-        if made[index as usize] != key {
+        // A narrowed slot whose texture has more mips now is made again
+        // though its descriptor did not change: bindless draws never write
+        // the slot again, so nothing else would widen it (#672).
+        if made[index as usize] != key || self.widen_due(index) {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
@@ -1415,9 +1555,12 @@ impl HostHeap {
             }
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
+                self.forget_narrowed(index);
                 None
             } else {
-                make(&view, self.cpu(index))
+                let kept = make(&view, self.cpu(index));
+                self.note_narrowed(index);
+                kept
             };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
@@ -1474,6 +1617,14 @@ fn narrow_to_resident(
     texture: &ID3D12Resource,
     desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC,
 ) -> Option<(u32, u32)> {
+    if !crate::texture::resident_mips_on() {
+        return None;
+    }
+    // A copy or resolve filled the host chain: title-memory residency is
+    // stale and must not clamp the view (#616).
+    if crate::texture::is_host_written(resource) {
+        return None;
+    }
     let resident = crate::texture::resident(resource)?;
     if resident.1 == 0 {
         return None;
@@ -1521,6 +1672,9 @@ fn narrow_to_resident(
             };
         }
     }
+    // Remembered for the slot that shows it: more levels arriving want a
+    // wider window than this one, and its descriptor will not change.
+    LAST_NARROW.set(Some((Narrowed { resource, asked }, (first, count))));
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::ViewNarrowed, 1);
     Some((first, count))
@@ -2166,6 +2320,7 @@ fn twin_uav(
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+    LAST_NARROW.set(None);
     let host = host()?;
     let device = &host.device;
     match view {
@@ -2552,6 +2707,82 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A subscriber that only counts the lines said: what a diagnostic's cost
+    /// comes to offline.
+    #[derive(Clone, Default)]
+    struct Lines(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Lines {
+        fn said(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl tracing::Subscriber for Lines {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// The title asks for 1 245 184 slots, more than the 1 000 000 a host heap
+    /// holds, and walks them in increasing order. "Line when the high-water
+    /// mark moves" was therefore a line per slot: 199 846 of the first 200 000
+    /// lines of a run, ~8 000 a second, on the thread recording the frame,
+    /// which was the whole of the first frame's 21 s stall. A quarter of a
+    /// million slots past the heap now cost one line.
+    #[test]
+    fn a_slot_past_the_host_heap_is_said_once_not_per_slot() {
+        let lines = Lines::default();
+        tracing::subscriber::with_default(lines.clone(), || {
+            let once = std::sync::Once::new();
+            for index in 0..250_000u32 {
+                say_slot_past(&once, SlotDiag::Once, index, 1_000_000, true);
+            }
+        });
+        assert_eq!(lines.said(), 1);
+    }
+
+    /// The line can still be had per slot (the way it was, for a run that has
+    /// to count them) or not at all, and either way once it has been said in
+    /// the "once" mode it is not said again.
+    #[test]
+    fn the_slot_past_the_host_heap_follows_its_switch() {
+        let lines = Lines::default();
+        {
+            let lines = lines.clone();
+            tracing::subscriber::with_default(lines.clone(), move || {
+                let once = std::sync::Once::new();
+                for index in 0..3 {
+                    say_slot_past(&once, SlotDiag::All, index, 2, false);
+                }
+                assert_eq!(lines.said(), 3);
+                for index in 0..3 {
+                    say_slot_past(&once, SlotDiag::Off, index, 2, false);
+                }
+                assert_eq!(lines.said(), 3, "off says nothing");
+                say_slot_past(&once, SlotDiag::Once, 0, 2, false);
+                say_slot_past(&once, SlotDiag::Once, 1, 2, false);
+                assert_eq!(lines.said(), 4, "once, whatever the mode before it");
+            });
+        }
+        assert_eq!(SlotDiag::parse(None), SlotDiag::Once, "on by default");
+        assert_eq!(SlotDiag::parse(Some("once")), SlotDiag::Once);
+        assert_eq!(SlotDiag::parse(Some("all")), SlotDiag::All);
+        assert_eq!(SlotDiag::parse(Some("0")), SlotDiag::Off);
+        assert_eq!(SlotDiag::parse(Some("off")), SlotDiag::Off);
+        assert_eq!(SlotDiag::parse(Some("1")), SlotDiag::Once);
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
