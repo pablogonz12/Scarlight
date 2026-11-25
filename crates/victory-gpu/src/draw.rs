@@ -324,6 +324,14 @@ fn mesh_test() -> u8 {
     })
 }
 
+/// `VICTORY_MESH_GRID=0`: the older mesh dispatch call, one group across
+/// `y` and `z` (off means the caller's whole grid is forwarded; on by
+/// default).
+fn mesh_grid() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_MESH_GRID").as_deref() != Ok("0"))
+}
+
 /// `VICTORY_MESH_TEST=keep:<hex digits>[:<hex digits>]`: only the mesh
 /// draws whose mesh shader's hash ends in one of the first digits (and
 /// whose digit before it is one of the second, if given) are issued: a
@@ -1031,8 +1039,15 @@ impl State {
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
-            // Title memory by address: what the shader finds it by.
+            // Title memory by address: what the shader finds it by. A builder
+            // stage's writes through it stay in the copies
+            // ([`crate::pipeline::builder_map_host`]): #1198's rule for the
+            // map, and the writes run 98 killed the title with. The root UAVs
+            // below still copy back: that is a diff against the submission's
+            // snapshot (`shadow::gpu_writes`), and a page only the map's copies
+            // hold is unchanged there, so nothing is written over it.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
+                let writes = writes && !crate::pipeline::builder_map_host(self.pipeline as This);
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
@@ -2070,22 +2085,23 @@ impl State {
         }
     }
 
-    /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
-    /// programs are one-dimensional).
-    pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+    /// Runs a mesh dispatch with the caller's three-dimensional group grid.
+    pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         self.window = None;
+        // The older call took one group across `y` and `z`.
+        let (x, y, z) = if mesh_grid() { (x, y, z) } else { (x, 1, 1) };
         #[cfg(feature = "diagnostics")]
-        self.trace("mesh", x, 0);
+        self.trace("mesh", x * y * z, 0);
         let ran = mesh_test() != 1
             && mesh_kept(self.pipeline)
             && self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
-                    list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    list.note_op(|| self.op_text(format!("mesh {x}x{y}x{z}"), false));
                     self.mesh_scissor(list, true);
                     // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, 1, 1) };
+                    unsafe { l6.DispatchMesh(x, y, z) };
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true

@@ -58,6 +58,8 @@ pub mod signature;
 mod test_device;
 #[cfg(windows)]
 mod texture;
+#[cfg(all(test, windows))]
+mod warptest;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]

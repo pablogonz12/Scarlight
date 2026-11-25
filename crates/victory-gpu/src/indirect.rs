@@ -619,7 +619,9 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn card_compare_stores_the_hash_it_made_when_told() {
+        let _once = crate::warptest::lock();
         let Some(mut harness) = Harness::new() else {
+
             return;
         };
         let compare = compile_cs(&harness.device, crate::host::CARD_COMPARE).expect("the card compare must compile on the test device");
@@ -736,7 +738,9 @@ void main() {
     ///     records into `dst_args` at offset `0`.
     #[test]
     fn count_buffer_ignores_garbage_tail_and_preserves_source() {
+        let _once = crate::warptest::lock();
         let Some(mut harness) = Harness::new() else {
+
             return;
         };
         const KIND_DISPATCH: u32 = 2;
@@ -945,7 +949,9 @@ void main() {
     /// to the most and spend the budget.
     #[test]
     fn window_leaves_unfilled_slots_empty_and_uncharged() {
+        let _once = crate::warptest::lock();
         let Some(mut harness) = Harness::new() else {
+
             return;
         };
         const KIND_MESH: u32 = 10;
@@ -1041,7 +1047,9 @@ void main() {
 
     #[test]
     fn budget_saturates_without_wraparound_and_preserves_draw_fields() {
+        let _once = crate::warptest::lock();
         let Some(mut harness) = Harness::new() else {
+
             return;
         };
         const KIND_INDEXED: u32 = 1;

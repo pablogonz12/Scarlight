@@ -1504,7 +1504,9 @@ mod tests {
     /// run with `VICTORY_INPLACE_PROBE=1` adds.
     #[test]
     fn probe_opens_title_like_memory_and_the_gpu_sees_its_bytes() {
+        let _once = crate::warptest::lock();
         let Some(device) = device() else { return };
+
         if device.cast::<ID3D12Device13>().is_err() {
             eprintln!("skipped: no device: no ID3D12Device13, a part of an allocation cannot be opened");
             return;
@@ -1534,6 +1536,7 @@ mod tests {
     /// follow it.
     #[test]
     fn a_committed_section_in_place_on_the_software_adapter() {
+        let _once = crate::warptest::lock();
         let Some(device) = device() else { return };
         if device.cast::<ID3D12Device13>().is_err() {
             eprintln!("skipped: no device: no ID3D12Device13, a part of an allocation cannot be opened");
@@ -1558,7 +1561,9 @@ mod tests {
     /// whole is turned down without asking the host.
     #[test]
     fn a_title_buffer_in_place_shows_its_bytes_at_its_offset() {
+        let _once = crate::warptest::lock();
         let Some(device) = device() else { return };
+
         if device.cast::<ID3D12Device13>().is_err() {
             eprintln!("skipped: no device: no ID3D12Device13, a part of an allocation cannot be opened");
             return;
@@ -1589,7 +1594,9 @@ mod tests {
     /// answer there is that our own page is the GPU's page too.
     #[test]
     fn the_self_check_reads_and_writes_our_own_page() {
+        let _once = crate::warptest::lock();
         let Some(device) = device() else { return };
+
         if device.cast::<ID3D12Device13>().is_err() {
             eprintln!("skipped: no device: no ID3D12Device13, a part of an allocation cannot be opened");
             return;
