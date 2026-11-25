@@ -84,6 +84,10 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   ray-tracing structures are unbuilt, as `VICTORY_REFLECTION=miss`
   (`crates/victory-gpu/src/reflection.rs`). Its `alpha`, `water` and `history` values and the sky-probe fallback
   tracking that tells the passes apart are not taken: this tree clears one image, the opaque pass's.
+- **fxceless/victory-fork [PR #979](https://github.com/fxceless/victory-fork/pull/979)** (gmanka), GPL-3.0: the
+  guarded views' clean blocks kept as contiguous runs (`CleanBlocks`, `crates/victory-gpu/src/watch.rs`), so a
+  refresh of a mostly clean view heap walks only its dirty gaps instead of collecting one entry per 64 KiB
+  block under the guard mutex; the per-block set it replaces is the test's reference.
 
 ## Tools
 
