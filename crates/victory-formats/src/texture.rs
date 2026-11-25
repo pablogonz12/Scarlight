@@ -1442,13 +1442,12 @@ mod tests {
                 };
                 let mut whole = vec![0xee; len];
                 l.detile(&a, mip as u32, 0, &mut whole, row, plane).unwrap();
-                if at == 0 && window.len() as u64 == l.size {
-                    let mut full = vec![0xee; len];
-                    l.detile_window(window, at, mip as u32, 0, &mut full, row, plane)
-                        .unwrap();
-                    assert_eq!(full, whole, "{d:?} mip {mip}: the whole window");
-                    continue;
-                }
+                // The whole texture as a window is the whole detile, for
+                // every mip.
+                let mut full = vec![0xee; len];
+                l.detile_window(&a, 0, mip as u32, 0, &mut full, row, plane)
+                    .unwrap();
+                assert_eq!(full, whole, "{d:?} mip {mip}: the whole window");
                 // The staging buffer holds the previous contents (a detile
                 // of `b`): only what lies in the window is replaced.
                 let full_b = {
