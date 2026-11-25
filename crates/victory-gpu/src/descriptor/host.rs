@@ -656,6 +656,14 @@ fn view_layout(count: u32, null: u32) -> (u32, u32, u32, u32) {
     let guards = HEAP_GUARDS.len() as u32;
     match victory_shader::emit::view_bounds_of(null) {
         Some((dyn_start, guard)) => (null + 1, count.min(dyn_start), dyn_start, guard - dyn_start),
+        // No bounds (no limit, or `VICTORY_HEAP_BOUNDS=0`): shaders clamp
+        // every index to `null`, so the heap ends there and the null slot sits
+        // at its end, the dynamic slots before it.
+        None if null != 0 => {
+            let held = null.saturating_sub(DYNAMIC);
+            let fitted = count.min(held.saturating_sub(guards));
+            (null + 1, fitted, fitted, DYNAMIC - guards)
+        }
         // No limit: the title's slots, then the dynamic ones.
         None => (count + DYNAMIC, count, count, DYNAMIC - guards),
     }
@@ -1600,11 +1608,11 @@ impl HostHeap {
     pub(crate) fn flush_deferred(&self, finished: u64) -> usize {
         let ready = self.deferred.take_ready(finished);
         let n = ready.len();
-        for (index, handle, for_draw, required) in ready {
-            // The decision is already made (`born_after <= finished`): the
-            // view is made now, and `required` no longer matters.
-            let _ = required;
-            self.mirror_as(index, handle, for_draw, false, false);
+        for (index, handle, for_draw, _required) in ready {
+            // The entry is re-mirrored from the handle's current contents: a
+            // write since it was queued may show another resource, whose own
+            // allocation is deferred in turn rather than published early.
+            self.mirror_as(index, handle, for_draw, false, true);
         }
         if n > 0 {
             DEFERRED_VIEWS[1].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
@@ -2611,9 +2619,20 @@ fn view_born_after(view: &View) -> u64 {
                 0
             }
         }
-        View::Unordered(resource, _, _) => crate::resource::host_born_after(
-            *resource as crate::object::This,
-        ),
+        View::Unordered(resource, _, desc) => {
+            let resource = *resource as crate::object::This;
+            if crate::resource::host_resource(resource).is_some() {
+                crate::resource::host_born_after(resource)
+            } else if desc.is_some()
+                && let Some((data, len)) = crate::resource::buffer_bytes(resource)
+            {
+                // An unordered view of title buffer memory: its host copy's
+                // allocation (`Shadow::born_after`).
+                crate::shadow::find(data as u64, len).map_or(0, |shadow| shadow.born_after())
+            } else {
+                0
+            }
+        }
         View::Placed(unordered, resource, desc) => {
             if let Some(inner) = placed_texture(view) {
                 return view_born_after(&inner);

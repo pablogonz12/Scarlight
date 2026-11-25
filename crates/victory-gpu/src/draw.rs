@@ -2459,7 +2459,10 @@ impl State {
                 + 1;
             let last = table.checked_add(u64::from(n - 1) * 32);
             if n > host.table_room() || last.and_then(|handle| heap.index(handle)).is_none() {
+                // No span for it: the draw must not run with the title's own
+                // offsets (slots never made for it); `bind` drops it.
                 once!(slot, n, "fresh descriptor table exceeds the available span");
+                made.push((slot, u32::MAX));
                 continue;
             }
             // The table and what its entries hold (record words and alias
