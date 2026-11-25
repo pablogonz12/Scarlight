@@ -108,6 +108,12 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   allocation and fence tracked so a remapped or released allocation is not landed
   (`crates/victory-gpu/src/texback.rs`).
 
+- **DexNom/VIctory [ddb73326](https://github.com/DexNom/VIctory/commit/ddb73326b09e600bd2405ee5c987fa611098aaa1)** (DexNom), GPL-3.0: a
+  sample whose sampler comes from a uniform branch between two immediate samplers binds both as static
+  samplers, samples twice with the original derivatives and selects the texel on the edge that supplied the
+  console's sampler (`crates/victory-shader/src/emit/lower.rs`); this is what recovered the archive's refused
+  windshield and wiper pixel and mesh variants.
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
