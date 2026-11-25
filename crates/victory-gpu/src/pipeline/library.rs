@@ -468,10 +468,38 @@ pub(super) fn serialized() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_LOCK").is_some_and(|v| v == "1"))
 }
 
+thread_local! {
+    /// Whether this thread holds [`one_call`]'s lock now: a driver crash
+    /// here loses the lock for good, so the thread exits instead of
+    /// parking (see `pipeline::wine`).
+    static CALLING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One library call at a time, held: clears the thread's mark when let go.
+struct OneCall {
+    _held: MutexGuard<'static, ()>,
+}
+
+impl Drop for OneCall {
+    fn drop(&mut self) {
+        let _ = CALLING.try_with(|c| c.set(false));
+    }
+}
+
 /// With `VICTORY_LIBRARY_LOCK=1`: held by every library call, as before.
-fn one_call() -> Option<MutexGuard<'static, ()>> {
-    static CALLING: Mutex<()> = Mutex::new(());
-    serialized().then(|| CALLING.lock().unwrap_or_else(|e| e.into_inner()))
+fn one_call() -> Option<OneCall> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    if !serialized() {
+        return None;
+    }
+    let held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = CALLING.try_with(|c| c.set(true));
+    Some(OneCall { _held: held })
+}
+
+/// Whether this thread holds [`one_call`]'s lock now.
+pub(super) fn calling() -> bool {
+    CALLING.try_with(|c| c.get()).unwrap_or(false)
 }
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
@@ -606,8 +634,16 @@ pub(crate) fn pipeline(
         let _call = call("make", name);
         create()
     };
-    HOLDS.set(None);
-    let pso = pso?;
+    // `HOLDS` stays the name until the store is done: a driver crash in
+    // `StorePipeline` loses the pipeline too, and `abandon` must be able to
+    // let the name go (the thread parks and never drops its `Held`).
+    let pso = match pso {
+        Ok(pso) => pso,
+        Err(e) => {
+            HOLDS.set(None);
+            return Err(e);
+        }
+    };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
@@ -624,6 +660,7 @@ pub(crate) fn pipeline(
     if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
         library.added.fetch_add(1, Ordering::Relaxed);
     }
+    HOLDS.set(None);
     Ok(pso)
 }
 
