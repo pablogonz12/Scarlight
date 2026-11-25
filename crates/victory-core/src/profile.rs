@@ -119,6 +119,42 @@ impl Hook {
     }
 }
 
+/// Reads the profile in `text`, from the file at `path` (for the log).
+///
+/// Hooks are read one at a time: a hook carrying a field this version does
+/// not know was written for a newer loader, and is left out on its own with
+/// a line naming it, rather than the whole profile going with it. (A hook
+/// `when` needs a loader that knows `when`; the rest of a profile there is
+/// no reason to lose.)
+fn parse(text: &str, path: &Path) -> Result<Profile> {
+    let mut value: toml::Value = toml::from_str(text)?;
+    // Taken out so the rest of the profile is read without them, and each
+    // hook is then read on its own.
+    let hooks = value
+        .get_mut("hooks")
+        .and_then(|hooks| hooks.as_array_mut())
+        .map(std::mem::take)
+        .unwrap_or_default();
+    let mut profile: Profile = value.try_into()?;
+    for (at, hook) in hooks.into_iter().enumerate() {
+        let name = hook
+            .get("what")
+            .and_then(|what| what.as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("hook {at}"));
+        match hook.try_into() {
+            Ok(hook) => profile.hooks.push(hook),
+            // The name in the message, not only as a field: the usual log
+            // format prints the message alone.
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                "hook {name:?} not placed: {e}"
+            ),
+        }
+    }
+    Ok(profile)
+}
+
 /// Reads every `*.toml` in `dir` (a missing directory is an empty list).
 /// A file that does not parse is reported and skipped: a profile is opt-in,
 /// and one bad file must not keep the title from running.
@@ -136,7 +172,7 @@ pub fn load_dir(dir: &Path) -> Vec<Profile> {
     for path in paths {
         let loaded = std::fs::read_to_string(&path)
             .map_err(anyhow::Error::from)
-            .and_then(|text| Ok(toml::from_str::<Profile>(&text)?));
+            .and_then(|text| parse(&text, &path));
         match loaded {
             Ok(mut profile) => {
                 profile.source = Some(path);
@@ -242,6 +278,40 @@ mod tests {
         let q = profile("[skip]\nshaders = [\"0123456789abcdef\"]\nstages = [\"mesh\"]\n");
         assert_eq!(q.skip.shaders.len(), 1);
         assert_eq!(q.skip.stages, ["mesh"]);
+    }
+
+    #[test]
+    fn a_hook_with_a_field_this_version_does_not_know_is_skipped_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("p.toml"),
+            r#"name = "ours"
+build = ["0123456789abcdef"]
+
+[[hooks]]
+what = "kept"
+rva = 0x10
+expect = "90"
+new = "91"
+
+[[hooks]]
+what = "written for a later loader"
+rva = 0x20
+expect = "90"
+new = "91"
+shinier = true
+
+[[hooks]]
+what = "kept too"
+rva = 0x30
+expect = "90"
+new = "91"
+"#,
+        )
+        .unwrap();
+        let found = for_build(dir.path(), IMAGE).unwrap();
+        let names: Vec<&str> = found.hooks.iter().map(|hook| hook.what.as_str()).collect();
+        assert_eq!(names, ["kept", "kept too"]);
     }
 
     #[test]
