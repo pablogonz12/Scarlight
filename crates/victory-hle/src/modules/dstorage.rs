@@ -2057,6 +2057,141 @@ mod tests {
         assert_eq!(seen, plain);
     }
     #[test]
+    fn a_page_list_filled_after_its_request_starts() {
+        use crate::modules::xmem;
+        let (mut given, mut page) = (1usize, [0usize; 1]);
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut given, page.as_mut_ptr()),
+            1
+        );
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, page.as_ptr()), mapped);
+
+        // The title's list, still empty when the request is submitted.
+        let list = Box::leak(Box::new([0usize; 1]));
+        let at = std::ptr::from_mut(list) as usize;
+        let plain = pattern(4096);
+        let (queue, array) = (new_queue(1), status_array(1));
+        let r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            list.as_mut_ptr().cast(),
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        let number = page[0];
+        let filler = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            // SAFETY: the leaked list, alive for the whole test.
+            unsafe { std::ptr::write_volatile(at as *mut usize, number) };
+        });
+        enqueue(queue, &r);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        filler.join().unwrap();
+        // SAFETY: the page is mapped read-write.
+        let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
+        assert_eq!(seen, plain);
+    }
+    #[test]
+    fn a_queue_that_submits_itself_holds_reads_into_pages() {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64));
+        let array = status_array(1).cast::<Instance<StatusArray>>();
+        read(&mut l, 0, PAGE_DESTINATION, 16);
+        read(&mut l, 0, 0, 16);
+        add_ref_instance(array);
+        l.lanes.get_mut(&0).unwrap().unsubmitted.push(Command::Status(Status { array, index: 0 }));
+        l.submit_as(0, false);
+        // Only the plain read starts; the status waits behind the held one.
+        let plain = l.start().unwrap();
+        assert_eq!(plain.request.options, 0);
+        assert!(l.start().is_none());
+        let _ = l.finish(&plain, Ok(()));
+        assert_eq!(l.lanes[&0].held.len(), 2);
+        l.submit(0);
+        let paged = l.start().unwrap();
+        assert_eq!(paged.request.options, PAGE_DESTINATION);
+        assert!(l.lanes[&0].held.is_empty());
+        assert!(!l.lanes[&0].statuses.is_empty());
+        let _ = l.finish(&paged, Ok(()));
+        assert!(l.lanes[&0].statuses.is_empty());
+    }
+
+    #[test]
+    fn a_page_list_the_title_changes_before_its_submit() {
+        use crate::modules::xmem;
+        let (mut given, mut pages) = (2usize, [0usize; 2]);
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut given, pages.as_mut_ptr()),
+            1
+        );
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 2, pages.as_ptr()), mapped);
+        // The title's page table: still the page's previous owner when the
+        // request is enqueued, the right page by its Submit.
+        let mut list = [pages[0]];
+        let plain = pattern(4096);
+        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x50);
+        let desc = QueueDesc {
+            source_type: 0,
+            capacity: 4,
+            priority: 1,
+            name: c"pages".as_ptr(),
+            unknown: 1,
+        };
+        let mut queue = std::ptr::null_mut();
+        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
+        let array = status_array(1);
+        let r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            list.as_mut_ptr().cast(),
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        enqueue(queue, &r);
+        let mut out = [0u8; 16];
+        enqueue(queue, &request(MEMORY_SOURCE, out.as_mut_ptr().cast(), 16, plain.as_ptr().cast(), 0, 16));
+        // Half of four: the queue submitted itself. Time for a read started
+        // then to land in the old page.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // SAFETY: the list outlives the request, which reads it when it runs.
+        unsafe { std::ptr::write_volatile(list.as_mut_ptr(), pages[1]) };
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(out, plain[..16]);
+        // SAFETY: both pages are mapped read-write.
+        let (first, second) = unsafe {
+            (
+                std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()),
+                std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE), plain.len()),
+            )
+        };
+        assert_eq!(second, plain);
+        assert!(first.iter().all(|&b| b == 0), "the old page was written");
+    }
+
+    #[test]
     fn zlib_into_pages_in_place_and_across_allocations() {
         use crate::modules::xmem;
         let allocate = |n: usize| {
