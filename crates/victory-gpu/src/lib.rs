@@ -52,6 +52,8 @@ mod switches;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod shader_meta;
+#[cfg(windows)]
 mod shadow;
 pub mod signature;
 #[cfg(windows)]
