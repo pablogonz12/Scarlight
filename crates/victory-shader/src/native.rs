@@ -421,6 +421,9 @@ pub fn program_part<'a>(c: &Container<'a>) -> Option<&'a [u8]> {
 /// or the one of an `ACCC` part's `FSPX` image.
 pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     if part.get(0..4) == Some(crate::fspx::MAGIC) {
+        if !crate::fspx::enabled() {
+            return Err(Malformed("FSPX image not read (VICTORY_FSPX=0)"));
+        }
         return Ok(vec![crate::fspx::program(part)?]);
     }
     if part.get(XDAT_OFFSET..XDAT_OFFSET + 4) != Some(b"XDAT") {

@@ -37,6 +37,21 @@ use crate::native::{
 };
 
 pub const MAGIC: &[u8; 4] = b"FSPX";
+
+/// Whether an `ACCC` part's `FSPX` image is read as a program (on) or left
+/// to fail as it did when only a `DXIL` part was known (`VICTORY_FSPX=0`).
+/// The translated program is the console's own upscaler run as code, so the
+/// switch is for telling a fault in its translation from one in the picture
+/// that was there before.
+pub fn enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| enabled_from(std::env::var("VICTORY_FSPX").ok().as_deref()))
+}
+
+/// `VICTORY_FSPX`'s value: off only for `0`. Pure, for testing.
+fn enabled_from(value: Option<&str>) -> bool {
+    value.map(str::trim) != Some("0")
+}
 const VERSION: u32 = 1;
 const MAX_SECTIONS: u32 = 16;
 const KIND_CONFIG: u32 = 0;
@@ -200,6 +215,15 @@ fn root_map(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fspx_switch_is_on_unless_set_to_zero() {
+        for on in [None, Some(""), Some("1"), Some(" yes ")] {
+            assert!(enabled_from(on), "{on:?}");
+        }
+        assert!(!enabled_from(Some("0")));
+        assert!(!enabled_from(Some(" 0 ")));
+    }
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
