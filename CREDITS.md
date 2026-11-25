@@ -26,7 +26,7 @@ wrothgaril, Yaekai.
 
 ## Co-authors
 
-BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shader metadata cache, VIctory #2614).
+andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VIctory #2614), BlueKaiman, kais7654, pushkarreddyy, shh.
 
 ## Design notes
 
@@ -84,6 +84,10 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   bits of each operand (`crates/victory-shader/src/emit/lower/valu_int.rs`). Reimplemented on this tree's
   `mul_hi`, which moved to `lower/valu_int.rs` after that fork; its tests came across in spirit.
 
+- **Chezzuss/VIctory batch 7 (unpublished), GPL-3.0**: clearing the ray-traced reflection image while the
+  ray-tracing structures are unbuilt, as `VICTORY_REFLECTION=miss`
+  (`crates/victory-gpu/src/reflection.rs`). Its `alpha`, `water` and `history` values and the sky-probe fallback
+  tracking that tells the passes apart are not taken: this tree clears one image, the opaque pass's.
 - **fxceless/victory-fork [PR #979](https://github.com/fxceless/victory-fork/pull/979)** (gmanka), GPL-3.0: the
   guarded views' clean blocks kept as contiguous runs (`CleanBlocks`, `crates/victory-gpu/src/watch.rs`), so a
   refresh of a mostly clean view heap walks only its dirty gaps instead of collecting one entry per 64 KiB
@@ -101,9 +105,25 @@ BlueKaiman, kais7654, pushkarreddyy, shh, Bebrik229 (the `shader-meta.bin` shade
   and its per-page reads are not taken: our subresource ranges come from the layout (`Layout::mip_extents`) and
   the written pages are read in runs, with the rows outside the window skipped whole.
 
+- **Marvisak/VIctory [#2163](https://github.com/Marvisak/VIctory/pull/2163)** (0xkn0wh3r3), GPL-3.0: the
+  built-in BCPack table's first BC7 dictionary entry has its 32 indices right after its width bytes, where
+  every other entry repeats them first and holds 31 (`crates/victory-formats/src/bcpack.rs`).
+
+- **fxceless/victory-fork** (Geckomacabre, Codex), GPL-3.0: textures a list's shaders write that the title's own
+  code then reads on the CPU are copied into a read-back buffer when the list closes and tiled into the texture's
+  title memory in the console's layout, by kind (`VICTORY_TEXTURE_BACK`, off by default), with each read-back's
+  allocation and fence tracked so a remapped or released allocation is not landed
+  (`crates/victory-gpu/src/texback.rs`).
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
 responsible for the code they submit, whoever or whatever helped write it.
 
 Missing or wrong name? Open an issue.
+
+- **miatson/VIctory [28b7278f](https://github.com/miatson/VIctory/commit/28b7278f)** (miatson), GPL-3.0: the
+  finding that the console blends (MIN, MAX) into integer render targets while D3D12 refuses a pipeline that
+  enables blending on one, so those targets are made to write unblended, per target and with independent
+  blending turned on only where it was needed (`crates/victory-gpu/src/pipeline/host.rs`,
+  `VICTORY_HOST_BLEND=0`). Its host-pipeline device test used `D3DCompile`; ours checks the state itself.
