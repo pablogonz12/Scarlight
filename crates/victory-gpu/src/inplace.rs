@@ -34,11 +34,28 @@
 //!   decommit, release or protect the pages in it (`VirtualFree` and
 //!   `VirtualProtect` fail with error 87), nor unmap a view in it. Pages
 //!   outside the opened part are free to change.
+//! - `OpenExistingHeapFromAddress` takes one shape and no other: the
+//!   allocation's own base, one committed region, one protection
+//!   (vkd3d-proton `device.c:7603-7627`). A `MapViewOfFile` view of a section
+//!   is not that shape, and `OpenExistingHeapFromFileMapping` (`device.c:7637`)
+//!   maps the section again and unmaps it before the GPU uses the heap, so
+//!   neither is a way in for the page pool; memory we make ourselves is
+//!   `VirtualAlloc`ed as one region, and the title's own pages go through
+//!   `OpenExistingHeapFromAddress1`, which does take a part
+//!   (`xcl-bin/notes/linux-stack-fixes.md` 2.1). Needs vkd3d-proton master at
+//!   `563eb6c` (2026-11-04, "Do not force a failure in OpenHeapFromAddress"),
+//!   which 3.1.0 predates; our bundled `ec20719` has it.
+//! - A heap that opened is not a promise that the GPU uses those pages:
+//!   when the import is refused vkd3d-proton allocates memory of its own
+//!   and says nothing to the app (`xcl-bin/notes/zero-copy.md` §2). So
+//!   [`check`] moves bytes both ways through a page of the process's own
+//!   memory once, when the host device is made, and every copy stays a copy
+//!   unless they arrive.
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -61,16 +78,30 @@ pub(crate) fn probe_level() -> u8 {
     *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE_PROBE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
-/// `VICTORY_INPLACE`: 0 (unset) off. 1: a window of title memory outside
-/// buffers that lies in private memory committed whole is not copied: a
-/// part of the title's allocation is opened as a host heap and the window
-/// is a buffer placed over it ([`place_for`]). 2: title buffers too,
-/// except the big ones in the card's memory.
+/// `VICTORY_INPLACE`: 2 (unset) on, the measured-safe class only; 1: a
+/// window of title memory outside buffers only; 0: off, every copy as
+/// before. At 2 a window or a title buffer that lies in private memory
+/// committed whole is not copied: a part of the title's allocation is
+/// opened as a host heap and the window is a buffer placed over it
+/// ([`place_for`]).
 ///
-/// What stage 1 covers is private memory (`XMemVirtualAlloc`'s). View
+/// What 1 and 2 cover is private memory (`XMemVirtualAlloc`'s). View
 /// memory (the page pool) is turned down here: its section is made
 /// reserved, which the host refuses, and what a view shows changes when
 /// the title maps pages.
+///
+/// On by default since the probe and the game runs of 24-25 Nov say this
+/// class is safe and the rest is not (`xcl-bin/notes/zero-copy.md`):
+/// private memory in place read true, the CPU read at its own address what
+/// the GPU wrote with no flush and no map true, and write watching saw the
+/// GPU's writes true; a committed section through a view read false and
+/// wrote false, whatever the views did. The same split in the game: with
+/// view memory in place (the fork's `4cbe9d76`) every presented frame was
+/// black from frame 1, and with only that class refused the menus and the
+/// intro were right. What it costs: opening 64 MB locked into the PC's
+/// memory takes 15.3 ms once (4 MB: 1.6 ms), and the card reads such a heap
+/// at 9.2 GB/s at 256 MB against 20.5 GB/s from a committed buffer of
+/// today's kind - the CPU copy it replaces costs more than that difference.
 ///
 /// What it assumes, for 2: nothing reads title memory that a submission
 /// not yet run writes through such a buffer. With every submission waited
@@ -85,7 +116,23 @@ pub(crate) fn probe_level() -> u8 {
 /// call before such a call once it takes them over.
 pub(crate) fn level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+    *LEVEL.get_or_init(|| {
+        let level = level_from(std::env::var("VICTORY_INPLACE").ok().as_deref());
+        if level > 1 && crate::host::late() {
+            tracing::info!("title buffers are not used in place: VICTORY_LATE_WAIT is on");
+            return 1;
+        }
+        level
+    })
+}
+
+/// [`level`] from the variable's text: unset (or empty, or not a number) is
+/// 2, the measured-safe class on; `0` off; `1` windows outside buffers only.
+fn level_from(text: Option<&str>) -> u8 {
+    match text.map(str::trim) {
+        None | Some("") => 2,
+        Some(text) => text.parse().unwrap_or(2),
+    }
 }
 
 /// The most title memory in place at once, in bytes
@@ -96,7 +143,7 @@ fn most() -> u64 {
     *MOST.get_or_init(|| std::env::var("VICTORY_INPLACE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4096) << 20)
 }
 
-/// In place now: windows and their bytes, title buffers and their bytes;
+/// In place now: windows and the pages they lock, title buffers and theirs;
 /// then, since the start: asks turned down because the memory is a view
 /// or not private memory committed whole, because the host refused,
 /// because of [`most`]; and what was let go because its memory changed.
@@ -136,21 +183,41 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
+    // Late wait can come on *after* [`level`] was read (`switches::poll`): a
+    // title buffer in place assumes every submission has been waited for, so
+    // the question is asked here, not of the cached level.
+    if !window && crate::host::late() {
+        STATS[4].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     // View memory: known from the runtime without asking Windows.
     if cover(start as usize, len as usize) != Cover::None {
         STATS[4].fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
+    // A window of a few KiB lies in a 64 KiB page that the heap locks whole,
+    // so the cap is charged (and [`gone`] releases) the rounded span, never
+    // the title's: seventeen 4 KiB spans can hold 1,088 KiB of imports, not
+    // the 68 KiB their lengths add up to.
+    let pages = charged(len);
+    if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + pages > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let host = crate::host::host()?;
+    // The host may take the heap and still give the GPU other memory: the
+    // import is refused and the driver falls back without a word, so only
+    // the self-check's answer says whether a placed buffer shows the
+    // title's bytes at all.
+    if !in_place(check(&host.device)) {
+        UNCHECKED.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     match place_part(&host.device, start, len) {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
-            STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+            STATS[at + 1].fetch_add(pages, Ordering::Relaxed);
             Some(placed)
         }
         Err(None) => {
@@ -158,19 +225,228 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             None
         }
         Err(Some(e)) => {
-            if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
-                tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "title memory not opened in place: a copy instead");
+            if STATS[5].fetch_add(1, Ordering::Relaxed) == 0 {
+                tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "title memory not opened in place: the host refused, a copy instead (and every ask after it until one is let go)");
             }
             None
         }
     }
 }
 
-/// What [`place_for`] gave is gone.
+/// What the cap is charged for `len` bytes of title memory at `start`: the
+/// pages a heap locks for it, and never less. It is the upper bound of
+/// [`place_part`]'s `bytes`, ((start + len).ceil to a page - (start's page)),
+/// from `len` alone: `len` rounded up, plus the one page that the span's own
+/// offset inside its first page can add. Charging the bound rather than the
+/// exact count keeps the number a function of what [`gone`] is told (the
+/// window's span, not its address) and can only ever hold the cap tighter,
+/// never let it past: `len` bytes of `0x2000` starting at page offset
+/// `0xf000` lock 128 KiB, and so do the 96 KiB this counts for `0x2000`.
+fn charged(len: u64) -> u64 {
+    len.max(1).next_multiple_of(K64 as u64) + K64 as u64
+}
+
+/// What [`place_for`] gave is gone. The bytes are the title's span, so they
+/// are rounded here exactly as [`place_for`] rounded them: what a heap locked
+/// and what it gives back must be the same number.
 pub(crate) fn gone(window: bool, bytes: u64) {
     let at = if window { 0 } else { 2 };
     STATS[at].fetch_sub(1, Ordering::Relaxed);
-    STATS[at + 1].fetch_sub(bytes, Ordering::Relaxed);
+    STATS[at + 1].fetch_sub(charged(bytes), Ordering::Relaxed);
+}
+
+/// What the startup self-check ([`check`]) found about this host: whether
+/// memory handed to it as a heap is the memory its shaders read and write.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Health {
+    /// Not asked yet.
+    Unknown,
+    /// The GPU read the page the CPU wrote, and the CPU read the page the
+    /// GPU wrote: title memory may be used in place.
+    Sound,
+    /// The host refused the heap or the buffer in it (no silent fallback
+    /// yet, but nothing in place either).
+    Refused,
+    /// The heap and the buffer were taken and the bytes did not arrive: the
+    /// driver fell back to memory of its own (vkd3d-proton does this
+    /// without telling the app, `xcl-bin/notes/zero-copy.md` §2).
+    Fallback,
+    /// The check could not be made at all (no queue, no page to make it in).
+    Unchecked,
+}
+
+/// What the self-check found, once, as a number (0 until it has run).
+static HEALTH: AtomicU8 = AtomicU8::new(Health::Unknown as u8);
+/// Asks turned down because the self-check's answer was not [`Health::Sound`].
+static UNCHECKED: AtomicU64 = AtomicU64::new(0);
+
+fn health_of(value: u8) -> Health {
+    match value {
+        1 => Health::Sound,
+        2 => Health::Refused,
+        3 => Health::Fallback,
+        4 => Health::Unchecked,
+        _ => Health::Unknown,
+    }
+}
+
+/// What the check found from what the GPU answered: it read `reads` the
+/// page the CPU wrote, and after it `wrote` the page the CPU read `writes`
+/// at its own address.
+fn arrived(reads: bool, writes: bool) -> Health {
+    if reads && writes { Health::Sound } else { Health::Fallback }
+}
+
+/// Whether the run may use title memory in place: only a host whose check
+/// said [`Health::Sound`]. A refusal, a silent fallback and a check that
+/// could not be made all leave every copy a copy.
+fn in_place(health: Health) -> bool {
+    health == Health::Sound
+}
+
+/// The one line the self-check leaves in the log, whatever it found, so
+/// that a run's log says whether title memory is in place or copied, and
+/// why, before a single frame is drawn.
+fn say_health(found: Health, detail: &str) {
+    match found {
+        Health::Sound => tracing::info!(
+            "title memory in place: the host reads and writes our own pages (the self-check moved a page both ways, no flush and no map; {detail}): title memory is used in place"
+        ),
+        Health::Refused => tracing::warn!(
+            "title memory in place: the host refused the import of a page of our own memory ({detail}): every copy stays a copy, and this is counted"
+        ),
+        Health::Fallback => tracing::warn!(
+            "title memory in place: the host took the heap and the GPU used memory of its own (the self-check's bytes never arrived at our address): the import was refused and the driver fell back silently - every copy stays a copy, and this is counted"
+        ),
+        Health::Unchecked => tracing::warn!(
+            "title memory in place: the self-check could not be made ({detail}): every copy stays a copy, and this is counted"
+        ),
+        Health::Unknown => {}
+    }
+}
+
+/// Asks the host once, when its device is made (and before any title
+/// memory is asked for), whether a host heap on our own pages really is
+/// those pages. What vkd3d-proton does when the import fails is `vkAllocateMemory` of its own
+/// memory, a `WARN` and `allocation->cpu_address = host_ptr`
+/// (`libs/vkd3d/memory.c:1630`): the CPU goes on using the title's bytes
+/// and the GPU does not, which is a black picture from frame 1 with every
+/// draw still running (the belobug run). Nothing in the API says so, so the
+/// only way to see it is to move bytes and look.
+fn check(device: &ID3D12Device) -> Health {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _held = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let known = health_of(HEALTH.load(Ordering::Relaxed));
+    if known != Health::Unknown {
+        return known;
+    }
+    let (found, detail) = ask(device);
+    HEALTH.store(found as u8, Ordering::Relaxed);
+    say_health(found, &detail);
+    found
+}
+
+/// [`check`] for the host's startup, which has no use for the answer: the
+/// line it logs and [`HEALTH`] (which [`place_for`] reads) are the whole of
+/// it.
+pub(crate) fn check_at_startup(device: &ID3D12Device) {
+    check(device);
+}
+
+/// [`check`]'s work, on objects of its own: four 64 KiB pages of private
+/// memory, opened as a part the way [`place_part`] opens the title's, and
+/// the GPU asked to read what the CPU wrote there and to write what the CPU
+/// then reads at its own address. `Health::Sound` is the only answer that
+/// allows anything in place.
+fn ask(device: &ID3D12Device) -> (Health, String) {
+    let mut rig = match Rig::new(device) {
+        Ok(rig) => rig,
+        Err(e) => return (Health::Unchecked, format!("no queue of its own: {e}")),
+    };
+    // SAFETY: an allocation of the check's own, released before it returns.
+    unsafe {
+        let base = mem::VirtualAlloc(std::ptr::null(), 4 * K64, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE).cast::<u8>();
+        if base.is_null() {
+            return (Health::Unchecked, "no private memory to make it in".to_owned());
+        }
+        // The check's own pages are made the way an import needs them: one
+        // `VirtualAlloc`, 64 KiB aligned, one committed region of one
+        // protection (`whole_allocation`). The title's pages are not always
+        // that shape, which is why they go through `From::Part` instead.
+        if !whole_allocation(base as usize, 4 * K64) {
+            return (Health::Unchecked, "the check's own pages are not one allocation region".to_owned());
+        }
+        let (found, detail) = ask_page(&mut rig, device, base);
+        if found != Health::Sound {
+            // Not a sound host: the GPU's work on these pages may not have
+            // finished (a failed signal or wait is exactly one of the ways
+            // this is not sound), so the pages stay rather than being freed
+            // under it (256 KiB, once, and nothing is used in place).
+            return (found, detail);
+        }
+        let freed = mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE) != 0;
+        if !freed && found == Health::Sound {
+            return (Health::Unchecked, "the check's own page could not be released".to_owned());
+        }
+        (found, detail)
+    }
+}
+
+/// [`ask`] on `base`, the first of four pages of private memory of its own,
+/// which is the least that can be committed whole. `base` is [`ask`]'s own
+/// committed memory, of four pages.
+fn ask_page(rig: &mut Rig, device: &ID3D12Device, base: *mut u8) -> (Health, String) {
+    const SIZE: usize = K64;
+    let heap = match open(device, From::Part(base as usize, SIZE)) {
+        Ok(heap) => heap,
+        Err(e) => return (Health::Refused, format!("the heap: {e}")),
+    };
+    let buffer = match place(device, &heap, 0, SIZE as u64) {
+        Ok(buffer) => buffer,
+        Err(e) => return (Health::Refused, format!("the buffer in it: {e}")),
+    };
+    fill(base, SIZE, 3);
+    let reads = match rig.fetch(&buffer, 0, SIZE) {
+        Ok(got) => same(base, &got),
+        Err(e) => {
+            // A submission whose end is not known: the heap and the buffer
+            // stay with it (`std::mem::forget`) rather than being released
+            // while the GPU may still read them.
+            std::mem::forget(heap);
+            std::mem::forget(buffer);
+            return (Health::Fallback, format!("the GPU's read failed: {e}"));
+        }
+    };
+    // A page's worth, so that nothing of the copy is the host's idea of a
+    // minimum: the pattern differs from the read pass's.
+    let mut sent = [0u8; K64];
+    fill(sent.as_mut_ptr(), sent.len(), 200);
+    if let Err(e) = rig.store(&buffer, 0, &sent) {
+        std::mem::forget(heap);
+        std::mem::forget(buffer);
+        return (Health::Fallback, format!("the GPU's write failed: {e}"));
+    }
+    let writes = same(base, &sent);
+    let found = arrived(reads, writes);
+    if found != Health::Sound {
+        return (
+            found,
+            if reads {
+                "the GPU read our page but its write never reached our address"
+            } else {
+                "the GPU never read our address"
+            }
+            .to_owned(),
+        );
+    }
+    // The strict opening (an allocation's own base, one region) beside the
+    // part the title's buffers use: both are ours to make here, and a host
+    // that refuses the first but takes the second is worth a word in the line.
+    let strict = match open(device, From::Region(base as usize, 4 * K64)) {
+        Ok(_) => "the whole-allocation opening takes these pages too",
+        Err(_) => "but the whole-allocation opening refuses them",
+    };
+    (Health::Sound, strict.to_owned())
 }
 
 /// Title memory `[at, at + len)` is about to show something else, or the
@@ -187,6 +463,17 @@ pub fn title_memory_freeing(at: usize, len: usize) {
     STATS[7].fetch_add(gone, Ordering::Relaxed);
 }
 
+/// [`Health`] in words, for the line of what is in place.
+fn health_name(found: Health) -> &'static str {
+    match found {
+        Health::Unknown => "not asked yet",
+        Health::Sound => "our own pages, both ways",
+        Health::Refused => "the host refused the import",
+        Health::Fallback => "the host fell back to memory of its own",
+        Health::Unchecked => "could not be made",
+    }
+}
+
 /// The line of what is in place, every ten seconds while [`level`] is on.
 fn say() {
     static LAST: AtomicU64 = AtomicU64::new(0);
@@ -198,7 +485,7 @@ fn say() {
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
         "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
-         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
+         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed; the self-check says {}, {} asks turned down for it",
         s[0],
         s[1] >> 20,
         s[2],
@@ -206,15 +493,28 @@ fn say() {
         s[4],
         s[5],
         s[6],
-        s[7]
+        s[7],
+        health_name(health_of(HEALTH.load(Ordering::Relaxed))),
+        UNCHECKED.load(Ordering::Relaxed)
     );
 }
 
 /// What a heap is opened on.
 pub(crate) enum From {
-    /// A whole `VirtualAlloc` allocation, by its base address.
-    Region(usize),
-    /// A committed part of one: address and bytes.
+    /// A whole `VirtualAlloc` allocation: its base address and its bytes. It
+    /// is the strict opening, and it takes nothing else - vkd3d-proton
+    /// refuses (`device.c:7603-7627`) unless `VirtualQuery` says the address
+    /// *is* the allocation's base, the range begins at that base and every
+    /// page of it has one protection, i.e. one region. A view of a section
+    /// from `MapViewOfFile` is not such a base, which is why the section path
+    /// ([`From::Section`], `OpenExistingHeapFromFileMapping`, `device.c:7637`,
+    /// which maps again and unmaps before the GPU uses the heap) always fails;
+    /// it is [`From::Part`] or memory of our own that can be imported
+    /// (`xcl-bin/notes/linux-stack-fixes.md` 2.1).
+    Region(usize, usize),
+    /// A committed part of one: address and bytes. `ID3D12Device13` takes a
+    /// part, so the title's own pages do not have to be the allocation's base
+    /// (or one region) for this.
     Part(usize, usize),
     /// A section made with `SEC_COMMIT`, by its handle.
     Section(usize),
@@ -226,7 +526,15 @@ pub(crate) fn open(device: &ID3D12Device, from: From) -> windows::core::Result<I
     // themselves; a refusal is an error code.
     unsafe {
         match from {
-            From::Region(at) => device.cast::<ID3D12Device3>()?.OpenExistingHeapFromAddress(at as *const c_void),
+            From::Region(at, bytes) => {
+                // The host's own rule, checked here so a refusal is ours and
+                // not a silent `E_INVALIDARG`: an allocation's base, one
+                // region, one protection.
+                if !whole_allocation(at, bytes) {
+                    return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG));
+                }
+                device.cast::<ID3D12Device3>()?.OpenExistingHeapFromAddress(at as *const c_void)
+            }
             From::Part(at, bytes) => device.cast::<ID3D12Device13>()?.OpenExistingHeapFromAddress1(at as *const c_void, bytes),
             From::Section(handle) => device.cast::<ID3D12Device3>()?.OpenExistingHeapFromFileMapping(HANDLE(handle as *mut c_void)),
         }
@@ -358,6 +666,27 @@ pub(crate) fn private_whole(at: usize, len: usize) -> bool {
         && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= at.saturating_add(len)
 }
 
+/// Whether `[at, at + len)` is a whole allocation as `OpenExistingHeapFromAddress`
+/// takes it (vkd3d-proton `device.c:7603-7627`: the address must be the
+/// allocation's own base, the range must begin there, and every page must have
+/// one protection, i.e. be one region). Memory we make ourselves is
+/// `VirtualAlloc`ed this way, one region per import, which is the fix
+/// `xcl-bin/notes/linux-stack-fixes.md` 2.1 asks for; a view of a section is
+/// not, and is never handed to this opening.
+fn whole_allocation(at: usize, len: usize) -> bool {
+    // SAFETY: plain data filled in by the query.
+    let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
+    n != 0
+        && info.AllocationBase as usize == at
+        && info.BaseAddress as usize == at
+        && info.State == mem::MEM_COMMIT
+        && info.Type == mem::MEM_PRIVATE
+        && info.Protect == mem::PAGE_READWRITE
+        && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= at.saturating_add(len)
+}
+
 fn hr<T>(result: &windows::core::Result<T>) -> String {
     match result {
         Ok(_) => "ok".to_owned(),
@@ -435,7 +764,13 @@ impl Rig {
     fn fetch(&mut self, resource: &ID3D12Resource, offset: u64, size: usize) -> windows::core::Result<Vec<u8>> {
         let back = self.committed(D3D12_HEAP_TYPE_READBACK, size as u64, D3D12_RESOURCE_STATE_COPY_DEST)?;
         // SAFETY: two live buffers, the range inside both.
-        self.run(|list| unsafe { list.CopyBufferRegion(&back, 0, resource, offset, size as u64) })?;
+        // A run that does not complete leaves `back` the GPU's, not ours: it
+        // stays (a `forget`, 64 KiB once) rather than being released under a
+        // copy whose end is unknown.
+        if let Err(e) = self.run(|list| unsafe { list.CopyBufferRegion(&back, 0, resource, offset, size as u64) }) {
+            std::mem::forget(back);
+            return Err(e);
+        }
         let mut data = std::ptr::null_mut();
         // SAFETY: the mapping holds `size` bytes until unmapped.
         unsafe {
@@ -457,7 +792,12 @@ impl Rig {
             up.Unmap(0, None);
         }
         // SAFETY: two live buffers, the range inside both.
-        self.run(|list| unsafe { list.CopyBufferRegion(resource, offset, &up, 0, bytes.len() as u64) })
+        // As in `fetch`: a submission whose end is not known keeps its source.
+        let run = self.run(|list| unsafe { list.CopyBufferRegion(resource, offset, &up, 0, bytes.len() as u64) });
+        if run.is_err() {
+            std::mem::forget(up);
+        }
+        run
     }
 
     /// A compute shader stores, through a root unordered-access view at
@@ -617,7 +957,7 @@ unsafe fn private(p: &mut Probe, rig: &mut Rig) {
         }
         // The part: 16 pages from the 16th on.
         let (at, bytes) = (base.add(16 * K64), 16 * K64);
-        let whole = open(&rig.device, From::Region(base as usize));
+        let whole = open(&rig.device, From::Region(base as usize, SIZE));
         p.lines.push(format!("private memory, the whole allocation (OpenExistingHeapFromAddress): {}", hr(&whole)));
         drop(whole);
         let opened = open(&rig.device, From::Part(at as usize, bytes));
@@ -965,6 +1305,12 @@ fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
 /// and 150 seconds later.
 pub(crate) fn tick() {
     if level() > 0 {
+        // The self-check (the host device makes it too, when it is made;
+        // this catches a device made before the level was known): one line
+        // on whether title memory can be used in place at all.
+        if let Some(host) = crate::host::host() {
+            check(&host.device);
+        }
         say();
     }
     if probe_level() == 0 {
@@ -1050,6 +1396,82 @@ mod tests {
         assert_eq!(cover(at + 4 * K64, K64), Cover::Run(77, 4 * K64 as u64));
         views_gone(at + 4 * K64, K64);
         assert_eq!(cover(at + 4 * K64, K64), Cover::None);
+    }
+
+    /// The switch: unset is on (the measured-safe class only), `0` off,
+    /// `1` windows outside buffers only; a value that is not a number keeps
+    /// the default rather than silently turning it off.
+    #[test]
+    fn the_switch_is_on_by_default() {
+        assert_eq!(level_from(None), 2);
+        assert_eq!(level_from(Some("")), 2);
+        assert_eq!(level_from(Some("0")), 0);
+        assert_eq!(level_from(Some("1")), 1);
+        assert_eq!(level_from(Some(" 2 ")), 2);
+        assert_eq!(level_from(Some("on")), 2);
+    }
+
+    /// The self-check decides the whole run: only "the bytes arrived both
+    /// ways" keeps title memory in place; a refusal, a silent fallback and a
+    /// check that could not be made leave every copy a copy.
+    #[test]
+    fn only_a_host_that_reads_our_pages_keeps_memory_in_place() {
+        assert!(in_place(Health::Sound));
+        assert!(!in_place(Health::Unknown));
+        assert!(!in_place(Health::Refused));
+        assert!(!in_place(Health::Fallback));
+        assert!(!in_place(Health::Unchecked));
+        assert_eq!(arrived(true, true), Health::Sound);
+        assert_eq!(arrived(true, false), Health::Fallback, "the GPU read our page but wrote elsewhere");
+        assert_eq!(arrived(false, true), Health::Fallback, "the GPU wrote at our address but read elsewhere");
+        assert_eq!(arrived(false, false), Health::Fallback);
+        // The stored numbers are the ones `place_for` reads back.
+        for found in [Health::Unknown, Health::Sound, Health::Refused, Health::Fallback, Health::Unchecked] {
+            assert_eq!(health_of(found as u8), found);
+        }
+        assert_eq!(health_of(9), Health::Unknown, "a number nobody wrote is not asked yet");
+    }
+
+    /// The cap counts the pages a heap locks, not the title's span, and what
+    /// it gives back is the same number: seventeen 4 KiB spans are 1,088 KiB
+    /// of imports under a 1 MiB cap, not the 68 KiB their lengths add up to.
+    #[test]
+    fn the_cap_is_charged_the_pages_that_are_locked() {
+        // Never zero for a span place_part would import at least one page for.
+        assert_eq!(charged(0), 2 * K64 as u64);
+        assert!(charged(4 * 1024) >= K64 as u64);
+        // A span that crosses a page line locks one page more than its own
+        // rounded length: 0x2000 from page offset 0xf000 is 128 KiB, and the
+        // charge is at least that.
+        let (start, len) = (0xf000u64, 0x2000u64);
+        let pages = (start + len).next_multiple_of(K64 as u64) - (start & !(K64 as u64 - 1));
+        assert_eq!(pages, 2 * K64 as u64);
+        assert!(charged(len) >= pages, "the charge is an upper bound of what place_part imports");
+        // What a heap locked and what gone() gives back are the same number.
+        assert_eq!(charged(len) - charged(len), 0);
+        // And the seventeen 4 KiB spans of a 1 MiB cap are over it.
+        assert!(charged(4 * 1024) * 17 > 1 << 20);
+    }
+
+    /// The strict opening takes one shape only (vkd3d-proton
+    /// `device.c:7603-7627`): the allocation's own base, one committed region
+    /// of one protection. Our own pages are made that way; a part of them, or
+    /// a range that spans a second protection, is not.
+    #[test]
+    fn only_an_allocations_own_base_is_a_whole_allocation() {
+        // SAFETY: an allocation of the test's own.
+        unsafe {
+            let base = mem::VirtualAlloc(std::ptr::null(), 4 * K64, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            assert!(whole_allocation(base as usize, 4 * K64), "a VirtualAlloc's own base, one region");
+            assert!(!whole_allocation(base as usize + K64, 2 * K64), "an offset inside it is a part, not its base");
+            let mut old = 0;
+            assert_ne!(mem::VirtualProtect(base.add(K64).cast(), K64, mem::PAGE_READONLY, &mut old), 0);
+            assert!(!whole_allocation(base as usize, 4 * K64), "a page with a protection of its own makes a second region");
+            mem::VirtualProtect(base.add(K64).cast(), K64, mem::PAGE_READWRITE, &mut old);
+            assert!(whole_allocation(base as usize, 4 * K64));
+            mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
     }
 
     /// Only private memory committed whole, read-write, is taken for a part.
@@ -1141,6 +1563,19 @@ mod tests {
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }
+    }
+
+    /// The self-check on the software adapter: the same calls the card gets,
+    /// so the answer there is that our own page is the GPU's page too.
+    #[test]
+    fn warp_the_self_check_reads_and_writes_our_own_page() {
+        let Some(device) = warp() else { return };
+        if device.cast::<ID3D12Device13>().is_err() {
+            eprintln!("no ID3D12Device13 here: a part of an allocation cannot be opened");
+            return;
+        }
+        let (found, detail) = ask(&device);
+        assert_eq!(found, Health::Sound, "the software adapter reads and writes a page we hand it: {detail}");
     }
 
     /// The census names each kind of memory.
