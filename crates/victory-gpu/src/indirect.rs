@@ -1127,6 +1127,7 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
+        let _once = crate::warptest::lock();
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
@@ -1326,6 +1327,7 @@ void main() {
     ///     records into `dst_args` at offset `0`.
     #[test]
     fn warp_count_buffer_ignores_garbage_tail_and_preserves_source() {
+        let _once = crate::warptest::lock();
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
@@ -1635,6 +1637,7 @@ void main() {
 
     #[test]
     fn warp_window_leaves_unfilled_slots_empty_and_uncharged() {
+        let _once = crate::warptest::lock();
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
@@ -1726,6 +1729,7 @@ void main() {
 
     #[test]
     fn warp_budget_saturates_without_wraparound_and_preserves_draw_fields() {
+        let _once = crate::warptest::lock();
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };

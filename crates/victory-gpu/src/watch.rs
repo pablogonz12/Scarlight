@@ -45,6 +45,34 @@ pub(crate) fn written_since(start: usize, end: usize, since: u64) -> Option<bool
     covered.then(|| j.written.range(first..last).any(|(_, &w)| w > since))
 }
 
+/// Whether every 64 KiB block of `[at, at + len)` is title memory the layer
+/// knows is there ([`copied`]) or has guarded: then a copy can go at the
+/// bytes with `ptr::copy` instead of a kernel call, which on Wine costs a
+/// wineserver roundtrip for every write (Wine 11: `NtWriteVirtualMemory` has
+/// no self path) and a guarded `memmove` for every read.
+pub(crate) fn mapped(at: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    let g = guards();
+    // One pass over the set, not a lookup a block at a time.
+    g.mapped.range(first..last).count() == last - first
+}
+
+/// A kernel copy took all of `[at, at + len)` of title memory: every block
+/// of it is committed and mapped, so later copies of it (and of ranges
+/// inside it) may go at the bytes ([`mapped`]). Cleared for a range the
+/// runtime unmaps ([`title_memory_remapped`]).
+pub(crate) fn copied(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    let mut g = guards();
+    g.mapped.extend(first..last);
+}
+
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
 /// big buffers cost more than the copies they saved.
@@ -643,6 +671,10 @@ struct Guards {
     /// runtime last mapped or unmapped them. They are view memory whether
     /// their guard stands now or a write has opened it.
     viewed: BTreeSet<usize>,
+    /// Blocks of title memory a copy has taken whole (or a guard has made
+    /// read-only, which only committed memory allows): memory that is there,
+    /// so a copy may go straight at its bytes ([`mapped`]).
+    mapped: BTreeSet<usize>,
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -692,6 +724,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
     viewed: BTreeSet::new(),
+    mapped: BTreeSet::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {

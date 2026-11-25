@@ -155,6 +155,7 @@ Then point `EXE` in `play.sh` at `target/x86_64-pc-windows-msvc/diag/victory.exe
 | `VICTORY_HOOKS=1` | Places the code patches the profile for this build lists (see [title profiles](title-profiles.md)). Nothing is patched without a profile, and a patch whose bytes do not match is skipped. `VICTORY_NO_WATCHDOG=1`, the old name, still works |
 | `VICTORY_ASYNC_WRITEBACK=1` | **Experimental**, off by default; has hung the title in our tests |
 | `VICTORY_LOG=info` | Normal per-frame log; `VICTORY_LOG=<target>=debug` for debug output from one area |
+| `VICTORY_LOG_FILE=<path>` | Appends the log to that file instead of stderr. A title Steam starts has no terminal, so its stderr goes nowhere; with this, `play.sh` leaves the log where you can read it (`Z:\home\you\victory.log` is the Linux path as Wine sees it). Without it the log stays on stderr |
 | `VICTORY_GPU_TIMING=1` | Diagnostics builds only: runs and waits for each command list on its own, and logs any list over 50 ms with its slowest commands. Serialising the submission changes what you measure; the per-frame copy statistics are logged without it |
 | `VICTORY_SHOW_TARGET=<n>` / `busiest` | Diagnostics builds only: shows the nth texture the frame rendered to or wrote, in first-use order — the index a target dump uses — instead of the title's picture; `busiest` picks the displayable target the most draws wrote. A frame with fewer targets shows the title's own picture |
 
