@@ -588,6 +588,17 @@ fn rename(mut blocks: Vec<Block>, wave64: bool, vgprs: u16) -> Program {
             .map(|reg| (reg, current[index(reg)]))
             .collect();
     }
+    let mut blocks = blocks;
+    let mut reachable = vec![false; blocks.len()];
+    for &b in &order {
+        reachable[b] = true;
+    }
+    for (b, block) in blocks.iter_mut().enumerate() {
+        if !reachable[b] {
+            block.phis.clear();
+            block.insts.clear();
+        }
+    }
     for block in &mut blocks {
         for phi in &mut block.phis {
             phi.args = block
@@ -643,6 +654,48 @@ pub(crate) fn thread_edges(
     Ok(rename(blocks, p.wave64, p.vgprs))
 }
 
+/// Whether block `b` only executes scalar/no-op instructions and unconditionally
+/// ends the program within a short jump chain (including `s_getpc`/`s_setpc`
+/// long-jump trampolines to `s_endpgm`).
+fn ends_trivially(p: &Program, mut b: usize) -> bool {
+    for _ in 0..8 {
+        let block = &p.blocks[b];
+        let trivial = block.insts.iter().all(|i| {
+            matches!(i.fields, crate::gfx10::Fields::Sopp { .. } | crate::gfx10::Fields::Sop { .. })
+                && !matches!(
+                    i.name(),
+                    "s_barrier" | "s_sendmsg" | "s_sendmsghalt" | "s_sethalt" | "s_trap"
+                )
+        });
+        if !trivial {
+            return false;
+        }
+        match block.exit {
+            Exit::End => return true,
+            Exit::Jump(next) => b = next,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Removes an early-out `s_cbranch_execz`/`s_cbranch_execnz` whose exit path
+/// trivially ends the program, turning the block into an unconditional jump to
+/// the continuing body.
+fn strip_early_out(src: &Block, dst: &mut Block, p: &Program) -> bool {
+    let Exit::Branch { taken, not_taken } = src.exit else {
+        return false;
+    };
+    let next = match src.insts.last().map(|i| i.name()) {
+        Some("s_cbranch_execz") if ends_trivially(p, taken) => not_taken,
+        Some("s_cbranch_execnz") if ends_trivially(p, not_taken) => taken,
+        _ => return false,
+    };
+    dst.insts.pop();
+    dst.exit = Exit::Jump(next);
+    true
+}
+
 /// The program without its early-outs: an `s_cbranch_execz` to a block that
 /// only ends the program (`if (!inBounds) return;`, the outermost branch of
 /// most compute programs) is left out, so the lanes that would have left
@@ -653,21 +706,10 @@ pub(crate) fn thread_edges(
 /// waves needs for the barriers of its exchanges and LDS accesses.
 /// `None` if the program has no such branch.
 pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
-    let ends = |b: usize| {
-        p.blocks[b].exit == Exit::End
-            && p.blocks[b].insts.iter().all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
-    };
     let mut blocks = p.blocks.clone();
     let mut any = false;
-    for block in &mut blocks {
-        let Exit::Branch { taken, not_taken } = block.exit else {
-            continue;
-        };
-        if ends(taken) && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
-            block.insts.pop();
-            block.exit = Exit::Jump(not_taken);
-            any = true;
-        }
+    for (src, dst) in p.blocks.iter().zip(&mut blocks) {
+        any |= strip_early_out(src, dst, p);
     }
     if !any {
         return None;
@@ -701,10 +743,6 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
 /// are then code every lane runs.
 pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
     let n = p.blocks.len();
-    let ends = |b: usize| {
-        p.blocks[b].exit == Exit::End
-            && p.blocks[b].insts.iter().all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
-    };
     // Scalars moved from register to register (a scalar the compiler parked in a VGPR lane
     // comes back by such a move, `unspill`) are the value they copy.
     let mut copy: std::collections::HashMap<Value, Value> = Default::default();
@@ -812,13 +850,17 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
     let mut blocks = p.blocks.clone();
     let mut any = false;
     for b in 0..n {
+        if strip_early_out(&p.blocks[b], &mut blocks[b], p) {
+            any = true;
+            continue;
+        }
         let Exit::Branch { taken, not_taken } = p.blocks[b].exit else {
             continue;
         };
         if !p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
             continue;
         }
-        if ends(taken) || skipped(b, taken, not_taken).is_some() {
+        if skipped(b, taken, not_taken).is_some() {
             blocks[b].insts.pop();
             blocks[b].exit = Exit::Jump(not_taken);
             any = true;
@@ -904,12 +946,22 @@ pub(crate) fn reverse_postorder(blocks: &[Block]) -> Vec<usize> {
     post
 }
 
-/// Recomputes every block's predecessors from the exits.
+/// Recomputes every block's predecessors from the reachable exits.
 fn link(blocks: &mut [Block]) {
     for block in blocks.iter_mut() {
         block.preds.clear();
     }
+    if blocks.is_empty() {
+        return;
+    }
+    let mut reachable = vec![false; blocks.len()];
+    for b in reverse_postorder(blocks) {
+        reachable[b] = true;
+    }
     for b in 0..blocks.len() {
+        if !reachable[b] {
+            continue;
+        }
         for s in blocks[b].exit.successors() {
             blocks[s].preds.push(b);
         }

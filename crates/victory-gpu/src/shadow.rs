@@ -725,6 +725,33 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     differs != 0
 }
 
+/// One piece of a declared range put back into title memory by
+/// [`Shadow::copy_back`]: what the GPU wrote (`now` where it differs from
+/// `before`, the snapshot) goes in, and the copy and its snapshot take the
+/// title's bytes in turn.
+///
+/// The snapshot follows the merged bytes, not just the GPU's: the bytes the
+/// copy takes from title memory are the title's own, and a later copy-back
+/// of a range that overlaps this one must not take them for the GPU's and
+/// put the copy's older value back over a title write made after this
+/// (upstream #2436). Whether `title` changed.
+///
+/// [`merge_piece`]'s rule in one pass that stores into the copy too, written
+/// out rather than copied a second time (this runs over the differing bytes
+/// of every declared range: some hundred MB a frame on the copy-back path).
+fn merge_back(now: &mut [u8], before: &mut [u8], title: &mut [u8]) -> bool {
+    let mut differs = 0u8;
+    for ((n, b), t) in now.iter_mut().zip(before.iter_mut()).zip(title.iter_mut()) {
+        let wrote = if *n != *b { 0xffu8 } else { 0 };
+        let merged = (*t & !wrote) | (*n & wrote);
+        differs |= merged ^ *t;
+        *t = merged;
+        *n = merged;
+        *b = merged;
+    }
+    differs != 0
+}
+
 /// `[from, to)` without the ranges of `skip`, in order.
 fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     skip.sort_unstable();
@@ -1685,7 +1712,38 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod merge_tests {
-    use super::changed_runs;
+    use super::{changed_runs, merge_back, merge_piece};
+
+    /// A copy-back keeps the snapshot in step: the bytes the copy takes from
+    /// title memory are the title's own, so a later copy-back of the same
+    /// bytes finds them unchanged and does not put the copy's older value
+    /// back over a title write made after it (upstream #2436: a shader's
+    /// byte at 10, a title write at 40).
+    #[test]
+    fn a_copy_back_keeps_its_snapshot_in_step() {
+        // One piece of two bytes: the copy before the submission, the title
+        // and the copy after the shaders wrote the first byte.
+        let mut before = [0x00u8, 0x00];
+        let mut title = [0x00u8, 0x40];
+        let mut copy = [0xaau8, 0x00];
+        assert!(merge_back(&mut copy, &mut before, &mut title));
+        // The GPU's byte is in title memory; the copy took the title's.
+        assert_eq!(title, [0xaa, 0x40]);
+        assert_eq!(copy, [0xaa, 0x40]);
+        assert_eq!(before, copy, "the snapshot follows the copy");
+
+        // The title writes both again after the copy-back; a later copy-back
+        // of the same piece takes them, nothing goes back.
+        title = [0x11, 0x41];
+        assert!(!merge_back(&mut copy, &mut before, &mut title));
+        assert_eq!(title, [0x11, 0x41], "the title's later writes stay");
+
+        // What the snapshot left behind did: the copy's older first byte was
+        // taken for the GPU's and written over the title's.
+        let (stale, mut taken, mut older_title) = ([0xaau8, 0x00u8], [0x00u8, 0x00], [0x11u8, 0x41]);
+        assert!(merge_piece(&stale, &mut taken, &mut older_title));
+        assert_eq!(older_title, [0xaa, 0x41]);
+    }
 
     /// The runs hold exactly the bytes that differ: putting them into the
     /// old bytes gives the new ones, and no run holds an equal byte.
@@ -2251,17 +2309,21 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
-        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
         self.compared(from, to);
-        if let Some(before) = &*snapshot
+        if snapshot.is_some()
             && from < to
         {
             // SAFETY: `writing` set the snapshot's bytes of every declared
-            // range, at the copy's offsets.
-            let before = unsafe { std::slice::from_raw_parts(before.as_ptr().add(from), to - from) };
+            // range, at the copy's offsets; the merge below, under the same
+            // lock, brings the bytes the copy takes from title memory into
+            // them too. Every read of them ends before its piece is written:
+            // one slice per use, no borrow of the snapshot kept across the
+            // merge.
+            let base = snapshot.as_mut().unwrap().as_mut_ptr();
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission (on several threads: gigabytes a frame, bound by
             // memory speed), title memory read only where the GPU wrote.
@@ -2269,7 +2331,10 @@ impl Shadow {
             let scanning = std::time::Instant::now();
             let differing = match found {
                 Some(found) => found,
-                None => self.differing(from, to, before),
+                None => {
+                    let before = unsafe { std::slice::from_raw_parts(base.add(from), to - from) };
+                    self.differing(from, to, before)
+                }
             };
             #[cfg(feature = "diagnostics")]
             let syncing = {
@@ -2288,17 +2353,23 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
                 // From the first byte that differs to the last: title
                 // memory is read and written there only (a shader that sets
                 // a few words of a piece cost a read, a walk and a write of
-                // all 64 KiB of it).
-                let Some(first) = first_difference(host, old) else {
+                // all 64 KiB of it). The snapshot's bytes are read here and
+                // nowhere else before they are written below.
+                let found = {
+                    // SAFETY: inside the snapshot's allocation (`writing`),
+                    // read only for this comparison.
+                    let old = unsafe { std::slice::from_raw_parts(base.add(at), n) };
+                    first_difference(host, old)
+                        .map(|first| (first, last_difference(host, old).unwrap_or(first)))
+                };
+                let Some((first, last)) = found else {
                     continue;
                 };
-                let last = last_difference(host, old).unwrap_or(first);
                 let (at, n) = (at + first, last + 1 - first);
-                let (host, old) = (&mut host[first..=last], &old[first..=last]);
+                let host = &mut host[first..=last];
                 let title = &mut title[..n];
                 // On the write-back worker the piece may be held
                 // inaccessible (the job's own `back_begin`): the kernel's
@@ -2311,21 +2382,20 @@ impl Shadow {
                 if !crate::host::read_into((start + at) as *const u8, title) {
                     continue;
                 }
-                // Title memory with the GPU's bytes put in; the copy takes
-                // the title's bytes in turn.
+                // Title memory with the GPU's bytes put in; the copy and its
+                // snapshot take the title's bytes in turn, so that a later
+                // copy-back of a range that overlaps this one finds only
+                // what the card writes from now on and not the older bytes
+                // of the copy (upstream #2436).
                 // Without a branch, so the loop runs many bytes at a time:
                 // the GPU's byte where the copy's byte is not what it was
                 // before the submission, else the title's. (With the two
                 // searches above this was 44 ms a frame for 970 pieces.)
-                let mut differs = 0u8;
-                for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                    let gpu = if *h != *o { 0xffu8 } else { 0 };
-                    let merged = (*t & !gpu) | (*h & gpu);
-                    differs |= merged ^ *t;
-                    *t = merged;
-                    *h = merged;
-                }
-                if differs != 0 {
+                // SAFETY: inside the snapshot's allocation (`writing`) and
+                // not read elsewhere while it is written here.
+                let held = unsafe { std::slice::from_raw_parts_mut(base.add(at), n) };
+                let differs = merge_back(host, held, title);
+                if differs {
                     crate::watch::writing(start + at, n);
                     crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                     written += n;
