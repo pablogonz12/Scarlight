@@ -7,6 +7,7 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
+#[cfg(windows)]
 mod translate;
 
 use std::path::PathBuf;
@@ -190,6 +191,12 @@ fn main() -> Result<()> {
             verbose,
             disasm,
         } => shader::run(paths, verbose || disasm, disasm),
+        // `translate` checks the output with the host's D3D12: Windows only.
+        #[cfg(not(windows))]
+        Command::Translate { .. } => {
+            anyhow::bail!("translate checks shaders against the host's D3D12 and needs Windows")
+        }
+        #[cfg(windows)]
         Command::Translate {
             paths,
             validate,
