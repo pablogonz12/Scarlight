@@ -2055,7 +2055,7 @@ impl Shadow {
                     if kept.0[piece] {
                         // Kept until the runtime unmapped or remapped the
                         // block: what is there now is not what was kept.
-                        if !crate::watch::remapped_block(self.start as usize + lo) {
+                        if !crate::watch::remapped_any(self.start as usize + lo, hi - lo) {
                             continue;
                         }
                         kept.0[piece] = false;
@@ -2155,12 +2155,6 @@ impl Shadow {
             }
             let mut title = vec![0u8; PIECE];
             for (at, n) in differing {
-                // The runtime unmapped or remapped this block while the
-                // submission was pending: what it shows is someone else's
-                // now, so the copy's bytes for it stay out (FIND-14).
-                if crate::watch::remapped_block(start + at) {
-                    continue;
-                }
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
@@ -2202,9 +2196,26 @@ impl Shadow {
                     *h = merged;
                 }
                 if differs != 0 {
-                    crate::watch::writing(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                    written += n;
+                    // Only the bytes the runtime did not unmap or remap
+                    // while the submission was pending: what it shows there
+                    // is someone else's now, so the copy's bytes stay out
+                    // (FIND-14).
+                    let base = start + at;
+                    if !crate::watch::remapped_any(base, n) {
+                        crate::watch::writing(base, n);
+                        crate::host::write_mapped(base as *mut u8, title.as_ptr(), n);
+                        written += n;
+                    } else {
+                        for (from, to) in crate::watch::unremapped_runs(base, n) {
+                            let (at, n) = (from - base, to - from);
+                            crate::watch::writing(from, n);
+                            // SAFETY: inside the bytes just merged above.
+                            // SAFETY: `at` is inside the bytes merged above.
+                            let bytes = unsafe { title.as_ptr().add(at) };
+                            crate::host::write_mapped(from as *mut u8, bytes, n);
+                            written += n;
+                        }
+                    }
                 }
             }
             // Our write shows as a title write at the copy's next refresh,

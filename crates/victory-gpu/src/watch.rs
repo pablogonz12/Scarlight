@@ -422,18 +422,64 @@ fn remapped_range(at: usize, len: usize) {
     map.insert(start, end);
 }
 
-/// Whether block `at` lies in title memory the runtime unmapped or remapped
-/// since a copy took its bytes: the copy-back must not put the snapshot's
-/// bytes over the new mapping.
-pub(crate) fn remapped_block(at: usize) -> bool {
-    if !copy_back_skips_remapped() {
+/// Whether any byte of `[at, at + len)` was unmapped or remapped by the
+/// runtime since a copy took it: the copy-back must not put the snapshot's
+/// bytes there.
+pub(crate) fn remapped_any(at: usize, len: usize) -> bool {
+    if !copy_back_skips_remapped() || len == 0 {
         return false;
     }
-    // A mark on any part of the block keeps the copy's bytes out of it: the
-    // snapshot's bytes of the rest are as stale as the marked part's.
-    let lo = at / BLOCK * BLOCK;
     let map = remapped();
-    map.range(..lo + BLOCK).next_back().is_some_and(|(_, &e)| e > lo)
+    map.range(..at + len).next_back().is_some_and(|(_, &e)| e > at)
+}
+
+/// The runs of `[at, at + len)` no byte of which was remapped since a copy
+/// took it: what a copy-back may write (an empty `Vec` when all of it is
+/// marked, `[(at, at + len)]` when none is).
+pub(crate) fn unremapped_runs(at: usize, len: usize) -> Vec<(usize, usize)> {
+    let to = at.saturating_add(len);
+    if to <= at {
+        return Vec::new();
+    }
+    if !remapped_any(at, len) {
+        return vec![(at, to)];
+    }
+    let map = remapped();
+    let mut runs = Vec::new();
+    let mut run = at;
+    for (&s, &e) in map.range(..to) {
+        if e <= run {
+            continue;
+        }
+        if s >= to {
+            break;
+        }
+        if s > run {
+            runs.push((run, s));
+        }
+        run = run.max(e);
+    }
+    if run < to {
+        runs.push((run, to));
+    }
+    runs
+}
+
+/// Takes `[from, to)` out of the marks.
+fn clear_marks(map: &mut BTreeMap<usize, usize>, from: usize, to: usize) {
+    if to <= from {
+        return;
+    }
+    let covered: Vec<(usize, usize)> = map.range(..to).filter(|&(_, &e)| e > from).map(|(&s, &e)| (s, e)).collect();
+    for (s, e) in covered {
+        map.remove(&s);
+        if s < from {
+            map.insert(s, from);
+        }
+        if e > to {
+            map.insert(to, e);
+        }
+    }
 }
 
 /// A copy took the bytes of `[at, at + len)` afresh: what the runtime did to
@@ -446,16 +492,31 @@ pub(crate) fn remapped_taken(at: usize, len: usize) {
     if to <= from {
         return;
     }
+    // Blocks a write-back job holds have not been merged yet, and the merge
+    // reads the mark: it stands there until the job is done and a copy takes
+    // the blocks again.
+    let held: Vec<(usize, usize)> = {
+        let jobs = back();
+        jobs.range(from / BLOCK..to.div_ceil(BLOCK))
+            .map(|(&block, _)| (block * BLOCK, (block + 1) * BLOCK))
+            .collect()
+    };
     let mut map = remapped();
-    let covered: Vec<(usize, usize)> = map.range(..to).filter(|&(_, &e)| e > from).map(|(&s, &e)| (s, e)).collect();
-    for (s, e) in covered {
-        map.remove(&s);
-        if s < from {
-            map.insert(s, from);
+    let mut run = from;
+    for (held_from, held_to) in held {
+        if held_to <= run {
+            continue;
         }
-        if e > to {
-            map.insert(to, e);
+        if held_from >= to {
+            break;
         }
+        if held_from > run {
+            clear_marks(&mut map, run, held_from.min(to));
+        }
+        run = run.max(held_to);
+    }
+    if run < to {
+        clear_marks(&mut map, run, to);
     }
 }
 
@@ -1486,7 +1547,7 @@ mod tests {
 #[cfg(test)]
 mod mapping_tests {
     use super::{
-        BLOCK, copy_back_skips_remapped, remapped, remapped_block, remapped_taken, title_memory_reading,
+        BLOCK, copy_back_skips_remapped, remapped, remapped_any, remapped_taken, title_memory_reading,
         title_memory_remapped, title_memory_remapping,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1539,8 +1600,8 @@ mod mapping_tests {
     }
 
     /// A range the runtime unmapped or remapped is marked once, joined with
-    /// the marks next to it, until a copy takes it afresh or part of it:
-    /// that is what keeps a pending copy-back's bytes out of a new mapping.
+    /// the marks next to it, until a copy takes it afresh: that is what keeps
+    /// a pending copy-back's bytes out of a new mapping.
     #[test]
     fn remapping_marks_blocks_until_a_copy_takes_them_again() {
         if !copy_back_skips_remapped() {
@@ -1551,24 +1612,32 @@ mod mapping_tests {
             VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
         } as usize;
         assert_ne!(at, 0, "the pool allocates");
+        // Counted over this allocation only: other tests remap memory of
+        // their own, and the runner may have them in the air.
+        let marks = |at: usize| {
+            remapped().range(..at + 2 * BLOCK).filter(|&(&s, &e)| e > at && s < at + 2 * BLOCK).count()
+        };
+        let saved = remapped().clone();
         remapped().clear();
         title_memory_remapped(at, BLOCK);
-        assert!(remapped_block(at), "a remapped block is marked");
-        assert!(!remapped_block(at + BLOCK), "the block after it is not");
-        assert_eq!(remapped().len(), 1, "one range holds both blocks");
+        assert!(remapped_any(at, BLOCK), "a remapped range is marked");
+        assert!(!remapped_any(at + BLOCK, BLOCK), "the range after it is not");
+        assert_eq!(marks(at), 1, "one range holds both blocks");
         remapped_taken(at, BLOCK);
-        assert!(!remapped_block(at), "a copy that takes it clears the mark");
-        // Two blocks remapped apart are one range; a copy taking one of them
-        // leaves the other marked.
+        assert!(!remapped_any(at, BLOCK), "a copy that takes it clears the mark");
+        // Two ranges remapped apart join; a copy taking one leaves the other.
         title_memory_remapped(at + BLOCK, BLOCK);
         title_memory_remapped(at, BLOCK);
-        assert_eq!(remapped().len(), 1, "the marks next to each other join");
-        assert!(remapped_block(at) && remapped_block(at + BLOCK));
+        assert_eq!(marks(at), 1, "the marks next to each other join");
+        assert!(remapped_any(at, 2 * BLOCK));
         remapped_taken(at + BLOCK, BLOCK);
-        assert!(!remapped_block(at + BLOCK), "the taken bytes are current");
-        assert!(remapped_block(at), "the block no copy took stays marked");
+        assert!(!remapped_any(at + BLOCK, BLOCK), "the taken bytes are current");
+        assert!(remapped_any(at, BLOCK), "the range no copy took stays marked");
+        assert_eq!(crate::watch::unremapped_runs(at, 2 * BLOCK), [(at + BLOCK, at + 2 * BLOCK)]);
         remapped_taken(at, 2 * BLOCK);
-        assert!(!remapped_block(at) && !remapped_block(at + BLOCK));
+        assert!(!remapped_any(at, 2 * BLOCK));
+        assert_eq!(crate::watch::unremapped_runs(at, 2 * BLOCK), [(at, at + 2 * BLOCK)]);
+        *remapped() = saved;
         // SAFETY: our allocation.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
