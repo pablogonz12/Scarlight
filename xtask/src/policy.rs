@@ -37,12 +37,10 @@ const ALLOWED_NAMES: &[&str] = &[
 ];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
-const EXCEPTIONS: &[(&str, &str)] = &[
-    (
-        "crates/victory-formats/src/bcpack-tables.bin",
-        "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
-    ),
-];
+const EXCEPTIONS: &[(&str, &str)] = &[(
+    "crates/victory-formats/src/bcpack-tables.bin",
+    "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
+)];
 
 /// Files whose type is not on the allowlist but which still get every other
 /// check (size, forbidden signatures, NUL bytes, encoded-data runs).
@@ -309,7 +307,13 @@ mod tests {
 
     #[test]
     fn accepts_tool_scripts() {
-        assert!(check("tools/scarlight-launcher/scarlight", b"#!/usr/bin/env bash\n").is_empty());
+        assert!(
+            check(
+                "tools/scarlight-launcher/scarlight",
+                b"#!/usr/bin/env bash\n"
+            )
+            .is_empty()
+        );
         assert!(
             !check("tools/scarlight-launcher/scarlight", b"no shebang here\n").is_empty(),
             "an extensionless file under tools/ must be a script"
@@ -338,9 +342,19 @@ mod tests {
     fn extension_exception_still_runs_other_checks() {
         let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>";
         assert!(check_with("docs/brand/logo.svg", svg, (true, false)).is_empty());
-        let embedded = format!("<svg><image href=\"data:image/png;base64,{}\"/></svg>", "A1".repeat(400));
+        let embedded = format!(
+            "<svg><image href=\"data:image/png;base64,{}\"/></svg>",
+            "A1".repeat(400)
+        );
         assert!(!check_with("docs/brand/logo.svg", embedded.as_bytes(), (true, false)).is_empty());
-        assert!(!check_with("docs/brand/logo.svg", &vec![b'a'; 600 * 1024], (true, false)).is_empty());
+        assert!(
+            !check_with(
+                "docs/brand/logo.svg",
+                &vec![b'a'; 600 * 1024],
+                (true, false)
+            )
+            .is_empty()
+        );
         assert!(!check_with("docs/brand/logo.svg", b"MZ\x90\0", (true, false)).is_empty());
     }
 }

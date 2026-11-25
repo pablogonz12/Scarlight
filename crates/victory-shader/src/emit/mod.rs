@@ -146,6 +146,44 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// With the `diagnostics` feature, `VICTORY_SHADER_LOOP_LIMIT_CS` (same
+/// form) sets the limit for compute programs alone, in place of
+/// [`loop_limit`]; unset, they follow it. A low `VICTORY_SHADER_LOOP_LIMIT`
+/// that keeps the card alive in pixel and mesh loops also cuts genuine
+/// compute loops short: a lane that reaches the limit leaves the program
+/// without its writes. A hair simulation's per-vertex constraint pass loops
+/// once per vertex of a strand, more than 32 times, so with a limit of 32
+/// its lanes never store and the strands drawn from the simulation buffers
+/// scatter around the head; 128 here keeps them in place.
+/// Part of the translation like the other limit (the shader cache keys on it).
+pub fn compute_loop_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        if cfg!(feature = "diagnostics") {
+            parse_compute_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT_CS").ok().as_deref(), loop_limit())
+        } else {
+            loop_limit()
+        }
+    })
+}
+
+/// `VICTORY_SHADER_LOOP_LIMIT_CS`'s value; `fallback` (the general limit)
+/// when it is unset, unreadable or 0. Pure, for testing.
+fn parse_compute_loop_limit(value: Option<&str>, fallback: u32) -> u32 {
+    parse_count(value).unwrap_or(fallback)
+}
+
+/// A count at least 1, decimal or `0x` hex, surrounding blanks ignored.
+fn parse_count(value: Option<&str>) -> Option<u32> {
+    value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        })
+        .filter(|&n| n > 0)
+}
+
 /// Which of a translated program's group barriers wait for the whole
 /// group (`GroupMemoryBarrierWithGroupSync`); the others keep their memory
 /// fence and lose the wait. A wait that some thread of the group never
@@ -208,16 +246,7 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
-    let parsed = value
-        .map(str::trim)
-        .and_then(|v| match v.strip_prefix("0x") {
-            Some(hex) => u32::from_str_radix(hex, 16).ok(),
-            None => v.parse().ok(),
-        });
-    match parsed {
-        Some(n) if n > 0 => n,
-        _ => lower::LOOP_LIMIT,
-    }
+    parse_count(value).unwrap_or(lower::LOOP_LIMIT)
 }
 
 /// A translated shader and what the host binds for it.
@@ -763,7 +792,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
-    use super::parse_loop_limit;
+    use super::{parse_compute_loop_limit, parse_loop_limit};
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
@@ -784,6 +813,18 @@ mod tests {
         assert_eq!(parse_loop_limit(Some("1")), 1);
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_compute_loop_limit_follows_the_general_one_unless_set() {
+        assert_eq!(parse_compute_loop_limit(None, 32), 32);
+        assert_eq!(parse_compute_loop_limit(Some("1024"), 32), 1024);
+        assert_eq!(parse_compute_loop_limit(Some(" 0x400 "), 32), 1024);
+        let full = LOOP_LIMIT.to_string();
+        assert_eq!(parse_compute_loop_limit(Some(&full), 32), LOOP_LIMIT);
+        for bad in ["", "0", "-5", "lots"] {
+            assert_eq!(parse_compute_loop_limit(Some(bad), 32), 32, "{bad:?}");
         }
     }
     use super::container::SigElement;
@@ -916,6 +957,106 @@ mod tests {
         ) {
             v.validate(&mut out.dxil.clone()).unwrap();
         }
+    }
+
+    /// Emits a pixel program of `words` (wave32 unless `wave64`) with one TEXCOORD input and
+    /// SV_Depth/SV_StencilRef out: translated, or refused with a reason.
+    fn pixel_emits(words: &[u32], wave64: bool) -> Result<(), crate::ShaderError> {
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![crate::native::PsInput {
+                    usage: crate::native::Usage::Generic,
+                    row: 0,
+                    mask: 0b1000,
+                    attr: 0,
+                    flat: false,
+                    fp16: false,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let el = |name: &str, kind, comp| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp,
+            interp: 0,
+            row: Some(0),
+            col: 3,
+            cols: 1,
+            usage: 1,
+            half: false,
+        };
+        let isg1 = container::signature(&[el("TEXCOORD", 0, 9)], true);
+        let osg1 =
+            container::signature(&[el("SV_Depth", 17, 9), el("SV_StencilRef", 20, 5)], false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        emit(&c, &native, &p, &st, &io, &res).map(|_| ())
+    }
+
+    /// A pixel program whose one register holds a lane mask on one path and a number on the
+    /// other, counted after the join (`s_bcnt1_i32_b32`): a use that means the same on any
+    /// wave, so the host wave's ballot stands in for the mask, taken at the end of the phi's
+    /// predecessor.
+    #[test]
+    fn a_lane_mask_joined_with_a_number_lowers_for_a_wave_independent_reader() {
+        let words = [
+            0x7E00_0283, // v_mov_b32 v0, 3
+            0x7E02_0285, // v_mov_b32 v1, 5
+            0x7D88_0101, // v_cmp_gt_u32 vcc_lo, v1, v0 (every lane)
+            0xBE94_036A, // s_mov_b32 s20, vcc_lo
+            0xBE95_0F14, // s_bcnt1_i32_b32 s21, s20
+            0xBF06_8015, // s_cmp_eq_u32 s21, 0
+            0xBF85_0001, // s_cbranch_scc1 over the next word
+            0xBE94_0385, // s_mov_b32 s20, 5 (the number path)
+            0xBE96_0F14, // s_bcnt1_i32_b32 s22, s20 (the join, read as a number)
+            0x7E00_0216, // v_mov_b32 v0, s22
+            0x7E02_0300, // v_mov_b32 v1, v0
+            0xF800_1883, // exp mrtz v0, v1, off, off done vm
+            0x0000_0100,
+            0xBF81_0000, // s_endpgm
+        ];
+        pixel_emits(&words, false).expect("a lane mask counted after a join");
+    }
+
+    /// The same join read by anything else: the ballot's bit n is host lane n, which a
+    /// 64-lane host numbers differently from the console's 32, so the number the register
+    /// holds is not the console's. Refused rather than silently different.
+    #[test]
+    fn a_lane_mask_joined_with_a_number_is_refused_for_other_readers() {
+        let words = [
+            0x7E00_0283, // v_mov_b32 v0, 3
+            0x7E02_0285, // v_mov_b32 v1, 5
+            0x7D88_0101, // v_cmp_gt_u32 vcc_lo, v1, v0
+            0xBE94_036A, // s_mov_b32 s20, vcc_lo
+            0xBE95_0F14, // s_bcnt1_i32_b32 s21, s20
+            0xBF06_8015, // s_cmp_eq_u32 s21, 0
+            0xBF85_0001, // s_cbranch_scc1 over the next word
+            0xBE94_0385, // s_mov_b32 s20, 5
+            0xBE96_0314, // s_mov_b32 s22, s20 (the join, copied as a whole number)
+            0x7E00_0216, // v_mov_b32 v0, s22
+            0x7E02_0300, // v_mov_b32 v1, v0
+            0xF800_1883, // exp mrtz v0, v1, off, off done vm
+            0x0000_0100,
+            0xBF81_0000, // s_endpgm
+        ];
+        let r = pixel_emits(&words, false);
+        assert!(r.is_err(), "a joined mask copied as a number must be refused");
     }
 
     /// A wave64 compute program that writes only EXEC's high dword
