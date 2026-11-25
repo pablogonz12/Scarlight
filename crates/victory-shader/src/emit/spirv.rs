@@ -216,6 +216,8 @@ mod glsl {
     pub const UMAX: u32 = 41;
     pub const SMAX: u32 = 42;
     pub const FCLAMP: u32 = 43;
+    pub const FIND_I_LSB: u32 = 73;
+    pub const FIND_S_MSB: u32 = 75;
 }
 
 /// The register dwords the machine can name, mapped into one space.
@@ -812,8 +814,13 @@ impl<'a> Emitter<'a> {
     }
 
     fn ext1(&mut self, inst: u32, a: u32) -> u32 {
+        self.ext1t(inst, self.t_f32, a)
+    }
+
+    /// [`ext1`](Self::ext1) with the result type the ext instruction returns.
+    fn ext1t(&mut self, inst: u32, ty: u32, a: u32) -> u32 {
         let id = self.m.id();
-        self.ins(op::EXT_INST, self.t_f32, id, &[self.ext, inst, a]);
+        self.ins(op::EXT_INST, ty, id, &[self.ext, inst, a]);
         id
     }
 
@@ -2683,25 +2690,28 @@ impl<'a> Emitter<'a> {
                     .strip_prefix("s_cmp_")
                     .and_then(|s| s.split_once('_'))
                     .ok_or(Gap("a compare name this emitter does not know"))?;
-                let pred = int_pred(kind, int == "i32")
-                    .ok_or(Gap("a compare kind this emitter does not know"))?;
-                let unsigned = matches!(
-                    pred,
-                    op::U_GREATER_THAN
-                        | op::U_GREATER_THAN_EQUAL
-                        | op::U_LESS_THAN
-                        | op::U_LESS_THAN_EQUAL
-                );
-                let (a, b) = if unsigned {
-                    (self.as_u32(a), self.as_u32(b))
-                } else if kind != "eq" && kind != "ne" && kind != "lg" && int == "i32" {
-                    (self.as_s32(a), self.as_s32(b))
+                self.scc_compare(kind, int, a, b)
+            }
+            // SOPK's compare: one register source (the word's `dst` field, as
+            // SOPK is decoded) and the immediate, sign-extended in the `_i32`
+            // forms.
+            "s_cmpk_eq_u32" | "s_cmpk_lg_u32" | "s_cmpk_lt_u32" | "s_cmpk_le_u32"
+            | "s_cmpk_gt_u32" | "s_cmpk_ge_u32" | "s_cmpk_eq_i32" | "s_cmpk_lg_i32"
+            | "s_cmpk_lt_i32" | "s_cmpk_le_i32" | "s_cmpk_gt_i32" | "s_cmpk_ge_i32" => {
+                let sop = self.sop(i)?;
+                let a = self.src32(&sop.src[0])?;
+                let imm = sop.imm.ok_or(Gap("a compare without an immediate"))?;
+                let (kind, int) = name
+                    .strip_prefix("s_cmpk_")
+                    .and_then(|s| s.split_once('_'))
+                    .ok_or(Gap("a compare name this emitter does not know"))?;
+                let k = if int == "i32" {
+                    i32::from(imm as i16) as u32
                 } else {
-                    (a, b)
+                    u32::from(imm)
                 };
-                let c = self.cmp(pred, a, b);
-                self.store_scc(c);
-                Ok(())
+                let b = self.c32(k);
+                self.scc_compare(kind, int, a, b)
             }
             "s_addk_i32" | "s_mulk_i32" => {
                 let sop = self.sop(i)?;
@@ -2802,6 +2812,29 @@ impl<'a> Emitter<'a> {
         let v = self.src32(&s.src[0])?;
         let r = self.un(opcode, self.t_i32, v);
         self.wdst(&s.dst.ok_or(Gap("an operation without a destination"))?, r)
+    }
+
+    /// SCC = `a` <pred> `b`: the shared body of `s_cmp_*` and `s_cmpk_*`.
+    fn scc_compare(&mut self, kind: &str, int: &str, a: u32, b: u32) -> R<()> {
+        let pred =
+            int_pred(kind, int == "i32").ok_or(Gap("a compare kind this emitter does not know"))?;
+        let unsigned = matches!(
+            pred,
+            op::U_GREATER_THAN
+                | op::U_GREATER_THAN_EQUAL
+                | op::U_LESS_THAN
+                | op::U_LESS_THAN_EQUAL
+        );
+        let (a, b) = if unsigned {
+            (self.as_u32(a), self.as_u32(b))
+        } else if kind != "eq" && kind != "ne" && kind != "lg" && int == "i32" {
+            (self.as_s32(a), self.as_s32(b))
+        } else {
+            (a, b)
+        };
+        let c = self.cmp(pred, a, b);
+        self.store_scc(c);
+        Ok(())
     }
 
     fn sop2(&mut self, i: &Inst, opcode: u16) -> R<()> {
@@ -3315,6 +3348,32 @@ impl<'a> Emitter<'a> {
                 let t = self.minmax(smin, hi, c);
                 let r = self.minmax(smax, lo, t);
                 self.wdst(&v.dst.ok_or(Gap("a median without a destination"))?, r)
+            }
+            "v_min3_u32" => {
+                let (a, b, c) = self.src3(&v)?;
+                let lo = self.minmax(glsl::UMIN, a, b);
+                let r = self.minmax(glsl::UMIN, lo, c);
+                self.wdst(&v.dst.ok_or(Gap("a min without a destination"))?, r)
+            }
+            "v_max3_u32" => {
+                let (a, b, c) = self.src3(&v)?;
+                let hi = self.minmax(glsl::UMAX, a, b);
+                let r = self.minmax(glsl::UMAX, hi, c);
+                self.wdst(&v.dst.ok_or(Gap("a max without a destination"))?, r)
+            }
+            // First set bit, low end for the unsigned form and high end for
+            // the signed one (which looks at the operand's sign bit).
+            "v_ffbl_b32" => {
+                let a = self.src32(&v.src[0])?;
+                let i = self.as_s32(a);
+                let r = self.ext1t(glsl::FIND_I_LSB, self.t_i32, i);
+                self.wdst(&v.dst.ok_or(Gap("a find without a destination"))?, r)
+            }
+            "v_ffbh_i32" => {
+                let a = self.src32(&v.src[0])?;
+                let i = self.as_s32(a);
+                let r = self.ext1t(glsl::FIND_S_MSB, self.t_i32, i);
+                self.wdst(&v.dst.ok_or(Gap("a find without a destination"))?, r)
             }
             "v_min_u32" => self.iv_ext2(&v, glsl::UMIN),
             "v_max_u32" => self.iv_ext2(&v, glsl::UMAX),

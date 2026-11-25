@@ -573,3 +573,77 @@ fn an_image_sample_binds_a_sampled_image() {
     assert_eq!(images, 1, "{m:08x?}");
 }
 
+
+// ---- the long tail added on the unified core --------------------------------
+
+/// SOPK `s_cmpk_*`: one register source and the immediate, sign-extended in
+/// the `_i32` forms (the word holds 16 bits).
+const fn cmpk(op: u32, sdst: u8, imm: u16) -> u32 {
+    0xB000_0000 | op << 23 | (sdst as u32) << 16 | imm as u32
+}
+
+#[test]
+fn the_hand_built_sopk_and_tail_words_decode() {
+    assert_eq!(
+        names(&[cmpk(0x005, 2, 0xFFFE), S_ENDPGM]),
+        ["s_cmpk_gt_i32", "s_endpgm"]
+    );
+    assert_eq!(
+        names(&[cmpk(0x004, 2, 3), S_ENDPGM]),
+        ["s_cmpk_lg_i32", "s_endpgm"]
+    );
+    let min3 = vop3(0x153, 0, [V0 + 1, V0 + 2, V0 + 3], 0, 0);
+    assert_eq!(names(&[min3[0], min3[1], S_ENDPGM]), ["v_min3_u32", "s_endpgm"]);
+}
+
+/// `s_cmpk_gt_i32 s2, -2` compares against the sign-extended immediate, not
+/// against 0xfffe read as unsigned (which would flip the result).
+#[test]
+fn a_sopk_compare_sign_extends_its_immediate() {
+    let m = module(&[cmpk(0x005, 2, 0xFFFE), S_ENDPGM]);
+    // SCC = s2 > -2, so the compare is the signed one...
+    let signed = instructions(&m)
+        .into_iter()
+        .filter(|(op, _)| *op == 173) // OpSGreaterThan
+        .count();
+    assert_eq!(signed, 1, "not a signed compare: {m:08x?}");
+    // ...and its second operand is the constant 0xfffffffe.
+    let constants: Vec<u32> = instructions(&m)
+        .into_iter()
+        .filter(|(op, ops)| *op == 43 && ops.len() == 3)
+        .map(|(_, ops)| ops[2])
+        .collect();
+    assert!(
+        constants.contains(&0xFFFF_FFFE),
+        "the immediate is not sign-extended: {constants:08x?}"
+    );
+}
+
+/// `v_min3_u32`: the smallest of three unsigned integers, as two
+/// `UMin` instructions.
+#[test]
+fn a_minimum_of_three_integers() {
+    let w = vop3(0x153, 0, [V0 + 1, V0 + 2, V0 + 3], 0, 0);
+    let m = module(&[w[0], w[1], S_ENDPGM]);
+    let umins = instructions(&m)
+        .into_iter()
+        .filter(|(op, ops)| *op == EXT_INST && ops.len() >= 4 && ops[3] == 38)
+        .count();
+    assert_eq!(umins, 2, "not a minimum of three: {m:08x?}");
+}
+
+/// `v_ffbl_b32` and `v_ffbh_i32` are GLSL `FindILsb`/`FindSMsb`: the bit
+/// position, -1 for a zero (or all-ones) input, no capability needed.
+#[test]
+fn the_vector_bit_searches_use_the_glsl_ext() {
+    for (op, ext) in [(0x03au32, 73u32), (0x03b, 75)] {
+        // VOP1 `v_ffb*_b32 v0, v1`
+        let word = 0x7E00_0000 | op << 9 | 1 << 17 | u32::from(V0);
+        let m = module(&[word, S_ENDPGM]);
+        let found = instructions(&m)
+            .into_iter()
+            .filter(|(o, ops)| *o == EXT_INST && ops.len() >= 4 && ops[3] == ext)
+            .count();
+        assert_eq!(found, 1, "no ext {ext} for VOP1 {op:#05x}: {m:08x?}");
+    }
+}
