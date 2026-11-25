@@ -166,11 +166,14 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         start(p, REQUESTED);
         wait(p, crate::frame::current());
-        if p.made.get().is_none() {
-            dropped(p);
-        }
     }
-    let made = p.made.get()?.as_ref();
+    // One observation of it for both the drop report and the answer: a worker
+    // may finish between two reads, and a finished pipeline is not dropped.
+    let made = p.made.get();
+    if made.is_none() {
+        dropped(p);
+    }
+    let made = made?.as_ref();
     // What it is made from, for the next start's warm-up (only one that has
     // a host pipeline: the list names pipelines to build).
     if made.is_some() && !p.warmed.swap(true, Ordering::Relaxed) {
