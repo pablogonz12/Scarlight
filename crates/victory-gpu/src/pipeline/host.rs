@@ -1459,15 +1459,14 @@ mod tests {
 
         // WARP reports depth bounds support through `D3D12_FEATURE_D3D12_OPTIONS2`
         // and then draws through the bounds: check that the host applies what it
-        // reports before holding it to the assertions below (the probe is the
+        // reports before holding it to the assertion below (the probe is the
         // rejection case itself, so nothing is weakened where the feature works).
-        if run_draw(0.9, 1.0) != 0 {
-            eprintln!(
-                "host reports depth bounds support but draws through the bounds; skipped"
-            );
+        let rejected = run_draw(0.9, 1.0);
+        if rejected != 0 {
+            eprintln!("host reports depth bounds support but draws through the bounds; skipped");
             return;
         }
-        assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
+        assert_eq!(rejected, 0, "depth 0.5 outside [0.9, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
     }
 }
