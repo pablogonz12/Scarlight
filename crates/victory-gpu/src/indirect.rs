@@ -618,20 +618,54 @@ void main() {
     }
 
     /// The compare of copies in the card's memory (`crate::host`), on the
-    /// software adapter. Told 1 it flags the pieces whose bytes are not
-    /// what was hashed last and leaves the hashes: a piece a shader changed
-    /// and a later one changed back then looks untouched, which is right
-    /// only if the piece was fetched after both. Told 2 (submissions sent
-    /// ahead with the relay, whose pieces are fetched flight by flight) it
-    /// stores the hash it made: each compare flags what changed since the
-    /// compare before it, also a change back.
+    /// software adapter, in both forms of its hash: a thread to a piece
+    /// ([`crate::host::CARD_COMPARE`]) and a group of 64 to a piece
+    /// ([`crate::host::CARD_COMPARE_WIDE`], `VICTORY_CARD_HASH_WIDE`). Told 1
+    /// it flags the pieces whose bytes are not what was hashed last and
+    /// leaves the hashes: a piece a shader changed and a later one changed
+    /// back then looks untouched, which is right only if the piece was
+    /// fetched after both. Told 2 (submissions sent ahead with the relay,
+    /// whose pieces are fetched flight by flight) it stores the hash it
+    /// made: each compare flags what changed since the compare before it,
+    /// also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
         let _once = crate::warptest::lock();
+        for (source, wide) in [(crate::host::CARD_COMPARE, false), (crate::host::CARD_COMPARE_WIDE, true)] {
+            card_compare_modes(source, wide);
+        }
+    }
+
+    /// Both forms of the compare compile for the host (`cs_5_1`, with the
+    /// root signature they ask for): the software adapter's test below runs
+    /// the bytes, and this catches a source that no host would take before
+    /// any of it is needed (a host without a software adapter on Wine has
+    /// no test of the bytes themselves).
+    #[test]
+    fn card_compare_sources_compile() {
+        for source in [crate::host::CARD_COMPARE, crate::host::CARD_COMPARE_WIDE] {
+            let bytes = compile(source, "main", "cs_5_1").expect("the card compare must compile");
+            assert!(bytes.len() > 4);
+        }
+    }
+
+    /// A compare pass is one group to a piece when a piece has a group of
+    /// its own, and the pieces a group of 64 threads covers when not.
+    #[test]
+    fn card_compare_dispatches_one_group_a_piece_when_wide() {
+        for pieces in [0u32, 1, 2, 63, 64, 65, 1000, 16_385] {
+            assert_eq!(crate::host::card_compare_groups(pieces, true), pieces);
+            assert_eq!(crate::host::card_compare_groups(pieces, false), pieces.div_ceil(64));
+        }
+    }
+
+    /// [`warp_card_compare_stores_the_hash_it_made_when_told`] for one form
+    /// of the hash.
+    fn card_compare_modes(source: &str, wide: bool) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        let compare = compile_cs(&warp.device, source).expect("the card compare must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
@@ -641,9 +675,10 @@ void main() {
         let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
         // SAFETY: the mapping holds `size` bytes.
         unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
-        // One pass over the three pieces; what it left in `differs` (7s
-        // where it stored nothing).
-        let run = |warp: &mut WarpHarness, mode: u32| -> [u32; 3] {
+        // One pass over `pieces` pieces from the `first` one, the copy
+        // starting `skew` bytes into its piece 0; what it left in `differs`
+        // (7s where it stored nothing).
+        let run_with = |warp: &mut WarpHarness, mode: u32, (first, skew, pieces): (u32, u32, u32)| -> [u32; 3] {
             // SAFETY: our open list, live buffers, the compare's own root
             // signature; the mappings hold what is read and written.
             unsafe {
@@ -652,17 +687,18 @@ void main() {
                 }
                 warp.list.SetComputeRootSignature(&compare.root);
                 warp.list.SetPipelineState(&compare.pso);
-                let constants = [0u32, 0, size as u32, PIECES, 0, mode];
+                let constants = [first, skew, size as u32, pieces, 0, mode];
                 warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list.Dispatch(crate::host::card_compare_groups(pieces, wide), 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
             [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
         };
+        let run = |warp: &mut WarpHarness, mode: u32| run_with(warp, mode, (0, 0, PIECES));
         let at = PIECE + 1234;
         // SAFETY (each): inside the mapping.
         let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
@@ -685,6 +721,32 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        // A byte anywhere in the piece, the first and the last ones
+        // included: flagged in this piece alone, in both forms (a group of
+        // 64 threads hashes steps t, t + 64... and folds them in order; a
+        // step nobody hashed is a byte nobody saw).
+        for offset in [0usize, 15, 16, 4096, PIECE - 1] {
+            let at = PIECE + offset;
+            let old = content[at];
+            // SAFETY: inside the mapping.
+            unsafe { now_ptr.add(at).write_volatile(old ^ 0x40) };
+            assert_eq!(run(&mut warp, 2), [0, 1, 0], "offset {offset}");
+            unsafe { now_ptr.add(at).write_volatile(old) };
+            assert_eq!(run(&mut warp, 2), [0, 1, 0], "offset {offset}, changed back");
+        }
+        // A copy that does not start on a piece boundary, hashed from a span
+        // that does not start at its piece 0.
+        const SKEW: u32 = 1000;
+        let run_skewed = |warp: &mut WarpHarness, mode: u32| run_with(warp, mode, (1, SKEW, 2));
+        assert_eq!(run_skewed(&mut warp, 0), [7, 7, 7]);
+        assert_eq!(run_skewed(&mut warp, 1), [0, 0, 0]);
+        let skewed = 2 * PIECE + 5000;
+        // SAFETY: inside the mapping.
+        unsafe { now_ptr.add(skewed).write_volatile(content[skewed] ^ 0x10) };
+        assert_eq!(run_skewed(&mut warp, 2), [0, 1, 0]);
+        assert_eq!(run_skewed(&mut warp, 2), [0, 0, 0]);
+        unsafe { now_ptr.add(skewed).write_volatile(content[skewed]) };
+        assert_eq!(run_skewed(&mut warp, 2), [0, 1, 0]);
     }
 
     /// The last record's span is its payload: a tight title buffer asks for

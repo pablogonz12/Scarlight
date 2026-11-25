@@ -43,6 +43,10 @@ BlueKaiman, kais7654, pushkarreddyy, shh.
   GPL-3.0: narrowing a host shader resource view of a streamed texture to the mips whose memory is
   there, and remaking it when more levels arrive or a host copy fills the chain
   (`crates/victory-gpu/src/texture.rs`, `crates/victory-gpu/src/descriptor/host.rs`).
+- **fxceless/victory-fork [#1014](https://github.com/fxceless/victory-fork/pull/1014)** (Martin Hartfelder),
+  GPL-3.0: a group of 64 threads to a 64 KiB piece in the card compare's hash, thread `t` hashing steps `t`,
+  `t + 64`... of the piece and the first thread folding the lanes in order, instead of one thread walking the
+  piece 16 bytes at a time (`crates/victory-gpu/src/host.rs`, `VICTORY_CARD_HASH_WIDE`).
 
 ## Tools
 
