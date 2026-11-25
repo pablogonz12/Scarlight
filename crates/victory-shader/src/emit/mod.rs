@@ -1175,6 +1175,17 @@ mod tests {
         stores_v1(&[0x7E04_028B, 0xDACC_0000, 0x0100_0200]).unwrap();
     }
 
+    /// `ds_permute_b32` (the forward permute) stopped as "ds_permute_b32":
+    /// it was not translated on any host. Like `ds_bpermute_b32` it touches
+    /// no LDS: each lane sends its data to the lane its address names in its
+    /// own 32-lane half (RDNA ISA 10.4.4, 12.13), so it needs no exchange
+    /// and no wave size of its own.
+    #[test]
+    fn a_forward_permute_sends_the_lane_its_address_names() {
+        // v_mov_b32 v2, 11; ds_permute_b32 v1, v0, v2
+        stores_v1(&[0x7E04_028B, 0xDAC8_0000, 0x0001_0200]).unwrap();
+    }
+
     /// A carry-in reading a join of compares after a divergent branch. A
     /// lane that skipped the inner compare has VCC clear there (VOPC clears
     /// inactive lanes), not the first compare's bit, so the join is no
