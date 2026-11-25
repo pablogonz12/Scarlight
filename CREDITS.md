@@ -148,6 +148,11 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   `crates/victory-shader/src/dxbc.rs`; `Source::bytes()` for both the raw and the `SGD5` paths,
   `apps/victory/src/shader.rs`). Reimplemented on this tree's `victory translate`, which has no `warm` command.
 
+- **Marvisak/VIctory [`8ff791351`](https://github.com/Marvisak/VIctory/commit/8ff791351)** (Marvis),
+  GPL-3.0: a rectangle list's fourth corner is completed opposite the right angle, wherever the three
+  corners put it. This tree's geometry stage (`emit::rect_list_gs`) already finds the corner in any order; the
+  rule is now in the CPU expansion too (`right_angle`, `right_corners` in `crates/victory-gpu/src/primitive.rs`).
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
@@ -164,3 +169,7 @@ Missing or wrong name? Open an issue.
   a page the title maps at more than one address, where a guard at one address can be written through another: the
   guarded blocks of the views beside it are given back to write together, under the one look
   (`crates/victory-gpu/src/watch.rs`, `VICTORY_GUARD_ALIASES=0`).
+- **avatarmanz/VIctory-7900XTX [17c4717b](https://github.com/avatarmanz/VIctory-7900XTX/commit/17c4717b4)**
+  (after fxceless/victory-fork [c36971b2](https://github.com/fxceless/victory-fork/commit/c36971b2)), GPL-3.0:
+  `VICTORY_CARD_BUFFERS_MIN_KB`, so that title buffers' copies under the MiB floor can go into the card's memory
+  (unset: the floor of before) (`crates/victory-gpu/src/shadow.rs`).
