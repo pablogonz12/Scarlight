@@ -99,6 +99,12 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   another's ticks under it when `cargo test` runs the crate's tests in parallel.
 - **AnyPS5** ([boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5)): the format of the
   source-counted progress page (reference instruction forms, history chart). No code taken.
+- **HUMAN** ([HumanlyDev/HUMAN](https://github.com/HumanlyDev/HUMAN)) by HumanlyDev and bdycounter-sudo,
+  GPL-3.0-or-later: the pass that draws a depth plane's twin into the plane runs inline, in the list that
+  wrote the twin (and that list replays the title's state after it), so a depth test in the same list sees
+  what the shaders wrote (`crates/victory-gpu/src/host.rs` `twin_use`/`pass_plane`, `draw.rs` `replay`);
+  `VICTORY_PLANE_INLINE=0` waits for the list's close, as before.
+
 - **Mesa** ([aco_opcodes.py](https://gitlab.freedesktop.org/mesa/mesa)), MIT: the reference list of
   RDNA2 instruction forms in `tools/progress/rdna2_isa_forms.txt` is generated from it.
 - **Marvisak/VIctory [#2513](https://github.com/Marvisak/VIctory/pull/2513)** (Calvix2k), GPL-3.0: the idea
