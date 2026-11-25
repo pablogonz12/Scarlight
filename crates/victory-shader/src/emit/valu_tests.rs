@@ -1842,3 +1842,61 @@ fn mad_u32_u16_i32_i16_and_lerp_u8() {
         );
     });
 }
+
+/// The CPU model of the 24-bit multiplies: the 48-bit product of the low 24 bits of
+/// each operand, zero- or sign-extended; `hi` picks its high dword.
+fn mul24(a: u32, b: u32, signed: bool, hi: bool) -> u32 {
+    let ext = |x: u32| {
+        if signed {
+            i64::from(((x << 8) as i32) >> 8)
+        } else {
+            i64::from(x & 0xFF_FFFF)
+        }
+    };
+    let p = ext(a) * ext(b);
+    (if hi { p >> 32 } else { p }) as u32
+}
+
+#[test]
+fn mul24_model_follows_the_isa() {
+    assert_eq!(mul24(0xFF_FFFF, 0xFF_FFFF, false, true), 0xFFFF);
+    assert_eq!(mul24(0xFF_FFFF, 0xFF_FFFF, false, false), 0xFE00_0001);
+    // -1 * -1 = 1: the high dword is 0.
+    assert_eq!(mul24(0xFF_FFFF, 0xFF_FFFF, true, true), 0);
+    // -2^23 * 1: the high dword is all ones.
+    assert_eq!(mul24(0x80_0000, 1, true, true), u32::MAX);
+    // The top byte of each operand is ignored.
+    assert_eq!(mul24(0xAB80_0000, 0xCD80_0000, false, true), 0x4000);
+}
+
+/// `v_mul_hi_u32_u24` and `v_mul_hi_i32_i24` give the high dword of the 48-bit product
+/// whose low dword `v_mul_u32_u24`/`v_mul_i32_i24` give.
+#[test]
+fn mul_hi_24_bit_products() {
+    let inputs: Vec<[u32; 4]> = [
+        (0, 0),
+        (0xFF_FFFF, 0xFF_FFFF),
+        (0x80_0000, 0x80_0000),
+        (0x80_0000, 1),
+        (0x7F_FFFF, 0x80_0001),
+        (0xFF12_3456, 0x00AB_CDEF),
+        (0x1234_5678, 0x9ABC_DEF0),
+    ]
+    .iter()
+    .map(|&(a, b)| [a, b, 0, 0])
+    .collect();
+    // VOP2 `op v0, v1, v2`.
+    for (op, signed, what) in [
+        (0x0A, true, "v_mul_hi_i32_i24"),
+        (0x0C, false, "v_mul_hi_u32_u24"),
+    ] {
+        let shader = build_valu_cs(&[vop2(op, 0, vgpr(1), 2)]);
+        run_cases(&shader, &inputs, |backend, i, x, got| {
+            let want = mul24(x[0], x[1], signed, true);
+            assert_eq!(
+                got, want,
+                "{backend}: {what} case {i}: {got:#010x}, want {want:#010x}"
+            );
+        });
+    }
+}

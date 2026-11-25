@@ -483,6 +483,9 @@
     // The 16-bit multiply-add and lerp tests, in their own file as well.
     #[path = "lower/tests/mad_u16_lerp.rs"]
     mod mad_u16_lerp;
+    // The 24-bit high multiply tests, likewise.
+    #[path = "lower/tests/mul24_hi.rs"]
+    mod mul24_hi;
 
     /// Tables of 2D textures at s0 and samplers at s1.
     fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
