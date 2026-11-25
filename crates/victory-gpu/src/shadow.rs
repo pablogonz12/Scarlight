@@ -2175,6 +2175,11 @@ impl Shadow {
                 if !crate::host::read_into((start + at) as *const u8, title) {
                     continue;
                 }
+                // Read again after the read: a write may have taken the block
+                // meanwhile, and its bytes are newer than ours.
+                if crate::watch::given_over(start + at) {
+                    continue;
+                }
                 // Title memory with the GPU's bytes put in; the copy takes
                 // the title's bytes in turn.
                 // Without a branch, so the loop runs many bytes at a time:
