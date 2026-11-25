@@ -101,9 +101,13 @@ unsafe extern "system" fn exit(code: u32) -> ! {
     // Parking keeps what the driver and vkd3d-proton held, but the parked
     // thread never unwinds: with `VICTORY_LIBRARY_LOCK=1` and the library's
     // one-call lock held, that would keep the lock for the rest of the run,
-    // so it exits. A crash outside the lock (a creation) parks as before;
-    // the name it held is let go by `library::abandon`.
-    if !super::make::worker_lost() || super::library::calling() {
+    // so it exits; likewise while it holds the library's store guard, which
+    // every later save waits on. A crash outside both (a creation) parks as
+    // before; the name it held is let go by `library::abandon`.
+    if !super::make::worker_lost()
+        || super::library::calling()
+        || super::library::storing_now()
+    {
         // SAFETY: what the caller asked for.
         unsafe { ExitProcess(code) }
     }

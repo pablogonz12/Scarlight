@@ -502,6 +502,34 @@ pub(super) fn calling() -> bool {
     CALLING.try_with(|c| c.get()).unwrap_or(false)
 }
 
+thread_local! {
+    /// Whether this thread holds the library's store guard now: a driver
+    /// crash in `StorePipeline` would park with it, and every later `save`
+    /// would wait on the save lock for the rest of the run.
+    static STORING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The library's store guard for one store call, held: clears the thread's
+/// mark when let go.
+struct Storing(#[expect(dead_code, reason = "held for its Drop: it keeps the store alone")] std::sync::RwLockReadGuard<'static, ()>);
+
+impl Drop for Storing {
+    fn drop(&mut self) {
+        let _ = STORING.try_with(|s| s.set(false));
+    }
+}
+
+fn storing(library: &'static Library) -> Storing {
+    let held = library.saving.read().unwrap_or_else(|e| e.into_inner());
+    let _ = STORING.try_with(|s| s.set(true));
+    Storing(held)
+}
+
+/// Whether this thread holds the library's store guard now.
+pub(super) fn storing_now() -> bool {
+    STORING.try_with(|s| s.get()).unwrap_or(false)
+}
+
 const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// A saved library that could not replace [`LIBRARY_FILE`] while this run
 /// had it mapped (a system that refuses to replace a mapped file): the next
@@ -679,7 +707,7 @@ pub(crate) fn pipeline(
         )
     });
     let _all = one_call();
-    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+    let _stores = storing(library);
     let _call = call("store", name);
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
