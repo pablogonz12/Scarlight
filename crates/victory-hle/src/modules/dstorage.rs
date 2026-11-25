@@ -220,11 +220,15 @@ extern "system" fn create_queue(
 /// queues are all from memory, and 16, 20, 24, 28 and 32 MiB.
 const STAGING_SIZES: [u32; 6] = [0, 16 << 20, 20 << 20, 24 << 20, 28 << 20, 32 << 20];
 
-/// The capacity `size` asks for, if the console has it; `None` for any other
-/// size, which leaves the scheduler's as it is.
-fn staging_capacity(size: u32) -> Option<u64> {
-    (STAGING_SIZES.contains(&size) || !staging_checked()).then_some(u64::from(size))
+/// The capacity `size` asks for, if the console has it or `checked` is off;
+/// `None` for any other size, which leaves the scheduler's as it is.
+fn staging_capacity(size: u32, checked: bool) -> Option<u64> {
+    (STAGING_SIZES.contains(&size) || !checked).then_some(u64::from(size))
 }
+
+/// Whether the refusal of a size outside [`STAGING_SIZES`] is already logged:
+/// a title that asks many times fills the log with one line otherwise.
+static REFUSAL_LOGGED: std::sync::Once = std::sync::Once::new();
 
 /// Whether a size outside [`STAGING_SIZES`] is refused: on by default,
 /// `VICTORY_DSTORAGE_STAGING_CHECK=0` takes any size and copies it, as this
@@ -243,8 +247,10 @@ fn staging_checked() -> bool {
 /// code.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     tracing::info!(size, "dstorage: staging buffer size");
-    let Some(capacity) = staging_capacity(size) else {
-        tracing::warn!(size, "dstorage: a staging buffer size the console has none of");
+    let Some(capacity) = staging_capacity(size, staging_checked()) else {
+        REFUSAL_LOGGED.call_once(|| {
+            tracing::warn!(size, "dstorage: a staging buffer size the console has none of");
+        });
         return E_INVALIDARG;
     };
     if let Some(scheduler) = scheduler() {
@@ -1663,7 +1669,11 @@ mod tests {
     #[test]
     fn staging_buffer_sizes_the_console_has_none_of_are_refused() {
         for size in [0, 16 << 20, 20 << 20, 24 << 20, 28 << 20, 32 << 20] {
-            assert_eq!(staging_capacity(size), Some(u64::from(size)), "{size}");
+            assert_eq!(
+                staging_capacity(size, true),
+                Some(u64::from(size)),
+                "{size}"
+            );
         }
         for size in [
             1,
@@ -1676,13 +1686,23 @@ mod tests {
             64 << 20,
             u32::MAX,
         ] {
-            assert_eq!(staging_capacity(size), None, "{size}");
+            assert_eq!(staging_capacity(size, true), None, "{size}");
         }
-        // Through the factory method: refused, and the capacity kept.
-        let before = scheduler()
-            .expect("no scheduler")
-            .lock()
-            .staging;
+        // With the check off, any size is taken, as this module did before.
+        for size in [1, 8 << 20, (20 << 20) + 1, u32::MAX] {
+            assert_eq!(staging_capacity(size, false), Some(u64::from(size)), "{size}");
+        }
+    }
+
+    /// Through the factory method, a refused size keeps the capacity the
+    /// scheduler has (the process-wide setting is whatever the test's
+    /// environment holds, so the refusal is checked only where it is on).
+    #[test]
+    fn a_refused_size_keeps_the_capacity_the_scheduler_has() {
+        if !staging_checked() {
+            return;
+        }
+        let before = scheduler().expect("no scheduler").lock().staging;
         assert_eq!(
             set_staging_buffer_size(std::ptr::null(), (20 << 20) + 1),
             E_INVALIDARG
