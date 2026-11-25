@@ -157,6 +157,7 @@ groupshared uint single_run;
 uint compute_clamped(uint kind, uint src_at, out uint2 draw_counts, out uint3 groups) {
     draw_counts = uint2(0, 0);
     groups = uint3(0, 0, 0);
+    [branch]
     if (kind <= 1) {
         uint count = min(src_args.Load(src_at), 1u << 24);
         uint instances = min(src_args.Load(src_at + 4), (1u << 26) / max(count, 1u));
@@ -164,8 +165,10 @@ uint compute_clamped(uint kind, uint src_at, out uint2 draw_counts, out uint3 gr
         return count * instances;
     } else if (kind == 2) {
         uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
-            g = uint3(0, 0, 0);
+        if (g.z != 0) {
+            if (g.x * g.y > GROUPS / max(g.z, 1u)) {
+                g = uint3(0, 0, 0);
+            }
         }
         groups = g;
         return g.x * g.y * g.z * 64u;
@@ -208,14 +211,26 @@ void main(uint lane : SV_GroupIndex) {
     uint end = first_job + job_count;
     while (j < end) {
         // Fast path: clamp up to 64 consecutive single-record jobs in one wave.
-        bool has_job = (j + lane < end);
-        uint4 j0 = has_job ? jobs.Load4((j + lane) * 32) : uint4(0, 0, 0, 0);
-        uint4 j1 = has_job ? jobs.Load4((j + lane) * 32 + 16) : uint4(0, 0, 0, 0);
+        // Guard root-SRV loads with `[branch]` so inactive tail lanes never
+        // load past the end of `jobs` (root descriptors have no HW bounds check).
+        uint4 j0 = uint4(0, 0, 0, 0);
+        uint4 j1 = uint4(0, 0, 0, 0);
+        [branch]
+        if (j + lane < end) {
+            j0 = jobs.Load4((j + lane) * 32);
+            j1 = jobs.Load4((j + lane) * 32 + 16);
+        }
         costs[lane] = j0.z;
         GroupMemoryBarrierWithGroupSync();
         if (lane == 0) {
             uint run = 0;
-            while (run < 64 && costs[run] == 1) {
+            // Avoid `&&` here: FXC evaluates both sides, which would read
+            // `costs[64]` past the 64-element groupshared array.
+            [loop]
+            while (run < 64) {
+                if (costs[run] != 1) {
+                    break;
+                }
                 run++;
             }
             single_run = run;
@@ -226,6 +241,7 @@ void main(uint lane : SV_GroupIndex) {
             uint cost = 0;
             uint2 draw_counts = uint2(0, 0);
             uint3 groups = uint3(0, 0, 0);
+            [branch]
             if (lane < run) {
                 cost = compute_clamped(j0.x, j0.w, draw_counts, groups);
             }
@@ -242,6 +258,7 @@ void main(uint lane : SV_GroupIndex) {
                 }
             }
             GroupMemoryBarrierWithGroupSync();
+            [branch]
             if (lane < run) {
                 write_record(j0.x, j0.y, j0.w, j1.x, costs[lane] == PAST, draw_counts, groups);
             }
@@ -257,6 +274,7 @@ void main(uint lane : SV_GroupIndex) {
                 uint cost = 0;
                 uint2 draw_counts = uint2(0, 0);
                 uint3 groups = uint3(0, 0, 0);
+                [branch]
                 if (record < m0.z) {
                     cost = compute_clamped(m0.x, src_at, draw_counts, groups);
                 }
@@ -273,6 +291,7 @@ void main(uint lane : SV_GroupIndex) {
                     }
                 }
                 GroupMemoryBarrierWithGroupSync();
+                [branch]
                 if (record < m0.z) {
                     write_record(m0.x, m0.y, src_at, dst_at, costs[lane] == PAST, draw_counts, groups);
                 }
@@ -399,6 +418,7 @@ pub(crate) struct HoistedClamps {
     hoistable: bool,
     restored: bool,
     jobs: Vec<Job>,
+    payload: Vec<[u32; 8]>,
     upload: Option<JobUpload>,
     chunks: Vec<ID3D12Resource>,
     used: usize,
@@ -415,6 +435,7 @@ impl Default for HoistedClamps {
             hoistable: true,
             restored: false,
             jobs: Vec::new(),
+            payload: Vec::new(),
             upload: None,
             chunks: Vec::new(),
             used: 0,
@@ -429,6 +450,7 @@ impl HoistedClamps {
         self.hoistable = true;
         self.restored = false;
         self.jobs.clear();
+        self.payload.clear();
         self.used = 0;
         self.at = 0;
         self.kept.clear();
@@ -509,12 +531,14 @@ impl HoistedClamps {
         crate::host::name(&buffer, || format!("hoisted clamp jobs ({capacity})"));
         // SAFETY: a live upload buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        if let Some(old) = &self.upload
-            && !self.jobs.is_empty()
-        {
-            // SAFETY: both mappings are valid for `self.jobs.len() * 32` bytes and disjoint.
+        if self.upload.is_some() && !self.payload.is_empty() {
+            // SAFETY: `data` has room for `capacity >= self.payload.len()` 32-byte jobs.
             unsafe {
-                std::ptr::copy_nonoverlapping(old.mapped as *const u8, data, self.jobs.len() * 32);
+                std::ptr::copy_nonoverlapping(
+                    self.payload.as_ptr().cast::<u8>(),
+                    data,
+                    self.payload.len() * 32,
+                );
             }
         }
         self.upload = Some(JobUpload {
@@ -557,6 +581,7 @@ impl HoistedClamps {
                 (u.mapped as *mut [u32; 8]).add(slot).write(words);
             }
         }
+        self.payload.push(words);
         self.jobs.push(Job { src_gpu, dst_gpu });
         Some((dst, dst_at))
     }
@@ -627,7 +652,10 @@ impl HoistedClamps {
                     run_end += 1;
                 }
                 if run_start > 0 {
-                    prelude.ResourceBarrier(&[uav_barrier_of(Some(budget_resource))]);
+                    // Full UAV barrier between runs: keeps both `budget` and
+                    // adjacent 16-byte-aligned slices of the same scratch
+                    // chunk coherent on wide-cache-line GPUs.
+                    prelude.ResourceBarrier(&[uav_barrier_of(None)]);
                 }
                 let constants = [run_start as u32, (run_end - run_start) as u32, 0, 0];
                 prelude.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
