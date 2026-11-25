@@ -93,10 +93,19 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   refresh of a mostly clean view heap walks only its dirty gaps instead of collecting one entry per 64 KiB
   block under the guard mutex; the per-block set it replaces is the test's reference.
 
+- **DexNom/VIctory [4775e8aaf](https://github.com/DexNom/VIctory/commit/4775e8aaf0f45c316807d26202efb369f40ceea0)**,
+  GPL-3.0: one lock serializing the tests that set the global frame clock or read it across a wait
+  (`TEST_FRAME_LOCK`, `crates/victory-gpu/src/frame.rs`), so a test that retimes the clock cannot move
+  another's ticks under it when `cargo test` runs the crate's tests in parallel.
 - **AnyPS5** ([boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5)): the format of the
   source-counted progress page (reference instruction forms, history chart). No code taken.
 - **Mesa** ([aco_opcodes.py](https://gitlab.freedesktop.org/mesa/mesa)), MIT: the reference list of
   RDNA2 instruction forms in `tools/progress/rdna2_isa_forms.txt` is generated from it.
+- **Marvisak/VIctory [#2513](https://github.com/Marvisak/VIctory/pull/2513)** (Calvix2k), GPL-3.0: the idea
+  that a copy-back brings a declared range's snapshot in step with the bytes it takes from title memory, so that a
+  later overlapping range does not put the copy's older bytes back over a title write (`merge_back` in
+  `crates/victory-gpu/src/shadow.rs`). Reimplemented: theirs changes `copy_back_marked`, which this tree has no
+  equivalent of (its `copy_back` merges into the copy and keeps one snapshot per submission).
 
 - **Marvisak/VIctory [#2163](https://github.com/Marvisak/VIctory/pull/2163)** (0xkn0wh3r3), GPL-3.0: the
   built-in BCPack table's first BC7 dictionary entry has its 32 indices right after its width bytes, where
