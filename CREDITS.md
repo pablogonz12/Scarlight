@@ -147,3 +147,14 @@ Missing or wrong name? Open an issue.
   enables blending on one, so those targets are made to write unblended, per target and with independent
   blending turned on only where it was needed (`crates/victory-gpu/src/pipeline/host.rs`,
   `VICTORY_HOST_BLEND=0`). Its host-pipeline device test used `D3DCompile`; ours checks the state itself.
+
+- **avatarmanz/VIctory-7900XTX** ([ca1d519f1](https://github.com/avatarmanz/VIctory-7900XTX/commit/ca1d519f1),
+  [44629de2e](https://github.com/avatarmanz/VIctory-7900XTX/commit/44629de2e), and the four commits beside them),
+  GPL-3.0, after ZJOU acf478b8 and Belobug 92d353f8, 84ea9c12, dd799aad and 76387c2d (romainhedouin): per-frame CPU
+  work taken off the submitting thread — render targets compared by their views and not set again
+  (`crates/victory-gpu/src/bindcache.rs`, `VICTORY_BIND_CACHE=0`), a pipeline a list binds again neither kept nor
+  named again (`HostList::bind_pipeline`), a root constant buffer not 256-byte aligned filled into scratch memory
+  once per list (`HostList::fill_scratch`), a range shaders write declared once until the list next writes title
+  memory (`VICTORY_DECLARE_ONCE=0`), an indirect record that does not fit its list's budget taking nothing from the
+  ones after it and the frame line counting those refused (`VICTORY_INDIRECT_REST=0`), and the heaps' records copied
+  as bytes read, compared and sorted out on several threads.

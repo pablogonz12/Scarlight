@@ -15,6 +15,8 @@
 //! share, [`console`] which console model the title sees. Planned: `present`
 //! (swap chain).
 
+#[cfg(any(windows, test))]
+mod bindcache;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
