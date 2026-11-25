@@ -33,6 +33,9 @@ BlueKaiman.
 - **xcl** ([ivall/xcl](https://github.com/ivall/xcl) and its fork Bathyal), GPL-2.0-only: the
   wave-pairing approach and the NVIDIA wave lane-assignment report used in
   [docs/wave64-on-wave32.md](docs/wave64-on-wave32.md). No code taken.
+- **u/General_Pool_3859** (Reddit, r/vulkan): pinning the SPIR-V path's subgroup size to each
+  program's wave size with VK_EXT_subgroup_size_control and full subgroups
+  ([thread](https://www.reddit.com/r/vulkan/comments/1y5e5gi/)).
 
 ## Tools
 

@@ -168,7 +168,8 @@ mod decoration {
     pub const OFFSET: u32 = 35;
 }
 
-/// Capabilities the image bindings need (SPIR-V 1.6 numbering).
+/// Capabilities the image bindings and the cross-lane code need (SPIR-V 1.6
+/// numbering).
 #[allow(dead_code)]
 mod cap {
     pub const SAMPLED_1D: u32 = 43;
@@ -177,6 +178,10 @@ mod cap {
     pub const IMAGE_QUERY: u32 = 50;
     pub const STORAGE_READ_WITHOUT_FORMAT: u32 = 55;
     pub const STORAGE_WRITE_WITHOUT_FORMAT: u32 = 56;
+    /// `OpGroupNonUniform*`: cross-lane code runs on the console's own wave.
+    pub const GROUP_NON_UNIFORM: u32 = 61;
+    /// `OpGroupNonUniformShuffle`: another lane's value, DPP and lane reads.
+    pub const GROUP_NON_UNIFORM_SHUFFLE: u32 = 65;
 }
 
 mod storage {
@@ -440,7 +445,6 @@ impl SampleFlags {
 
 pub struct Emitter<'a> {
     m: M,
-    native: &'a NativeProgram,
     p: &'a Program,
     io: &'a Io,
     t_void: u32,
@@ -498,6 +502,8 @@ pub struct Emitter<'a> {
     exit: u32,
     labels: Vec<u32>,
     lds_words: u32,
+    /// The thread-group size the module declares (`LocalSize`).
+    local_size: [u32; 3],
     scope_device: u32,
     scope_workgroup: u32,
     sem_acq_rel_workgroup: u32,
@@ -520,15 +526,88 @@ pub struct Emitter<'a> {
     v4f: u32,
 }
 
+/// One compute program as a SPIR-V module, with the two facts the pipeline
+/// that runs it needs beyond the words.
+///
+/// The console runs a program's threads in waves of 32 or 64 lanes, and the
+/// program reads other lanes of its own wave (DPP, `v_readlane`, `v_mbcnt`).
+/// A host subgroup is a different wave unless it is pinned, so the module
+/// carries the console's wave size: the pipeline asks for it with
+/// `VkPipelineShaderStageRequiredSubgroupSizeCreateInfo`
+/// (`requiredSubgroupSize = wave_size`) chained onto the shader stage, sets
+/// `VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT`, and checks
+/// `VkPhysicalDeviceSubgroupSizeControlProperties` first (32..64 on RADV
+/// RDNA4). `REQUIRE_FULL_SUBGROUPS` needs `local_size[0]` to be a multiple of
+/// `wave_size` (see [`SpirvProgram::full_subgroups`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpirvProgram {
+    /// The SPIR-V words.
+    pub words: Vec<u32>,
+    /// The console's wave size, 32 or 64 (the ISA record's `wave32` flag, the
+    /// same source the DXIL path takes its `wave_size` from).
+    pub wave_size: u32,
+    /// The thread-group size (the module's `LocalSize`).
+    pub local_size: [u32; 3],
+}
+
+impl SpirvProgram {
+    /// Whether the pipeline may set `REQUIRE_FULL_SUBGROUPS`: it needs a whole
+    /// number of subgroups per group along x, which every console group size
+    /// does not give (`v_mbcnt` programs with 32 threads and 64-lane waves).
+    pub fn full_subgroups(&self) -> bool {
+        self.local_size[0].is_multiple_of(self.wave_size)
+    }
+
+    /// What a Vulkan compute pipeline has to ask for to run this program the
+    /// way the console does, for whoever creates it (see
+    /// `docs/spirv-subgroup-size.md`): the subgroup size pinned to the
+    /// program's wave size, and full subgroups where the group allows it.
+    /// A group that cannot have full subgroups gets the reason here, so the
+    /// caller reports it rather than dropping the flag quietly.
+    pub fn subgroup_plan(&self) -> SubgroupPlan {
+        let full = self.full_subgroups();
+        SubgroupPlan {
+            required_subgroup_size: self.wave_size,
+            require_full_subgroups: full,
+            no_full_subgroups: (!full).then_some(NO_FULL_SUBGROUPS_GROUP),
+        }
+    }
+}
+
+/// `REQUIRE_FULL_SUBGROUPS` is out: `local_size[0]` is not a multiple of the
+/// wave size (a 32-thread group of a 64-lane wave, say). The subgroup size is
+/// still pinned; only the flag is left off.
+pub const NO_FULL_SUBGROUPS_GROUP: &str = "local_size_x is not a multiple of the wave size";
+
+/// The pipeline's side of [`SpirvProgram::wave_size`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubgroupPlan {
+    /// `requiredSubgroupSize` for
+    /// `VkPipelineShaderStageRequiredSubgroupSizeCreateInfo`, which must be
+    /// chained onto the shader stage (with `ALLOW_VARYING` off).
+    pub required_subgroup_size: u32,
+    /// Whether `VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT` can
+    /// be set: every subgroup complete, as a console wave is.
+    pub require_full_subgroups: bool,
+    /// Why it cannot, when it cannot.
+    pub no_full_subgroups: Option<&'static str>,
+}
+
 /// Emits the SPIR-V module of a compute program.
-pub fn emit(native: &NativeProgram, p: &Program, io: &Io) -> Result<Vec<u32>, ShaderError> {
+pub fn emit(native: &NativeProgram, p: &Program, io: &Io) -> Result<SpirvProgram, ShaderError> {
     if native.stage != HwStage::Cs {
         return Err(Gap("a non-compute stage").into());
     }
     let StageIo::Cs(cs) = native.io else {
         return Err(Gap("compute code without compute stage data").into());
     };
-    let mut e = Emitter::new(native, p, io, cs.lds_bytes() / 4);
+    let local_size = [
+        cs.threads[0].max(1),
+        cs.threads[1].max(1),
+        cs.threads[2].max(1),
+    ];
+    let wave_size = wave_size(native);
+    let mut e = Emitter::new(p, io, cs.lds_bytes() / 4, local_size);
     e.build()?;
     let mut pre = std::mem::take(&mut e.m.words);
     let mut consts = std::mem::take(&mut e.consts);
@@ -537,11 +616,41 @@ pub fn emit(native: &NativeProgram, p: &Program, io: &Io) -> Result<Vec<u32>, Sh
     pre.extend_from_slice(&consts);
     pre.extend_from_slice(&e.m.words);
     e.m.words = pre;
-    Ok(e.m.finish())
+    Ok(SpirvProgram {
+        words: e.m.finish(),
+        wave_size,
+        local_size,
+    })
+}
+
+/// The console wave size the program runs with, 32 or 64: the ISA record's
+/// `wave32` flag, as [`super::Psv::wave_size`] passes it on for DXIL.
+fn wave_size(native: &NativeProgram) -> u32 {
+    if native.wave64 { 64 } else { 32 }
+}
+
+/// Whether the program reads other lanes of its wave: DPP source modifiers,
+/// lane reads and writes, `v_mbcnt`, `ds_swizzle` and `ds_(b)permute`. Those
+/// are the programs a host subgroup must line up with the console's wave for,
+/// and the ones that need the group-non-uniform capabilities declared.
+fn crosses_lanes(p: &Program) -> bool {
+    p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+        let n = i.name();
+        n.starts_with("ds_swizzle")
+            || n.contains("permute")
+            || n.starts_with("v_mbcnt")
+            || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+            || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+    })
 }
 
 impl<'a> Emitter<'a> {
-    fn new(native: &'a NativeProgram, p: &'a Program, io: &'a Io, lds_words: u32) -> Emitter<'a> {
+    fn new(
+        p: &'a Program,
+        io: &'a Io,
+        lds_words: u32,
+        local_size: [u32; 3],
+    ) -> Emitter<'a> {
         let mut m = M::new();
         let mut ids = Vec::new();
         for _ in 0..23 {
@@ -665,7 +774,6 @@ impl<'a> Emitter<'a> {
         };
         Emitter {
             m,
-            native,
             p,
             io,
             t_void,
@@ -717,6 +825,7 @@ impl<'a> Emitter<'a> {
             exit,
             labels: Vec::new(),
             lds_words,
+            local_size,
             scope_device,
             scope_workgroup,
             sem_acq_rel_workgroup: sem,
@@ -1095,14 +1204,7 @@ impl<'a> Emitter<'a> {
     // ---- the module --------------------------------------------------------
 
     fn build(&mut self) -> R<()> {
-        let (ls_x, ls_y, ls_z) = match self.native.io {
-            StageIo::Cs(cs) => (
-                cs.threads[0].max(1),
-                cs.threads[1].max(1),
-                cs.threads[2].max(1),
-            ),
-            _ => (1, 1, 1),
-        };
+        let [ls_x, ls_y, ls_z] = self.local_size;
         // Header.
         self.m.ins(op::CAPABILITY, 0, 0, &[1]); // Shader
         self.m.ins(op::CAPABILITY, 0, 0, &[5347]); // PhysicalStorageBufferAddresses
@@ -1123,6 +1225,15 @@ impl<'a> Emitter<'a> {
         }
         if !self.images.is_empty() {
             caps.push(cap::IMAGE_QUERY);
+        }
+        caps.sort_unstable();
+        caps.dedup();
+        // Cross-lane code (DPP, lane reads, DPP row ops) runs on the console's
+        // own wave: the pipeline pins the subgroup to `wave_size`, and the
+        // module declares the group-non-uniform capabilities it will use.
+        if crosses_lanes(self.p) {
+            caps.push(cap::GROUP_NON_UNIFORM);
+            caps.push(cap::GROUP_NON_UNIFORM_SHUFFLE);
         }
         caps.sort_unstable();
         caps.dedup();
