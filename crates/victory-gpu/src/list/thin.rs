@@ -43,12 +43,9 @@ const CHUNK: usize = 1024;
 /// Whether list calls are only written down (`VICTORY_THIN=1`).
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        wanted() && crate::host::host().is_some() && {
-            start();
-            true
-        }
-    })
+    // Only with a thread of ours to translate: a spawn that fails leaves no
+    // one to translate, and a submission would wait for it for good.
+    *ON.get_or_init(|| wanted() && crate::host::host().is_some() && start() > 0)
 }
 
 /// Whether it is asked for.
@@ -75,14 +72,39 @@ impl Drop for Front {
 
 impl Front {
     /// Lets go of the recording there is: one never submitted is not run any
-    /// further.
+    /// further. A translation of it already running is waited for (it still
+    /// reads the title's objects, which that may free the moment this
+    /// returns), and upload memory written down after the last hand-over
+    /// never runs: it goes with the words.
     fn leave(&mut self) {
         if let Some(recording) = self.recording.take()
             && !self.submitted
         {
             recording.abandoned.store(true, Release);
+            recording.quiet();
         }
+        self.free_uploads();
         self.words.clear();
+    }
+
+    /// Let go of the upload blocks the words written down still name: they
+    /// never reached a thread of ours, so nothing else will free them.
+    fn free_uploads(&mut self) {
+        let mut i = 0;
+        while i < self.words.len() {
+            let (op, len) = (self.words[i] & 0xffff, (self.words[i] >> 16) as usize);
+            if i + 1 + len > self.words.len() {
+                break;
+            }
+            if op == UPLOAD {
+                // SAFETY: made by `allocate_upload`, named once, and never
+                // handed over.
+                drop(unsafe { Box::from_raw(self.words[i + 1] as usize as *mut Upload) });
+                #[cfg(test)]
+                LET_GO.fetch_add(1, Relaxed);
+            }
+            i += 1 + len;
+        }
     }
 
     /// Begins a recording, with `pipeline` bound.
@@ -179,6 +201,10 @@ static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static STREAMS: AtomicU64 = AtomicU64::new(0);
 static THREADS: AtomicU64 = AtomicU64::new(0);
 
+/// Let go of in tests: upload blocks that never reached a thread of ours.
+#[cfg(test)]
+static LET_GO: AtomicU64 = AtomicU64::new(0);
+
 fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -201,6 +227,9 @@ struct Inner {
     kept: Vec<Vec<u64>>,
     /// It is among [`READY`] or being translated.
     scheduled: bool,
+    /// A thread of ours is inside one of its streams now (what a discarded
+    /// recording waits for before it lets the title's objects go).
+    working: bool,
     /// The list of ours (0: none yet).
     back: usize,
     /// That list was closed by the stream.
@@ -225,8 +254,22 @@ impl Recording {
 
     /// Waits until it is translated.
     pub(crate) fn wait(&self) {
+        // With no thread of ours (none could be started, or none is asked
+        // for) the translation happens here rather than never.
+        if THREADS.load(Relaxed) == 0 {
+            self.run();
+        }
         let mut inner = held(&self.inner);
         while !self.done() {
+            inner = self.moved.wait(inner).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Waits until no thread of ours is inside one of its streams any more:
+    /// a recording the title lets go of must not be read after it returns.
+    fn quiet(&self) {
+        let mut inner = held(&self.inner);
+        while inner.working {
             inner = self.moved.wait(inner).unwrap_or_else(|e| e.into_inner());
         }
     }
@@ -247,7 +290,19 @@ impl Recording {
                 };
                 if inner.back == 0 {
                     inner.back = back_list(self.kind) as usize;
+                    if inner.back == 0 {
+                        // No list of ours to run it in (the host has none:
+                        // the device has failed, and is reported so). What
+                        // was written down is not run, rather than run into
+                        // a list that cannot be submitted.
+                        inner.chunks.clear();
+                        inner.scheduled = false;
+                        self.done.store(true, Release);
+                        self.moved.notify_all();
+                        return;
+                    }
                 }
+                inner.working = true;
                 (chunk, inner.back as This)
             };
             let began = std::time::Instant::now();
@@ -255,6 +310,8 @@ impl Recording {
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
             let mut inner = held(&self.inner);
+            inner.working = false;
+            self.moved.notify_all();
             inner.kept.push(chunk);
             if closed {
                 inner.closed = true;
@@ -294,7 +351,8 @@ fn give_back(streams: Vec<Vec<u64>>) {
     }
 }
 
-/// A list of ours, closed.
+/// A list of ours, closed (0: the host has none to give, and the device has
+/// failed).
 fn back_list(kind: u32) -> This {
     if let Some(back) = held(&BACKS).pop() {
         // SAFETY: a list of ours nobody uses.
@@ -302,17 +360,30 @@ fn back_list(kind: u32) -> This {
         return back as This;
     }
     let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast();
+    #[cfg(windows)]
+    if super::host_list(list).is_none() {
+        // Nothing could be submitted in it: a submission would run nothing
+        // and present a list without its writes. Say so, let this one go (it
+        // is not kept, so the next recording asks the host again), and hand
+        // out none — as a submission of the title's skips a list it could
+        // not take a host list for.
+        tracing::error!("no host command list for a list that calls were written down for");
+        // SAFETY: just made, and nobody has it.
+        drop(unsafe { Box::from_raw(list.cast_mut().cast::<List>()) });
+        return std::ptr::null();
+    }
     super::close(list);
     list
 }
 
-fn start() {
+/// Starts the threads that translate; how many started.
+fn start() -> usize {
     let threads = std::env::var("VICTORY_THIN_THREADS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(8usize)
         .clamp(1, 32);
-    THREADS.store(threads as u64, Relaxed);
+    let mut started = 0;
     for i in 0..threads {
         let worker = move || {
             loop {
@@ -332,17 +403,24 @@ fn start() {
                 }
             }
         };
-        if let Err(e) = std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name(format!("victory-list-{i}"))
             .spawn(worker)
         {
-            tracing::warn!(error = %e, "a thread less to translate lists");
+            Ok(_) => started += 1,
+            Err(e) => tracing::warn!(error = %e, "a thread less to translate lists"),
         }
     }
+    THREADS.store(started as u64, Relaxed);
+    if started == 0 {
+        tracing::warn!("no thread of ours to translate lists: their calls are translated where they are submitted");
+        return 0;
+    }
     tracing::info!(
-        threads,
+        started,
         "list calls are written down and translated by threads of ours (VICTORY_THIN=1)"
     );
+    started
 }
 
 /// The recordings of submitted lists, in order (one that was not begun is left
@@ -521,6 +599,31 @@ fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
     unsafe { std::slice::from_raw_parts(items.cast(), count * size_of::<T>()) }
 }
 
+/// The words of a vector, as bytes.
+fn word_bytes(words: &[u64]) -> &[u8] {
+    // SAFETY: the words are initialized, and a `u64` is exactly eight bytes.
+    unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), size_of_val(words)) }
+}
+
+/// A copy location's words: each field written where it goes, in zeroed
+/// words. The structure has padding between `kind` and its footprint, which
+/// the title does not initialize: reading the structure's bytes whole (as
+/// [`bytes_of`] does) would read those as bytes of a `&[u8]`, which is not
+/// allowed, and would copy whatever was there into the stream.
+fn location_words(location: &CopyLocation) -> Vec<u64> {
+    let mut words = vec![0u64; size_of::<CopyLocation>().div_ceil(8)];
+    let place = words.as_mut_ptr().cast::<CopyLocation>();
+    // SAFETY: the words are as large as the structure and aligned (as `u64`
+    // words are); each field is written to its own place and the padding
+    // stays zero.
+    unsafe {
+        std::ptr::addr_of_mut!((*place).resource).write(location.resource);
+        std::ptr::addr_of_mut!((*place).kind).write(location.kind);
+        std::ptr::addr_of_mut!((*place).footprint).write(location.footprint);
+    }
+    words
+}
+
 /// Where the things are in a stream (null for none).
 fn at<T>(w: &[u64], from: usize, count: usize) -> *const T {
     if count == 0 || from >= w.len() {
@@ -611,11 +714,12 @@ extern "system" fn scissors(this: This, count: u32, items: *const RECT) {
     front(this).put_with(SCISSORS, &[u64::from(count)], &[bytes_of(items, count as usize)]);
 }
 extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
+    // A null factor is a call too: the ordinary path puts the default back
+    // (`[1.0; 4]`), so dropping it here would keep an earlier one in force.
+    let present = u64::from(!factor.is_null());
     // SAFETY: the title passes four floats or null.
-    let Some(factor) = (unsafe { factor.as_ref() }) else {
-        return;
-    };
-    front(this).put_with(BLEND_FACTOR, &[1], &[bytes_of(factor, 1)]);
+    let floats = if present != 0 { bytes_of(factor, 1) } else { &[] };
+    front(this).put_with(BLEND_FACTOR, &[present], &[floats]);
 }
 extern "system" fn heaps(this: This, count: u32, items: *const This) {
     let count = if items.is_null() { 0 } else { count };
@@ -650,12 +754,14 @@ extern "system" fn index_buffer(this: This, view: *const IndexView) {
     front(this).put_with(INDEX_BUFFER, &[u64::from(!view.is_null())], &[bytes_of(blob.as_ptr(), blob.len())]);
 }
 extern "system" fn vertex_buffers(this: This, start: u32, count: u32, views: *const VertexView) {
+    // The count is the title's, also when the views are null (which clears
+    // that many slots): only the copying of the views depends on them.
     let present = !views.is_null();
-    let count = if present { count } else { 0 };
+    let copied = if present { count } else { 0 };
     front(this).put_with(
         VERTEX_BUFFERS,
         &[u64::from(start) | u64::from(count) << 32, u64::from(present)],
-        &[bytes_of(views, count as usize)],
+        &[bytes_of(views, copied as usize)],
     );
 }
 extern "system" fn targets(this: This, count: u32, handles: *const u64, one_range: i32, depth: *const u64) {
@@ -735,10 +841,15 @@ extern "system" fn copy_texture_region(
         return;
     }
     let boxed = !source_box.is_null();
+    // SAFETY: the title passes both locations (null is not: nothing recorded).
+    let (Some(dst), Some(src)) = (unsafe { dst.as_ref() }, unsafe { src.as_ref() }) else {
+        return;
+    };
+    let (dst, src) = (location_words(dst), location_words(src));
     front(this).put_with(
         COPY_TEXTURE,
         &[u64::from(x) | u64::from(y) << 32, u64::from(z) | u64::from(boxed) << 32],
-        &[bytes_of(dst, 1), bytes_of(src, 1), bytes_of(source_box, usize::from(boxed))],
+        &[word_bytes(&dst), word_bytes(&src), bytes_of(source_box, usize::from(boxed))],
     );
 }
 #[allow(clippy::too_many_arguments)] // the method's own arguments
@@ -753,6 +864,20 @@ extern "system" fn copy_texture_region_x(
     _flags: u32,
 ) {
     copy_texture_region(this, dst, x, y, z, src, source_box);
+}
+
+/// Calls left to translate one at a time slower, in tests of what a discarded
+/// recording waits for.
+#[cfg(test)]
+static SLOW: AtomicU64 = AtomicU64::new(0);
+
+/// [`SLOW`]: one call of the stream takes a while.
+#[cfg(test)]
+fn slow_one() {
+    if SLOW.load(Relaxed) > 0 {
+        SLOW.fetch_sub(1, Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
 }
 
 /// Makes the calls of a stream on `list`: how many, and whether the last one
@@ -772,6 +897,8 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         if calls % 64 == 0 {
             skip = left();
         }
+        #[cfg(test)]
+        slow_one();
         if op == UPLOAD {
             // SAFETY: made by `allocate_upload`, named once.
             let block = *unsafe { Box::from_raw(w[0] as usize as *mut Upload) };
@@ -804,7 +931,7 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             BARRIER_GROUPS => super::barrier_groups(list, n as u32, std::ptr::null()),
             VIEWPORTS => super::state::viewports(list, n as u32, at(w, 1, n)),
             SCISSORS => super::state::scissors(list, n as u32, at(w, 1, n)),
-            BLEND_FACTOR => super::state::blend_factor(list, at(w, 1, 1)),
+            BLEND_FACTOR => super::state::blend_factor(list, at(w, 1, n)),
             HEAPS => super::state::heaps(list, n as u32, at(w, 1, n)),
             COMPUTE_CONSTANTS => super::state::compute_constants(
                 list,
@@ -982,17 +1109,159 @@ mod tests {
         list
     }
 
+    /// How many records a stream holds (a call each).
+    fn records(stream: &[u64]) -> u64 {
+        let (mut i, mut calls) = (0, 0);
+        while i < stream.len() {
+            let len = (stream[i] >> 16) as usize;
+            if i + 1 + len > stream.len() {
+                break;
+            }
+            calls += 1;
+            i += 1 + len;
+        }
+        calls
+    }
+
+    /// Nothing of a submission waits for a thread of ours that is not there:
+    /// the translation happens where the submission is made.
+    #[test]
+    fn a_submission_with_no_thread_of_ours_translates_here() {
+        let mut list = test_list();
+        let this: This = (&mut *list as *mut List).cast();
+        for n in 0..8u32 {
+            draw(this, n, 1, 0, 0);
+        }
+        assert_eq!(THREADS.load(Relaxed), 0, "no thread of ours in a test");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let bits = this as usize;
+        std::thread::spawn(move || {
+            let submitted = super::submitted(&[bits as This]);
+            tx.send(submitted.backs().len()).ok();
+        });
+        let backs = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("a submission waited for a translation no thread of ours would do");
+        assert_eq!(backs, 1);
+        let chunks = held(&list.thin.recording.as_ref().expect("a recording").inner).chunks.len();
+        assert_eq!(chunks, 0, "what it wrote down was translated");
+    }
+
+    /// A recording the title resets or releases is not read any more once that
+    /// returns: a translation already in it is waited for (the title's objects
+    /// it names may be freed the moment it does).
+    #[test]
+    fn a_recording_let_go_of_is_not_read_afterwards() {
+        let mut list = test_list();
+        let this: This = (&mut *list as *mut List).cast();
+        for n in 0..64u32 {
+            draw(this, n, 1, 0, 0);
+        }
+        list.thin.close();
+        let recording = list.thin.recording.clone().expect("a recording");
+        SLOW.store(64, Relaxed);
+        let worker = {
+            let recording = recording.clone();
+            std::thread::spawn(move || recording.run())
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !held(&recording.inner).working {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no thread of ours entered the recording"
+            );
+            std::thread::yield_now();
+        }
+        list.thin.leave();
+        assert!(
+            !held(&recording.inner).working,
+            "the recording was let go of while a thread of ours was still in it"
+        );
+        worker.join().ok();
+    }
+
+    /// A list of ours with no host list could run nothing: it is not handed
+    /// out (the device says why) rather than a submission losing its work and
+    /// presenting a list without it.
+    #[test]
+    fn a_list_of_ours_nothing_could_run_in_is_not_handed_out() {
+        if crate::host::host().is_none() {
+            assert!(back_list(0).is_null(), "no host list: none is handed out");
+        } else {
+            assert!(!back_list(0).is_null(), "the host has a list to give");
+        }
+    }
+
+    /// A copy location is written down field by field: the padding between
+    /// them (which the title does not initialize) is not read as its bytes.
+    #[test]
+    fn a_copy_location_is_written_down_without_its_padding() {
+        let mut raw = [0xffu8; size_of::<CopyLocation>()];
+        let place = raw.as_mut_ptr().cast::<CopyLocation>();
+        // SAFETY: the fields are written where they go; the rest stays 0xff.
+        unsafe {
+            std::ptr::addr_of_mut!((*place).resource).write(0x1000 as This);
+            std::ptr::addr_of_mut!((*place).kind).write(1);
+            std::ptr::addr_of_mut!((*place).footprint).write(std::mem::zeroed());
+        }
+        let words = location_words(unsafe { &*place });
+        assert_eq!(words[1] as u32, 1, "the kind is written down");
+        assert_eq!(words[1] >> 32, 0, "the padding after it is not");
+        assert_eq!(words.len(), size_of::<CopyLocation>().div_ceil(8));
+    }
+
+    /// Upload memory the title allocated and never submitted is let go with
+    /// the words that named it: nothing else would free it.
+    #[test]
+    fn upload_memory_that_never_ran_is_let_go() {
+        let mut list = test_list();
+        let this: This = (&mut *list as *mut List).cast();
+        let before = LET_GO.load(Relaxed);
+        assert!(!allocate_upload(this, 128, 16).is_null());
+        list.thin.leave();
+        assert_eq!(
+            LET_GO.load(Relaxed) - before,
+            1,
+            "the block that never reached a thread of ours is let go"
+        );
+    }
+
+    /// A vertex buffer unbound with no views clears the slots the title names:
+    /// the count is its, only the copying of the views depends on the pointer.
+    #[test]
+    fn unbinding_vertex_buffers_keeps_the_count() {
+        let mut list = test_list();
+        let this: This = (&mut *list as *mut List).cast();
+        vertex_buffers(this, 2, 1, std::ptr::null());
+        let words = &list.thin.words;
+        assert_eq!((words[2] & 0xffff, words[2] >> 16), (VERTEX_BUFFERS, 2));
+        assert_eq!((words[3] >> 32) as u32, 1, "the slot count is the title's");
+        assert_eq!(words[4], 0, "and no views are written down");
+    }
+
+    /// A null blend factor is a call: the ordinary path puts the default back,
+    /// so it is written down and replayed as null.
+    #[test]
+    fn a_null_blend_factor_is_written_down() {
+        let mut list = test_list();
+        let this: This = (&mut *list as *mut List).cast();
+        blend_factor(this, std::ptr::null());
+        let words = &list.thin.words;
+        assert_eq!((words[2] & 0xffff, words[2] >> 16), (BLEND_FACTOR, 1));
+        assert_eq!(words[3], 0, "no factor: the default is put back");
+    }
+
     /// Each call writes exactly one record of its words: the count a
     /// submission carries, and the arguments come out as they went in.
     #[test]
     fn a_submission_records_one_record_a_call() {
         let mut list = test_list();
-        let before = OPS.load(Relaxed);
         let this: This = (&mut *list as *mut List).cast();
         for n in 0..64u32 {
             draw(this, n, 1, 0, 0);
         }
-        assert_eq!(OPS.load(Relaxed) - before, 64, "one record a draw");
+        // begin's RESET, then a record a call.
+        assert_eq!(records(&list.thin.words), 1 + 64, "one record a draw");
         let viewport = D3D12_VIEWPORT {
             TopLeftX: 1.0,
             TopLeftY: 2.0,
@@ -1003,7 +1272,7 @@ mod tests {
         };
         viewports(this, 1, &viewport);
         constants(this, COMPUTE_CONSTANTS, 3, 2, [9u32, 10].as_ptr(), 7);
-        assert_eq!(OPS.load(Relaxed) - before, 66);
+        assert_eq!(records(&list.thin.words), 1 + 66);
         let words = std::mem::take(&mut list.thin.words);
         // begin's RESET, 64 draws, one viewport, one constants block.
         assert_eq!((words[0] & 0xffff, words[0] >> 16), (RESET, 1));
@@ -1036,13 +1305,20 @@ mod tests {
         const N: u32 = 20_000;
         let mut list = test_list();
         let this: This = (&mut *list as *mut List).cast();
-        let before = OPS.load(Relaxed);
         let began = std::time::Instant::now();
         for n in 0..N {
             draw(this, n, 1, 0, 0);
         }
         let recorded = began.elapsed();
-        assert_eq!(OPS.load(Relaxed) - before, u64::from(N), "one record a draw");
+        // Every call is one record, in the words held and the streams handed
+        // over (this list's own, not a count of the process's).
+        let recording = list.thin.recording.clone().expect("a recording");
+        let handed: u64 = held(&recording.inner).chunks.iter().map(|c| records(c)).sum();
+        assert_eq!(
+            handed + records(&list.thin.words) - 1,
+            u64::from(N),
+            "one record a draw"
+        );
         // What translating the same calls through the list methods costs,
         // here with no host list behind them (the floor of that cost).
         let began = std::time::Instant::now();
@@ -1054,7 +1330,6 @@ mod tests {
             "{N} draws: recorded {recorded:?} with words written down, {plain:?} through the \
              list methods (no host list, the floor)"
         );
-        assert!(OPS.load(Relaxed) > 0);
     }
 
     /// A view's record is the one at the call, also if its slot is written
