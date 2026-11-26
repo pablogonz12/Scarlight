@@ -13,8 +13,16 @@
 //!                  new: memcmp piece, and when the title did not write there,
 //!                  one bulk copy (vectorised) instead of that loop
 //!
-//! usage: copybw [all|a|b|c] [--contend]
-use std::sync::atomic::{AtomicBool, Ordering};
+//!   d  guard probe does a guard (VirtualProtect read-only) on write-watched
+//!                  memory reach our handler, and does the kernel's watch still
+//!                  see the write?  plus the cost of one guard fault
+//!   e  guarded      the same 2409 spans, watched by our own guards instead of
+//!                  the kernel: cost per frame at 240 written blocks a frame,
+//!                  with the kernel's asking every 8th frame as the verifier
+//!
+//! usage: copybw [all|a|b|c|d|e] [--contend]
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
@@ -58,6 +66,87 @@ fn write_watch(base: *const u8, len: usize, found: &mut [usize]) -> usize {
     if ok { count } else { 0 }
 }
 
+// The guard model (legs d, e): one byte per 64 KiB block, 0 while the block is
+// read-only by our hand, 1 once its first write has faulted and been noted.
+const STATE_MAX: usize = 1 << 17;
+static STATE: AtomicUsize = AtomicUsize::new(0);
+static BASE_BLOCK: AtomicUsize = AtomicUsize::new(0);
+static FAULTS: AtomicUsize = AtomicUsize::new(0);
+
+fn state(table: *mut u8, first_block: usize) {
+    STATE.store(table as usize, Ordering::Relaxed);
+    BASE_BLOCK.store(first_block, Ordering::Relaxed);
+}
+
+fn block_state(block: usize) -> u8 {
+    let base = STATE.load(Ordering::Relaxed) as *const u8;
+    let i = block.wrapping_sub(BASE_BLOCK.load(Ordering::Relaxed));
+    if base.is_null() || i >= STATE_MAX { return 1; }
+    unsafe { *base.add(i) }
+}
+
+fn set_block_state(block: usize, v: u8) {
+    let base = STATE.load(Ordering::Relaxed) as *mut u8;
+    let i = block.wrapping_sub(BASE_BLOCK.load(Ordering::Relaxed));
+    if base.is_null() || i >= STATE_MAX { return; }
+    unsafe { *base.add(i) = v };
+}
+
+fn protect_ro(block: usize) -> bool {
+    let mut old = 0u32;
+    unsafe { VirtualProtect((block * PAGE) as *const _, PAGE, PAGE_READONLY, &mut old) != 0 }
+}
+
+fn protection(at: *const u8) -> u32 {
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    unsafe { VirtualQuery(at as *const _, &mut info, std::mem::size_of_val(&info)) };
+    info.Protect
+}
+
+/// The first write to a block we made read-only: note it, give the write
+/// access back (what `guards::open` does in the layer).
+unsafe extern "system" fn on_write(
+    info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+    };
+    let r = unsafe { &*(*info).ExceptionRecord };
+    if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r.NumberParameters < 2 || r.ExceptionInformation[0] != 1 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let block = r.ExceptionInformation[1] / PAGE;
+    let mut old = 0u32;
+    unsafe { VirtualProtect((block * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
+    set_block_state(block, 1);
+    FAULTS.fetch_add(1, Ordering::Relaxed);
+    EXCEPTION_CONTINUE_EXECUTION
+}
+
+fn install_handler() {
+    use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
+    unsafe { AddVectoredExceptionHandler(1, Some(on_write)) };
+}
+
+/// The frame's 2409 spans (leg b's), as absolute 64 KiB blocks: `(first, last)`.
+fn frame_spans(base: usize, size: usize) -> Vec<(usize, usize)> {
+    let n = 2409;
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut spans = Vec::with_capacity(n);
+    for i in 0..n {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        let s = if i % 5 == 4 {
+            (4 * MIB) + (x as usize % (28 * MIB))
+        } else {
+            (256 << 10) + (x as usize % (4 * MIB - (256 << 10)))
+        };
+        let at = base + (i * 77_003) % (size - s);
+        spans.push((at / PAGE, (at + s).div_ceil(PAGE)));
+    }
+    spans
+}
+
 /// The three-way compare-and-select of `Shadow::copy_back`, per 64 KiB piece.
 /// Returns the bytes written back.
 unsafe fn loop_three_way(title: *mut u8, host: *mut u8, old: &[u8], n: usize) -> usize {
@@ -79,7 +168,8 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let which = args.first().cloned().unwrap_or_else(|| "all".into());
     let contend = args.iter().any(|a| a == "--contend");
-    let run = |leg: &str| which == "all" || which == leg;
+    // `all`, one leg, or several at once (`be`).
+    let run = |leg: &str| which == "all" || which.contains(leg);
 
     let stop = Arc::new(AtomicBool::new(false));
     let mut churn = Vec::new();
@@ -106,7 +196,7 @@ fn main() {
     // the title's bytes: the same as the copy it holds
     unsafe { std::ptr::write_bytes(title, 7, title_size) };
     let mut host: Vec<u8> = vec![7u8; title_size];
-    let mut snapshot: Vec<u8> = host.clone();
+    let snapshot: Vec<u8> = host.clone();
     let mut found = vec![0usize; 64 * MIB / 4096];
 
     if run("a") {
@@ -294,6 +384,131 @@ fn main() {
             wpm,
             plain,
             (pieces as f64 / 5.0 * PAGE as f64 / 1e6) * scale
+        );
+    }
+
+    if run("d") {
+        // Does a guard on write-watched memory reach our handler at all, and
+        // does the kernel's watch still see the page after we gave the write
+        // back? (If Wine's own watch handler swallows the fault, guarding a
+        // write-watched pool is useless and the asking must stay.)
+        let size = 8 * MIB;
+        let p = alloc(size);
+        touch(p, size, 1);
+        let blocks = size / PAGE;
+        let table = Box::leak(vec![0u8; blocks].into_boxed_slice());
+        state(table.as_mut_ptr(), p as usize / PAGE);
+        install_handler();
+        // The first touch's writes are the baseline.
+        let _ = write_watch(p, size, &mut found);
+        let before = protection(p);
+        let ro = protect_ro(p as usize / PAGE);
+        set_block_state(p as usize / PAGE, 0);
+        FAULTS.store(0, Ordering::Relaxed);
+        unsafe { *p = 9 };
+        let faults = FAULTS.load(Ordering::Relaxed);
+        let after = protection(p);
+        let n = write_watch(p, size, &mut found);
+        let saw = (0..n).any(|k| found[k] == p as usize);
+        println!(
+            "d guard probe: VirtualProtect {ro}, protection {before:#x} -> {after:#x}, our handler ran \
+             {faults}x on the write, the kernel's watch sees that page: {saw} ({n} pages reported)"
+        );
+        // The cost of one guard fault: protect a block, write it, repeat.
+        let n = 120;
+        FAULTS.store(0, Ordering::Relaxed);
+        let started = Instant::now();
+        for i in 1..=n {
+            let at = i * PAGE;
+            let block = (p as usize + at) / PAGE;
+            protect_ro(block);
+            set_block_state(block, 0);
+            unsafe { *p.add(at) = 7 };
+        }
+        let us = started.elapsed().as_secs_f64() * 1e6;
+        println!(
+            "d fault cost : {:.2} us per guard fault over {n} blocks ({:.1} ms, {} faults)",
+            us / n as f64,
+            us / 1e3,
+            FAULTS.load(Ordering::Relaxed)
+        );
+    }
+
+    if run("e") {
+        // The frame's 2409 spans watched by our own guards: every block
+        // read-only until its first write faults; an asking about a span with
+        // no opened block costs a search, one with opened blocks re-protects
+        // just those. `writes` a frame: 240 blocks (the 4% of 384 MB the
+        // copy-back bench assumes the title writes).
+        let size = title_size;
+        let blocks = size / PAGE;
+        let table = Box::leak(vec![0u8; blocks].into_boxed_slice());
+        state(table.as_mut_ptr(), title as usize / PAGE);
+        install_handler();
+        // Every block counts as written at the start: the first frame guards
+        // them all, as the first asking would.
+        let mut dirty: BTreeSet<usize> = (title as usize / PAGE..title as usize / PAGE + blocks).collect();
+        let spans = frame_spans(title as usize, size);
+        let mb = spans.iter().map(|&(a, b)| (b - a) * PAGE).sum::<usize>() as f64 / 1e6;
+        let mut x: u64 = 0x5d5d_1234_5678_9abc;
+        let write = |block: usize| {
+            if block_state(block) == 0 {
+                // Still read-only: the write faults, the handler opens it.
+                unsafe { *((block * PAGE) as *mut u8) = 1 };
+            }
+            block_state(block) == 1
+        };
+        const ROUNDS: usize = 8;
+        const PER_FRAME: usize = 240;
+        let mut reasks = 0;
+        let mut wrote = 0;
+        let mut us = 0.0f64;
+        let mut verify = 0.0f64;
+        for round in 0..ROUNDS {
+            // The title's writes of this frame.
+            for _ in 0..PER_FRAME {
+                x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                let block = title as usize / PAGE + (x as usize % blocks);
+                if write(block) {
+                    wrote += 1;
+                    dirty.insert(block);
+                }
+            }
+            let started = Instant::now();
+            for &(first, last) in &spans {
+                if dirty.range(first..last).next().is_none() {
+                    continue;
+                }
+                let mine: Vec<usize> = dirty.range(first..last).copied().collect();
+                for block in mine {
+                    protect_ro(block);
+                    set_block_state(block, 0);
+                    dirty.remove(&block);
+                }
+                reasks += 1;
+            }
+            us += started.elapsed().as_secs_f64() * 1e6;
+            if round % 8 == 0 {
+                // The kernel's asking as the verifier: it sees writes the
+                // guards cannot, and costs what leg b costs.
+                let started = Instant::now();
+                for &(first, last) in &spans {
+                    let _ = write_watch((first * PAGE) as *const u8, (last - first) * PAGE, &mut found);
+                }
+                verify += started.elapsed().as_secs_f64() * 1e6;
+            }
+        }
+        let _ = table;
+        let frames = ROUNDS as f64;
+        println!(
+            "e guarded    : {:.1} ms/frame over {} spans ({mb:.1} MB), {:.0} re-guard askings and {:.0} writes a \
+             frame; the verifier {:.1} ms every 8th frame = {:.1} ms/frame",
+            us / 1e3 / frames,
+            2409,
+            reasks as f64 / frames,
+            wrote as f64 / frames,
+            verify / 1e3,
+            verify / 1e3 / 8.0
         );
     }
 
