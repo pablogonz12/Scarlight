@@ -61,6 +61,36 @@ shaders and emulates the one instruction.
    partly working builder wrote garbage bounds into title memory and crashed
    the title.
 
+## The switch that turns live ray tracing on
+
+Whether the world is lit by ray tracing follows one switch, the builder's, and
+that switch is necessary but not sufficient: the trace and shading programs
+always run, the structures they walk are only built while
+`VICTORY_BVH_BUILDER=1` is set, and even then the builder's first dispatch runs
+only if every builder pipeline the title has created has a host pipeline —
+otherwise the builder stays off for the rest of the run (`builder_runs` in
+`crates/victory-gpu/src/pipeline.rs`). Everything else about the builder is a
+check on top of it, or a way back:
+
+| switch | default | effect |
+|---|---|---|
+| `VICTORY_BVH_BUILDER=1` | off | the builder's dispatches run (all of its pipelines or none) |
+| `VICTORY_BVH_HOST_STRUCTURES=0` | 1 | the builder's writes *by address* go to title memory again instead of staying in the host's copies (the A/B for the map) |
+| `VICTORY_BVH_QUARANTINE=1` | off | also keeps the builder's ordinary stores in the host's copies, for a first run of the whole builder |
+
+The tester's set for a lit world (fxceless/victory-fork #905, RTX 3080, Series S
+profile) is `VICTORY_BVH_BUILDER=1 VICTORY_BVH_QUARANTINE=0
+VICTORY_CARD_FETCH_INFLIGHT=1 VICTORY_TEXTURE_DROP_MIPS=1
+VICTORY_TEXTURE_ROOM_PERCENT=82`: with it, "the cell interior in the first scene
+is lit (walls, photos, bunk); without the builder it is black".
+
+Offline on the branch that carries the node-test fix (25 Nov, RADV gfx1201):
+751/751 programs translate and pipeline; on the run dump 2,909/2,912, the three
+failures being the known `image_bvh*` core dumps in dxil-spirv
+(dxil-spirv-crash.md), unchanged by this branch; and the builder's own set 52/52.
+One program's DXIL changed in the 751 set, 14 in the run set: the node test's
+new rules, below.
+
 ## Known gaps
 
 - With `VICTORY_BVH_BUILDER=1` the builder still stays off in a real run: a few
@@ -71,7 +101,9 @@ shaders and emulates the one instruction.
   store is dropped).
 - Not publicly documented, and assumed: the instruction's rounding, the order
   of two boxes entered at the same distance, and the result for a ray exactly
-  through an edge.
+  through an edge. Held by this tree's reference and its emitted form, and
+  tested in both: a child that is not there is a miss whatever its box holds,
+  and an empty or inverted box and any NaN coordinate miss (`bvh.rs`).
 - Cost on the GPU is unmeasured.
 
 ## Where to look
