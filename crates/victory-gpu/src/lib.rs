@@ -76,6 +76,10 @@ mod primitive;
 pub mod query;
 pub mod queue;
 mod reflection;
+// Host memory is read like the rest of `host` (`GlobalMemoryStatusEx`); the
+// Linux build tests other modules.
+#[cfg(windows)]
+mod residency;
 pub mod resource;
 #[cfg(any(windows, test))]
 mod scratchfill;

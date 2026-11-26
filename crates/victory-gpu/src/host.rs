@@ -233,20 +233,40 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
 /// when free physical RAM is low. Never returns less than 2,000 ms.
+/// Effective idle timeout (in milliseconds) for system-RAM caches (staging
+/// buffers, loose shadows, and the mapped pipeline library), scaled down
+/// when free physical RAM is low and at once when the host-memory guard says
+/// the PC is under pressure. Never returns less than 2,000 ms.
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
+    ram_idle_for(avail_phys, crate::total_system_ram_bytes())
+}
+
+/// [`ram_idle_ms`] for a PC of `total_ram` bytes, so a test states the PC it
+/// means instead of measuring the one it runs on.
+pub(crate) fn ram_idle_for(avail_phys: Option<u64>, total_ram: Option<u64>) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
     const NORMAL_MS: u64 = 10_000;
     const MODERATE_MS: u64 = 5_000;
     const HIGH_MS: u64 = 2_000;
-    let Some(avail) = avail_phys else {
-        return NORMAL_MS;
-    };
-    if avail < 2 * GIB {
-        HIGH_MS
-    } else if avail < 4 * GIB {
-        MODERATE_MS
+    // Off, the idle timeout is the one of before: the guard's smaller budget
+    // for a small PC is part of what VICTORY_RESIDENCY=0 turns off.
+    let budget = if crate::residency::enabled() {
+        crate::residency::budgets(total_ram).idle_ms
     } else {
         NORMAL_MS
+    };
+    if crate::residency::pressured() {
+        return budget.min(crate::residency::PRESSURE_IDLE_MS);
+    }
+    let Some(avail) = avail_phys else {
+        return budget;
+    };
+    if avail < 2 * GIB {
+        budget.min(HIGH_MS)
+    } else if avail < 4 * GIB {
+        budget.min(MODERATE_MS)
+    } else {
+        budget
     }
 }
 
@@ -274,6 +294,30 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
 fn sweep() {
     // The in-place probe and census, if asked for (`VICTORY_INPLACE_PROBE`).
     crate::inplace::tick();
+    // Host-memory pressure and the refusal backoff ([`crate::residency`]).
+    crate::residency::tick();
+    if crate::residency::pressured() {
+        // A pool that already holds idle chunks gives them back now, not at the
+        // next give (`0` above only stops new ones being kept).
+        let gone = {
+            let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::replace(&mut *spare, Spare::new())
+        };
+        if gone.bytes > 0 {
+            ALIVE[3].fetch_sub(gone.kept.len() as u64, Ordering::Relaxed);
+            ALIVE[4].fetch_sub(gone.bytes, Ordering::Relaxed);
+            tracing::debug!(bytes = gone.bytes, "idle upload chunks freed under host-memory pressure");
+        }
+        drop(gone);
+    }
+    let deferred = crate::residency::take_deferred();
+    if deferred > 0 {
+        tracing::debug!(
+            deferred,
+            pressured = crate::residency::pressured(),
+            "upload growth held back by the host-memory guard"
+        );
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP").is_none_or(|v| v != "0")) {
         return;
@@ -1667,16 +1711,9 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 /// list that did took 4 MiB of the PC's memory for it.
 const SCRATCH_FIRST: u64 = 256 << 10;
 /// The most bytes of chunks kept while no list holds them, scaled from total
-/// system RAM.
+/// system RAM ([`crate::residency::budgets`]).
 fn spare_most(total_ram_bytes: Option<u64>) -> u64 {
-    const GIB: u64 = 1 << 30;
-    match total_ram_bytes {
-        Some(ram) if ram <= 16 * GIB => 64 << 20,
-        // 32 GB Windows systems typically report ~31.7–31.9 GiB in
-        // `ullTotalPhys` after firmware/hardware reservations.
-        Some(ram) if ram >= 30 * GIB => 256 << 20,
-        _ => 128 << 20,
-    }
+    crate::residency::budgets(total_ram_bytes).spare_upload
 }
 
 /// Whether lists share their scratch chunks: a list takes a chunk when it
@@ -1736,6 +1773,21 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
+    // A refused upload buffer must not be asked for again for every small
+    // copy of the frame: the driver has said there is nothing, and each ask is
+    // a failed call ([`crate::residency`], his `pool::grow`). Chunks already
+    // kept are still handed out above.
+    if crate::residency::refused() {
+        crate::residency::note_deferred();
+        return None;
+    }
+    // A new OS block of upload storage is what the host-memory guard may hold
+    // back when the PC is close to its limit: a copy that gets no chunk is the
+    // same failure as one whose allocation would have been refused, and the
+    // title asks again next frame.
+    if !crate::residency::admit_growth(size) {
+        return None;
+    }
     let (buffer, data) = host.upload_buffer(size)?;
     name(&buffer, || "list scratch".into());
     // SAFETY: a live buffer.
@@ -1757,6 +1809,17 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         return;
     }
     let most = spare_most(crate::total_system_ram_bytes());
+    // Idle chunks are speculative storage: capped where a small PC already
+    // holds a gigabyte of staging, and none at all under pressure
+    // ([`crate::residency`], his `pool::room` dropping the spare limit to
+    // zero), rather than waiting for the next allocation to notice.
+    let most = crate::residency::prefetch_limit(
+        most,
+        false,
+        crate::residency::limited_host_ram(),
+        crate::texture::staged_bytes(),
+    );
+    let most = if crate::residency::pressured() { 0 } else { most };
     let mut freed = Vec::new();
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
@@ -7080,6 +7143,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
             }
@@ -8490,8 +8554,9 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
     #[test]
     fn ram_idle_ms_scales_with_pressure() {
-        use super::ram_idle_ms;
         let gib = 1024 * 1024 * 1024;
+        // Stated: a 30 GiB desktop, whatever the machine running the test has.
+        let ram_idle_ms = |avail| super::ram_idle_for(avail, Some(30 * gib));
         // Normal (>= 4 GiB)
         assert_eq!(ram_idle_ms(Some(8 * gib)), 10_000);
         assert_eq!(ram_idle_ms(Some(4 * gib)), 10_000);

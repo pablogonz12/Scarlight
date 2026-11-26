@@ -284,6 +284,14 @@ D
   is clipped rather than refused after its range was unmapped (`crates/victory-hle/src/modules/xmem.rs`,
   `VICTORY_MAP_CLIP=0` turns it off).
 
+- **codec-d/CGBJ (codec-d/cool_fox [`ab75ac3e0`](https://github.com/codec-d/cool_fox/commit/ab75ac3e0),
+  [`18bdf7932`](https://github.com/codec-d/cool_fox/commit/18bdf7932),
+  [`8cc31ab37`](https://github.com/codec-d/cool_fox/commit/8cc31ab37))**, GPL-3.0-or-later: a host-memory guard for
+  speculative uploads — a free-RAM and commit sample with hysteresis, a floor left free after an upload and a larger
+  one before a new block of upload storage is committed, a backoff after a refused allocation instead of one attempt
+  per small upload, and idle upload storage given back at once under pressure. Reimplemented for our 16 GiB PC and
+  16 GiB RADV card, where a refused import falls back silently, so only pool growth waits and no texture an
+  on-demand upload needs is ever deferred (`crates/victory-gpu/src/residency.rs`, `VICTORY_RESIDENCY=0`).
 - **codec-d/cool_fox [`e05d4633a`](https://github.com/codec-d/cool_fox/commit/e05d4633a)**, GPL-3.0: a
   `SetEventOnCompletion` with no event blocks the guest thread on the fence's value with `WaitOnAddress`, and
   `Signal`/`Set` wakes it with `WakeByAddressAll` (`crates/victory-gpu/src/fence.rs`; the wait here is bounded

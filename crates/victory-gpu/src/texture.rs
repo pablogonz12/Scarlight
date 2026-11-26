@@ -889,6 +889,12 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
 
 /// Staging buffers alive (also those only a list still holds) and their
 /// bytes.
+/// Bytes of texture staging buffers alive: what the host-memory guard weighs
+/// speculative upload storage against ([`crate::residency::prefetch_limit`]).
+pub(crate) fn staged_bytes() -> u64 {
+    STAGED[1].load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static STAGED: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
@@ -2366,6 +2372,14 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             f.Offset + u64::from(f.Footprint.RowPitch) * u64::from(r) * u64::from(f.Footprint.Depth)
         })
         .fold(total, u64::max);
+    // A staging buffer is a committed upload resource the size of the texture.
+    // When the host is out of commit, or the driver has just refused one, it is
+    // made on a later frame instead of failing again now: no list marks the
+    // texture uploaded, so the next one that samples it asks again
+    // ([`crate::residency`], and its starvation valve for a PC that stays low).
+    if !crate::residency::admit_upload(total) {
+        return None;
+    }
     let (buffer, data) = host.upload_buffer(total)?;
     // Memory each subresource (plane, then mip plus slice times mips)
     // occupies, for detiling only the pages that changed. 3D textures
