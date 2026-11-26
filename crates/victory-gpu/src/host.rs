@@ -768,11 +768,9 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
-            small_buffers: Box::leak(Box::new(crate::placed::Pool::new(device.clone()))),
             present_compositor_retry: Mutex::new(Retry::new()),
-        };
-        host.log_features();
-        Ok(host)
+        })
+
     }
 }
 

@@ -1269,7 +1269,7 @@ pub(crate) struct HostTexture {
 /// A host copy of `texture` the host believes is in `state`, for a test that
 /// presents a plane no title made (the present's own bookkeeping is what it
 /// wants; nothing writes through it).
-#[cfg(all(windows, test))]
+#[cfg(all(windows, test, feature = "diagnostics"))]
 pub(crate) fn test_copy(
     texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     state: u32,
@@ -1277,6 +1277,7 @@ pub(crate) fn test_copy(
     std::sync::Arc::new(HostTexture {
         texture: texture.clone(),
         state: std::sync::atomic::AtomicU32::new(state),
+        dropped: 0,
         bytes: 0,
         filled: false,
     })
