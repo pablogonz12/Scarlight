@@ -386,6 +386,12 @@ impl Module {
         }
     }
 
+    /// How many blocks the module has (a test of what lowering made).
+    #[cfg(test)]
+    pub fn blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
     pub fn new_block(&mut self) -> usize {
         self.blocks.push(Block::default());
         self.blocks.len() - 1
@@ -1046,6 +1052,47 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A view slot the title made itself, on a host heap whose dynamic slots
+    /// follow the title's, reads the heap's null slot instead of one of the
+    /// host's tables (upstream PR #2628, moe-miau).
+    #[test]
+    fn title_view_indices_past_the_title_slots_read_the_null_slot() {
+        use crate::emit::DYNAMIC_VIEWS;
+        use crate::emit::shader::Shader;
+
+        let mut s = Shader::new(false);
+        let index = s.m.undef(s.t.i32);
+        // No host heap probed: an index is left as the title made it.
+        assert_eq!(s.clamp_title_heap_index(s.entry, index), index);
+        // A heap of 1,000,000 slots (NVIDIA's cap): the title's slots, then
+        // the host's dynamic ones, then the null slot.
+        let limit = 1_000_000 - 1;
+        s.view_limit = limit;
+        let V::Inst(selected) = s.clamp_title_heap_index(s.entry, index) else {
+            panic!("a select")
+        };
+        // A constant's value, as the module holds it.
+        fn value(m: &Module, v: V) -> i64 {
+            match v {
+                V::Const(i) => match m.consts[i as usize].1 {
+                    Const::Int(x) => x,
+                    _ => panic!("an integer constant"),
+                },
+                _ => panic!("a constant"),
+            }
+        }
+        let Op::Select(over, t, f) = s.m.insts[selected as usize].op else {
+            panic!("a select")
+        };
+        assert_eq!((value(&s.m, t), f), (i64::from(limit as i32), index));
+        let V::Inst(over) = over else { panic!("a compare") };
+        let Op::Cmp(pred, a, b) = s.m.insts[over as usize].op else {
+            panic!("a compare")
+        };
+        assert_eq!((pred, a), (pred::IUGT, index));
+        assert_eq!(value(&s.m, b), i64::from((limit - DYNAMIC_VIEWS - 1) as i32));
+    }
 
     #[test]
     fn vbr_and_blocks() {
