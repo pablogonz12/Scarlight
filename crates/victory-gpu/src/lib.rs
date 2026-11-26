@@ -86,6 +86,8 @@ mod test_device;
 mod texback;
 #[cfg(windows)]
 mod texture;
+#[cfg(windows)]
+mod upload_pool;
 #[cfg(all(test, windows))]
 mod warptest;
 #[cfg(windows)]
