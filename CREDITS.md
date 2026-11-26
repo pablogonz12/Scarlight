@@ -161,6 +161,10 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   `crates/victory-shader/src/dxbc.rs`; `Source::bytes()` for both the raw and the `SGD5` paths,
   `apps/victory/src/shader.rs`). Reimplemented on this tree's `victory translate`, which has no `warm` command.
 
+- **HUMAN** ([HumanlyDev/HUMAN](https://github.com/HumanlyDev/HUMAN)) by HumanlyDev and bdycounter-sudo,
+  GPL-3.0-or-later: one immediate sampler constant used both for normal and for comparison sampling takes two
+  static sampler slots (`crates/victory-shader/src/emit/lower.rs`, `samplers`/`cmp_samplers`), where our bit
+  per slot made the normal use sample with a comparison sampler.
 - **Marvisak/VIctory [`8ff791351`](https://github.com/Marvisak/VIctory/commit/8ff791351)** (Marvis),
   GPL-3.0: a rectangle list's fourth corner is completed opposite the right angle, wherever the three
   corners put it. This tree's geometry stage (`emit::rect_list_gs`) already finds the corner in any order; the
