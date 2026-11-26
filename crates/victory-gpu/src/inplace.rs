@@ -769,6 +769,62 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     views_write().views.insert(at, (len, section, offset));
+    // The bytes of this view may be shown at another address too (the
+    // runtime maps a section again elsewhere): the guards of those views
+    // come off, all together and under the one look, before anything is
+    // copied through this one (after avatarmanz 2be0515c).
+    let beside = {
+        let v = views_read();
+        beside_in(&v.views, at, section, offset, len)
+    };
+    if !beside.is_empty() {
+        ALIASED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    crate::watch::opened_beside(&beside);
+}
+
+/// Whether any two of the title's views show bytes of one section (a page
+/// mapped twice) anywhere: `false` until one does, which is the answer that
+/// lets the guards take their fast path.
+static ALIASED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the bytes at `at` are also shown at another address: the view
+/// that holds `at` has another view of the same section over its bytes.
+/// A block of such a page may not be made read-only (a write through the
+/// other view would go unseen), so the guards ask this before protecting.
+/// One atomic load while nothing is mapped twice.
+pub(crate) fn aliased(at: usize) -> bool {
+    if !ALIASED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let v = views_read();
+    let Some((&base, &(bytes, section, offset))) =
+        v.views.range(..=at).next_back().filter(|(base, view)| **base + view.0 > at)
+    else {
+        return false;
+    };
+    // The bytes of the view that `at` lies in, of the section's offsets.
+    !beside_in(&v.views, base, section, offset, bytes).is_empty()
+}
+
+/// The views of `section` that show any of the bytes a view at `at` shows
+/// (`[offset, offset + len)`), other than the view at `at` itself: a page
+/// the title mapped twice. Empty when nothing else shows them.
+fn beside_in(
+    views: &BTreeMap<usize, (usize, usize, u64)>,
+    at: usize,
+    section: usize,
+    offset: u64,
+    len: usize,
+) -> Vec<(usize, usize)> {
+    let end = offset.saturating_add(len as u64);
+    views
+        .iter()
+        .filter(|&(&base, &(bytes, s, o))| {
+            base != at && s == section && o < end && offset < o.saturating_add(bytes as u64)
+        })
+        .map(|(&base, &(bytes, ..))| (base, bytes))
+        .collect()
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
@@ -1583,6 +1639,30 @@ mod tests {
         assert_eq!(cover(at + 4 * K64, K64), Cover::Run(77, 4 * K64 as u64));
         views_gone(at + 4 * K64, K64);
         assert_eq!(cover(at + 4 * K64, K64), Cover::None);
+    }
+
+    /// The views of a section that show the same bytes as a new one: the
+    /// ones whose guards are opened together (a page mapped twice).
+    #[test]
+    fn views_beside_a_new_one_show_the_same_bytes_of_the_section() {
+        // Only the local map: `title_memory_view` writes the process-wide
+        // one, which other tests read.
+        let at = 0x7_8000_0000usize;
+        let views = BTreeMap::from([
+            (at, (4 * K64, 78, 0u64)),
+            (at + 8 * K64, (2 * K64, 78, 2 * K64 as u64)),
+            (at + 12 * K64, (K64, 79, 0)),
+        ]);
+        // The view at `at` shows section bytes 0..256 KiB, the one at
+        // `at + 8 * K64` the second half of them: each is the other's
+        // alias, and the view at `at + 12 * K64` (another section) none.
+        assert_eq!(beside_in(&views, at, 78, 0, 4 * K64), [(at + 8 * K64, 2 * K64)]);
+        assert_eq!(beside_in(&views, at + 8 * K64, 78, 2 * K64 as u64, 2 * K64), [(at, 4 * K64)]);
+        assert!(beside_in(&views, at + 12 * K64, 79, 0, K64).is_empty());
+        // A view is not its own alias.
+        assert!(!beside_in(&views, at, 78, 0, 4 * K64).iter().any(|&(b, _)| b == at));
+        // A range past both views: nothing.
+        assert!(beside_in(&views, at, 78, 6 * K64 as u64, K64).is_empty());
     }
 
     /// The switch: unset is on (the measured-safe class only), `0` off,
