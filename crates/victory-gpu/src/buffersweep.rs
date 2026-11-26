@@ -15,6 +15,7 @@
 //! (18bdf7932).
 
 use std::collections::HashMap;
+#[cfg(windows)]
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -43,6 +44,8 @@ pub(crate) struct Sweep {
     /// The last frame whose lists refreshed this heap.
     frame: AtomicU64,
     /// Slot: the host copy and the first and last byte its buffer view reads.
+    /// Only a host heap has copies, so only a Windows build keeps them.
+    #[cfg(windows)]
     pub(crate) ranges: HashMap<u32, (Arc<crate::shadow::Shadow>, u64, u64)>,
     /// Host copy: the frame it was last refreshed, and the span it covered
     /// then. Copies no write watch covers are copied whole, so the span is
@@ -57,6 +60,7 @@ impl Default for Sweep {
         Self {
             passes: 0,
             frame: AtomicU64::new(u64::MAX),
+            #[cfg(windows)]
             ranges: HashMap::new(),
             unwatched: HashMap::new(),
             next: HashMap::new(),
@@ -74,7 +78,7 @@ impl Sweep {
     pub(crate) fn pass(&mut self) -> (u64, bool) {
         let passes = self.passes;
         self.passes += 1;
-        (passes, passes % HEAP_ROUND == 0)
+        (passes, passes.is_multiple_of(HEAP_ROUND))
     }
 
     /// Whether the unwatched copy `id`, whose views now read `from..to`, is
@@ -118,13 +122,14 @@ mod tests {
         assert!(a.frame_due(8) && b.frame_due(8));
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_heap_new_at_a_freed_address_starts_with_no_slots() {
         // `ranges` is per heap now: nothing is left to inherit.
         let mut old = Sweep::default();
         old.ranges.reserve(1);
         old.pass();
-        let new = Sweep::default();
+        let mut new = Sweep::default();
         assert!(new.ranges.is_empty());
         assert_eq!(new.pass().0, 0, "the first pass looks at every slot");
     }

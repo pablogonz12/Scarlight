@@ -19,6 +19,7 @@
 mod ambient;
 #[cfg(any(windows, test))]
 mod bound;
+#[cfg(any(windows, test))]
 mod buffersweep;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
