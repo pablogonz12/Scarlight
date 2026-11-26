@@ -4606,12 +4606,12 @@ impl<'a> Lower<'a> {
                 let lane = self.s.m.i32(u32::from(p & 3));
                 return broadcast(self, lane);
             }
-            Some(p @ (0xb1 | 0x4e | 0x1b)) => {
-                // Every lane reads the one that differs in the low two bits.
+            Some(0xb1 | 0x4e | 0x1b) => {
+                // These three permutations are lane ^ 1, ^ 2 and ^ 3, which
+                // is what `src` already picks (the callers decode the
+                // pattern into it), so no XOR here: one read, not four.
                 let three = self.s.m.i32(3);
-                let d = self.s.m.i32(u32::from(p & 3));
                 let lane = self.s.m.bin(c, Bin::And, src, three);
-                let lane = self.s.m.bin(c, Bin::Xor, lane, d);
                 return broadcast(self, lane);
             }
             _ => {}
