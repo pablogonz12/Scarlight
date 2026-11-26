@@ -42,9 +42,6 @@ pub(crate) fn enabled() -> bool {
 }
 
 static PRESSURED: AtomicBool = AtomicBool::new(false);
-/// Free physical RAM and available commit, whichever is less (u64::MAX until a
-/// sample has landed).
-static HEADROOM: AtomicU64 = AtomicU64::new(u64::MAX);
 /// The commit sample the admission gates read, at most one per sample window.
 static COMMIT: AtomicU64 = AtomicU64::new(u64::MAX);
 static NEXT_SAMPLE: AtomicU64 = AtomicU64::new(0);
@@ -95,7 +92,8 @@ fn next_pressure(was: bool, total: u64, physical: u64, commit: u64) -> bool {
 /// Whether `bytes` more may be taken with `commit` available, leaving the
 /// floor (`growth`: the larger one) free afterwards.
 fn admitted(total: u64, commit: u64, bytes: u64, growth: bool) -> bool {
-    let floor = if growth { growth_floor(total) } else { upload_floor(total) };
+    let budget = budgets(Some(total));
+    let floor = if growth { budget.growth_floor } else { budget.upload_floor };
     commit >= floor.saturating_add(bytes)
 }
 
@@ -111,6 +109,41 @@ pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, limited: bool, staging:
         bytes.min(64 * MIB)
     } else {
         bytes
+    }
+}
+
+/// What this PC may keep for uploads, and for how long: one table by total
+/// RAM instead of a constant at each site (his "32GB RAM residency budgets",
+/// ours by tier). Unknown RAM gets the middle row's numbers.
+pub(crate) struct Budgets {
+    /// Scratch chunks no list holds that are kept for the next list.
+    pub(crate) spare_upload: u64,
+    /// How long idle upload storage is kept before it is freed.
+    pub(crate) idle_ms: u64,
+    /// Free commit left after an upload has taken its bytes.
+    pub(crate) upload_floor: u64,
+    /// Free commit left after a brand-new block of upload storage.
+    pub(crate) growth_floor: u64,
+}
+
+pub(crate) fn budgets(total_ram: Option<u64>) -> Budgets {
+    let spare_upload = match total_ram {
+        Some(ram) if ram <= 16 * GIB => 64 * MIB,
+        Some(ram) if ram >= 30 * GIB => 256 * MIB,
+        _ => 128 * MIB,
+    };
+    // A small PC gives idle upload storage back sooner: it has less to spare
+    // and the title's own allocations are what it is competing with.
+    let idle_ms = match total_ram {
+        Some(ram) if ram <= 12 * GIB => 5_000,
+        _ => 10_000,
+    };
+    let total = total_ram.unwrap_or(0);
+    Budgets {
+        spare_upload,
+        idle_ms,
+        upload_floor: upload_floor(total),
+        growth_floor: growth_floor(total),
     }
 }
 
@@ -205,7 +238,6 @@ pub(crate) fn tick() {
     let Some((physical, commit)) = memory_status() else {
         return;
     };
-    HEADROOM.store(physical.min(commit), Ordering::Relaxed);
     COMMIT.store(commit, Ordering::Relaxed);
     if !enabled() {
         PRESSURED.store(false, Ordering::Relaxed);
@@ -238,8 +270,8 @@ pub(crate) fn tick() {
             available_commit_mib = commit >> 20,
             staging_buffers,
             texture_staging_mib,
-            upload_floor_mib = upload_floor(total) >> 20,
-            growth_floor_mib = growth_floor(total) >> 20,
+            upload_floor_mib = budgets(Some(total)).upload_floor >> 20,
+            growth_floor_mib = budgets(Some(total)).growth_floor >> 20,
             "host memory pressure: deferring new upload storage and speculative uploads (VICTORY_RESIDENCY=0 turns this off)"
         );
     } else {
@@ -260,12 +292,6 @@ pub(crate) fn pressured() -> bool {
 /// caller's did.
 pub(crate) fn limited_host_ram() -> bool {
     crate::total_system_ram_bytes().is_some_and(|ram| ram <= 32 * GIB)
-}
-
-/// Free physical RAM and commit, whichever is less, once a sample has landed.
-pub(crate) fn headroom() -> Option<u64> {
-    let bytes = HEADROOM.load(Ordering::Relaxed);
-    (bytes != u64::MAX).then_some(bytes)
 }
 
 #[cfg(test)]
@@ -350,6 +376,27 @@ mod tests {
         assert_eq!(prefetch_limit(512 * MIB, false, false, 2 * GIB), 512 * MIB);
         assert_eq!(prefetch_limit(0, false, false, 0), 0);
         assert_eq!(prefetch_limit(192 * MIB, false, false, 0), 192 * MIB);
+    }
+
+    /// The budget table: the target PC (16 GiB) keeps 64 MiB of idle upload
+    /// storage, the 30 GiB desktop 256 MiB, a 12 GiB one gives it back in 5 s,
+    /// and the floors follow the RAM.
+    #[test]
+    fn the_budget_table_follows_the_pc() {
+        let small = budgets(Some(12 * GIB));
+        assert_eq!(small.spare_upload, 64 * MIB);
+        assert_eq!(small.idle_ms, 5_000);
+        let ours = budgets(Some(OURS));
+        assert_eq!(ours.spare_upload, 64 * MIB);
+        assert_eq!(ours.idle_ms, 10_000);
+        assert_eq!(ours.upload_floor, GIB);
+        assert_eq!(ours.growth_floor, 2 * GIB);
+        let desktop = budgets(Some(30 * GIB));
+        assert_eq!(desktop.spare_upload, 256 * MIB);
+        assert_eq!(desktop.idle_ms, 10_000);
+        let unknown = budgets(None);
+        assert_eq!(unknown.spare_upload, 128 * MIB);
+        assert_eq!(unknown.idle_ms, 10_000);
     }
 
     /// Microbench: the whole admission decision is arithmetic, so it has to be

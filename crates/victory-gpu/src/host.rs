@@ -145,20 +145,27 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
 /// when free physical RAM is low. Never returns less than 2,000 ms.
+/// Effective idle timeout (in milliseconds) for system-RAM caches (staging
+/// buffers, loose shadows, and the mapped pipeline library), scaled down
+/// when free physical RAM is low and at once when the host-memory guard says
+/// the PC is under pressure. Never returns less than 2,000 ms.
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
-    const NORMAL_MS: u64 = 10_000;
     const MODERATE_MS: u64 = 5_000;
     const HIGH_MS: u64 = 2_000;
+    let budget = crate::residency::budgets(crate::total_system_ram_bytes()).idle_ms;
+    if crate::residency::pressured() {
+        return budget.min(crate::residency::PRESSURE_IDLE_MS);
+    }
     let Some(avail) = avail_phys else {
-        return NORMAL_MS;
+        return budget;
     };
     if avail < 2 * GIB {
-        HIGH_MS
+        budget.min(HIGH_MS)
     } else if avail < 4 * GIB {
-        MODERATE_MS
+        budget.min(MODERATE_MS)
     } else {
-        NORMAL_MS
+        budget
     }
 }
 
@@ -1504,16 +1511,9 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 /// list that did took 4 MiB of the PC's memory for it.
 const SCRATCH_FIRST: u64 = 256 << 10;
 /// The most bytes of chunks kept while no list holds them, scaled from total
-/// system RAM.
+/// system RAM ([`crate::residency::budgets`]).
 fn spare_most(total_ram_bytes: Option<u64>) -> u64 {
-    const GIB: u64 = 1 << 30;
-    match total_ram_bytes {
-        Some(ram) if ram <= 16 * GIB => 64 << 20,
-        // 32 GB Windows systems typically report ~31.7–31.9 GiB in
-        // `ullTotalPhys` after firmware/hardware reservations.
-        Some(ram) if ram >= 30 * GIB => 256 << 20,
-        _ => 128 << 20,
-    }
+    crate::residency::budgets(total_ram_bytes).spare_upload
 }
 
 /// Whether lists share their scratch chunks: a list takes a chunk when it
@@ -1609,9 +1609,16 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         return;
     }
     let most = spare_most(crate::total_system_ram_bytes());
-    // Under host-memory pressure an idle chunk is memory the title could use:
-    // keep none ([`crate::residency`], his `pool::room` dropping the spare
-    // limit to zero), rather than waiting for the next allocation to notice.
+    // Idle chunks are speculative storage: capped where a small PC already
+    // holds a gigabyte of staging, and none at all under pressure
+    // ([`crate::residency`], his `pool::room` dropping the spare limit to
+    // zero), rather than waiting for the next allocation to notice.
+    let most = crate::residency::prefetch_limit(
+        most,
+        false,
+        crate::residency::limited_host_ram(),
+        crate::texture::staged_bytes(),
+    );
     let most = if crate::residency::pressured() { 0 } else { most };
     let mut freed = Vec::new();
     {
