@@ -176,6 +176,10 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   `crates/victory-gpu/src/texture.rs`'s `Staging::refresh_pages`, `VICTORY_DETILE_DIRTY=0`). Its own page table
   and its per-page reads are not taken: our subresource ranges come from the layout (`Layout::mip_extents`) and
   the written pages are read in runs, with the rows outside the window skipped whole.
+- **DexNom/VIctory [76749ce5](https://github.com/DexNom/VIctory/commit/76749ce58da23a43a3500454a8b69c53f05aa477)** (DexNom), GPL-3.0: a
+  wave64 lane mask parked in two SGPRs and restored one `s_mov_b32` at a time is recognised as the mask it was
+  copied from when both words still trace back to the same known pair through scalar moves
+  (`crates/victory-shader/src/structure.rs`); `VICTORY_DX_LANE_MASK_MOVES=0` keeps the split pair opaque.
 
 - **Marvisak/VIctory [#2163](https://github.com/Marvisak/VIctory/pull/2163)** (0xkn0wh3r3), GPL-3.0: the
   built-in BCPack table's first BC7 dictionary entry has its 32 indices right after its width bytes, where
