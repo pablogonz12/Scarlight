@@ -28,6 +28,15 @@ wrothgaril, Yaekai.
 
 andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VIctory #2614), BlueKaiman, kais7654, pushkarreddyy, shh.
 
+## Ports of fork pull requests
+
+Code reimplemented here from a fork's pull request, because the fork's tree had diverged from ours;
+the design and the author are credited in the commit's `Co-authored-by:` and here.
+
+- **Marvisak/VIctory #2401** (Mumogg) — the Wine `ExitProcess` hook that makes a host driver
+  compiler crash cost one pipeline instead of the run ([`pipeline/wine.rs`](crates/victory-gpu/src/pipeline/wine.rs)),
+  adapted to our pipeline workers and library.
+
 ## Design notes
 
 - **Marvisak/VIctory [#2478](https://github.com/Marvisak/VIctory/pull/2478)** (HoLa-Lee), GPL-3.0: the idea
@@ -67,9 +76,6 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   pruned. Reimplemented against this tree's library, which has no `victory_shader::SOURCE_HASH`: the key is
   the executable's BLAKE3, the same bytes the shader cache keys its translations on
   (`crates/victory-gpu/src/shader_cache.rs`), and `VICTORY_LIBRARY_PRUNE=0` keeps every library.
-- **vitutu1** by **ZigZagBoi1** ([ZigZagBoi1/ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort),
-  GPL-3.0-or-later): the resolution and upscaler levers, which here are profile hooks and the
-  switches `VICTORY_RENDER_SCALE` / `VICTORY_OWN_UPSCALER` rather than code that names a title.
 
 - **fxceless/victory-fork [PR #1117](https://github.com/fxceless/victory-fork/pull/1117)** (Azemed),
   GPL-3.0: the title's views behind an `RwLock` (`views_read`/`views_write`, `crates/victory-gpu/src/inplace.rs`)
@@ -82,11 +88,6 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   the copy-back and the rest, the largest named (`crates/victory-gpu/src/frame_budget.rs`,
   `VICTORY_FRAME_BUDGET=0`). Reimplemented on this tree's counters and its own 50 ms budget: its
   per-command timestamps, memory-trait breakdown and slow-pipeline guard are not taken.
-- **fxceless/victory-fork [#1068](https://github.com/fxceless/victory-fork/pull/1068)** (UwUCammie), GPL-3.0: the
-  idea that the title buffers' table is read most of the time and so wants a read lock, and that one submission's
-  buffer refreshes go into the list in one batch (`crates/victory-gpu/src/shadow.rs`, `VICTORY_REFRESH_BATCH=0` puts
-  one step in per span again). Its `defer_refreshes` came over as written; our `lookup` re-checks under the write
-  lock, so a copy is made once.
 - **miatson/VIctory [#2801](https://github.com/miatson/VIctory/pull/2801)** (miatson), GPL-3.0: the idea that
   the console blends MIN/MAX into integer render targets, which the host refuses, so such a target is made to
   write unblended when the pipeline is built (`crates/victory-gpu/src/pipeline/host.rs`). Its twin pipeline

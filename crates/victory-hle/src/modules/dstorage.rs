@@ -341,9 +341,7 @@ struct Lanes {
     /// Bytes of staging held by running requests, and the limit.
     staged: u64,
     staging: u64,
-    /// Queue and sequence of a blocked head after another read used the spare space.
-    staging_reservation: Option<(u64, u64)>,
-    /// Queue and sequence of a blocked head after another read used the spare space.
+    /// A start waited for staging space since the last finish.
     starved: bool,
     /// Weighted round robin: each class's virtual time (bytes × cost), and
     /// the time of the last start; within a class, the lane clock of the
@@ -371,7 +369,7 @@ struct Lane {
     /// Submitted, by sequence number: reads not started (with the time
     /// the title enqueued them), status entries not written, reads
     /// running, and failures not yet reported.
-    reads: VecDeque<(u64, ReadRequest, std::time::Instant)>,
+    reads: VecDeque<(u64, Request, std::time::Instant)>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
@@ -379,15 +377,15 @@ struct Lane {
 }
 
 // SAFETY: requests point into title memory and our own objects, which stay
-// valid until the title has seen them complete; file sources and status
-// arrays count their references atomically.
+// valid until the title has seen them complete; status arrays count their
+// references atomically.
 unsafe impl Send for Lane {}
 
 /// A read a worker runs.
 struct Job {
     lane: u64,
     seq: u64,
-    request: ReadRequest,
+    request: Request,
     staging: u64,
     /// When the title enqueued it: from there to the worker's start is the
     /// time a request waited (the diagnostics summary's `queue` stage).
@@ -514,7 +512,6 @@ fn scheduler() -> Option<&'static Scheduler> {
                     next_seq: 0,
                     staged: 0,
                     staging: STAGING,
-                    staging_reservation: None,
                     starved: false,
                     clock: [0; 3],
                     now: 0,
@@ -561,16 +558,13 @@ impl Scheduler {
 fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
     loop {
-        let Some(mut job) = lanes.start() else {
+        let Some(job) = lanes.start() else {
             lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
             continue;
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request.request);
-        // Drop the file reference before publishing completion so a caller
-        // that already released the file sees its OS handle closed on wakeup.
-        job.request.release_file();
+        let result = execute(&job.request);
         // The lock's wait, with 16 workers queueing for a request each: the
         // scheduler's own cost shows up here, not in a read.
         let mark = Mark::begin();
@@ -590,10 +584,10 @@ impl Lanes {
     fn count(&mut self, job: &Job, started: std::time::Instant) {
         let (requests, bytes, busy) = &mut self.done;
         *requests += 1;
-        *bytes += u64::from(job.request.request.destination_size);
+        *bytes += u64::from(job.request.destination_size);
         *busy += started.elapsed();
-        if job.request.request.options & BCPACK != 0 {
-            self.bcpack.0 += u64::from(job.request.request.destination_size);
+        if job.request.options & BCPACK != 0 {
+            self.bcpack.0 += u64::from(job.request.destination_size);
             self.bcpack.1 += started.elapsed();
         }
         // Its enqueue to its start, charged to the queue stage.
@@ -622,78 +616,31 @@ impl Lanes {
         }
     }
 
-    /// Selects an eligible queue head by class time, lane time and submission order.
-    fn next_lane(&self, eligible: impl Fn(&Request) -> bool) -> Option<u64> {
-        self.lanes
-            .iter()
-            .filter_map(|(&id, lane)| {
-                let (seq, request, _) = lane.reads.front()?;
-                eligible(&request.request).then_some((
-                    self.clock[lane.class],
-                    lane.class,
-                    lane.clock,
-                    *seq,
-                    id,
-                ))
-            })
-            .min()
-            .map(|(_, _, _, _, id)| id)
-    }
-
-    /// Starts the next read when its staging fits, or when the buffer is empty.
-    /// A blocked head permits one fitting read from another queue before it
-    /// reserves the next admission. Only queue heads participate.
+    /// Starts the next read of the class with the least virtual time, from
+    /// its lane that has started the fewest bytes, if the staging buffer
+    /// has room for it (or nothing else holds any).
     fn start(&mut self) -> Option<Job> {
-        self.start_with(staging_bypass())
-    }
-
-    /// [`start`], with the cross-queue staging fill on or off.
-    fn start_with(&mut self, bypass: bool) -> Option<Job> {
-        let reservation = self.staging_reservation.filter(|&(id, seq)| {
-            self.lanes
-                .get(&id)
-                .and_then(|lane| lane.reads.front())
-                .is_some_and(|&(head, _, _)| head == seq)
-        });
-        self.staging_reservation = reservation;
-        let id = reservation
-            .map(|(id, _)| id)
-            .or_else(|| self.next_lane(|_| true))?;
-        let (head, request, _) = self.lanes.get(&id)?.reads.front()?;
-        let head = *head;
-        let available = self.staging.saturating_sub(self.staged);
-        let id = if self.staged > 0 && self.staged + staging_bytes(&request.request) > self.staging {
+        let busy = || self.lanes.iter().filter(|(_, l)| !l.reads.is_empty());
+        let (_, class) = busy().map(|(_, l)| (self.clock[l.class], l.class)).min()?;
+        let (_, _, id) = busy()
+            .filter(|(_, l)| l.class == class)
+            .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
+            .min()?;
+        let lane = self.lanes.get_mut(&id)?;
+        let &(seq, request, submitted) = lane.reads.front()?;
+        let staging = staging_bytes(&request);
+        if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
-            if reservation.is_some() || !bypass {
-                return None;
-            }
-            let fitting = self.next_lane(|request| {
-                let bytes = staging_bytes(request);
-                bytes != 0 && bytes <= available
-            })?;
-            self.staging_reservation = Some((id, head));
-            fitting
-        } else {
-            self.staging_reservation = None;
-            id
-        };
-        let lane = self.lanes.get_mut(&id)?;
-        // The read chosen here, not the blocked head: `submitted` is what
-        // its queue wait is charged from ([`Self::finish`]).
-        let (seq, request, submitted) = lane.reads.pop_front()?;
-        let staging = staging_bytes(&request.request);
-        let class = lane.class;
+            return None;
+        }
+        lane.reads.pop_front();
         lane.running.insert(seq);
         self.staged += staging;
-        let size = u64::from(request.request.destination_size.max(request.request.source_size)).max(1);
-        // Charge a bypass to its queue without advancing the clocks used to
-        // admit newly active queues ahead of the reserved read.
-        if self.staging_reservation.is_none() {
-            self.now = self.clock[class];
-            self.lane_now[class] = lane.clock;
-        }
+        let size = u64::from(request.destination_size.max(request.source_size)).max(1);
+        self.now = self.clock[class];
         self.clock[class] += size * COST[class];
+        self.lane_now[class] = lane.clock;
         lane.clock += size;
         Some(Job {
             lane: id,
@@ -802,14 +749,6 @@ fn staging_bytes(request: &Request) -> u64 {
     }
 }
 
-/// Whether a blocked queue's head lets another queue's fitting read use the
-/// spare staging space (`VICTORY_DS_STAGING=0` keeps the buffer to the head
-/// that came first).
-fn staging_bypass() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_DS_STAGING").is_none_or(|value| value != "0"))
-}
-
 /// Ends a queue: what was not started is dropped, and this waits for the
 /// reads already running (they write title memory).
 fn close_lane(id: u64) {
@@ -872,38 +811,8 @@ const PAGE: usize = 64 * 1024;
 enum Command {
     /// A read, and when the title enqueued it: the queue stage runs from
     /// there, not from the submission that moved it to the workers.
-    Read(ReadRequest, std::time::Instant),
+    Read(Request, std::time::Instant),
     Status(Status),
-}
-
-/// A read request queued in the scheduler, holding a reference on its file
-/// source (when file-backed) until the read finishes or is dropped.
-struct ReadRequest {
-    request: Request,
-    file: Option<*mut Instance<File>>,
-}
-
-impl ReadRequest {
-    fn new(request: Request) -> Self {
-        let file = (request.options & MEMORY_SOURCE == 0 && !request.source.is_null()).then(|| {
-            let file = request.source.cast_mut().cast::<Instance<File>>();
-            add_ref_instance(file);
-            file
-        });
-        ReadRequest { request, file }
-    }
-
-    fn release_file(&mut self) {
-        if let Some(file) = self.file.take() {
-            release(file);
-        }
-    }
-}
-
-impl Drop for ReadRequest {
-    fn drop(&mut self) {
-        self.release_file();
-    }
 }
 
 
@@ -931,7 +840,7 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
-    queue(this, Command::Read(ReadRequest::new(request), std::time::Instant::now()));
+    queue(this, Command::Read(request, std::time::Instant::now()));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -1728,7 +1637,6 @@ mod tests {
             next_seq: 0,
             staged: 0,
             staging,
-            staging_reservation: None,
             starved: false,
             clock: [0; 3],
             now: 0,
@@ -1744,10 +1652,7 @@ mod tests {
         let mut r = request(options, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
-        lane.unsubmitted.push(Command::Read(
-            ReadRequest::new(r),
-            std::time::Instant::now(),
-        ));
+        lane.unsubmitted.push(Command::Read(r, std::time::Instant::now()));
     }
 
     #[test]
@@ -1794,78 +1699,6 @@ mod tests {
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
         assert!(l.start().is_some());
-    }
-
-    #[test]
-    fn a_blocked_read_allows_one_fitting_read_from_another_queue() {
-        let mut l = lanes(100);
-        for id in 0..4 {
-            l.lanes.insert(id, Lane::new(0, 64));
-        }
-        read(&mut l, 0, ZLIB, 60);
-        l.submit(0);
-        let active = l.start_with(true).unwrap();
-
-        for (id, size) in [(1, 80), (2, 20), (3, 20)] {
-            read(&mut l, id, ZLIB, size);
-            l.submit(id);
-        }
-
-        let small = l
-            .start_with(true)
-            .expect("another queue can use the free staging space");
-        assert_eq!((small.lane, l.staged), (2, 80));
-        assert!(l.start_with(true).is_none(), "keep space for the blocked read");
-        l.finish(&small, Ok(()));
-        assert!(l.start_with(true).is_none(), "the same blocked read gets only one bypass");
-
-        l.finish(&active, Ok(()));
-        let large = l.start_with(true).unwrap();
-        assert_eq!((large.lane, l.staged), (1, 80));
-        assert_eq!(l.start_with(true).unwrap().lane, 3);
-        assert_eq!(l.staged, 100);
-    }
-
-    #[test]
-    fn the_staging_fill_holds_bytes_the_switch_leaves_idle() {
-        // The same script with the fill on and off: a head that needs more
-        // than the buffer has, then a queue of large reads (still blocked)
-        // and one of small reads that fit the spare space.
-        let script = |bypass: bool| {
-            let mut l = lanes(100);
-            for id in 0..3 {
-                l.lanes.insert(id, Lane::new(0, 64));
-            }
-            read(&mut l, 0, ZLIB, 70);
-            l.submit(0);
-            let mut jobs = vec![l.start_with(bypass).unwrap()];
-            read(&mut l, 1, ZLIB, 60);
-            l.submit(1);
-            read(&mut l, 2, ZLIB, 30);
-            l.submit(2);
-            jobs.extend(l.start_with(bypass));
-            (l.staged, jobs.len(), l.refused)
-        };
-        // Off: the blocked head faults the start and 30 bytes idle.
-        assert_eq!(script(false), (70, 1, 1));
-        // On: the small read fills them, charged to its own queue.
-        assert_eq!(script(true), (100, 2, 1));
-    }
-
-    #[test]
-    fn clearing_a_blocked_queue_releases_its_staging_reservation() {
-        let mut l = lanes(100);
-        for (id, size) in [(0, 60), (1, 80), (2, 20), (3, 10)] {
-            l.lanes.insert(id, Lane::new(0, 64));
-            read(&mut l, id, ZLIB, size);
-            l.submit(id);
-        }
-
-        assert_eq!(l.start_with(true).unwrap().lane, 0);
-        assert_eq!(l.start_with(true).unwrap().lane, 2);
-        l.lanes.get_mut(&1).unwrap().reads.clear();
-        assert_eq!(l.start_with(true).unwrap().lane, 3);
-        assert_eq!(l.staged, 90);
     }
 
     #[test]
@@ -2245,29 +2078,5 @@ mod tests {
         )
         .expect("a zlib request");
         assert_eq!(bench::page_bytes(pages.numbers(), raw.len()), raw);
-    }
-
-    #[test]
-    fn queued_file_read_survives_caller_releasing_file() {
-        let contents = pattern(256);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("released.bin");
-        std::fs::write(&path, &contents).unwrap();
-        let file = open(&path);
-        let (queue, array) = (new_queue(0), status_array(1));
-
-        let mut out = [0u8; 64];
-        enqueue(queue, &request(0, out.as_mut_ptr().cast(), 64, file, 32, 64));
-        enqueue_status(queue, array, 0);
-
-        // Release the caller's only reference before submitting the queue.
-        let release_fn: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
-        assert_eq!(release_fn(file), 1);
-
-        void(queue, 0x30);
-        assert_eq!(wait(array, 0), S_OK);
-        assert_eq!(out, contents[32..96]);
-        // The file handle was released before completion was published.
-        std::fs::remove_file(&path).unwrap();
     }
 }

@@ -827,96 +827,25 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
-/// What a title buffer copy does.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CopyPlan {
-    /// One `CopyBufferRegion` on the host GPU: both sides have a host copy of
-    /// their range, so the GPU moves the bytes between them and title memory
-    /// gets them after the submission (like a shader write) instead of a
-    /// kernel read and write of title memory at submission time.
-    Gpu,
-    /// On the CPU, as always: a side without a host copy, or
-    /// `VICTORY_GPU_COPIES=0`.
-    Title,
-}
-
-/// [`CopyPlan`] for a copy whose sides do or do not have host copies: the
-/// whole decision, so it can be tested without a device.
-pub(crate) fn copy_plan(enabled: bool, src_hosted: bool, dst_hosted: bool) -> CopyPlan {
-    if enabled && src_hosted && dst_hosted {
-        CopyPlan::Gpu
-    } else {
-        CopyPlan::Title
-    }
-}
-
-/// Records a GPU copy of `len` bytes at `src_address` into `dst_address`
-/// through the buffers' host copies, in this list where the copy was
-/// recorded: `false` (nothing recorded) unless both ranges are inside their
-/// host copies.
-///
-/// The source's host copy is brought up to date by the submission-time steps,
-/// before the list runs (so after every CPU-side step recorded before this
-/// one), and the destination is marked GPU-written there: nothing refreshes
-/// title memory over it, and once the submission has run it is copied back
-/// like a shader write. Buffers are in the `COMMON` state, which a buffer copy
-/// promotes to and from without a barrier.
+/// Whether a title texture's host copy lacks its top mip levels (the host
+/// could not give them, [`crate::resource::dropped_mips`]). A copy or a
+/// resolve names the title's subresources and sizes, so it is skipped on
+/// such a copy.
 #[cfg(windows)]
-pub(crate) fn record_gpu_copy(
-    list: &crate::host::HostList,
-    dst: &std::sync::Arc<crate::shadow::Shadow>,
-    dst_address: usize,
-    src: &std::sync::Arc<crate::shadow::Shadow>,
-    src_address: usize,
-    len: usize,
-) -> bool {
-    let (Some((dst_buffer, dst_offset)), Some((src_buffer, src_offset))) =
-        (dst.gpu_range(dst_address, len), src.gpu_range(src_address, len))
-    else {
-        return false;
-    };
-    // The source first: the copy reads the host copy's bytes, and the refresh
-    // is what makes them the title's (the pages a CPU copy would read).
-    src.refresh(list, src_address as u64, len as u64);
-    // Then the destination, brought up to date first: the bytes kept for the
-    // copy-back are its baseline, and title memory may have moved on since
-    // this host copy was last read (a stale baseline would leave the title's
-    // newer bytes there for a copy the GPU does not change). In place there
-    // is nothing to bring up: it is title memory.
-    if !dst.in_place() {
-        dst.refresh(list, dst_address as u64, len as u64);
+fn mip_dropped(texture: This) -> bool {
+    let dropped = crate::resource::dropped_mips(texture);
+    if dropped > 0 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                "a copy or resolve skipped: a host texture lost mips to memory pressure"
+            );
+        });
     }
-    dst.gpu_writes(list, dst_address as u64, len as u64);
-    // SAFETY: an open list and live buffers, both inside their resources.
-    unsafe {
-        list.list
-            .CopyBufferRegion(&dst_buffer, dst_offset, &src_buffer, src_offset, len as u64)
-    };
-    #[cfg(feature = "diagnostics")]
-    crate::copystat::gpu_copy(len);
-    true
+    dropped > 0
 }
 
-/// A title buffer copy of `len` bytes at `from` into `to`: on the host GPU
-/// when both ranges have a host copy, else on the CPU as always.
-#[cfg(windows)]
-fn buffer_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: usize) {
-    let src = crate::shadow::peek(from as u64, len as u64);
-    let dst = crate::shadow::peek(to as u64, len as u64);
-    if let (Some(s), Some(d)) = (&src, &dst)
-        && matches!(
-            copy_plan(crate::host::gpu_copies(), src.is_some(), dst.is_some()),
-            CopyPlan::Gpu
-        )
-        && record_gpu_copy(list, d, to as usize, s, from as usize, len)
-    {
-        return;
-    }
-    list.defer_copy(to, from, len);
-}
-
-/// Buffer to buffer: both are host memory, copied at submission, or on the
-/// host GPU through their host copies when both have one.
+/// Buffer to buffer: both are host memory, copied at submission.
 extern "system" fn copy_buffer_region(
     this: This,
     dst: This,
@@ -929,9 +858,8 @@ extern "system" fn copy_buffer_region(
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
-        && let Ok(len) = usize::try_from(len)
     {
-        buffer_copy(list, to, from, len);
+        list.defer_copy(to, from, len as usize);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
@@ -962,7 +890,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            if unlike(dst, src) {
+            if unlike(dst, src) || mip_dropped(dst) || mip_dropped(src) {
                 return;
             }
             // A source the title fills itself is uploaded first (upstream
@@ -984,7 +912,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            buffer_copy(list, to, from, a.min(b) as usize);
+            list.defer_copy(to, from, a.min(b) as usize);
         }
     }
     #[cfg(not(windows))]
@@ -1038,6 +966,9 @@ extern "system" fn copy_texture_region(
             // and 1x1 RGBA32F, 80 and 16 bytes: run 90), and read a buffer
             // nobody wrote. `VICTORY_READ_BACK=0` leaves them unmade, as
             // before.
+            if src.kind != FOOTPRINT && mip_dropped(src.resource) {
+                return;
+            }
             static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             let made = read_back(list, dst, x, y, z, src, source_box);
@@ -1064,7 +995,10 @@ extern "system" fn copy_texture_region(
             }
             return;
         };
-        if unlike(dst.resource, src.resource) {
+        if unlike(dst.resource, src.resource)
+            || mip_dropped(dst.resource)
+            || (src.kind != FOOTPRINT && mip_dropped(src.resource))
+        {
             return;
         }
         let mut from = src;
@@ -1253,7 +1187,7 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
-        if unlike(dst, src) {
+        if unlike(dst, src) || mip_dropped(dst) || mip_dropped(src) {
             return;
         }
         // Depth textures shaders also write: what they wrote, first.
@@ -1865,11 +1799,63 @@ pub(crate) struct ValueWait {
     wide: bool,
 }
 
+/// The comparison code that asks nothing of the value: a wait with it is met
+/// whatever the memory holds, mapped or not.
+const ALWAYS: u32 = 8;
+
+/// Whether a wait on memory that cannot be read yet holds its queue until it
+/// reads, rather than running on at once (`VICTORY_WAIT_UNREAD=0`, as before).
+/// Memory that is not mapped is taken as not holding what is waited for
+/// unless the comparison does not look at the value (1..=7 do,
+/// `ValueWait::holds_for`), and it is taken as met after the bound
+/// (`VICTORY_WAIT_UNREAD_MS`) with a warning, so memory that never reads
+/// cannot hold a queue forever.
+fn unread_holds() -> bool {
+    static HOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HOLD.get_or_init(|| std::env::var("VICTORY_WAIT_UNREAD").as_deref() != Ok("0"))
+}
+
+/// How long a wait may stand on memory that cannot be read before it is taken
+/// as met (`VICTORY_WAIT_UNREAD_MS`, 2000 ms; `0` waits forever).
+fn unread_bound() -> std::time::Duration {
+    static BOUND: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *BOUND.get_or_init(|| {
+        let ms = std::env::var("VICTORY_WAIT_UNREAD_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000);
+        std::time::Duration::from_millis(ms)
+    })
+}
+
+/// The unread waits seen: address, the bytes waited for there, when a look
+/// first found it unreadable, and whether the bound's warning has been
+/// logged. The bytes are part of the key: a 32-bit wait at an address reads
+/// while a 64-bit wait there does not, and one must not restart the other's
+/// bound.
+fn unread_seen() -> &'static std::sync::Mutex<Vec<(u64, usize, std::time::Instant, bool)>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<Vec<(u64, usize, std::time::Instant, bool)>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// How many unread waits are tracked at once: far above the five queues the
+/// title submits (one wait per queue at most), so churn is a diagnostic, not
+/// a policy.
+const UNREAD_SEEN_MAX: usize = 64;
+
 impl ValueWait {
     /// Whether the memory holds what is waited for now.
     /// shortcut: the comparison codes are taken to be the comparison
     /// functions' (1 never .. 8 always, value against reference); one not
-    /// known counts as met, and so does memory that is not mapped.
+    /// known counts as met.
+    ///
+    /// Memory that cannot be read yet (a page not mapped, say) is taken as
+    /// not holding, and the queue waits until it reads: running on at once
+    /// sent the work after the wait to the card before the work that writes
+    /// the value, and the wait was reported as an unknown comparison in the
+    /// frame's summary. `ALWAYS` asks nothing of the value, so it is met.
+    /// `VICTORY_WAIT_UNREAD=0` reads unreadable memory as met, as before.
     ///
     /// The value is read through the kernel, which reports memory that is
     /// not there instead of faulting (as the copies of title memory are
@@ -1886,7 +1872,7 @@ impl ValueWait {
     pub(crate) fn met(&self) -> bool {
         #[cfg(all(windows, feature = "diagnostics"))]
         let started = std::time::Instant::now();
-        let met = self.holds();
+        let met = self.holds(true);
         #[cfg(all(windows, feature = "diagnostics"))]
         {
             use crate::copystat::{C, add};
@@ -1896,31 +1882,130 @@ impl ValueWait {
         met
     }
 
+    /// [`Self::met`] for a line that only reports the wait (the first waits of
+    /// a list, a capture): it does not start the unread-wait bound, so a look
+    /// taken for the log cannot age a wait the queue has not checked.
+    pub(crate) fn met_peek(&self) -> bool {
+        self.holds(false)
+    }
+
     /// Off Windows there is no title memory to read (this crate is built
     /// there for the unit tests and rustdoc only): the wait counts as met.
     #[cfg(not(windows))]
-    fn holds(&self) -> bool {
+    fn holds(&self, _track: bool) -> bool {
         true
     }
 
     #[cfg(windows)]
-    fn holds(&self) -> bool {
+    fn holds(&self, track: bool) -> bool {
         let bytes = if self.wide { 8 } else { 4 };
         if self.address == 0 {
             return true;
         }
         static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // Asking first is the same question the read answers: memory that is
+        // not committed is not readable, and is held as below.
         if *ASK.get_or_init(|| std::env::var_os("VICTORY_WAIT_ASK").is_some_and(|v| v == "1"))
             && !crate::texture::committed(self.address as *const u8, bytes)
         {
-            return true;
+            return self.unread_met_tracked(track);
         }
         // The low `bytes` bytes; the rest stays zero.
         let mut raw = [0u8; 8];
         if !crate::host::read_into(self.address as *const u8, &mut raw[..bytes]) {
-            return true;
+            return self.unread_met_tracked(track);
+        }
+        if unread_holds() && (1..ALWAYS).contains(&self.comparison) {
+            self.unread_read();
         }
         self.holds_for(u64::from_le_bytes(raw))
+    }
+
+    /// Whether a wait is met while its memory cannot be read: only a
+    /// comparison that does not look at the value is (`holds_for` says what
+    /// the 1..=7 codes compare), or, with `VICTORY_WAIT_UNREAD=0`, every one,
+    /// as before.
+    ///
+    /// Otherwise it is not met until it has stood on that address longer than
+    /// the bound (`VICTORY_WAIT_UNREAD_MS`, 2 s), then it is taken as met with
+    /// one warning: memory that never reads would hold its queue forever
+    /// (nothing releases a held queue on a timer, only a submission, a signal
+    /// or a present).
+    /// [`Self::unread_met`]; a look that only reports the wait (`track`
+    /// false) finds the entry it has but never starts one, so a diagnostic
+    /// look cannot start the bound of the queue's own check
+    /// ([`Self::met_peek`]).
+    fn unread_met_tracked(&self, track: bool) -> bool {
+        self.unread_met_at(std::time::Instant::now(), unread_bound(), track)
+    }
+
+    /// `unread_met` with the time, bound and whether to start tracking given.
+    fn unread_met_at(
+        &self,
+        now: std::time::Instant,
+        bound: std::time::Duration,
+        track: bool,
+    ) -> bool {
+        if !unread_holds() || !(1..ALWAYS).contains(&self.comparison) {
+            return true;
+        }
+        if bound.is_zero() {
+            return false;
+        }
+        let bytes = if self.wide { 8 } else { 4 };
+        let mut seen = unread_seen().lock().unwrap_or_else(|e| e.into_inner());
+        let i = match seen
+            .iter()
+            .position(|&(at, n, ..)| at == self.address && n == bytes)
+        {
+            Some(i) => i,
+            None => {
+                if !track {
+                    return false;
+                }
+                if seen.len() >= UNREAD_SEEN_MAX {
+                    // Room for one more: the newest entry goes, so the oldest
+                    // waits keep the time they have already stood on. (Taking
+                    // out every expired entry would restart a wait that is
+                    // close to its bound each time another address arrives.)
+                    let newest = seen
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|(_, entry)| entry.2)
+                        .map(|(i, _)| i);
+                    if let Some(i) = newest {
+                        seen.swap_remove(i);
+                    }
+                }
+                seen.push((self.address, bytes, now, false));
+                return false;
+            }
+        };
+        let (_, _, first, warned) = seen[i];
+        if now.duration_since(first) < bound {
+            return false;
+        }
+        if !warned {
+            seen[i].3 = true;
+            tracing::warn!(
+                address = format_args!("{:#x}", self.address),
+                comparison = self.comparison,
+                reference = format_args!("{:#x}", self.reference),
+                ms = bound.as_millis() as u64,
+                "a wait on memory that cannot be read was taken as met at the bound (VICTORY_WAIT_UNREAD_MS)"
+            );
+        }
+        true
+    }
+
+    /// The wait reads after standing on unreadable memory: the bound starts
+    /// over if it is unreadable again.
+    fn unread_read(&self) {
+        let bytes = if self.wide { 8 } else { 4 };
+        unread_seen()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&(at, n, ..)| !(at == self.address && n == bytes));
     }
 
     /// Where the value waited for is: address and bytes.
@@ -2008,7 +2093,7 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
             comparison,
             reference,
             wide,
-            met = wait.met(),
+            met = wait.met_peek(),
             "a list waits for a memory value"
         );
     }
@@ -2017,7 +2102,7 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
         crate::capture::op(std::ptr::from_ref(host) as usize, || {
             format!(
                 "WAIT VALUE at {address:#x} comparison {comparison} reference {reference:#x} wide {wide} met {}",
-                wait.met()
+                wait.met_peek()
             )
         });
     }
@@ -2339,10 +2424,214 @@ mod tests {
         assert_eq!(release(allocator), 0);
     }
 
+    /// A wait on memory that cannot be read yet is not met: its queue waits
+    /// for the value instead of sending the work after it to the card first
+    /// (#2604). On the old code the wait was met at once. Bounded, so a look
+    /// that never returns fails the test instead of hanging the run.
     #[cfg(windows)]
     #[test]
-    fn idle_most_scales_with_ram_and_cores() {
-        const GIB: u64 = 1 << 30;
+    fn a_wait_on_memory_not_mapped_yet_is_not_met() {
+        use windows_sys::Win32::System::Memory::*;
+        // EQUAL 5 holds once the page reads.
+        let wait = |address: u64, comparison: u32| ValueWait {
+            address,
+            comparison,
+            reference: 5,
+            wide: false,
+        };
+        // SAFETY: a private page, committed, protected and freed here only.
+        let page = unsafe {
+            let at = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+                .cast::<u32>();
+            assert!(!at.is_null());
+            at.write(5);
+            at
+        };
+        let mut old = 0;
+        // SAFETY: the page is ours and is read through the kernel, which
+        // reports an unreadable page instead of faulting.
+        assert_ne!(
+            unsafe { VirtualProtect(page.cast(), 4096, PAGE_NOACCESS, &mut old) },
+            0
+        );
+        // The look is a kernel call that does not block; the deadline only
+        // bounds a look that would not return at all.
+        let look = |w: ValueWait| {
+            let (send, got) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = send.send(w.met());
+            });
+            got.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("a wait's look returns")
+        };
+        let equal = wait(page as u64, 3);
+        assert!(
+            !look(equal),
+            "memory that cannot be read yet does not hold: the queue waits"
+        );
+        assert!(
+            look(wait(page as u64, ALWAYS)),
+            "ALWAYS asks nothing of the value"
+        );
+        assert!(
+            look(wait(page as u64, 0)),
+            "a comparison we do not know counts as met, readable or not"
+        );
+        // SAFETY: readable again, and ours.
+        assert_ne!(
+            unsafe { VirtualProtect(page.cast(), 4096, PAGE_READWRITE, &mut old) },
+            0
+        );
+        assert!(look(equal), "met once the value reads");
+        // SAFETY: ours, freed once.
+        assert_eq!(unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) }, 1);
+    }
+
+    /// A wait on memory that never reads is taken as met at the bound, with
+    /// one warning: nothing else releases a held queue (only a submission, a
+    /// signal or a present does), so without it the queue would stand there.
+    #[cfg(windows)]
+    #[test]
+    fn an_unreadable_wait_is_met_at_the_bound() {
+        let wait = ValueWait {
+            address: 0x7FF0_0000_0000,
+            comparison: 3,
+            reference: 5,
+            wide: false,
+        };
+        let bound = std::time::Duration::from_millis(2000);
+        let first = std::time::Instant::now();
+        assert!(!wait.unread_met_at(first, bound, true), "held at the first look");
+        assert!(
+            !wait.unread_met_at(first + std::time::Duration::from_millis(1999), bound, true),
+            "still held below the bound"
+        );
+        assert!(
+            wait.unread_met_at(first + bound, bound, true),
+            "met at the bound, so the queue runs"
+        );
+        let warned = unread_seen()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&(at, .., warned)| at == wait.address && warned)
+            .count();
+        assert_eq!(warned, 1, "one warning for the address");
+        assert!(
+            wait.unread_met_at(first + bound, bound, true),
+            "still met after the bound"
+        );
+        wait.unread_read();
+        assert!(
+            !wait.unread_met_at(first + bound, bound, true),
+            "the bound starts over once it reads"
+        );
+        assert!(
+            !wait.unread_met_at(first, std::time::Duration::ZERO, true),
+            "VICTORY_WAIT_UNREAD_MS=0 waits forever"
+        );
+    }
+
+    /// A look taken for a log line (`met_peek`) does not start the bound: the
+    /// queue's own first check still has the whole bound to stand on.
+    #[cfg(windows)]
+    #[test]
+    fn a_peek_does_not_start_the_unread_bound() {
+        let wait = ValueWait {
+            address: 0x7FF0_0000_2000,
+            comparison: 3,
+            reference: 5,
+            wide: false,
+        };
+        let bound = std::time::Duration::from_millis(2000);
+        let first = std::time::Instant::now();
+        assert!(!wait.met_peek(), "a peek reports the wait as held");
+        assert!(
+            !wait.unread_met_at(first + bound, bound, true),
+            "the queue's first check starts the bound, the peek did not"
+        );
+        assert!(
+            wait.unread_met_at(first + bound + bound, bound, true),
+            "met a bound after the queue's first check"
+        );
+        wait.unread_read();
+    }
+
+    /// The bound is tracked per address and width: a 32-bit wait reads where
+    /// a 64-bit wait there does not, and its read does not restart the wider
+    /// wait's bound.
+    #[cfg(windows)]
+    #[test]
+    fn a_narrower_wait_does_not_restart_a_wider_bound() {
+        let wide = ValueWait {
+            address: 0x7FF0_0000_3000,
+            comparison: 3,
+            reference: 5,
+            wide: true,
+        };
+        let narrow = ValueWait { wide: false, ..wide };
+        let bound = std::time::Duration::from_millis(2000);
+        let first = std::time::Instant::now();
+        assert!(!wide.unread_met_at(first, bound, true));
+        narrow.unread_read();
+        let entries = unread_seen()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&(at, ..)| at == wide.address)
+            .count();
+        assert_eq!(entries, 1, "one entry for the address, the wide wait's");
+        assert!(
+            wide.unread_met_at(first + bound, bound, true),
+            "met at the bound it started before the narrow wait read"
+        );
+        wide.unread_read();
+    }
+
+    /// At the cap the newest entry makes room, so an old wait keeps the time
+    /// it has stood on and still reaches its bound.
+    #[cfg(windows)]
+    #[test]
+    fn a_full_table_keeps_the_oldest_waits() {
+        let bound = std::time::Duration::from_millis(2000);
+        let first = std::time::Instant::now();
+        // This test owns the table while it runs (the suite runs one test at
+        // a time, `--test-threads=1`): what it finds goes back afterwards.
+        let reused = std::mem::take(&mut *unread_seen().lock().unwrap_or_else(|e| e.into_inner()));
+        let waits: Vec<ValueWait> = (0..UNREAD_SEEN_MAX)
+            .map(|i| ValueWait {
+                address: 0x7FF0_0001_0000 + i as u64 * 8,
+                comparison: 3,
+                reference: 5,
+                wide: false,
+            })
+            .collect();
+        for w in &waits {
+            assert!(!w.unread_met_at(first, bound, true));
+        }
+        let newcomer = ValueWait {
+            address: 0x7FF0_0002_0000,
+            ..waits[0]
+        };
+        assert!(
+            !newcomer.unread_met_at(first + bound, bound, true),
+            "a new address at the cap starts its own bound"
+        );
+        assert!(
+            waits[0].unread_met_at(first + bound, bound, true),
+            "the first wait is still tracked and reaches its bound"
+        );
+        assert_eq!(
+            unread_seen().lock().unwrap_or_else(|e| e.into_inner()).len(),
+            UNREAD_SEEN_MAX,
+            "the table stays at its cap"
+        );
+        *unread_seen().lock().unwrap_or_else(|e| e.into_inner()) = reused;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn idle_most_scales_with_ram_and_cores() {        const GIB: u64 = 1 << 30;
         const MIB: u64 = 1 << 20;
         assert_eq!(idle_most(None, 8), (128, 256 * MIB));
         assert_eq!(idle_most(Some(8 * GIB), 4), (64, 128 * MIB));
@@ -2351,232 +2640,5 @@ mod tests {
         assert_eq!(idle_most(Some(31 * GIB), 16), (256, 512 * MIB));
         assert_eq!(idle_most(Some(32 * GIB), 16), (256, 512 * MIB));
         assert_eq!(idle_most(Some(64 * GIB), 32), (256, 512 * MIB));
-    }
-
-    /// The copy decision, without a device: only a copy whose source and
-    /// destination both have a host copy goes to the host GPU, and the switch
-    /// turns every one of them back into a CPU copy.
-    #[test]
-    fn a_copy_goes_to_the_gpu_only_when_both_sides_have_a_host_copy() {
-        assert_eq!(copy_plan(true, true, true), CopyPlan::Gpu);
-        assert_eq!(copy_plan(true, true, false), CopyPlan::Title);
-        assert_eq!(copy_plan(true, false, true), CopyPlan::Title);
-        assert_eq!(copy_plan(true, false, false), CopyPlan::Title);
-        assert_eq!(copy_plan(false, true, true), CopyPlan::Title);
-    }
-
-    /// A title buffer copy between two buffers with host copies is one
-    /// `CopyBufferRegion`: the source's host copy is brought up to date, the
-    /// destination is marked GPU-written (so title memory there is left alone
-    /// until the copy-back), the GPU's bytes land in the destination's host
-    /// copy, and the submission's copy-back puts them into title memory.
-    #[cfg(windows)]
-    #[test]
-    fn a_gpu_copy_refreshes_its_source_marks_its_destination_and_copies_back() {
-        use crate::host::StepKind;
-        use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
-        };
-        let Some(host) = crate::host::host() else {
-            return;
-        };
-        const LEN: usize = 64 << 10;
-        // SAFETY: two private committed ranges, as the title's buffers are.
-        let (src, dst) = unsafe {
-            let make = || {
-                let p = VirtualAlloc(
-                    std::ptr::null(),
-                    LEN,
-                    MEM_RESERVE | MEM_COMMIT,
-                    PAGE_READWRITE,
-                );
-                assert!(!p.is_null());
-                p.cast::<u8>()
-            };
-            (make(), make())
-        };
-        // SAFETY: both ranges are LEN committed bytes; a pattern with no zero
-        // in it, so a copy that did not happen shows.
-        unsafe {
-            for i in 0..LEN {
-                src.add(i).write((i % 251) as u8 + 1);
-            }
-            dst.write_bytes(0, LEN);
-        }
-        crate::shadow::register(src as usize, src as u64, LEN as u64);
-        crate::shadow::register(dst as usize, dst as u64, LEN as u64);
-        let (Some(from), Some(to)) = (
-            crate::shadow::find(src as u64, LEN as u64),
-            crate::shadow::find(dst as u64, LEN as u64),
-        ) else {
-            panic!("no host copies of the two buffers");
-        };
-        let list = host.new_list().unwrap();
-        assert!(record_gpu_copy(
-            &list,
-            &to,
-            dst as usize,
-            &from,
-            src as usize,
-            LEN
-        ));
-        // The source's refresh first (the bytes the copy reads), then the
-        // destination's GPU write (nothing may copy title memory over it
-        // before the copy-back).
-        // In place the destination's host copy *is* title memory
-        // ([`crate::shadow::Shadow::gpu_writes`] returns early): the GPU's
-        // copy lands there, so there is no snapshot to take and nothing to
-        // copy back for it.
-        // The source's copy, then the destination's own refresh (its
-        // baseline), then its GPU write; in place the destination is title
-        // memory: no refresh of it and no GPU write step.
-        let expected: &[StepKind] = if to.in_place() {
-            &[StepKind::Refresh]
-        } else {
-            &[StepKind::Refresh, StepKind::Refresh, StepKind::GpuWrite]
-        };
-        assert_eq!(list.step_kinds(), expected);
-        list.close();
-        host.execute(&[&list]);
-        // SAFETY: inside the destination's host copy, which is mapped.
-        let copy = unsafe {
-            std::slice::from_raw_parts(crate::shadow::bytes_of(&to, dst as usize, LEN).unwrap(), LEN)
-        };
-        assert_eq!(copy[..4], [1, 2, 3, 4], "the GPU's bytes are in the copy");
-        // SAFETY: the destination's title memory, committed above.
-        let title = unsafe { std::slice::from_raw_parts(dst, LEN) };
-        assert!(title == copy, "the copy-back put the GPU's bytes back");
-        list.reset();
-        crate::shadow::unregister(src as usize, src as u64);
-        crate::shadow::unregister(dst as usize, dst as u64);
-        // SAFETY: the two ranges allocated above.
-        unsafe {
-            VirtualFree(src.cast(), 0, MEM_RELEASE);
-            VirtualFree(dst.cast(), 0, MEM_RELEASE);
-        }
-    }
-
-    /// What a title buffer copy costs on the CPU against the host GPU, at the
-    /// size the world's copies come in: a 64 MiB copy read and written through
-    /// the kernel (`copy_mapped`, 86 MB/s in the world), the same copy as
-    /// `CopyBufferRegion` on the host GPU, and the whole GPU path including
-    /// the refresh it needs and the copy-back afterwards. Run with
-    /// `cargo xwin test --release -p victory-gpu -- --ignored --nocapture gpu_copy_benchmark`.
-    #[cfg(windows)]
-    #[test]
-    #[ignore = "benchmark"]
-    fn gpu_copy_benchmark() {
-        use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
-        };
-        let host = crate::host::host().expect("a host D3D12 device");
-        const LEN: usize = 64 << 20;
-        const RUNS: usize = 8;
-        // SAFETY: two private committed ranges of LEN, as title buffers are.
-        let (src, dst) = unsafe {
-            let make = || {
-                let p = VirtualAlloc(
-                    std::ptr::null(),
-                    LEN,
-                    MEM_RESERVE | MEM_COMMIT,
-                    PAGE_READWRITE,
-                );
-                assert!(!p.is_null());
-                p.cast::<u8>()
-            };
-            (make(), make())
-        };
-        // SAFETY: both ranges are LEN committed bytes.
-        unsafe {
-            for i in 0..LEN {
-                src.add(i).write((i % 251) as u8 + 1);
-            }
-            dst.write_bytes(0, LEN);
-        }
-        let mb = LEN as f64 / 1e6;
-        let rate = |time: std::time::Duration, copies: usize| {
-            format!(
-                "{:.2} ms/copy, {:.0} MB/s",
-                time.as_secs_f64() * 1e3 / copies as f64,
-                mb * copies as f64 / time.as_secs_f64()
-            )
-        };
-        // The CPU path, exactly as a title copy runs today.
-        let started = std::time::Instant::now();
-        for _ in 0..RUNS {
-            crate::host::copy_mapped(dst, src, LEN, true);
-        }
-        println!("CPU copy (copy_mapped): {}", rate(started.elapsed(), RUNS));
-        crate::shadow::register(src as usize, src as u64, LEN as u64);
-        crate::shadow::register(dst as usize, dst as u64, LEN as u64);
-        let (Some(from), Some(to)) = (
-            crate::shadow::find(src as u64, LEN as u64),
-            crate::shadow::find(dst as u64, LEN as u64),
-        ) else {
-            panic!("no host copies of the two buffers");
-        };
-        let (dst_buffer, dst_offset) = to.gpu_range(dst as usize, LEN).expect("the destination");
-        let (src_buffer, src_offset) = from.gpu_range(src as usize, LEN).expect("the source");
-        // The GPU copy alone: copies recorded in one list, one submission.
-        let list = host.new_list().unwrap();
-        for _ in 0..RUNS {
-            // SAFETY: an open list and live buffers.
-            unsafe {
-                list.list.CopyBufferRegion(
-                    &dst_buffer,
-                    dst_offset,
-                    &src_buffer,
-                    src_offset,
-                    LEN as u64,
-                )
-            };
-        }
-        let started = std::time::Instant::now();
-        list.close();
-        host.execute(&[&list]);
-        println!(
-            "GPU copy (CopyBufferRegion, recorded): {}",
-            rate(started.elapsed(), RUNS)
-        );
-        list.reset();
-        // The whole GPU path: each copy's refresh and copy-back with it, first
-        // with every byte of the destination new, then with the copy's bytes
-        // already in place (a copy the title repeats, whose copy-back writes
-        // nothing).
-        let whole = |runs: usize| {
-            let started = std::time::Instant::now();
-            for _ in 0..runs {
-                let list = host.new_list().unwrap();
-                assert!(record_gpu_copy(
-                    &list,
-                    &to,
-                    dst as usize,
-                    &from,
-                    src as usize,
-                    LEN
-                ));
-                list.close();
-                host.execute(&[&list]);
-                list.reset();
-            }
-            started.elapsed()
-        };
-        let first = whole(RUNS);
-        println!(
-            "GPU copy end to end, every byte new (refresh, copy, copy-back): {}",
-            rate(first, RUNS)
-        );
-        let again = whole(RUNS);
-        println!(
-            "GPU copy end to end, bytes already in place (copy-back writes nothing): {}",
-            rate(again, RUNS)
-        );
-        crate::shadow::unregister(src as usize, src as u64);
-        crate::shadow::unregister(dst as usize, dst as u64);
-        // SAFETY: the two ranges allocated above.
-        unsafe {
-            VirtualFree(src.cast(), 0, MEM_RELEASE);
-            VirtualFree(dst.cast(), 0, MEM_RELEASE);
-        }
     }
 }

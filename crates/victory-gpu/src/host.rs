@@ -666,7 +666,7 @@ fn create() -> windows::core::Result<Host> {
         if crate::inplace::level() > 0 {
             crate::inplace::check_at_startup(&device);
         }
-        let host = Host {
+        Ok(Host {
             device,
             queue,
             fence,
@@ -681,9 +681,7 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
-        };
-        host.log_features();
-        Ok(host)
+        })
     }
 }
 
@@ -1394,19 +1392,6 @@ pub(crate) fn dred_on() -> bool {
     })
 }
 
-/// Whether the title's own buffer copies run on the host GPU when both sides
-/// have a host copy (`VICTORY_GPU_COPIES`, on unless `0`; live): one
-/// `CopyBufferRegion` in the list instead of a read and a write of title
-/// memory at submission time, with the destination copied back like a shader
-/// write. Off, every copy is a CPU copy, as before.
-pub(crate) fn gpu_copies() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    crate::switches::b(
-        "VICTORY_GPU_COPIES",
-        *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_COPIES").is_none_or(|v| v != "0")),
-    )
-}
-
 /// Indirect dispatch records since the last frame line: the largest group
 /// count a record asked for, and the groups asked in all (from the lists'
 /// budget buffers, a run late). MESH_GROUPS are the mesh records,
@@ -1868,19 +1853,6 @@ impl Drop for Deferred {
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
-}
-
-/// What a [`Step`] is, for tests that check the order a list records them in.
-#[cfg(test)]
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum StepKind {
-    Copy,
-    Fill,
-    Refresh,
-    Run,
-    Host,
-    GpuWrite,
-    Texture,
 }
 
 /// Whether a queue's submissions go to the card without a wait for each
@@ -3110,116 +3082,6 @@ impl Host {
             tracing::info!(supported, "host depth bounds support");
             supported
         })
-    }
-
-    /// The adapter and the optional features the host gave us, logged once
-    /// when the device is ready: a hardware report starts with this line
-    /// (docs/hardware.md). A run that quietly takes the non-mesh or
-    /// non-ray path is visible in it.
-    fn log_features(&self) {
-        static DONE: OnceLock<()> = OnceLock::new();
-        DONE.get_or_init(|| {
-            // A tier's raw value is ten times its number, and 1.1 is 11.
-            fn tier(value: i32) -> String {
-                if value % 10 == 0 {
-                    (value / 10).to_string()
-                } else {
-                    format!("{}.{}", value / 10, value % 10)
-                }
-            }
-            // SAFETY: plain adapter and feature queries, each into its own
-            // structure of the given size.
-            unsafe {
-                let mut adapter = String::from("?");
-                let mut vendor = 0u32;
-                let mut device_id = 0u32;
-                if let Some(desc) = self
-                    .adapter
-                    .clone()
-                    .and_then(|a| a.cast::<IDXGIAdapter1>().ok())
-                    .and_then(|a| a.GetDesc1().ok())
-                {
-                    let end = desc.Description.iter().position(|c| *c == 0).unwrap_or(desc.Description.len());
-                    adapter = String::from_utf16_lossy(&desc.Description[..end]);
-                    vendor = desc.VendorId;
-                    device_id = desc.DeviceId;
-                }
-                // The runtime answers with its highest model at or below
-                // the probe; an unknown probe fails, so step down.
-                let mut model = 0i32;
-                for probe in [
-                    D3D_SHADER_MODEL_6_9,
-                    D3D_SHADER_MODEL_6_8,
-                    D3D_SHADER_MODEL_6_7,
-                    D3D_SHADER_MODEL_6_6,
-                    D3D_SHADER_MODEL_6_5,
-                    D3D_SHADER_MODEL_6_4,
-                    D3D_SHADER_MODEL_6_3,
-                    D3D_SHADER_MODEL_6_2,
-                    D3D_SHADER_MODEL_6_1,
-                    D3D_SHADER_MODEL_6_0,
-                ] {
-                    let mut data = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: probe };
-                    if self
-                        .device
-                        .CheckFeatureSupport(
-                            D3D12_FEATURE_SHADER_MODEL,
-                            (&raw mut data).cast(),
-                            size_of_val(&data) as u32,
-                        )
-                        .is_ok()
-                    {
-                        model = data.HighestShaderModel.0;
-                        break;
-                    }
-                }
-                // A refused query leaves its default: tier 0, no.
-                let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-                let mut o4 = D3D12_FEATURE_DATA_D3D12_OPTIONS4::default();
-                let mut o5 = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
-                let mut o7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
-                let query = |feature, data: *mut core::ffi::c_void, size: u32| {
-                    self.device
-                        .CheckFeatureSupport(feature, data, size)
-                        .is_ok()
-                };
-                query(
-                    D3D12_FEATURE_D3D12_OPTIONS1,
-                    (&raw mut o1).cast(),
-                    size_of_val(&o1) as u32,
-                );
-                query(
-                    D3D12_FEATURE_D3D12_OPTIONS4,
-                    (&raw mut o4).cast(),
-                    size_of_val(&o4) as u32,
-                );
-                query(
-                    D3D12_FEATURE_D3D12_OPTIONS5,
-                    (&raw mut o5).cast(),
-                    size_of_val(&o5) as u32,
-                );
-                query(
-                    D3D12_FEATURE_D3D12_OPTIONS7,
-                    (&raw mut o7).cast(),
-                    size_of_val(&o7) as u32,
-                );
-                tracing::info!(
-                    adapter = %adapter,
-                    vendor = format_args!("{vendor:#06x}"),
-                    device = format_args!("{device_id:#06x}"),
-                    shader_model = if model >= 96 {
-                        format!("6.{}", model - 96)
-                    } else {
-                        String::from("?")
-                    },
-                    mesh_tier = %tier(o7.MeshShaderTier.0),
-                    raytracing_tier = %tier(o5.RaytracingTier.0),
-                    int64_shader_ops = o1.Int64ShaderOps.as_bool(),
-                    shared_import_tier = o4.SharedResourceCompatibilityTier.0,
-                    "host device features"
-                );
-            }
-        });
     }
 
     /// A new list, open for recording.
@@ -5519,24 +5381,6 @@ impl HostList {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// (Tests.) The submission-time steps recorded so far, in order.
-    #[cfg(test)]
-    pub(crate) fn step_kinds(&self) -> Vec<StepKind> {
-        self.deferred()
-            .copies
-            .iter()
-            .map(|step| match step {
-                Step::Copy(..) => StepKind::Copy,
-                Step::Fill(..) => StepKind::Fill,
-                Step::Refresh(..) => StepKind::Refresh,
-                Step::Run(_) => StepKind::Run,
-                Step::Host(_) => StepKind::Host,
-                Step::GpuWrite(..) => StepKind::GpuWrite,
-                Step::Texture(_) => StepKind::Texture,
-            })
-            .collect()
-    }
-
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
@@ -5582,23 +5426,6 @@ impl HostList {
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
-        }
-    }
-
-    /// [`HostList::defer_refresh`] for many spans at once: one lock of the
-    /// list for all of them, the dedup and order as one call each would give.
-    pub(crate) fn defer_refreshes<'a>(
-        &self,
-        spans: impl IntoIterator<Item = (&'a std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
-    ) {
-        let mut deferred = self.deferred();
-        for (shadow, address, len) in spans {
-            let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
-            if deferred.refreshed.insert(key) {
-                deferred
-                    .copies
-                    .push(Step::Refresh(shadow.clone(), address, len));
-            }
         }
     }
 
@@ -5797,19 +5624,7 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
-                    // A GPU copy of this submission may have written the
-                    // source's host copy (not title memory, which is behind):
-                    // the copy comes out of the host copy then.
-                    match ahead_bytes(src, len) {
-                        Some(bytes) => {
-                            // The destination's guards open first, as
-                            // `copy_mapped` does: a write through a guarded
-                            // page fails piecemeal and is not reported.
-                            crate::watch::writing(dst, len);
-                            write_mapped(dst as *mut u8, bytes, len);
-                        }
-                        None => copy_mapped(dst as *mut u8, src as *const u8, len, true),
-                    }
+                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
                     len
@@ -6179,32 +5994,6 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize, title_dst: bool) {
             });
         }
     });
-}
-
-/// The host copy's bytes at `src` (`len` of them) when they are ahead of
-/// title memory: a GPU copy of this submission wrote them there, and title
-/// memory will not have them until its copy-back. `None` when title memory is
-/// what to read: no host copy, no GPU write pending, or a copy in the card's
-/// memory (whose bytes are on the card, not in the CPU's side).
-fn ahead_bytes(src: usize, len: usize) -> Option<*const u8> {
-    let shadow = crate::shadow::peek(src as u64, len as u64)?;
-    if !shadow.ahead(src, len) {
-        return None;
-    }
-    if shadow.carded() {
-        // Nothing to read: the bytes are on the card. Reported once, so a run
-        // shows the case instead of a silent stale read.
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            tracing::warn!(
-                src = format_args!("{src:#x}"),
-                len,
-                "a copy reads memory a GPU copy of this submission wrote, in the card's memory"
-            )
-        });
-        return None;
-    }
-    crate::shadow::bytes_of(&shadow, src, len)
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -6646,7 +6435,6 @@ impl Meter {
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
-        crate::fpsbox::set(fps);
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
@@ -7026,9 +6814,6 @@ impl Host {
                 )]);
             }
             list.CopyResource(&back, texture);
-            // The frame rate, into the corner of what is shown (not of the
-            // title's own frame, which the lines below read back).
-            crate::fpsbox::draw(self, list, &back, (width, height, format));
             #[cfg(feature = "diagnostics")]
             let shot = crate::capture::take_request();
             #[cfg(feature = "diagnostics")]
