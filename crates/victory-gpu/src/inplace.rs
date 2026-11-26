@@ -738,11 +738,64 @@ pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size:
 struct Views {
     /// By address: bytes, the section's handle, the offset in it.
     views: BTreeMap<usize, (usize, usize, u64)>,
+    /// Secondary index by `(section, offset, base)` -> view length in bytes,
+    /// so alias lookups (`beside`) are O(log N + k) instead of scanning every
+    /// mapped view.
+    by_section: BTreeMap<(usize, u64, usize), usize>,
+    /// Largest view length ever inserted for each section, bounding how far
+    /// before `offset` a view starting earlier could still overlap `[offset, end)`.
+    max_len: BTreeMap<usize, u64>,
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
 }
 
-static VIEWS: RwLock<Views> = RwLock::new(Views { views: BTreeMap::new(), sections: Vec::new() });
+impl Views {
+    fn insert(&mut self, at: usize, len: usize, section: usize, offset: u64) {
+        if let Some((old_len, old_section, old_offset)) = self.views.insert(at, (len, section, offset))
+        {
+            self.by_section.remove(&(old_section, old_offset, at));
+            let _ = old_len;
+        }
+        self.by_section.insert((section, offset, at), len);
+        let max = self.max_len.entry(section).or_insert(0);
+        if (len as u64) > *max {
+            *max = len as u64;
+        }
+    }
+
+    fn remove(&mut self, base: usize) {
+        if let Some((_, section, offset)) = self.views.remove(&base) {
+            self.by_section.remove(&(section, offset, base));
+        }
+    }
+
+    /// The views of `section` that show any of the bytes `[offset, offset + len)`,
+    /// other than the view at `at` itself. O(log N + k) via `by_section`.
+    fn beside(&self, at: usize, section: usize, offset: u64, len: usize) -> Vec<(usize, usize)> {
+        let Some(&max_len) = self.max_len.get(&section) else {
+            return Vec::new();
+        };
+        let end = offset.saturating_add(len as u64);
+        if end <= offset {
+            return Vec::new();
+        }
+        let lo = offset.saturating_sub(max_len);
+        self.by_section
+            .range((section, lo, 0)..(section, end, 0))
+            .filter_map(|(&(_, o, base), &bytes)| {
+                (base != at && o < end && offset < o.saturating_add(bytes as u64))
+                    .then_some((base, bytes))
+            })
+            .collect()
+    }
+}
+
+static VIEWS: RwLock<Views> = RwLock::new(Views {
+    views: BTreeMap::new(),
+    by_section: BTreeMap::new(),
+    max_len: BTreeMap::new(),
+    sections: Vec::new(),
+});
 
 /// The views, for reading. Every in-place ask asks [`cover`], and the level-2
 /// default asks it for every window and every title buffer, while the runtime
@@ -768,14 +821,14 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
-    views_write().views.insert(at, (len, section, offset));
     // The bytes of this view may be shown at another address too (the
     // runtime maps a section again elsewhere): the guards of those views
     // come off, all together and under the one look, before anything is
     // copied through this one (after avatarmanz 2be0515c).
     let beside = {
-        let v = views_read();
-        beside_in(&v.views, at, section, offset, len)
+        let mut v = views_write();
+        v.insert(at, len, section, offset);
+        v.beside(at, section, offset, len)
     };
     if !beside.is_empty() {
         ALIASED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -804,12 +857,11 @@ pub(crate) fn aliased(at: usize) -> bool {
         return false;
     };
     // The bytes of the view that `at` lies in, of the section's offsets.
-    !beside_in(&v.views, base, section, offset, bytes).is_empty()
+    !v.beside(base, section, offset, bytes).is_empty()
 }
 
-/// The views of `section` that show any of the bytes a view at `at` shows
-/// (`[offset, offset + len)`), other than the view at `at` itself: a page
-/// the title mapped twice. Empty when nothing else shows them.
+/// Reference linear scan of `views` for tests verifying [`Views::beside`].
+#[cfg(test)]
 fn beside_in(
     views: &BTreeMap<usize, (usize, usize, u64)>,
     at: usize,
@@ -839,7 +891,7 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
     let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
     for base in gone {
-        v.views.remove(&base);
+        v.remove(base);
     }
 }
 
@@ -1664,6 +1716,30 @@ mod tests {
         assert!(!beside_in(&views, at, 78, 0, 4 * K64).iter().any(|&(b, _)| b == at));
         // A range past both views: nothing.
         assert!(beside_in(&views, at, 78, 6 * K64 as u64, K64).is_empty());
+
+        // Indexed `Views::beside` agrees with the linear scan across inserts,
+        // overwrites, and removals.
+        let mut indexed = Views {
+            views: BTreeMap::new(),
+            by_section: BTreeMap::new(),
+            max_len: BTreeMap::new(),
+            sections: Vec::new(),
+        };
+        for (&base, &(len, sec, off)) in &views {
+            indexed.insert(base, len, sec, off);
+        }
+        assert_eq!(indexed.beside(at, 78, 0, 4 * K64), [(at + 8 * K64, 2 * K64)]);
+        assert_eq!(indexed.beside(at + 8 * K64, 78, 2 * K64 as u64, 2 * K64), [(at, 4 * K64)]);
+        assert!(indexed.beside(at + 12 * K64, 79, 0, K64).is_empty());
+        assert!(indexed.beside(at, 78, 6 * K64 as u64, K64).is_empty());
+        // Overwriting a view updates the secondary index cleanly.
+        indexed.insert(at + 8 * K64, K64, 78, 5 * K64 as u64);
+        assert!(indexed.beside(at, 78, 0, 4 * K64).is_empty());
+        // Removing a view removes it from the secondary index too.
+        indexed.insert(at + 8 * K64, 2 * K64, 78, 2 * K64 as u64);
+        assert_eq!(indexed.beside(at, 78, 0, 4 * K64), [(at + 8 * K64, 2 * K64)]);
+        indexed.remove(at + 8 * K64);
+        assert!(indexed.beside(at, 78, 0, 4 * K64).is_empty());
     }
 
     /// The switch: unset is on (the measured-safe class only), `0` off,
