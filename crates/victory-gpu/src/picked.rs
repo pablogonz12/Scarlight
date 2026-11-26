@@ -87,11 +87,12 @@ pub(crate) fn log(frames: f64) {
 /// its pages (`turn % slice` would otherwise only ever be the parity of its
 /// own turns, and half its pages never look).
 pub(crate) fn next_turn(id: u64) -> u64 {
+    // Keyed by slot, so the map cannot grow: it never has to clear what it
+    // holds, and a full map does not give every copy turn 0 again (the pages
+    // off its first then never look). Two copies that share a slot walk the
+    // same page of the slice, and each still walks all of them.
     let mut turns = TURNS.lock().unwrap_or_else(|e| e.into_inner());
-    if turns.len() >= KEPT && !turns.contains_key(&id) {
-        turns.clear();
-    }
-    let t = turns.entry(id).or_insert(0);
+    let t = turns.entry(id % KEPT as u64).or_insert(0);
     let now = *t;
     *t += 1;
     now
@@ -202,7 +203,9 @@ pub(crate) fn found(id: u64, start: usize, found: &[(usize, usize)]) {
 /// number does not inherit its pages.
 pub(crate) fn forget(id: u64) {
     SETS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-    TURNS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    // Its slot may be one another copy shares: that copy's count carries on
+    // from where it was, nothing of its sweep restarts.
+    TURNS.lock().unwrap_or_else(|e| e.into_inner()).remove(&(id % KEPT as u64));
 }
 
 #[cfg(test)]
@@ -319,6 +322,26 @@ mod tests {
             let covers = |at: usize| looked.iter().any(|&(a, e)| a <= at && at < e);
             assert!(covers(5 * PAGE), "{turn}: page 5 is compared every time");
         }
+    }
+
+    /// A copy's sweep goes on when the map is full: its turn is not cleared
+    /// back to 0 with everyone else's (the pages off its first then never
+    /// look).
+    #[test]
+    fn a_full_map_does_not_restart_a_copys_sweep() {
+        let id = 0x00fa_0000_0000_00d1u64;
+        let slot = id % super::KEPT as u64;
+        // A few of its own turns first, so a restart cannot hide behind 0.
+        let first = (0..4).map(|_| super::next_turn(id)).last().unwrap_or(0);
+        // More copies than the map keeps, each asking once: a whole-range
+        // scan of a big title does this, and so does a small one that learns.
+        for i in 0..(super::KEPT as u64 * 2) {
+            let other = 0x0100_0000_0000_0000u64 | i.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            if other % super::KEPT as u64 != slot {
+                super::next_turn(other);
+            }
+        }
+        assert!(super::next_turn(id) > first, "its sweep went on, it did not start again");
     }
 
     /// The spans are of the range, in order, never overlapping; over a
