@@ -157,7 +157,9 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   GPL-3.0: a pixel shader's quad permutations (`ds_swizzle_b32` quad_perm and DPP) read through quad operations,
   whose values include a helper lane's, as the console's do at a triangle's edge; common broadcasts and exchanges
   take one read, and a DPP8 that selects across quads falls back to a wave-lane read (`VICTORY_DX_PIXEL_QUAD=0`
-  turns it off).
+  turns it off). Its other two parts: each view heap's run of raw page views grows with the copies that need one
+  (the 1,023-copy cap is gone, `crates/victory-gpu/src/memory.rs`), and a texture whose interior mips alone have
+  arrived is staged instead of treated as away (`crates/victory-gpu/src/texture.rs`).
 
 ## Tools
 
