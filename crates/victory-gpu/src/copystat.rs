@@ -30,6 +30,15 @@ pub(crate) enum C {
     /// Bytes of watched ranges checked, and of those found unchanged.
     Checked,
     Unchanged,
+    /// Askings the guards answered instead of the kernel's page-table walk,
+    /// the span of title memory they covered, and their time.
+    Guarded,
+    GuardSpan,
+    GuardAskUs,
+    /// Pages the kernel's periodic verifying asking found written that the
+    /// guards had not reported: they see no write another view or the card
+    /// makes. Any but zero says the guards are missing writes.
+    GuardMissed,
     /// Copies that met an unmapped page.
     Fallbacks,
     /// Writes taken by the guard on view memory.
@@ -1104,7 +1113,8 @@ pub(crate) fn log(frames: f64) {
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped, {:.1} MB of a copy's destination gone; {:.0} copies as bytes {:.1} MB; \
          {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
-         unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
+         unchanged; {:.0} guarded askings {:.2} ms over {:.1} MB, {:.0} pages missed; {:.1} fallbacks; \
+         {:.0} guard faults; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed, {:.0} written behind the guard; \
          presented textures from title memory {:.0}, of them a submission old {:.0}; \
          put up at the present {:.0}; shown out of order {:.0}, their copy's source \
@@ -1130,6 +1140,10 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::WatchUs as usize]),
         mb(c[C::Checked as usize]),
         mb(c[C::Unchanged as usize]),
+        c[C::Guarded as usize],
+        ms(c[C::GuardAskUs as usize]),
+        mb(c[C::GuardSpan as usize]),
+        c[C::GuardMissed as usize],
         c[C::Fallbacks as usize],
         c[C::GuardFaults as usize],
         mb(c[C::TexWatched as usize]),
