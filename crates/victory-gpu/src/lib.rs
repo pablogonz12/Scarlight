@@ -16,11 +16,14 @@
 //! (swap chain).
 
 #[cfg(windows)]
+mod ambient_floor;
 mod ambient;
 #[cfg(any(windows, test))]
 mod bindcache;
 #[cfg(any(windows, test))]
 mod bound;
+#[cfg(any(windows, test))]
+mod buffersweep;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
@@ -62,8 +65,9 @@ pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
-#[cfg(windows)]
 mod placed;
+#[cfg(windows)]
+mod present_compositor;
 mod primitive;
 pub mod query;
 pub mod queue;
