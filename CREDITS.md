@@ -161,6 +161,15 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   corners put it. This tree's geometry stage (`emit::rect_list_gs`) already finds the corner in any order; the
   rule is now in the CPU expansion too (`right_angle`, `right_corners` in `crates/victory-gpu/src/primitive.rs`).
 
+- **codec-d/CGBJ (codec-d/cool_fox [`ab75ac3e0`](https://github.com/codec-d/cool_fox/commit/ab75ac3e0),
+  [`18bdf7932`](https://github.com/codec-d/cool_fox/commit/18bdf7932),
+  [`8cc31ab37`](https://github.com/codec-d/cool_fox/commit/8cc31ab37))**, GPL-3.0-or-later: a host-memory guard for
+  speculative uploads — a free-RAM and commit sample with hysteresis, a floor left free after an upload and a larger
+  one before a new block of upload storage is committed, a backoff after a refused allocation instead of one attempt
+  per small upload, and idle upload storage given back at once under pressure. Reimplemented for our 16 GiB PC and
+  16 GiB RADV card, where a refused import falls back silently, so only pool growth waits and no texture an
+  on-demand upload needs is ever deferred (`crates/victory-gpu/src/residency.rs`, `VICTORY_RESIDENCY=0`).
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is

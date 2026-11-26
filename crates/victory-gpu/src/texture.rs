@@ -873,7 +873,13 @@ pub(crate) fn let_go_idle() {
     if map.is_empty() {
         return;
     }
-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let idle_ms = if crate::residency::pressured() {
+        // A staging buffer no list holds is plain system memory; under
+        // pressure it goes back at once rather than after the RAM-scaled idle.
+        crate::residency::PRESSURE_IDLE_MS
+    } else {
+        crate::host::ram_idle_ms(crate::host::available_physical_ram())
+    };
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.

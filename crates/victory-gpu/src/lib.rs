@@ -50,6 +50,7 @@ mod primitive;
 pub mod query;
 pub mod queue;
 mod reflection;
+mod residency;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

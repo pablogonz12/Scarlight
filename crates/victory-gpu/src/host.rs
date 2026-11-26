@@ -186,6 +186,8 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
 fn sweep() {
     // The in-place probe and census, if asked for (`VICTORY_INPLACE_PROBE`).
     crate::inplace::tick();
+    // Host-memory pressure and the refusal backoff ([`crate::residency`]).
+    crate::residency::tick();
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP").is_none_or(|v| v != "0")) {
         return;
@@ -1571,6 +1573,21 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
+    // A refused upload buffer must not be asked for again for every small
+    // copy of the frame: the driver has said there is nothing, and each ask is
+    // a failed call ([`crate::residency`], his `pool::grow`). Chunks already
+    // kept are still handed out above.
+    if crate::residency::refused() {
+        crate::residency::note_deferred();
+        return None;
+    }
+    // A new OS block of upload storage is what the host-memory guard may hold
+    // back when the PC is close to its limit: a copy that gets no chunk is the
+    // same failure as one whose allocation would have been refused, and the
+    // title asks again next frame.
+    if !crate::residency::admit_growth(size) {
+        return None;
+    }
     let (buffer, data) = host.upload_buffer(size)?;
     name(&buffer, || "list scratch".into());
     // SAFETY: a live buffer.
@@ -1592,6 +1609,10 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         return;
     }
     let most = spare_most(crate::total_system_ram_bytes());
+    // Under host-memory pressure an idle chunk is memory the title could use:
+    // keep none ([`crate::residency`], his `pool::room` dropping the spare
+    // limit to zero), rather than waiting for the next allocation to notice.
+    let most = if crate::residency::pressured() { 0 } else { most };
     let mut freed = Vec::new();
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
@@ -6494,6 +6515,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
             }
