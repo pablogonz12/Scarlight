@@ -800,7 +800,13 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         let note_holes = |g: &mut Guards, from: usize, to: usize| {
             if from < to {
                 g.absent.extend(from..to);
-                g.mapped.retain(|b| *b < from || *b >= to);
+                // Only the blocks of this hole: the set can hold a title's
+                // whole address space, and a scan of it a block at a time is
+                // what a guard round cannot afford (`title_memory_remapped`).
+                let stale: Vec<usize> = g.mapped.range(from..to).copied().collect();
+                for block in stale {
+                    g.mapped.remove(&block);
+                }
                 crate::inplace::PLACEHOLDER_HITS[1]
                     .fetch_add((to - from) as u64, std::sync::atomic::Ordering::Relaxed);
             }
