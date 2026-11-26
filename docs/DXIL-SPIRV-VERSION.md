@@ -3,8 +3,11 @@
 The translated DXIL is read by dxil-spirv inside vkd3d-proton. Three node-test compute
 programs (ray-tracing BVH node tests) of the 2,912-program runtime set crash the converter
 we bundled before 25 Nov 2026 with a stack overflow inside
-`CFGNode::find_common_dominator` (unbounded idom recomputation around a loop header that
-has two latches). Valid DXIL, older converter.
+`CFGNode::find_common_dominator` (unbounded idom recomputation, 87,191 frames). Valid DXIL,
+older converter. The CFG is finite and reducible: one loop header (preheader + one latch)
+whose body runs through two three-predicate merges back into the header, and the lazy
+dominator fill there resets a node's idom before recursing into its predecessors, so the
+back edge arrives at a node whose dominator it has just thrown away and the pair repeats.
 
 Minimum dxil-spirv: `b540c8a2` ("Cleanup recompute_dominance_frontier a bit.", upstream
 master on 25 Nov 2026). The pinned `34f0ff84` (vkd3d-proton master's submodule) is too old.
@@ -15,6 +18,14 @@ Measured, offline check with `b540c8a2` as the stage-2 converter:
 |---|---|---|
 | runtime set | 2912 / 2912 | 2912 / 2912 (no crashes) |
 | world dump | 751 / 751 | 751 / 751 |
+
+Re-measured 26 Nov, twice, against the older pin: 2,909 of the 2,912 convert and create a
+pipeline, the same three dump core, and `b540c8a2` converts all 2,912 (spirv-val clean, RADV
+pipeline for each). Byte-for-byte, our own iterative-dominator patch on the old pin leaves the
+other 2,909 untouched; `b540c8a2` carries one further upstream structurizer change that moves a
+single one of them. Translation is unaffected, and a second full pass reproduces every DXIL and
+every SPIR-V byte for byte. `b540c8a2` also converts the synthetic repro attached to
+HansKristian-Work/dxil-spirv#376.
 
 The converter lives in the shipped `d3d12.dll`/`d3d12core.dll` pair. Build a vkd3d-proton with
 the newer dxil-spirv submodule, then install that pair where the Steam tool takes it from:

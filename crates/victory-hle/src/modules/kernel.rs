@@ -350,6 +350,54 @@ fn refuse(file: &str) {
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 
+/// The title's thread priorities, but for the lowest two, which become
+/// "below normal", when `remapped`. Six of the title's threads run at "idle",
+/// the streaming pager's among them; on the console they have what the rest of
+/// the title leaves of its cores. A PC's processors are also wanted by other
+/// programs and by our own workers (sixteen when pipelines are made): with
+/// every one of them busy such a thread ran once in four seconds or so, when
+/// the host's scheduler took pity, and the loading that waits for it with it
+/// (stream-3: loads done 1.1 s late on average, 4.8 s at worst, fever308).
+/// Unset (or `0`): every thread keeps the priority the title asks for.
+fn title_priority(asked: i32, remapped: bool) -> i32 {
+    const IDLE: i32 = -15;
+    const LOWEST: i32 = -2;
+    const BELOW_NORMAL: i32 = -1;
+    if !remapped {
+        return asked;
+    }
+    match asked {
+        IDLE..=LOWEST => BELOW_NORMAL,
+        other => other,
+    }
+}
+
+/// [`title_priority`]'s `remapped`: `VICTORY_TITLE_PRIORITIES` is set and not
+/// `0`. Read once, as the title sets a priority on every thread it starts.
+fn remap_priorities() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_TITLE_PRIORITIES") {
+        None => false,
+        Some(v) => !v.is_empty() && v != "0",
+    })
+}
+
+/// The title sets its threads' priorities; the lowest two run below normal
+/// instead when `VICTORY_TITLE_PRIORITIES` is set (see [`title_priority`]).
+pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32 {
+    static NOTED: std::sync::Once = std::sync::Once::new();
+    let priority = title_priority(priority, remap_priorities());
+    if remap_priorities() {
+        NOTED.call_once(|| {
+            tracing::info!(
+                "the title's idle and lowest threads run below normal \
+                 (VICTORY_TITLE_PRIORITIES=0: as it sets them)"
+            );
+        });
+    }
+    host::set_thread_priority(thread, priority)
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -382,6 +430,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            hle_export!(SetThreadPriority),
         ],
     }
 }
@@ -503,6 +552,11 @@ mod host {
         unsafe { victory_loader::report_unhandled(info.cast()) };
     }
 
+    pub(super) fn set_thread_priority(thread: *mut c_void, priority: i32) -> i32 {
+        // SAFETY: the title passes a thread handle.
+        unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
+    }
+
     pub(super) fn note_title_output(line: &str) {
         victory_loader::note_title_output(line);
     }
@@ -583,6 +637,10 @@ mod host {
 
     pub(super) fn set_unhandled_exception_filter(_: extern "system" fn(*const c_void) -> i32) {}
 
+    pub(super) fn set_thread_priority(_: *mut c_void, _: i32) -> i32 {
+        1
+    }
+
     pub(super) fn report_unhandled(_: *const c_void) {}
 
     pub(super) fn note_title_output(_: &str) {}
@@ -597,6 +655,38 @@ mod tests {
     // Two tests use Windows path rules and run there only.
     #![cfg_attr(not(windows), allow(unused_imports, dead_code))]
     use super::*;
+
+    /// As the title sets them unless asked: the lowest two become "below
+    /// normal" only with `VICTORY_TITLE_PRIORITIES`, and no other priority
+    /// moves either way.
+    #[test]
+    fn the_lowest_two_priorities_run_below_normal_only_when_asked() {
+        let asked = [-15, -2, -1, 0, 1, 2, 15];
+        let as_set: Vec<i32> = asked.iter().map(|&p| title_priority(p, false)).collect();
+        assert_eq!(as_set, asked);
+        let remapped: Vec<i32> = asked.iter().map(|&p| title_priority(p, true)).collect();
+        assert_eq!(remapped, [-1, -1, -1, 0, 1, 2, 15]);
+        // Everything the title does not lower is left alone, a thread at
+        // "time critical" included.
+        for p in [3, 4, 6, 10, 15] {
+            assert_eq!(title_priority(p, true), p);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn the_host_takes_the_priority_it_is_given() {
+        std::thread::spawn(|| {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+            // SAFETY: plain calls on this thread.
+            let thread = unsafe { GetCurrentThread() };
+            assert_eq!(host::set_thread_priority(thread, title_priority(-15, true)), 1);
+            // SAFETY: as above.
+            assert_eq!(unsafe { GetThreadPriority(thread) }, -1);
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     #[cfg(windows)] // Windows path rules (`C:\\..`)

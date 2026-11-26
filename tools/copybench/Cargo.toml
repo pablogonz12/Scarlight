@@ -1,0 +1,11 @@
+# Not a workspace member: built by hand for measurements only.
+#   cd tools/copybench && cargo xwin build --release --target x86_64-pc-windows-msvc
+[package]
+name = "copybench"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Memory","Win32_System_Diagnostics_Debug","Win32_System_Threading","Win32_Foundation","Win32_Security","Win32_System_Kernel"] }
+
+# Standalone: an empty workspace table keeps cargo from reading the repo's.
+[workspace]

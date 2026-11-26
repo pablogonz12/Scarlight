@@ -662,6 +662,82 @@ fn v_cmp_lg_is_false_for_nan() {
     }
 }
 
+/// `v_div_fixup_f16` as the RDNA2 ISA lists it; `None` for a NaN.
+fn div_fixup_f16_reference(q: u16, den: u16, num: u16) -> Option<u16> {
+    let nan = |x: u16| is_f16_nan(x);
+    let abs = |x: u16| x & 0x7FFF;
+    let sign = (den ^ num) & 0x8000;
+    if nan(num) || nan(den) {
+        return None;
+    }
+    if (abs(den) == 0 && abs(num) == 0) || (abs(den) == 0x7C00 && abs(num) == 0x7C00) {
+        return None;
+    }
+    if abs(den) == 0 || abs(num) == 0x7C00 {
+        return Some(sign | 0x7C00);
+    }
+    if abs(den) == 0x7C00 || abs(num) == 0 {
+        return Some(sign);
+    }
+    // An all-ones exponent overflows, so a NaN quotient gives infinity
+    // (gfx1036 hardware).
+    if abs(q) >= 0x7C00 {
+        return Some(sign | 0x7C00);
+    }
+    Some(sign | abs(q))
+}
+
+/// `v_div_fixup_f16` is `v_div_fixup_f32`'s special cases with f16 operands:
+/// the numerator's or denominator's NaN comes back, 0/0 and inf/inf a NaN,
+/// x/0 and inf/x a signed infinity, 0/x and x/inf a signed zero, and the
+/// rest `|q|` with the sign of `num ^ den`.
+#[test]
+fn v_div_fixup_f16_follows_the_isa_special_cases() {
+    // v_mov_b32 v0, 0; v_div_fixup_f16 v0, v1, v2, v3 (VOP3 opcode 0x35f):
+    // v1 the quotient, v2 the denominator, v3 the numerator.
+    let mut body = vec![vop1(0x001, 0, 128)];
+    body.extend_from_slice(&vop3(0x35f, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let shader = build_valu_cs(&body);
+    // 0, -0, 1, -1.5, 2^-24, max finite, inf, -inf, NaN, -NaN.
+    let values = [
+        0x0000u16, 0x8000, 0x3C00, 0xBE00, 0x0001, 0x7BFF, 0x7C00, 0xFC00, 0x7E00, 0xFE01,
+    ];
+    let mut cases = Vec::new();
+    for &q in &[0x4248u16, 0xC248, 0x7E00, 0x7C01] {
+        for &den in &values {
+            for &num in &values {
+                cases.push([u32::from(q), u32::from(den), u32::from(num), 0]);
+            }
+        }
+    }
+    run_cases(&shader, &cases, |backend, _, inp, got| {
+        let (q, den, num) = (inp[0] as u16, inp[1] as u16, inp[2] as u16);
+        let got_h = got as u16;
+        // A NaN quotient beside a zero or infinite numerator or denominator:
+        // which of those checks the console tries first is not on record, and
+        // ours follows the f32 arm (`|q|` all ones gives a signed infinity,
+        // checked before the zero and infinity the numerator and denominator
+        // ask for). The cases with one side of that question alone are below.
+        let odd = |x: u16| x & 0x7FFF == 0 || x & 0x7FFF == 0x7C00;
+        if q & 0x7FFF >= 0x7C00 && (odd(num) || odd(den)) {
+            return;
+        }
+        assert_eq!(got >> 16, 0, "{backend}: the high half changed");
+        match div_fixup_f16_reference(q, den, num) {
+            Some(want) => assert_eq!(
+                got_h, want,
+                "{backend}: v_div_fixup_f16({q:#06x}, {den:#06x}, {num:#06x}) = {got_h:#06x}, \
+                 want {want:#06x}",
+            ),
+            None => assert!(
+                is_f16_nan(got_h),
+                "{backend}: v_div_fixup_f16({q:#06x}, {den:#06x}, {num:#06x}) = {got_h:#06x}, \
+                 want NaN",
+            ),
+        }
+    });
+}
+
 #[test]
 fn v_fract_f32_never_returns_one() {
     // v_fract_f32 v0, v1 (VOP1 opcode 0x020)
@@ -1975,6 +2051,182 @@ fn cmp16_sdwa_preserves_word_selects() {
                     "{backend}: {instruction:#x} {extension:#x}"
                 );
             });
+        }
+    }
+}
+
+/// VOP3P `op vdst, src0, src1, src2` with standard packed lane selects
+/// (`opsel = 0b000`, `opsel_hi = 0b111`) and optional `clamp`.
+const fn vop3p(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16, clamp: bool) -> [u32; 2] {
+    [
+        0x33 << 26
+            | (op as u32 & 0x7F) << 16
+            | (clamp as u32) << 15
+            | (1 << 14) // opsel_hi[2] = 1
+            | vdst as u32,
+        (0b11 << 27) // opsel_hi[1:0] = 0b11
+            | (src0 as u32 & 0x1FF)
+            | (src1 as u32 & 0x1FF) << 9
+            | (src2 as u32 & 0x1FF) << 18,
+    ]
+}
+
+#[test]
+fn v_pk_int16_clamp_saturates_as_rdna2() {
+    let pack_u = |lo: u16, hi: u16| u32::from(lo) | (u32::from(hi) << 16);
+    let pack_i = |lo: i16, hi: i16| pack_u(lo as u16, hi as u16);
+
+    // VOP3P opcodes: 0x00=mad_i16, 0x02=add_i16, 0x03=sub_i16, 0x09=mad_u16, 0x0a=add_u16, 0x0b=sub_u16.
+    let add_u16 = build_valu_cs(&vop3p(0x0a, 0, vgpr(1), vgpr(2), 0, true));
+    let sub_u16 = build_valu_cs(&vop3p(0x0b, 0, vgpr(1), vgpr(2), 0, true));
+    let mad_u16 = build_valu_cs(&vop3p(0x09, 0, vgpr(1), vgpr(2), vgpr(3), true));
+    let add_i16 = build_valu_cs(&vop3p(0x02, 0, vgpr(1), vgpr(2), 0, true));
+    let sub_i16 = build_valu_cs(&vop3p(0x03, 0, vgpr(1), vgpr(2), 0, true));
+    let mad_i16 = build_valu_cs(&vop3p(0x00, 0, vgpr(1), vgpr(2), vgpr(3), true));
+
+    // add_u16 clamp: lo overflows (60000+10000 -> 65535), hi fits (100+200 -> 300)
+    run_cases(
+        &add_u16,
+        &[
+            [pack_u(60000, 100), pack_u(10000, 200), 0, 0],
+            [pack_u(u16::MAX, 0), pack_u(u16::MAX, 0), 0, 0],
+        ],
+        |backend, i, _, got| {
+            let want = [pack_u(u16::MAX, 300), pack_u(u16::MAX, 0)][i];
+            assert_eq!(got, want, "{backend}: v_pk_add_u16 clamp case {i}");
+        },
+    );
+
+    // sub_u16 clamp: lo underflows (5-10 -> 0), hi fits (500-200 -> 300)
+    run_cases(
+        &sub_u16,
+        &[
+            [pack_u(5, 500), pack_u(10, 200), 0, 0],
+            [pack_u(0, u16::MAX), pack_u(u16::MAX, 0), 0, 0],
+        ],
+        |backend, i, _, got| {
+            let want = [pack_u(0, 300), pack_u(0, u16::MAX)][i];
+            assert_eq!(got, want, "{backend}: v_pk_sub_u16 clamp case {i}");
+        },
+    );
+
+    // mad_u16 clamp: lo max*max+max -> 65535 (tests no u32 wrap!), hi 20*30+40 -> 640
+    run_cases(
+        &mad_u16,
+        &[[
+            pack_u(u16::MAX, 20),
+            pack_u(u16::MAX, 30),
+            pack_u(u16::MAX, 40),
+            0,
+        ]],
+        |backend, _, _, got| {
+            let want = pack_u(u16::MAX, 640);
+            assert_eq!(got, want, "{backend}: v_pk_mad_u16 clamp");
+        },
+    );
+
+    // add_i16 clamp: lo +overflow (30000+10000 -> 32767), hi -overflow (-30000-10000 -> -32768)
+    run_cases(
+        &add_i16,
+        &[
+            [pack_i(30000, -30000), pack_i(10000, -10000), 0, 0],
+            [pack_i(100, -50), pack_i(-25, 20), 0, 0],
+        ],
+        |backend, i, _, got| {
+            let want = [pack_i(i16::MAX, i16::MIN), pack_i(75, -30)][i];
+            assert_eq!(got, want, "{backend}: v_pk_add_i16 clamp case {i}");
+        },
+    );
+
+    // sub_i16 clamp: lo -overflow (-30000-10000 -> -32768), hi +overflow (30000-(-10000) -> 32767)
+    run_cases(
+        &sub_i16,
+        &[
+            [pack_i(-30000, 30000), pack_i(10000, -10000), 0, 0],
+            [pack_i(0, -100), pack_i(i16::MIN, -200), 0, 0],
+        ],
+        |backend, i, _, got| {
+            let want = [pack_i(i16::MIN, i16::MAX), pack_i(i16::MAX, 100)][i];
+            assert_eq!(got, want, "{backend}: v_pk_sub_i16 clamp case {i}");
+        },
+    );
+
+    // mad_i16 clamp: lo (-32768)*(-32768)+32767 -> 32767, hi (-32768)*(32767)-32768 -> -32768
+    run_cases(
+        &mad_i16,
+        &[
+            [
+                pack_i(i16::MIN, i16::MIN),
+                pack_i(i16::MIN, i16::MAX),
+                pack_i(i16::MAX, i16::MIN),
+                0,
+            ],
+            [pack_i(-10, 5), pack_i(20, -4), pack_i(50, -3), 0],
+        ],
+        |backend, i, _, got| {
+            let want = [pack_i(i16::MAX, i16::MIN), pack_i(-150, -23)][i];
+            assert_eq!(got, want, "{backend}: v_pk_mad_i16 clamp case {i}");
+        },
+    );
+}
+
+#[test]
+fn ds_swizzle_reads_only_active_compute_lanes() {
+    let value = 0xdead_beef;
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (offset, threads, narrow, expected) in [
+        (0x041f, 1, false, 0), // bitmask-mode swap adjacent lanes (lane 1 absent)
+        (0x041f, 2, true, 0),  // bitmask-mode swap adjacent lanes (lane 1 masked by EXEC)
+        (0x80b1, 2, true, 0),  // quad-mode swap adjacent lanes (lane 1 masked by EXEC)
+        (0x041f, 2, false, value),
+        (0x80b1, 2, false, value),
+    ] {
+        let mut words = vec![vop1(0x001, 5, 128)];
+        if narrow {
+            words.push(0x7DA4_0080); // v_cmpx_eq_u32 0, v0 (local thread ID)
+        }
+        words.extend([0xD8D4_0000 | offset, 0x0500_0001]); // ds_swizzle_b32 v5, v1
+        // Only one lane writes the output, even if both ran the swizzle.
+        words.extend([0x7DA4_0080, vop1(0x001, 0, vgpr(5))]);
+        let shader = build_cs(&words, threads, 0);
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            let (root, pso) = match host.compute_pipeline(&shader) {
+                Ok(p) => p,
+                // WARP does not support fixed WaveSize(32) on SM 6.6.
+                Err(e) if warp => {
+                    eprintln!("{label}: ds_swizzle {offset:#x} skipped ({e})");
+                    continue;
+                }
+                Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
+            };
+            let inputs = [value, 0, 0, 0];
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => inputs[u.dword as usize],
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(1)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(
+                out[0][0], expected,
+                "{label}: ds_swizzle offset {offset:#x}, {threads} threads, narrowed {narrow}",
+            );
         }
     }
 }

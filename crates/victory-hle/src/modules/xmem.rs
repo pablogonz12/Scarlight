@@ -10,6 +10,7 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
@@ -356,6 +357,11 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        // A null handle is the non-owning placeholder the tests build (and
+        // `CloseHandle(NULL)` raises under a debugger, so it must not run).
+        if self.0.is_null() {
+            return;
+        }
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
@@ -372,15 +378,93 @@ struct Slice {
 #[derive(Default)]
 struct Physical {
     next_page: usize,
+    /// Page numbers whose pages the title freed; handed out again before
+    /// `next_page` grows (a long session must not walk off the number space).
+    free_pages: Vec<usize>,
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
 }
 
+/// Whether freed page numbers are handed out again (`VICTORY_PAGE_RECYCLE=0`
+/// keeps the old ever-growing counter).
+fn page_recycle() -> bool {
+    #[cfg(test)]
+    if let Some(on) = forced_recycle() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PAGE_RECYCLE").as_deref() != Ok("0"))
+}
+
+// Tests set the policy they exercise on their own thread, so a run with
+// `VICTORY_PAGE_RECYCLE=0` still tests the reuse (see `force_recycle`).
+#[cfg(test)]
+thread_local! {
+    static FORCED_RECYCLE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// The policy a test asked for on this thread, if any.
+#[cfg(test)]
+fn forced_recycle() -> Option<bool> {
+    FORCED_RECYCLE.with(std::cell::Cell::get)
+}
+
+/// Tests: whether this thread's allocator reuses freed page numbers.
+#[cfg(test)]
+fn force_recycle(value: Option<bool>) {
+    FORCED_RECYCLE.with(|c| c.set(value));
+}
+
+impl Physical {
+    /// Reserves `numbers.len()` page numbers for `section`, reusing freed
+    /// ones first. False when the number space would run past the title's
+    /// 21-bit `number >> 4` field.
+    fn allocate(&mut self, section: &Arc<Section>, numbers: &mut [MaybeUninit<usize>]) -> bool {
+        let reuse = if page_recycle() {
+            self.free_pages.len()
+        } else {
+            0
+        };
+        let fresh = numbers.len().saturating_sub(reuse);
+        if fresh > (PAGE_NUMBER_LIMIT - self.next_page) / FRAMES {
+            return false;
+        }
+        for (index, out) in numbers.iter_mut().enumerate() {
+            let recycled = if page_recycle() {
+                self.free_pages.pop()
+            } else {
+                None
+            };
+            let number = recycled.unwrap_or_else(|| {
+                let number = self.next_page;
+                self.next_page += FRAMES;
+                number
+            });
+            self.pages.insert(
+                number,
+                Slice {
+                    section: section.clone(),
+                    index,
+                },
+            );
+            out.write(number);
+        }
+        true
+    }
+
+    /// Drops a page and keeps its number for reuse.
+    fn free(&mut self, number: usize) {
+        if self.pages.remove(&number).is_some() {
+            self.free_pages.push(number);
+        }
+    }
+}
+
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
     Mutex::new(Physical {
         // Page numbers are opaque to titles; 0 stays unused.
-        next_page: 0x10_0000,
+        next_page: FIRST_PAGE_NUMBER,
         ..Default::default()
     })
 });
@@ -438,17 +522,13 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
     let section = Arc::new(Section(handle));
     let mut physical = physical();
-    let first = physical.next_page;
-    physical.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
+    // SAFETY: the title passes room for `n` page numbers.
+    let numbers = unsafe { std::slice::from_raw_parts_mut(pages.cast::<MaybeUninit<usize>>(), n) };
+    if !physical.allocate(&section, numbers) {
+        tracing::warn!(n, "XMemAllocatePhysicalPages: page numbers exhausted");
+        // SAFETY: checked non-null.
+        unsafe { count.write(0) };
+        return 0;
     }
     1
 }
@@ -457,6 +537,10 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 /// 16: the title keeps them as 21-bit `number >> 4` and rebuilds
 /// them with `<< 4` (128 GiB of pages at most).
 const FRAMES: usize = PAGE >> 12;
+/// One past the largest page number the title's 21-bit `number >> 4` holds.
+const PAGE_NUMBER_LIMIT: usize = (1 << 21) * FRAMES;
+/// The first number handed out (0 stays unused).
+const FIRST_PAGE_NUMBER: usize = 0x10_0000;
 
 /// Pages still mapped stay readable through their views until unmapped.
 pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
@@ -466,7 +550,7 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     let mut physical = physical();
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+        physical.free(unsafe { *pages.add(i) });
     }
     1
 }
@@ -798,8 +882,19 @@ pub extern "system" fn XMemMapPhysicalPages(
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
             return std::ptr::null_mut();
         };
-        // One view per run of consecutive slices of one section.
-        let run = 1 + pages[i + 1..]
+        // One view per run of consecutive slices of one section, but never
+        // past the placeholder the run starts in: the title splits its pool
+        // into placeholders of its own, and consecutive pages say nothing
+        // about where one ends. A call across two is refused, and its range
+        // has already been unmapped. Ask the host where that placeholder
+        // ends (Marvisak/VIctory #1264's triage), before the scan, so it
+        // covers only the pages this call maps (a page per placeholder
+        // would otherwise be searched once more on every page).
+        let at = base + i * PAGE;
+        // 0: not a reserved placeholder, so the run is as long as it comes.
+        let room = if clipping() { placeholder_room(at) / PAGE } else { 0 };
+        let most = if room > 0 { room.min(n - i) } else { n - i };
+        let run = 1 + pages[i + 1..i + most]
             .iter()
             .zip(1..)
             .take_while(|&(page, k)| {
@@ -808,7 +903,26 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+        // The scan stopped at the room and pages went on: clipped there.
+        if run == most && most < n - i {
+            let clipped = CLIPPED_RUNS.fetch_add(1, Ordering::Relaxed) + 1;
+            if clipped == 1 || clipped.is_multiple_of(1024) {
+                tracing::info!(
+                    address = format_args!("{at:#x}"),
+                    pages = run,
+                    clipped,
+                    "a mapping run stops at the end of its placeholder"
+                );
+            } else {
+                tracing::debug!(
+                    address = format_args!("{at:#x}"),
+                    pages = run,
+                    clipped,
+                    "a mapping run stops at the end of its placeholder"
+                );
+            }
+        }
+        if !map(&mut physical, at, run * PAGE, first) {
             return std::ptr::null_mut();
         }
         i += run;
@@ -843,6 +957,52 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
         }
     }
     1
+}
+
+/// How many bytes from `base` to the end of the placeholder it lies in: the
+/// most one call can map as one view there. 0 when the host does not report
+/// a reserved placeholder at `base` (an address already shown, or the title's
+/// own memory), so the caller maps page by page as before.
+fn placeholder_room(base: usize) -> usize {
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: `VirtualQueryEx` fills `info` for the region holding `base`.
+    let got = unsafe {
+        VirtualQueryEx(
+            GetCurrentProcess(),
+            base as *const c_void,
+            &mut info,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if got == 0 || info.State != MEM_RESERVE {
+        return 0;
+    }
+    (info.BaseAddress as usize)
+        .saturating_add(info.RegionSize)
+        .saturating_sub(base)
+}
+
+/// Batched mapping runs that stopped at the end of their placeholder
+/// (`VICTORY_MAP_CLIP`; reported in the counters line of `victory-gpu`).
+static CLIPPED_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a batched run is clipped to the placeholder it starts in;
+/// `VICTORY_MAP_CLIP=0` maps it as it comes (a title that splits its
+/// placeholders would get the refused batch of before).
+fn clip_from(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
+}
+
+fn clipping() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        clip_from(std::env::var("VICTORY_MAP_CLIP").ok().as_deref())
+    });
+    *ON
+}
+
+#[cfg(test)]
+pub(crate) fn clipped_runs() -> usize {
+    CLIPPED_RUNS.load(Ordering::Relaxed)
 }
 
 /// Maps the physical pages shown at `[from, from + len)` at `to` as well,
@@ -1454,6 +1614,73 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
+    /// Titles split one pool of 64 KiB placeholders into per-page ones, and
+    /// the pages of a batch say nothing about where their placeholder ends:
+    /// a run of consecutive slices that starts in one placeholder and ends
+    /// outside it must be clipped to the room the host reports, not handed
+    /// to the host whole (which is refused, after the range was unmapped).
+    #[test]
+    fn a_run_of_mappings_stops_at_the_end_of_its_placeholder() {
+        let pages = allocate(2);
+        for (k, page) in pages.iter().enumerate() {
+            assert!(write_physical(std::slice::from_ref(page), 0, &[b'0' + k as u8]));
+        }
+        // Two 64 KiB pages reserved as one pool, then split in two
+        // placeholders of their own, as the title hands its pool out.
+        let pool = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!pool.is_null());
+        let second = pool.wrapping_byte_add(PAGE);
+        // SAFETY: our own placeholder; the range freed stays a placeholder.
+        assert_ne!(
+            unsafe {
+                VirtualFree(
+                    second,
+                    PAGE,
+                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+                )
+            },
+            0
+        );
+        for at in [pool, second] {
+            assert_eq!(query(at).host.State, MEM_RESERVE, "a placeholder of its own");
+        }
+        // Two consecutive slices of one section, the run crossing from the
+        // first placeholder into the second.
+        let before = clipped_runs();
+        assert_eq!(XMemMapPhysicalPages(pool, 2, pages.as_ptr()), pool);
+        assert_eq!(clipped_runs(), before + 1, "one run clipped, none refused");
+        // Each page shows its own bytes: the clip maps the first, then the
+        // rest in the placeholder that follows.
+        for (k, at) in [pool, second].into_iter().enumerate() {
+            assert_eq!(
+                // SAFETY: mapped read-write.
+                unsafe { at.cast::<u8>().read() },
+                b'0' + k as u8,
+                "page {k} at its own address"
+            );
+        }
+        assert_eq!(XMemMapPhysicalPages(pool, 2, std::ptr::null()), pool);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// The clip's off switch: `VICTORY_MAP_CLIP=0` maps a run as it comes,
+    /// everything else (unset, empty, `1`) clips.
+    #[test]
+    fn the_map_clip_can_be_turned_off() {
+        assert!(clip_from(None));
+        assert!(clip_from(Some("1")));
+        assert!(!clip_from(Some("0")));
+        assert!(!clip_from(Some(" 0 ")));
+        // An unser switch is not one.
+        assert!(clip_from(Some("off")));
+    }
+
     #[test]
     fn mapping_no_pages_changes_nothing() {
         let pages = allocate(2);
@@ -1580,5 +1807,94 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// An owned allocator, so the page-number tests touch no shared state and
+    /// no other test can hand out or free numbers under them.
+    fn owned_physical(next_page: usize) -> Physical {
+        Physical {
+            next_page,
+            ..Default::default()
+        }
+    }
+
+    /// A section that owns nothing: the number bookkeeping under test never
+    /// looks inside it (`Drop` closes a null handle, which does nothing).
+    fn empty_section() -> Arc<Section> {
+        Arc::new(Section(std::ptr::null_mut()))
+    }
+
+    fn take(numbers: &[MaybeUninit<usize>]) -> Vec<usize> {
+        // SAFETY: `allocate` wrote every entry.
+        numbers.iter().map(|n| unsafe { n.assume_init() }).collect()
+    }
+
+    /// Streaming allocate/free must reuse page numbers: without a free list
+    /// `next_page` climbs by `FRAMES` a page, and a long session packs past
+    /// the title's 21-bit `number >> 4` field, after which allocation fails.
+    #[test]
+    fn freed_page_numbers_are_handed_out_again() {
+        // The policy is the test's, not the environment's.
+        force_recycle(Some(true));
+        let section = empty_section();
+        let mut physical = owned_physical(FIRST_PAGE_NUMBER);
+        let mut numbers = [MaybeUninit::<usize>::uninit(); 2];
+        assert!(physical.allocate(&section, &mut numbers));
+        let first = take(&numbers);
+        let ceiling = physical.next_page;
+        for &n in &first {
+            physical.free(n);
+        }
+        for round in 0..1024 {
+            assert!(physical.allocate(&section, &mut numbers), "round {round}");
+            let again = take(&numbers);
+            assert_eq!(physical.next_page, ceiling, "round {round}: next_page grew");
+            let mut got = again.clone();
+            got.sort_unstable();
+            let mut want = first.clone();
+            want.sort_unstable();
+            assert_eq!(got, want, "round {round}: the same numbers come back");
+            for &n in &again {
+                physical.free(n);
+            }
+        }
+        force_recycle(None);
+    }
+
+    /// `VICTORY_PAGE_RECYCLE=0` is the old ever-growing counter, which the
+    /// switch keeps testable without the environment.
+    #[test]
+    fn the_page_recycle_switch_keeps_the_counter_growing() {
+        force_recycle(Some(false));
+        let section = empty_section();
+        let mut physical = owned_physical(FIRST_PAGE_NUMBER);
+        let mut numbers = [MaybeUninit::<usize>::uninit(); 2];
+        assert!(physical.allocate(&section, &mut numbers));
+        for &n in &take(&numbers) {
+            physical.free(n);
+        }
+        let ceiling = physical.next_page;
+        assert!(physical.allocate(&section, &mut numbers));
+        let grown = physical.next_page;
+        force_recycle(None);
+        assert!(grown > ceiling, "VICTORY_PAGE_RECYCLE=0 must not reuse");
+        assert_eq!(take(&numbers), vec![ceiling, ceiling + FRAMES]);
+    }
+
+    /// A page number at the top of the title's 21-bit field still allocates;
+    /// one round past it is refused, which the caller turns into "no pages".
+    #[test]
+    fn page_numbers_stop_at_the_title_field() {
+        let section = empty_section();
+        let mut physical = owned_physical(PAGE_NUMBER_LIMIT - FRAMES);
+        let mut numbers = [MaybeUninit::<usize>::uninit(); 1];
+        assert!(physical.allocate(&section, &mut numbers));
+        let last = take(&numbers)[0];
+        // The title keeps `number >> 4` in 21 bits.
+        assert!(last >> 4 < 1 << 21, "{last:#x}");
+        assert!(
+            !physical.allocate(&section, &mut numbers),
+            "one round past the field must be refused"
+        );
     }
 }

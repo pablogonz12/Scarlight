@@ -872,6 +872,7 @@ impl<'a> Tracer<'a> {
             })) != Some(v)
             || f.abs != 0
             || f.neg != 0
+            || f.clamp
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -898,6 +899,7 @@ impl<'a> Tracer<'a> {
             && let Fields::Valu(f) = &inst.fields
             && f.abs == 0
             && f.neg == 0
+            && !f.clamp
             && f.sdwa.is_none()
             && f.dpp.is_none()
             && let Some(t) = f.src.first().and_then(|s| self.vterm(inst, s))
@@ -1239,6 +1241,9 @@ impl<'a> Tracer<'a> {
                 bits,
                 words: [w2, w3],
             });
+        }
+        if let Some(source) = self.raw_view(words) {
+            return Ok(source);
         }
         let loaded = |w: &Term| {
             matches!(*w, Term::Value(v)
@@ -1628,6 +1633,7 @@ impl<'a> Tracer<'a> {
             && let Fields::Valu(f) = &inst.fields
             && f.abs == 0
             && f.neg == 0
+            && !f.clamp
             && f.sdwa.is_none()
             && f.dpp.is_none()
             && let Some(t) = f.src.first().and_then(|s| self.raw(inst, s))
@@ -2113,6 +2119,48 @@ impl<'a> Tracer<'a> {
         Ok(out)
     }
 
+    /// A loaded buffer descriptor the code views as a raw buffer, as the
+    /// FidelityFX upscaler's programs do before byte-addressed access: the
+    /// stride cleared (dword 1 bits 16-29), the record count multiplied (by
+    /// the stride, into bytes), the out-of-bounds mode set (dword 3 bits
+    /// 28-29). The base address and everything else stay as loaded, so it
+    /// is the loaded descriptor; the host reads it raw through its view.
+    fn raw_view(&self, words: &[Term]) -> Option<Source> {
+        const STRIDE: u32 = 0x3FFF_0000;
+        const OOB: u32 = 0x3000_0000;
+        let [w0, w1, w2, w3] = *words else {
+            return None;
+        };
+        let value = |t: Term| match t {
+            Term::Value(v) => Some(v),
+            Term::Const(_) => None,
+        };
+        let w1 = match self.sop2(value(w1)?, &["s_and_b32"]) {
+            Some((_, [x, Term::Const(m)] | [Term::Const(m), x])) if m | STRIDE == !0 => x,
+            _ => w1,
+        };
+        let w2 = match self.sop2(value(w2)?, &["s_mul_i32"]) {
+            Some((_, [x, _])) if self.loaded(&[w0, w1, x]).is_some() => x,
+            Some((_, [_, y])) => y,
+            None => w2,
+        };
+        let mut w3 = w3;
+        if let Some((_, [x, Term::Const(o)] | [Term::Const(o), x])) =
+            self.sop2(value(w3)?, &["s_or_b32"])
+            && o & !OOB == 0
+        {
+            w3 = x;
+        }
+        if let Some((_, [x, Term::Const(m)] | [Term::Const(m), x])) =
+            self.sop2(value(w3)?, &["s_and_b32"])
+            && m | OOB == !0
+        {
+            w3 = x;
+        }
+        let source = self.loaded(&[w0, w1, w2, w3])?;
+        (words != [w0, w1, w2, w3]).then_some(source)
+    }
+
     /// Consecutive dwords of one scalar load.
     fn loaded(&self, words: &[Term]) -> Option<Source> {
         let Term::Value(v0) = words[0] else {
@@ -2378,6 +2426,12 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
+    if inst.name() == "s_bfm_b32" && k == 0 {
+        // A bit field of constant width and offset (a sampler word, say).
+        let (width, at) = (lane_of(*src.first()?)?, lane_of(*src.get(1)?)?);
+        let ones = (1u32 << (width & 31)).wrapping_sub(1);
+        return Some(Moved::Const(ones << (at & 31)));
+    }
     let src = src.first()?;
     match (inst.name(), *src) {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
@@ -2391,6 +2445,10 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         ("s_brev_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(x.reverse_bits())),
         ("s_not_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(!x)),
         // 64-bit inline integers are sign-extended.
+        // Literals below 2^31: zero and sign extension agree.
+        ("s_mov_b64", Operand::Literal(x)) if (x as i32) >= 0 => {
+            Some(Moved::Const(if k == 0 { x } else { 0 }))
+        }
         ("s_mov_b64", Operand::Const(c @ 128..=208)) => {
             let low = inline(c)?;
             Some(Moved::Const(if k == 0 {
@@ -2498,6 +2556,45 @@ pub(crate) mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn a_loaded_buffer_descriptor_viewed_raw_is_the_loaded_one() {
+        // As the FidelityFX upscaler's programs do (FSPX).
+        let mut words = vec![
+            0xBE8A_0304, // s_mov_b32 s10, s4
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xF408_0305,
+            0xFA00_0160, // s_load_dwordx4 s[12:15], s[10:11], 0x160
+            0x938A_FF0D,
+            0x000E_0010, // s_bfe_u32 s10, s13, 0x000e0010 (the stride)
+            0x848A_810A, // s_max_u32 s10, s10, 1
+            0x870F_FF0F,
+            0xCFFF_FFFF, // s_and_b32 s15, s15, 0xcfffffff
+            0x930E_0A0E, // s_mul_i32 s14, s14, s10
+            0x880F_FF0F,
+            0x3000_0000, // s_or_b32 s15, s15, 0x30000000
+            0x870D_FF0D,
+            0xC000_FFFF, // s_and_b32 s13, s13, 0xc000ffff
+            0xE038_1000,
+            0x8003_0802, // buffer_load_dwordx4 v[8:11], v2, s[12:15], 0 offen
+            S_ENDPGM,
+        ];
+        let layout = [param(Table, 4, 1)];
+        let r = track_words(&words, &layout, HwStage::Cs);
+        assert_eq!(r.scalar, [((0, 2), at(0, 0x160))]);
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Loaded {
+                load: (0, 2),
+                first: 0
+            }
+        );
+        // A moved base address is another buffer.
+        words.insert(14, 0x800C_900C); // s_add_u32 s12, s12, 16
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        assert!(track(&p, &layout, HwStage::Cs, None).is_err());
     }
 
     #[test]
@@ -2702,6 +2799,35 @@ pub(crate) mod tests {
         let a = r.scalar[0].1;
         assert_eq!((a.param, a.offset), (CODE, 4));
         assert!(a.dynamic.is_some(), "the lane's index is the computed term");
+    }
+
+    /// VOP3 integer `clamp` saturates, so a clamped add is no wrapping sum:
+    /// address analysis must not decompose one into the code's base plus an
+    /// index (`VIC-BT-010`, the resource side of project-flamingo #675).
+    #[test]
+    fn a_clamped_vector_add_is_not_wrapping_address_math() {
+        let r = track_words(
+            &[
+                0xBE82_1F00, // 0x00: s_getpc_b64 s[2:3]
+                0xD70F_8457, // v_add_co_u32 v87, s4, v74, s2, with clamp
+                0x0000_054A,
+                0xD528_0458,
+                0x0010_0680, // v_add_co_ci_u32 v88, s4, 0, s3, s4
+                0x7E0C_0557, // v_readfirstlane_b32 s6, v87
+                0x7E0E_0558, // v_readfirstlane_b32 s7, v88
+                0xF400_0203,
+                0xFA00_0000, // s_load_dword s8, s[6:7], 0x0
+                S_ENDPGM,
+            ],
+            &[],
+            HwStage::Cs,
+        );
+        assert_eq!(r.scalar.len(), 1);
+        let a = r.scalar[0].1;
+        assert_eq!(
+            a.param, MEMORY,
+            "a clamped add is not the code's base plus an index: {a:?}"
+        );
     }
 
     #[test]

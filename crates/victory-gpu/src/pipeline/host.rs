@@ -92,6 +92,52 @@ impl Default for GraphicsState {
 }
 
 impl GraphicsState {
+    /// The guest color buffer bypasses its blender for integer surfaces,
+    /// even when the draw asks for blending. D3D12 validates blend enable
+    /// against every active target format when the pipeline is created.
+    pub(crate) fn apply_integer_blend_bypass(&mut self) {
+        let integer = |f: &DXGI_FORMAT| {
+            matches!(
+                *f,
+                DXGI_FORMAT_R32G32B32A32_UINT
+                    | DXGI_FORMAT_R32G32B32A32_SINT
+                    | DXGI_FORMAT_R32G32B32_UINT
+                    | DXGI_FORMAT_R32G32B32_SINT
+                    | DXGI_FORMAT_R16G16B16A16_UINT
+                    | DXGI_FORMAT_R16G16B16A16_SINT
+                    | DXGI_FORMAT_R32G32_UINT
+                    | DXGI_FORMAT_R32G32_SINT
+                    | DXGI_FORMAT_R10G10B10A2_UINT
+                    | DXGI_FORMAT_R8G8B8A8_UINT
+                    | DXGI_FORMAT_R8G8B8A8_SINT
+                    | DXGI_FORMAT_R16G16_UINT
+                    | DXGI_FORMAT_R16G16_SINT
+                    | DXGI_FORMAT_R32_UINT
+                    | DXGI_FORMAT_R32_SINT
+                    | DXGI_FORMAT_R8G8_UINT
+                    | DXGI_FORMAT_R8G8_SINT
+                    | DXGI_FORMAT_R16_UINT
+                    | DXGI_FORMAT_R16_SINT
+                    | DXGI_FORMAT_R8_UINT
+                    | DXGI_FORMAT_R8_SINT
+            )
+        };
+        let formats = &self.targets.RTFormats[..(self.targets.NumRenderTargets as usize).min(8)];
+        if !self.blend.IndependentBlendEnable.as_bool() {
+            let shared = self.blend.RenderTarget[0];
+            if !shared.BlendEnable.as_bool() || !formats.iter().any(integer) {
+                return;
+            }
+            self.blend.RenderTarget[..formats.len()].fill(shared);
+            self.blend.IndependentBlendEnable = (formats.len() > 1).into();
+        }
+        for (format, target) in formats.iter().zip(&mut self.blend.RenderTarget) {
+            if integer(format) {
+                target.BlendEnable = false.into();
+            }
+        }
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -495,13 +541,42 @@ pub(crate) struct HostPipeline {
     pub(crate) state: String,
 }
 
-/// Logs a pipeline that gets no host pipeline, once per reason.
+/// Logs a pipeline that gets no host pipeline, once per reason; counts
+/// every refusal, since the draws that name a refused pipeline are skipped
+/// and a run should say how many it lost.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
-    static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.contains(&reason) {
-        seen.push(reason);
-        tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
+    refuse_why(reason, "-", shaders)
+}
+
+/// `refuse` with `why` in the log line: the adapter family, a driver's
+/// answer, whatever makes this reason narrower than its text.
+fn refuse_why(reason: &'static str, why: &str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEEN: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    static REFUSED: AtomicU64 = AtomicU64::new(0);
+    let refused = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+    let first = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.contains(&reason) {
+            false
+        } else {
+            seen.push(reason);
+            true
+        }
+    };
+    if first {
+        tracing::warn!(
+            ?shaders,
+            why,
+            "no host pipeline: {reason} (logged once; the draws with it are skipped and counted)"
+        );
+    } else if refused.is_power_of_two() {
+        // Cheap, bounded: 1, 2, 4, 8 ... refusals, so a run reports what it
+        // lost without a line per pipeline.
+        tracing::warn!(
+            refused,
+            "host pipelines refused so far; their draws are skipped"
+        );
     }
     None
 }
@@ -541,8 +616,24 @@ impl HostPipeline {
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             stages
         };
-        if mesh.is_some() && !host()?.mesh_shaders() {
-            return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
+        if mesh.is_some() {
+            let host = host()?;
+            if !host.mesh_shaders() {
+                return refuse(
+                    "the host GPU has no mesh shaders (or no shader model 6.6)",
+                    shaders,
+                );
+            }
+            if !host.mesh_pipelines_safe() {
+                return refuse_why(
+                    "the host GPU's driver does not expose mesh shaders, so a mesh \
+                     pipeline is refused before it reaches the driver (it would be \
+                     refused or would abort it): the draws that name it are lost, \
+                     other work goes on",
+                    host.mesh_family().unwrap_or("-"),
+                    shaders,
+                );
+            }
         }
         for (s, _) in &stages {
             s.translated()?;
@@ -1290,6 +1381,42 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    #[test]
+    fn integer_target_bypasses_blending_and_preserves_mixed_target_masks() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[..3].copy_from_slice(&[
+            DXGI_FORMAT_R32_FLOAT,
+            DXGI_FORMAT_B4G4R4A4_UNORM,
+            DXGI_FORMAT_R8_UINT,
+        ]);
+        g.blend.IndependentBlendEnable = true.into();
+        for (i, target) in g.blend.RenderTarget[..3].iter_mut().enumerate() {
+            target.BlendEnable = true.into();
+            target.BlendOp = D3D12_BLEND_OP_MAX;
+            target.RenderTargetWriteMask = [15, 15, 1][i];
+        }
+        let before = g.blend;
+        g.apply_integer_blend_bypass();
+        assert_eq!(g.blend.RenderTarget[0..2], before.RenderTarget[0..2]);
+        let mut expected = before.RenderTarget[2];
+        expected.BlendEnable = false.into();
+        assert_eq!(g.blend.RenderTarget[2], expected);
+
+        g.blend = before;
+        g.blend.IndependentBlendEnable = false.into();
+        g.blend.RenderTarget[0].RenderTargetWriteMask = 3;
+        g.targets.RTFormats.swap(0, 2);
+        g.apply_integer_blend_bypass();
+        assert!(g.blend.IndependentBlendEnable.as_bool());
+        assert!(!g.blend.RenderTarget[0].BlendEnable.as_bool());
+        for target in &g.blend.RenderTarget[1..3] {
+            assert!(target.BlendEnable.as_bool());
+            assert_eq!(target.BlendOp, D3D12_BLEND_OP_MAX);
+            assert_eq!(target.RenderTargetWriteMask, 3);
+        }
+    }
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };

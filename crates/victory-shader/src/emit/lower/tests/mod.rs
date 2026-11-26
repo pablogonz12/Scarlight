@@ -12,6 +12,29 @@ use crate::{io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
+/// A same-target branch that closes a loop can be cut short exactly as a
+/// plain jump can (`VICTORY_BRANCH_SAME_ARMS`), so a barrier after it
+/// must not wait for the group.
+#[test]
+fn a_same_target_branch_loop_counts_as_a_cut_short_loop() {
+    use super::cuts_short;
+    use crate::structure::LaneExit;
+    let back = |from: usize, to: usize| from > to;
+    let loop_ = |taken, not_taken| LaneExit::Branch {
+        when: crate::structure::Bool::TRUE,
+        taken,
+        not_taken,
+    };
+    // Index is the block the exit belongs to: 2 > 0 closes a loop.
+    assert!(!cuts_short(&[LaneExit::Jump(0)], &back));
+    assert!(cuts_short(&[LaneExit::End, LaneExit::End, LaneExit::Jump(0)], &back));
+    assert!(!cuts_short(&[loop_(0, 0)], &back));
+    assert!(cuts_short(&[LaneExit::End, LaneExit::End, loop_(0, 0)], &back));
+    assert!(!cuts_short(&[LaneExit::End, LaneExit::End, loop_(0, 1)], &back));
+    assert!(!cuts_short(&[LaneExit::End, LaneExit::End, loop_(2, 2)], &back));
+    assert!(!cuts_short(&[LaneExit::End], &back));
+}
+
 #[test]
 fn packed_pixel_inputs_find_their_second_row() {
     use super::super::container::SigElement;
@@ -727,4 +750,54 @@ fn a_program_that_reads_its_group_id_gets_the_group_base() {
     TEST_GROUP_SPLIT.set(Some(false));
     assert!(!base(&lowers_cs(&words, group_id_x, false, [1, 1, 1]).expect("group id")));
     TEST_GROUP_SPLIT.set(None);
+}
+
+/// An image store of some of the channels leaves the others as they were:
+/// DXIL's typed stores write all four, so the ones the store leaves are read
+/// from the texel first (SFI0's typed-UAV-load feature bit).
+#[test]
+fn an_image_store_of_some_channels_keeps_the_others() {
+    // An image descriptor loaded from the table at s0, then image_store of
+    // channels `dmask` (data from v1, or v[4:7] for all four) at (0, 0).
+    let store = |dmask: u32| {
+        let vdata = if dmask == 0xF { 4 } else { 1 };
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0
+            0x7E02_02F2, // v_mov_b32 v1, 1.0
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7E08_02F2, // v_mov_b32 v4, 1.0
+            0x7E0A_02F2, // v_mov_b32 v5, 1.0
+            0x7E0C_02F2, // v_mov_b32 v6, 1.0
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            0xF020_0008 | dmask << 8,
+            0x0002_0002 | vdata << 8, // image_store v1, v[2:3], s[8:15] dim:2D
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }];
+        let l = lower_with(&words, layout, used).unwrap();
+        let c = crate::Container::parse(&l.dxil).unwrap();
+        let sfi0 = c.part(crate::FourCC::SFI0).unwrap().data;
+        u64::from_le_bytes(sfi0.try_into().unwrap())
+    };
+    // DXIL's typed stores write all four channels: the ones the store
+    // leaves are read from the texel first (a typed UAV load).
+    for dmask in [0x1, 0x3, 0x4, 0x7] {
+        let features = store(dmask);
+        assert_ne!(features & 0x800, 0, "dmask {dmask:#x}: SFI0 {features:#x}");
+    }
+    assert_eq!(store(0xF) & 0x800, 0);
 }
