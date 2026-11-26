@@ -1087,12 +1087,12 @@ mod tests {
             S_OK
         );
         let _ = super::take_dropped_split();
-        let _ = super::take_drops();
         // Two by-design skips (the builder's stage twice), one real gap.
         super::note_design();
         super::note_drop(p);
         #[cfg(feature = "diagnostics")]
         {
+            let _ = super::take_drops();
             // Another, with its reason filed as the dispatch path files it.
             super::note_design_why(
                 "a stage of the ray-tracing structure builder (VICTORY_BVH_BUILDER is not 1)".to_owned(),
