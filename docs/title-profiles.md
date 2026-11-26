@@ -79,8 +79,13 @@ needs in `when`, and the profile (or the environment) says which are on:
 
 | Switch | On when | Written as |
 |---|---|---|
-| `render_scale` | `VICTORY_RENDER_SCALE` is a number in `0.2..=1.0`, else the profile's `render_scale` | an f32 |
-| `own_upscaler` | `VICTORY_OWN_UPSCALER` is set and not `0`, else the profile's `own_upscaler` | a bool |
+| `render_scale` | `VICTORY_RENDER_SCALE` is a number in `0.2..=1.0`; with the variable unset, the profile's `render_scale` | an f32 |
+| `own_upscaler` | `VICTORY_OWN_UPSCALER` is set and not `0`; with the variable unset, the profile's `own_upscaler = true` | a bool |
+
+The profile's fields are read only when the variable is absent. Set, the variable's own reading wins
+whatever the profile says: `VICTORY_OWN_UPSCALER=0` is off even where the profile says `true`, and a
+`VICTORY_RENDER_SCALE` that is not a number in `0.2..=1.0` turns the scale off rather than falling
+back to the profile's value (the log says the value was refused).
 
 `!own_upscaler` in `when` means the hook is placed only when the switch is off — a patch for the
 fallback path that must not run beside the one for the other, for instance. A hook whose `when`

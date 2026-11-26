@@ -149,8 +149,15 @@ impl Profile {
                 }
                 v
             }
-            None => self.render_scale.filter(|v| (0.2..=1.0).contains(v)),
+            None => self.profile_scale(),
         }
+    }
+
+    /// The scale this profile's own `render_scale` asks for, refused when it is
+    /// outside what the title's scale can be. The environment is not read, so a
+    /// test can assert on the profile alone.
+    pub fn profile_scale(&self) -> Option<f32> {
+        self.render_scale.filter(|v| (0.2..=1.0).contains(v))
     }
 
     /// Whether the title's own upscaler is asked for everywhere:
@@ -220,8 +227,12 @@ impl Hook {
             let on = match name {
                 "render_scale" => scale.is_some(),
                 "own_upscaler" => own,
-                // A switch we do not know is one the user meant to matter.
-                _ => false,
+                // A switch we do not know is one we cannot answer, so the hook
+                // is never placed: `!future_switch` must not turn it on either.
+                _ => {
+                    tracing::warn!(switch = name, "hook {:?}: unknown switch", self.what);
+                    return false;
+                }
             };
             on != negated
         })
@@ -375,7 +386,7 @@ mod tests {
             when = ["render_scale", "!own_upscaler"]
             "#,
         );
-        let scale = p.render_scale().unwrap();
+        let scale = p.profile_scale().unwrap();
         assert_eq!(scale, 0.5);
         assert_eq!(p.hooks[0].replacement_at(0, Some(scale)).unwrap(), 0.5f32.to_le_bytes());
         assert!(p.hooks[0].wanted(Some(scale), true));
@@ -410,7 +421,68 @@ mod tests {
         assert_eq!(parse_scale("0.1"), None);
         assert_eq!(parse_scale("1.5"), None);
         assert_eq!(parse_scale("half"), None);
-        assert_eq!(profile("render_scale = 1.5").render_scale(), None);
+        assert_eq!(profile("render_scale = 1.5").profile_scale(), None);
+    }
+
+    #[test]
+    fn an_unknown_switch_leaves_the_hook_out_either_way_round() {
+        let p = profile(
+            r#"
+            [[hooks]]
+            what = "future"
+            rva = 0
+            expect = "00"
+            new = "11"
+            when = ["future_switch"]
+            [[hooks]]
+            what = "not future"
+            rva = 1
+            expect = "00"
+            new = "11"
+            when = ["!future_switch", "render_scale"]
+            "#,
+        );
+        assert!(!p.hooks[0].wanted(Some(0.5), true), "a name we know nothing about is off");
+        assert!(
+            !p.hooks[1].wanted(Some(0.5), true),
+            "negating a name we know nothing about must not turn the hook on"
+        );
+    }
+
+    /// The environment arm of the scale runs in a child process: an inherited
+    /// `VICTORY_RENDER_SCALE` or `VICTORY_OWN_UPSCALER` on the machine must not
+    /// decide what the profile's own field is worth.
+    #[test]
+    fn the_environment_scale_beats_the_profile_field() {
+        if std::env::var_os("VICTORY_PROFILE_ENV_CHILD").is_some() {
+            let p = profile("render_scale = 0.5\nown_upscaler = true");
+            println!("SCALE {:?} OWN {}", p.render_scale(), p.own_upscaler());
+            std::process::exit(0);
+        }
+        let run = |scale: &str, own: &str| {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "profile::tests::the_environment_scale_beats_the_profile_field",
+                    "--nocapture",
+                ])
+                .env("VICTORY_PROFILE_ENV_CHILD", "1")
+                .env(RENDER_SCALE_ENV, scale)
+                .env(OWN_UPSCALER_ENV, own)
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            assert!(out.status.success(), "{text}");
+            text
+        };
+        assert!(
+            run("0.75", "1").contains("SCALE Some(0.75) OWN true"),
+            "the environment's scale wins"
+        );
+        assert!(
+            run("half", "0").contains("SCALE None OWN false"),
+            "a value outside 0.2..=1.0 turns the scale off, and 0 means no own upscaler"
+        );
     }
 
     #[test]
