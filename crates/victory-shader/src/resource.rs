@@ -109,6 +109,13 @@ impl Source {
             s => vec![s],
         }
     }
+
+    /// Whether every path to this descriptor reads the resource heap itself
+    /// (an index the title made, not a table), when `heap` says so of a leaf.
+    pub fn heap_only(&self, heap: impl Fn(&Self) -> bool) -> bool {
+        let l = self.leaves();
+        !l.is_empty() && l.iter().all(|s| heap(s))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

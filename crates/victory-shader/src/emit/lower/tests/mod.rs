@@ -1,4 +1,10 @@
-use super::{Lowered, Numeric, Parts, TEST_GROUP_SPLIT, USER_GROUP_BASE, buffer_format, half_shift, lower};
+//! The lowering tests, in their own file: `lower.rs` is at the 512 KiB cap
+//! (`cargo xtask policy`).
+
+use super::{
+    Lowered, Numeric, Parts, TEST_GROUP_SPLIT, USER_GROUP_BASE, buffer_format, code_table_start, half_shift,
+    lower,
+};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -149,6 +155,31 @@ fn packed_elements_behind_another_take_the_first_free_dword() {
     assert_eq!(at(3, 7), None);
     // A row no element holds gives nothing, as before.
     assert_eq!(packed_half(&sig, &[(8, None)], 8, 0), None);
+}
+
+/// A program's constant table starts after its instructions, unless a
+/// load at a fixed offset reads below that.
+#[test]
+fn the_code_table_starts_after_the_instructions() {
+    // s_nop 0, s_endpgm, then 1,000 dwords of constants.
+    let mut words = vec![0xBF80_0000, S_ENDPGM];
+    words.extend(0..1000u32);
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let p = ir::build(&code, false, 256).unwrap();
+    let at = |offset: u32, dynamic: bool| resource::Address {
+        param: resource::CODE,
+        offset,
+        dynamic: dynamic.then_some(ir::Value(0)),
+    };
+    let (computed, fixed_after, fixed_inside) = (at(0, true), at(12, false), at(4, false));
+    // A load at a computed offset from the code's start: the table is
+    // the constants only, not the whole program.
+    assert_eq!(code_table_start(&p, &[&computed], 0), 8);
+    assert_eq!(code_table_start(&p, &[&computed, &fixed_after], 0), 8);
+    // A load at a fixed offset inside the instructions keeps the start.
+    assert_eq!(code_table_start(&p, &[&computed, &fixed_inside], 0), 0);
+    // Loads past the instructions only: from the lowest of them.
+    assert_eq!(code_table_start(&p, &[&fixed_after], 12), 12);
 }
 
 /// Whether a synthetic compute program translates with these input registers.
@@ -415,9 +446,6 @@ fn a_descriptor_selected_by_scc_picks_its_heap_index() {
 // Descriptor words read as numbers: kept in their own file (lower.rs is at the size limit).
 mod code_table;
 mod desc_data;
-// A POPS pixel shader's rasterizer ordered views: likewise.
-mod pops_rov;
-
 mod mad_u16_lerp;
 mod vop3p_dot;
 mod mul24_hi;

@@ -31,6 +31,8 @@ macro_rules! once {
     }};
 }
 
+pub(crate) mod ahead;
+
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
@@ -50,6 +52,10 @@ pub(crate) struct Staging {
     ranges: Option<Vec<(u64, u64)>>,
     /// Mips per array slice.
     mips: u32,
+    /// The title's top mip levels the host copy lacks (memory pressure,
+    /// [`crate::resource::dropped_mips`]): subresource `i` holds the title's
+    /// mip `i + skipped` of its slice.
+    skipped: u32,
     /// Mips and array slices in one native plane.
     subresources_per_plane: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
@@ -70,6 +76,10 @@ pub(crate) struct Staging {
     /// of 1,120 textures in one frame of run 18.)
     dirty: std::sync::atomic::AtomicBool,
     uploaded: std::sync::atomic::AtomicBool,
+    /// What the texture's first upload is doing when it was started ahead on
+    /// the copy queue (`ahead`, `VICTORY_UPLOAD_AHEAD`): 0 nothing, 1 on its
+    /// way, 2 it has run.
+    ahead: std::sync::atomic::AtomicU8,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
     /// The frame of its last refresh, `NEVER` if it has had none: what
@@ -1032,6 +1042,61 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     };
     use std::sync::atomic::Ordering::Relaxed;
     staging.used.store(crate::host::moment(), Relaxed);
+    // `VICTORY_UPLOAD_AHEAD`: a texture's first upload is read and copied on
+    // the copy queue, ahead of the lists (`ahead`), so a frame's preparation
+    // does not stop for the read of a whole texture; the submission waits for
+    // it before its lists run (`VICTORY_SHOW_AFTER`).
+    if ahead::on()
+        && !staging.uploaded.load(Relaxed)
+        && !list.writes_title(staging.memory as usize, staging.layout.size as usize)
+    {
+        let key = ahead::key(&staging);
+        let upload = ahead::Upload {
+            buffer: staging.buffer.clone(),
+            footprints: staging.footprints.clone(),
+            texture: texture.clone(),
+            bytes: staging.bytes,
+        };
+        let detiling = staging.clone();
+        // The claim is taken with the job (and the registry's lock), so
+        // exactly one list starts a texture's first upload: two batches
+        // copying one texture is not something D3D12 allows, and the second
+        // would be waited on by nothing.
+        if let Some(job) = ahead::take(
+            key,
+            &staging.ahead,
+            upload,
+            Box::new(move || {
+                detiling.refresh_now();
+            }),
+        ) {
+            // The host texture holds what the staging buffer was detiled to
+            // once the copies have run, as a list's own uploads leave it; a
+            // batch that did not run gives the claim back, and the next list
+            // uploads it itself.
+            let ran = staging.clone();
+            job.then(move |copied: bool| {
+                use std::sync::atomic::Ordering::Relaxed;
+                ran.ahead
+                    .store(if copied { ahead::DONE } else { ahead::NONE }, Relaxed);
+                if copied {
+                    ran.uploaded.store(true, Relaxed);
+                    ran.dirty.store(false, Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    ran.present.queued();
+                }
+            });
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexUploads, 1);
+            return false;
+        }
+        // On its way with another list: this list records no copy, and the
+        // submission waits for it before the lists run
+        // (`ahead::synchronise`).
+        if staging.ahead.load(Relaxed) == ahead::PENDING {
+            return false;
+        }
+    }
     // The host texture has the staging buffer's contents: only the check
     // at submission is left, and what it finds changed the next list that
     // samples the texture uploads (a frame late where every list of the
@@ -1044,6 +1109,12 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
+    if ahead::on() {
+        // This list records the upload: no upload ahead may claim it until
+        // this one has run (`ahead::LIST`), or the copy queue would write the
+        // texture beside a drawing list's copy, with no fence between them.
+        staging.ahead.store(ahead::LIST, Relaxed);
+    }
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging buffer lives as long as `staging`, which the deferred
@@ -1103,6 +1174,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         list.defer_host(move || {
             staging.uploaded.store(true, Relaxed);
             staging.dirty.store(false, Relaxed);
+            if ahead::on() {
+                staging.ahead.store(ahead::DONE, Relaxed);
+            }
         });
     }
     // Once per submission however many of its lists sample the texture.
@@ -1126,6 +1200,11 @@ impl Staging {
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
         use std::sync::atomic::Ordering::Relaxed;
+        // Its first upload is on the copy queue, reading these bytes: it must
+        // have run before they are detiled over (`ahead`).
+        if self.ahead.load(Relaxed) == ahead::PENDING {
+            ahead::settle(ahead::key_of(self));
+        }
         // `VICTORY_TEXTURE_REFRESH_EVERY`: read at most once every n frames
         // (see [`due`]). Its contents then lag by up to that many frames, and
         // what was detiled before stays what is uploaded. Only once it has
@@ -1502,6 +1581,9 @@ impl Staging {
                 tracing::warn!(i, start, size = plane.layout.size, "a plane lies past the texture's memory");
                 return;
             };
+            // The title's top mips the host copy lacks (dropped_mips) are not
+            // subresources of a plane: they shift every mip it names.
+            let mip = mip + self.skipped;
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
@@ -2000,6 +2082,10 @@ fn planes_uploaded(
 
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
+    // Read (and make) the host copy first: `hosted` takes the texture's own
+    // lock, which `let_go_idle` holds while it calls `unstage` and so takes
+    // this one.
+    let skipped = crate::resource::dropped_mips(resource);
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize)) {
@@ -2133,6 +2219,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         layout,
         ranges,
         mips: u32::from(d.MipLevels),
+        skipped,
         subresources_per_plane,
         bytes: total,
         memory,
@@ -2141,6 +2228,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
+        ahead: std::sync::atomic::AtomicU8::new(0),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         looked: std::sync::atomic::AtomicU64::new(NEVER),
         present: Present::default(),

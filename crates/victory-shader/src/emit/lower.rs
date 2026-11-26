@@ -63,8 +63,8 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
-    /// Bit n: immediate sampler n is used for comparisons.
-    pub cmp_samplers: u64,
+    /// Per-slot flag: immediate sampler `n` is used for comparisons.
+    pub cmp_samplers: Vec<bool>,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
@@ -81,12 +81,6 @@ pub(crate) struct Lowered {
     /// The blocks of the module (a test of which edge blocks lowering made).
     #[cfg(test)]
     pub blocks: usize,
-    /// Whether its UAVs are rasterizer ordered views (a POPS pixel shader).
-    #[cfg(test)]
-    pub rovs: bool,
-    /// Whether the shader flags and `SFI0` declare rasterizer ordered views.
-    #[cfg(test)]
-    pub rov_flag: bool,
     /// The constant table's first byte and dwords, if the program has one.
     #[cfg(test)]
     pub code_table: Option<(u32, Vec<u32>)>,
@@ -249,7 +243,7 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
-    samplers: Vec<[u32; 4]>,
+    samplers: Vec<([u32; 4], bool)>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
@@ -990,6 +984,13 @@ pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
 /// the last place of a result that is not exact is then one lower than the console's).
 /// Off by default: it is exact but untried in a game run, and adds instructions to every
 /// such operation. The wave sum of 16-bit floats ([`Lower::half_sum`]) is always exact.
+/// `VICTORY_SHADER_DIV_FIXUP_F16=0` keeps `v_div_fixup_f16` refused, as it
+/// was before it was lowered (the program is dropped, not mistranslated).
+fn div_fixup_f16_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHADER_DIV_FIXUP_F16").is_none_or(|v| v != "0"))
+}
+
 fn f16_nearest_on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_F16_NEAREST.get() {
@@ -1256,6 +1257,27 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// Where a program's constant table starts in its code: where its
+/// instructions end, unless a load at a fixed offset reads below that (then
+/// at `lowest`, the lowest offset any load or descriptor names). The
+/// program's constants follow its instructions, and a load at a computed
+/// offset reads them, not instruction bytes.
+fn code_table_start(
+    p: &crate::ir::Program,
+    addresses: &[&crate::resource::Address],
+    lowest: u32,
+) -> u32 {
+    let code_end = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .map(|i| i.machine.offset + 4 * i.machine.words.len())
+        .max()
+        .unwrap_or(0) as u32;
+    let fixed_below = addresses.iter().any(|a| a.dynamic.is_none() && a.offset < code_end);
+    if fixed_below { lowest } else { lowest.max(code_end & !3) }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -1268,12 +1290,6 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
-        if let StageIo::Ps {
-            db_shader_control, ..
-        } = &x.native.io
-        {
-            s.pops(*db_shader_control);
-        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -1638,15 +1654,15 @@ impl<'a> Lower<'a> {
         let (g, base, len) = match self.code_table {
             Some(t) => t,
             None => {
-                let first = self
+                let addresses: Vec<&crate::resource::Address> = self
                     .x
                     .res
                     .scalar
                     .iter()
-                    .map(|s| s.1)
+                    .map(|s| &s.1)
                     .chain(self.x.res.descriptors.iter().flat_map(|d| {
                         d.source.leaves().into_iter().filter_map(|l| match l {
-                            Source::Built { address, .. } => Some(*address),
+                            Source::Built { address, .. } => Some(address),
                             _ => None,
                         })
                     }))
@@ -1659,13 +1675,12 @@ impl<'a> Lower<'a> {
                         } else {
                             &[]
                         }
-                        .iter()
-                        .copied(),
+                        .iter(),
                     )
                     .filter(|a| a.param == CODE)
-                    .map(|a| a.offset & !3)
-                    .min()
-                    .ok_or("a code table")?;
+                    .collect();
+                let lowest = addresses.iter().map(|a| a.offset & !3).min().ok_or("a code table")?;
+                let first = code_table_start(self.x.p, &addresses, lowest);
                 let code = &self.x.native.code;
                 let words: Vec<u32> = code
                     .get(first as usize..)
@@ -2340,7 +2355,11 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
-        let cmp_samplers = self.s.cmp_samplers;
+        // Cloned, not taken: `finish` below reads them, and a slot an
+        // immediate sampler used for comparison must still be known as one
+        // there (an emptied list defaults every slot to plain sampling).
+        let cmp_samplers = self.s.cmp_samplers.clone();
+        let samplers = self.samplers.into_iter().map(|(w, _)| w).collect();
         let wave_size = self.s.wave_size;
         #[cfg(test)]
         let buffer_loads = {
@@ -2350,6 +2369,7 @@ impl<'a> Lower<'a> {
         Ok(Lowered {
             wave_size,
             cmp_samplers,
+            samplers,
             root_cbvs,
             root_srvs,
             root_uavs,
@@ -2360,16 +2380,11 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             blocks: self.s.m.blocks(),
             #[cfg(test)]
-            rovs: self.s.rovs,
-            #[cfg(test)]
-            rov_flag: self.s.flags & flags::ROVS != 0,
-            #[cfg(test)]
             code_table: self.code_table.map(|t| (t.1, self.code_words)),
             #[cfg(test)]
             buffer_loads,
             dxil: self.s.finish(),
             user_data,
-            samplers: self.samplers,
         })
     }
 
@@ -2962,7 +2977,7 @@ impl<'a> Lower<'a> {
         );
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
-        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
+        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0), false);
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
@@ -6565,6 +6580,12 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
+        // An index the title made itself may not name a host slot.
+        let from_heap = !sampler && src.heap_only(|s| {
+            let (Source::Loaded { load, .. } | Source::Fetched { load, .. }) = s else { return false };
+            self.scalar.get(load).and_then(|a| self.x.native.layout.get(a.param))
+                .is_some_and(|p| p.root == RootType::ResourceHeap)
+        });
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props);
@@ -6577,7 +6598,7 @@ impl<'a> Lower<'a> {
                 let per_lane = self.x.res.waterfall.loads.contains(load);
                 let h = self
                     .s
-                    .heap_handle(self.cur, index, sampler, per_lane, props);
+                    .heap_handle(self.cur, index, sampler, per_lane, props, from_heap);
                 self.handles.insert(key, h);
                 Ok(h)
             }
@@ -6586,18 +6607,18 @@ impl<'a> Lower<'a> {
                     .get(..4)
                     .and_then(|w| w.try_into().ok())
                     .ok_or("a sampler constant")?;
-                let n = match self.samplers.iter().position(|w| *w == words) {
+                // A constant used both for normal and for comparison sampling
+                // gets two static samplers: the host's sampler kind is part of
+                // the static sampler, so one slot cannot be both.
+                let cmp = props.0 & 0x8000 != 0;
+                let n = match self.samplers.iter().position(|&e| e == (words, cmp)) {
                     Some(n) => n,
                     None => {
-                        self.samplers.push(words);
+                        self.samplers.push((words, cmp));
+                        self.s.cmp_samplers.push(cmp);
                         self.samplers.len() - 1
                     }
                 };
-                if props.0 & 0x8000 != 0 {
-                    // shortcut: one sampler used with and without comparison
-                    // would need two static samplers; it becomes a comparison one.
-                    self.s.cmp_samplers |= 1 << n;
-                }
                 Ok(self.s.sampler_handle(self.cur, n as u32))
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
@@ -6638,7 +6659,7 @@ impl<'a> Lower<'a> {
             Source::Phi { block, args } => {
                 let _ = site;
                 let phi = self.descriptor_phi(*block, args, sampler, 8)?;
-                Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
+                Ok(self.s.heap_handle(self.cur, phi, sampler, false, props, from_heap))
             }
             Source::Select { scc, args } => {
                 // The heap index of each choice, picked by SCC (uniform).
@@ -6656,14 +6677,14 @@ impl<'a> Lower<'a> {
                 let set = self.heap_index(a, fa, sampler)?;
                 let clear = self.heap_index(b, fb, sampler)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
-                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
+                Ok(self.s.heap_handle(self.cur, index, sampler, false, props, from_heap))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
                 // A descriptor each lane has its own of (a waterfall loop
                 // reads it from the first active lane): each lane's heap
                 // index, non-uniform.
                 let index = self.lane_heap_index(src, sampler)?;
-                Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
+                Ok(self.s.heap_handle(self.cur, index, sampler, true, props, from_heap))
             }
         }
     }
@@ -7067,6 +7088,60 @@ impl<'a> Lower<'a> {
         Ok((r, enable))
     }
 
+    /// `v_div_fixup`'s special cases on f32 values (an f16's are exact in
+    /// f32): `q` is the quotient a division computed, `den` and `num` its
+    /// denominator and numerator. A NaN numerator or denominator comes back
+    /// quieted (numerator first); 0/0 and inf/inf give a negative quiet NaN;
+    /// x/0 and inf/x give a signed infinity; 0/x and x/inf a signed zero; a
+    /// NaN quotient gives a signed infinity; anything else is `|q|` with the
+    /// sign of `num ^ den` (the ISA's order of checks).
+    fn div_fixup(&mut self, q: V, den: V, num: V) -> V {
+        let c = self.cur;
+        let (qi, di, ni) = (self.as_int(q), self.as_int(den), self.as_int(num));
+        let (ksign, kabs, kinf) = (
+            self.s.m.i32(0x8000_0000),
+            self.s.m.i32(0x7FFF_FFFF),
+            self.s.m.i32(0x7F80_0000),
+        );
+        let (kqnan_bit, kneg_qnan, zero) = (
+            self.s.m.i32(0x0040_0000),
+            self.s.m.i32(0xFFC0_0000),
+            self.s.m.i32(0),
+        );
+        let sign = {
+            let x = self.s.m.bin(c, Bin::Xor, ni, di);
+            self.s.m.bin(c, Bin::And, x, ksign)
+        };
+        let q_abs = self.s.m.bin(c, Bin::And, qi, kabs);
+        let d_abs = self.s.m.bin(c, Bin::And, di, kabs);
+        let n_abs = self.s.m.bin(c, Bin::And, ni, kabs);
+        let q_nan = self.s.m.cmp(c, pred::IUGT, q_abs, kinf);
+        let d_nan = self.s.m.cmp(c, pred::IUGT, d_abs, kinf);
+        let n_nan = self.s.m.cmp(c, pred::IUGT, n_abs, kinf);
+        let d_inf = self.s.m.cmp(c, pred::EQ, d_abs, kinf);
+        let n_inf = self.s.m.cmp(c, pred::EQ, n_abs, kinf);
+        let d_zero = self.s.m.cmp(c, pred::EQ, d_abs, zero);
+        let n_zero = self.s.m.cmp(c, pred::EQ, n_abs, zero);
+        let both_inf = self.s.m.bin(c, Bin::And, n_inf, d_inf);
+        let both_zero = self.s.m.bin(c, Bin::And, n_zero, d_zero);
+        let invalid = self.s.m.bin(c, Bin::Or, both_inf, both_zero);
+        let make_inf = {
+            let t = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
+            self.s.m.bin(c, Bin::Or, t, q_nan)
+        };
+        let make_zero = self.s.m.bin(c, Bin::Or, d_inf, n_zero);
+        let signed_q = self.s.m.bin(c, Bin::Or, sign, q_abs);
+        let signed_inf = self.s.m.bin(c, Bin::Or, sign, kinf);
+        let n_qnan = self.s.m.bin(c, Bin::Or, ni, kqnan_bit);
+        let d_qnan = self.s.m.bin(c, Bin::Or, di, kqnan_bit);
+        let r = self.s.m.select(c, make_zero, sign, signed_q);
+        let r = self.s.m.select(c, make_inf, signed_inf, r);
+        let r = self.s.m.select(c, invalid, kneg_qnan, r);
+        let r = self.s.m.select(c, d_nan, d_qnan, r);
+        let r = self.s.m.select(c, n_nan, n_qnan, r);
+        self.as_float(r)
+    }
+
     fn valu_op(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -7391,52 +7466,12 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.select(c, vcc, scaled, tmp);
                 float(self, r)
             }
+
+
             "v_div_fixup_f32" => {
-                let (q, den, num) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
-                let (qi, di, ni) = (self.as_int(q), self.as_int(den), self.as_int(num));
-                let (ksign, kabs, kinf) = (
-                    self.s.m.i32(0x8000_0000),
-                    self.s.m.i32(0x7FFF_FFFF),
-                    self.s.m.i32(0x7F80_0000),
-                );
-                let (kqnan_bit, kneg_qnan, zero) = (
-                    self.s.m.i32(0x0040_0000),
-                    self.s.m.i32(0xFFC0_0000),
-                    self.s.m.i32(0),
-                );
-                let sign = {
-                    let x = self.s.m.bin(c, Bin::Xor, ni, di);
-                    self.s.m.bin(c, Bin::And, x, ksign)
-                };
-                let q_abs = self.s.m.bin(c, Bin::And, qi, kabs);
-                let d_abs = self.s.m.bin(c, Bin::And, di, kabs);
-                let n_abs = self.s.m.bin(c, Bin::And, ni, kabs);
-                let q_nan = self.s.m.cmp(c, pred::IUGT, q_abs, kinf);
-                let d_nan = self.s.m.cmp(c, pred::IUGT, d_abs, kinf);
-                let n_nan = self.s.m.cmp(c, pred::IUGT, n_abs, kinf);
-                let d_inf = self.s.m.cmp(c, pred::EQ, d_abs, kinf);
-                let n_inf = self.s.m.cmp(c, pred::EQ, n_abs, kinf);
-                let d_zero = self.s.m.cmp(c, pred::EQ, d_abs, zero);
-                let n_zero = self.s.m.cmp(c, pred::EQ, n_abs, zero);
-                let both_inf = self.s.m.bin(c, Bin::And, n_inf, d_inf);
-                let both_zero = self.s.m.bin(c, Bin::And, n_zero, d_zero);
-                let invalid = self.s.m.bin(c, Bin::Or, both_inf, both_zero);
-                let make_inf = {
-                    let t = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
-                    self.s.m.bin(c, Bin::Or, t, q_nan)
-                };
-                let make_zero = self.s.m.bin(c, Bin::Or, d_inf, n_zero);
-                let signed_q = self.s.m.bin(c, Bin::Or, sign, q_abs);
-                let signed_inf = self.s.m.bin(c, Bin::Or, sign, kinf);
-                let n_qnan = self.s.m.bin(c, Bin::Or, ni, kqnan_bit);
-                let d_qnan = self.s.m.bin(c, Bin::Or, di, kqnan_bit);
-                let r = self.s.m.select(c, make_zero, sign, signed_q);
-                let r = self.s.m.select(c, make_inf, signed_inf, r);
-                let r = self.s.m.select(c, invalid, kneg_qnan, r);
-                let r = self.s.m.select(c, d_nan, d_qnan, r);
-                let r = self.s.m.select(c, n_nan, n_qnan, r);
-                let rf = self.as_float(r);
-                float(self, rf)
+                let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                let r = self.div_fixup(a, bb, cc);
+                float(self, r)
             }
             "v_fmac_f32" | "v_mac_f32" | "v_mac_legacy_f32" => {
                 let (a, bb) = (f(self, 0)?, f(self, 1)?);
@@ -8342,6 +8377,7 @@ impl<'a> Lower<'a> {
             "v_max3_f16",
             "v_min3_f16",
             "v_med3_f16",
+            "v_div_fixup_f16",
         ];
         const FLOAT1: &[&str] = &[
             "v_rcp_f16",
@@ -8376,6 +8412,9 @@ impl<'a> Lower<'a> {
             "v_cvt_norm_i16_f16",
             "v_cvt_norm_u16_f16",
         ];
+        if name == "v_div_fixup_f16" && !div_fixup_f16_on() {
+            return None;
+        }
         let all = [FLOAT1, FLOAT2, FLOAT3, INT];
         if !all.iter().any(|l| l.contains(&name))
             && !matches!(name, "v_cvt_f16_f32" | "v_cvt_f32_f16")
@@ -8477,6 +8516,9 @@ impl<'a> Lower<'a> {
                     let t = self.max_min(false, a, b);
                     self.max_min(false, t, acc)
                 }
+                // Every f16 is exact in f32, so the f32 special cases hold
+                // for the f16 operands; the result rounds once on the way back.
+                "v_div_fixup_f16" => self.div_fixup(a, b, acc),
                 _ => self.med3(a, b, acc),
             };
             return float_result(self, r);
