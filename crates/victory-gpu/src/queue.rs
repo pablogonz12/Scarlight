@@ -303,10 +303,11 @@ pub(crate) fn before_sync() {
     behind::drain();
 }
 
-/// Submissions the title made that the host has not begun ([`behind`]).
+/// Submissions the line holds or is running: what the card will be given
+/// (`FINISHED` counts them, a signal in the line does not).
 #[cfg(windows)]
-pub(crate) fn queued() -> u64 {
-    if behind::on() { behind::queued() } else { 0 }
+pub(crate) fn submissions() -> u64 {
+    if behind::on() { behind::submissions() } else { 0 }
 }
 
 /// For the frame line.
@@ -330,6 +331,13 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
     true
 }
 
+/// One thing a queue held: taken out under its lock, run once that is let go.
+#[cfg(windows)]
+enum Step {
+    Run(Vec<crate::list::Detached>, Vec<usize>),
+    Signal(usize, u64),
+}
+
 /// Runs what waiting queues hold as far as their fences have been reached
 /// (`all`: all of it), each queue's in the order it was given. Called
 /// where a fence may have moved: after a signal and after a submission (a
@@ -347,58 +355,84 @@ pub(crate) fn release_held(all: bool) {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
         for q in queues {
-            // SAFETY: a live queue: one released is taken off the list.
-            let held = unsafe { &(*(q as *const Queue)).held };
-            let mut held = lock(held);
-            loop {
-                match held.first() {
-                    None => break,
-                    Some(&Held::Wait(fence, value))
-                        if !all && crate::fence::completed(fence as This) < value =>
-                    {
-                        break;
-                    }
-                    Some(Held::Value(wait)) if !all && !value_met(wait) => break,
-                    Some(_) => {}
-                }
-                match held.remove(0) {
-                    Held::Wait(..) => {}
-                    Held::Value(wait) => {
-                        // Passed at a present without being met: what the
-                        // queue stood at.
-                        if all && !value_met(&wait) {
-                            static SEEN: AtomicU64 = AtomicU64::new(0);
-                            if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
-                                tracing::warn!(
-                                    queue = format_args!("{q:#x}"),
-                                    ?wait,
-                                    "a wait for a memory value was not met at a present: the queue runs on"
-                                );
-                            }
-                        }
-                    }
-                    Held::Run(lists, order) => {
-                        #[cfg(feature = "diagnostics")]
-                        crate::capture::op(q, || {
-                            format!(
-                                "RUN held submission of {} lists (forced {all})",
-                                order.len()
-                            )
-                        });
-                        // Diagnostics: the part behind this one stands at
-                        // waits that are met already, so the two could have
-                        // been one host submission (one wait for the card,
-                        // each range shaders write compared once).
-                        #[cfg(feature = "diagnostics")]
+            // What is free to run is taken out under the queue's own lock and
+            // run once it is let go: running waits for the card, and with
+            // `crate::queue::behind` the thread of the line takes this lock to
+            // submit what it was given — waiting for it while holding this
+            // lock waits for itself.
+            let mut steps: Vec<Step> = Vec::new();
+            {
+                // SAFETY: a live queue: one released is taken off the list.
+                let held = unsafe { &(*(q as *const Queue)).held };
+                let mut held = lock(held);
+                loop {
+                    match held.first() {
+                        None => break,
+                        // (Ours, not the title's: a read that takes the line in
+                        // here would wait for work that waits for this lock.)
+                        Some(&Held::Wait(fence, value))
+                            if !all && crate::fence::value(fence as This) < value =>
                         {
-                            let waits = held.iter().take_while(|h| matches!(h, Held::Value(_))).count();
-                            if waits > 0
-                                && matches!(held.get(waits), Some(Held::Run(..)))
-                                && held[..waits].iter().all(|h| matches!(h, Held::Value(w) if w.met()))
-                            {
-                                crate::copystat::add(crate::copystat::C::PartsTogether, 1);
+                            break;
+                        }
+                        Some(Held::Value(wait)) if !all && !value_met(wait) => break,
+                        Some(_) => {}
+                    }
+                    match held.remove(0) {
+                        Held::Wait(..) => {}
+                        Held::Value(wait) => {
+                            // Passed at a present without being met: what the
+                            // queue stood at.
+                            if all && !value_met(&wait) {
+                                static SEEN: AtomicU64 = AtomicU64::new(0);
+                                if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
+                                    tracing::warn!(
+                                        queue = format_args!("{q:#x}"),
+                                        ?wait,
+                                        "a wait for a memory value was not met at a present: the queue runs on"
+                                    );
+                                }
                             }
                         }
+                        Held::Run(lists, order) => {
+                            #[cfg(feature = "diagnostics")]
+                            crate::capture::op(q, || {
+                                format!(
+                                    "RUN held submission of {} lists (forced {all})",
+                                    order.len()
+                                )
+                            });
+                            // Diagnostics: the part behind this one stands at
+                            // waits that are met already, so the two could have
+                            // been one host submission (one wait for the card,
+                            // each range shaders write compared once).
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                let waits = held.iter().take_while(|h| matches!(h, Held::Value(_))).count();
+                                if waits > 0
+                                    && matches!(held.get(waits), Some(Held::Run(..)))
+                                    && held[..waits].iter().all(|h| matches!(h, Held::Value(w) if w.met()))
+                                {
+                                    crate::copystat::add(crate::copystat::C::PartsTogether, 1);
+                                }
+                            }
+                            steps.push(Step::Run(lists, order));
+                        }
+                        // Behind what was sent to the card and not waited for,
+                        // if anything was.
+                        Held::Signal(fence, value) => steps.push(Step::Signal(fence, value)),
+                    }
+                    moved = true;
+                }
+                if held.is_empty() {
+                    lock(&WAITING).retain(|&w| w != q);
+                }
+            }
+            // The queue's lock is let go: run what was taken out, in the
+            // order it was given.
+            for step in steps {
+                match step {
+                    Step::Run(lists, order) => {
                         if crate::host::late()
                             && let Some(host) = crate::host::host()
                         {
@@ -433,18 +467,12 @@ pub(crate) fn release_held(all: bool) {
                             }
                         }
                     }
-                    // Behind what was sent to the card and not waited
-                    // for, if anything was.
-                    Held::Signal(fence, value) => {
+                    Step::Signal(fence, value) => {
                         if !crate::host::late_signal(fence, value) {
                             crate::fence::set(fence as This, value);
                         }
                     }
                 }
-                moved = true;
-            }
-            if held.is_empty() {
-                lock(&WAITING).retain(|&w| w != q);
             }
         }
         if !moved {
@@ -532,7 +560,7 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
         out,
     )
 }
-extern "system" fn release(this: This) -> u32 {
+pub(crate) extern "system" fn release(this: This) -> u32 {
     let left = object::release_boxed::<Queue>(this);
     #[cfg(windows)]
     if left == 0 {
@@ -582,7 +610,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
 /// as much as for the title's own: a wait a stream wrote down cuts them where
 /// it stands, and a list before it does not wait for it.
 #[cfg(windows)]
-fn dispatch(host: &crate::host::Host, this: This, lists: &[This]) {
+pub(crate) fn dispatch(host: &crate::host::Host, this: This, lists: &[This]) {
     if cuts() && !this.is_null() {
         submit_cut(this, lists);
         return;
@@ -688,23 +716,30 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
     if behind::on() {
-        // After the submissions the queue was given before it (the line's
-        // thread keeps the order).
-        behind::signal(fence, value);
+        // After the submissions the queue was given before it: the line's
+        // thread keeps the order, and carries the queue so that a wait it was
+        // given before this signal still holds the value back.
+        behind::signal(this, fence, value);
         return S_OK;
     }
     #[cfg(windows)]
-    if hold(this, || Held::Signal(fence as usize, value)) {
-        return S_OK;
-    }
-    // Behind the submissions sent to the card and not waited for: the
-    // fence is set when they are settled.
-    #[cfg(windows)]
-    if crate::host::late_signal(fence as usize, value) {
+    if after_held(this, fence, value) {
         return S_OK;
     }
     let _ = this;
     crate::fence::signal(fence, value)
+}
+
+/// Whether a signal waits for something first: what the queue holds (a wait
+/// for a fence or a memory value it was given before), or the submissions sent
+/// to the card and not waited for (the value is set when they are settled).
+/// Whether it does; otherwise the caller sets it now.
+#[cfg(windows)]
+pub(crate) fn after_held(this: This, fence: This, value: u64) -> bool {
+    if hold(this, || Held::Signal(fence as usize, value)) {
+        return true;
+    }
+    crate::host::late_signal(fence as usize, value)
 }
 /// From here on the queue runs nothing it is given until `fence` reaches
 /// `value`: how the console orders work between queues (the title's

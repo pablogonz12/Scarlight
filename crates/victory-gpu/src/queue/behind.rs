@@ -51,8 +51,14 @@ enum Job {
         queue: This,
         lists: Box<Submitted>,
     },
-    /// A fence value, after the work before it.
-    Signal { fence: This, value: u64 },
+    /// A fence value, after the work the queue was given before it: the queue
+    /// is named, as the title's own signal names it (what it holds still holds
+    /// the value back).
+    Signal {
+        queue: This,
+        fence: This,
+        value: u64,
+    },
     /// Anything else, for tests of the order.
     #[cfg(test)]
     Work(Box<dyn FnOnce() + Send>),
@@ -65,6 +71,14 @@ unsafe impl Send for Job {}
 static LINE: Mutex<VecDeque<Job>> = Mutex::new(VecDeque::new());
 /// Jobs taken or waiting; the line is empty when it is zero.
 static PENDING: Mutex<usize> = Mutex::new(0);
+/// Jobs accepted since the process began, and those finished: a drain waits
+/// only for what was accepted before it was called (the line runs them in
+/// order, so a count of finished jobs covers the prefix).
+static ACCEPTED: AtomicU64 = AtomicU64::new(0);
+static FINISHED_JOBS: Mutex<u64> = Mutex::new(0);
+/// Submissions taken or waiting: those the card will be given (a signal in
+/// the line is not one).
+static SUBMISSIONS: Mutex<u64> = Mutex::new(0);
 static IDLE: Condvar = Condvar::new();
 static WORK: Condvar = Condvar::new();
 /// Since the last line of the log: submissions, waits the title took in, and
@@ -76,6 +90,12 @@ fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 fn push(job: Job) {
+    if matches!(job, Job::Submit { .. }) {
+        *held(&SUBMISSIONS) += 1;
+    }
+    // Counted before it is in the line: a drain that reads the count and then
+    // waits must not miss a job it came after.
+    ACCEPTED.fetch_add(1, Relaxed);
     *held(&PENDING) += 1;
     held(&LINE).push_back(job);
     WORK.notify_one();
@@ -90,7 +110,13 @@ fn run_one() -> bool {
         };
         job
     };
+    let submit = matches!(job, Job::Submit { .. });
     run(job);
+    if submit {
+        let mut submissions = held(&SUBMISSIONS);
+        *submissions = submissions.saturating_sub(1);
+    }
+    *held(&FINISHED_JOBS) += 1;
     let mut pending = held(&PENDING);
     *pending = pending.saturating_sub(1);
     IDLE.notify_all();
@@ -103,15 +129,33 @@ fn run(job: Job) {
             if let Some(host) = crate::host::host() {
                 let backs = lists.ready();
                 STATS[0].fetch_add(1, Relaxed);
-                submit_list(host, queue, &backs);
+                // The routes a title list's submission takes: a wait the
+                // stream wrote down cuts it where it stands.
+                crate::queue::dispatch(host, queue, &backs);
             }
-            // The title may release it as soon as its call returned.
-            crate::object::release(queue);
+            // The title may release it as soon as its call returned: the
+            // reference taken with the job is let go the way the title's is
+            // (the last one frees the queue, and takes it off the waiting
+            // list).
+            if !queue.is_null() {
+                crate::queue::release(queue);
+            }
         }
-        Job::Signal { fence, value } => {
-            crate::fence::signal(fence, value);
-            // As above: the title's reference may be gone already.
-            crate::object::release(fence);
+        Job::Signal { queue, fence, value } => {
+            // What the queue holds comes first: a wait it was given before
+            // this signal keeps the value back, as the title's own signal
+            // does.
+            let held_back = !queue.is_null() && crate::queue::after_held(queue, fence, value);
+            if !held_back {
+                crate::fence::signal(fence, value);
+            }
+            // As above: the title's references may be gone already.
+            if !queue.is_null() {
+                crate::queue::release(queue);
+            }
+            if !fence.is_null() {
+                crate::fence::release(fence);
+            }
         }
         #[cfg(test)]
         Job::Work(work) => work(),
@@ -156,11 +200,18 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
 }
 
 /// A fence value, after what the queue was given before it.
-pub(crate) fn signal(fence: This, value: u64) {
+pub(crate) fn signal(queue: This, fence: This, value: u64) {
     if !fence.is_null() {
         crate::object::add_ref(fence);
     }
-    push(Job::Signal { fence, value });
+    if !queue.is_null() {
+        crate::object::add_ref(queue);
+    }
+    push(Job::Signal {
+        queue,
+        fence,
+        value,
+    });
 }
 
 /// Takes in everything the line holds: the title meets the card here.
@@ -168,12 +219,19 @@ pub(crate) fn drain() {
     if !on() || WORKER.with(|w| w.get()) {
         return;
     }
+    // Only what the line took before this call: work other threads submit
+    // meanwhile is not what this waits for.
+    drain_to(ACCEPTED.load(Acquire));
+}
+
+/// Waits until the jobs accepted up to `accepted` have run.
+fn drain_to(accepted: u64) {
     let began = std::time::Instant::now();
-    let mut pending = held(&PENDING);
-    while *pending > 0 {
-        pending = IDLE.wait(pending).unwrap_or_else(|e| e.into_inner());
+    let mut finished = held(&FINISHED_JOBS);
+    while *finished < accepted {
+        finished = IDLE.wait(finished).unwrap_or_else(|e| e.into_inner());
     }
-    drop(pending);
+    drop(finished);
     // And what the line sent to the card without a wait has run: a drain point
     // is where the title meets the card again.
     crate::host::settle_for_present();
@@ -185,6 +243,11 @@ pub(crate) fn drain() {
 /// run count as made.
 pub(crate) fn queued() -> u64 {
     *held(&PENDING) as u64
+}
+
+/// Submissions the line holds or is running.
+pub(crate) fn submissions() -> u64 {
+    *held(&SUBMISSIONS)
 }
 
 /// For the frame line.
@@ -223,7 +286,11 @@ mod tests {
         let written = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = written.clone();
         push(Job::Work(Box::new(move || flag.store(true, Release))));
-        push(Job::Signal { fence, value: 1 });
+        push(Job::Signal {
+            queue: std::ptr::null(),
+            fence,
+            value: 1,
+        });
         assert!(!written.load(Acquire), "nothing runs before the line does");
         assert_eq!(queued(), 2);
         assert!(run_one(), "the work runs first");
@@ -232,5 +299,86 @@ mod tests {
         assert!(run_one(), "then the signal");
         assert_eq!(crate::fence::completed(fence), 1, "the value is set last");
         assert_eq!(queued(), 0);
+    }
+
+    /// A drain waits for what the line took before it was called, not for what
+    /// other threads hand it meanwhile (that would block for as long as they
+    /// keep submitting).
+    #[test]
+    fn a_drain_waits_only_for_what_it_came_after() {
+        push(Job::Work(Box::new(|| {})));
+        let up_to = ACCEPTED.load(Acquire);
+        push(Job::Work(Box::new(|| {})));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drain_to(up_to);
+            tx.send(()).ok();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(500)).is_err(),
+            "the drain returned before the job it came after ran"
+        );
+        assert!(run_one(), "the first job runs");
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the drain waited for a job made after it");
+        assert!(run_one(), "the second job runs");
+    }
+
+    /// A signal the line makes keeps the queue's identity: a wait the queue was
+    /// given before it still holds the value back, as the title's own signal
+    /// does (the value is not seen before the work before it ran).
+    #[test]
+    fn a_signal_of_the_line_waits_for_what_the_queue_holds() {
+        let mut queue: This = std::ptr::null();
+        let desc = crate::queue::QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        assert_eq!(
+            crate::queue::create(std::ptr::null(), &desc, &crate::queue::QUEUE_IIDS[0], &mut queue),
+            S_OK
+        );
+        let fence = fence();
+        // The queue is told to wait for a value nothing has reached.
+        assert_eq!(crate::queue::wait(queue, fence, 2), S_OK);
+        push(Job::Signal {
+            queue,
+            fence,
+            value: 1,
+        });
+        assert!(run_one());
+        assert_eq!(
+            crate::fence::value(fence),
+            0,
+            "the value was seen though the queue still waited for one before it"
+        );
+    }
+
+    /// A signal in the line is not a submission the card will be given: an
+    /// object is not kept for a number `FINISHED` will never reach.
+    #[test]
+    fn a_pending_signal_is_not_a_submission_to_keep_an_object_for() {
+        struct Flag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Release);
+            }
+        }
+        let fence = fence();
+        push(Job::Signal {
+            queue: std::ptr::null(),
+            fence,
+            value: 1,
+        });
+        assert_eq!(submissions(), 0, "a signal is not a submission");
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        crate::host::retire(Flag(dropped.clone()));
+        assert!(
+            dropped.load(Acquire),
+            "an object was kept for a submission that is only a signal"
+        );
+        assert!(run_one());
     }
 }

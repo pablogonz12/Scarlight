@@ -72,8 +72,13 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
         out,
     )
 }
-extern "system" fn release(this: This) -> u32 {
+pub(crate) extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
+}
+/// The value as it is, read by our own paths: no taking in of the line
+/// (`behind`), which may be waiting for what waits for the caller.
+pub(crate) fn value(this: This) -> u64 {
+    fence(this).value.load(Ordering::Acquire)
 }
 pub(crate) extern "system" fn completed(this: This) -> u64 {
     // With submissions in the line of a thread of ours (`VICTORY_ASYNC_SUBMIT`),

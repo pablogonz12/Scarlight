@@ -1146,7 +1146,7 @@ mod tests {
         let bits = this as usize;
         std::thread::spawn(move || {
             let submitted = super::submitted(&[bits as This]);
-            tx.send(submitted.backs().len()).ok();
+            tx.send(submitted.ready().len()).ok();
         });
         let backs = rx
             .recv_timeout(std::time::Duration::from_secs(30))

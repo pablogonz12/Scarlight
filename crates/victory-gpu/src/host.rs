@@ -237,7 +237,9 @@ fn sweep() {
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
     // (Those the title made and the line has not begun get the next numbers.)
-    let started = STARTED.load(Ordering::Acquire) + crate::queue::queued();
+    // Only submissions advance `FINISHED`: a signal in the line is not a
+    // number that will ever be reached.
+    let started = STARTED.load(Ordering::Acquire) + crate::queue::submissions();
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
