@@ -280,6 +280,10 @@ D
   is clipped rather than refused after its range was unmapped (`crates/victory-hle/src/modules/xmem.rs`,
   `VICTORY_MAP_CLIP=0` turns it off).
 
+- **codec-d/cool_fox [`e05d4633a`](https://github.com/codec-d/cool_fox/commit/e05d4633a)**, GPL-3.0: a
+  `SetEventOnCompletion` with no event blocks the guest thread on the fence's value with `WaitOnAddress`, and
+  `Signal`/`Set` wakes it with `WakeByAddressAll` (`crates/victory-gpu/src/fence.rs`; the wait here is bounded
+  by `VICTORY_FENCE_BLOCK_MS` and lets the queue run what it holds between slices).
 - **codec-d/cool_fox [`8cc31ab37`](https://github.com/codec-d/cool_fox/commit/8cc31ab37)**, GPL-3.0: an XMA
   voice whose input the title publishes again while the context stays enabled decodes on instead of staying
   ended, and the decode pass publishes only whole blocks (a short one only as the flushed tail), trying a few
