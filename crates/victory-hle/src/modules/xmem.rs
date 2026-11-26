@@ -154,6 +154,11 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if !at.is_null() && kind & MEM_COMMIT != 0 && protect == PAGE_READWRITE {
+        // Committed private memory the GPU may use: the arena's registry
+        // (`VICTORY_ARENA=1`, off by default; a no-op when off).
+        victory_gpu::title_memory_committed(at as usize, size);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
