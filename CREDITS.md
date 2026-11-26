@@ -28,6 +28,15 @@ wrothgaril, Yaekai.
 
 andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VIctory #2614), BlueKaiman, kais7654, pushkarreddyy, shh.
 
+## Ports of fork pull requests
+
+Code reimplemented here from a fork's pull request, because the fork's tree had diverged from ours;
+the design and the author are credited in the commit's `Co-authored-by:` and here.
+
+- **Marvisak/VIctory #2401** (Mumogg) — the Wine `ExitProcess` hook that makes a host driver
+  compiler crash cost one pipeline instead of the run ([`pipeline/wine.rs`](crates/victory-gpu/src/pipeline/wine.rs)),
+  adapted to our pipeline workers and library.
+
 ## Design notes
 
 - **Marvisak/VIctory [#2478](https://github.com/Marvisak/VIctory/pull/2478)** (HoLa-Lee), GPL-3.0: the idea
@@ -67,9 +76,6 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   pruned. Reimplemented against this tree's library, which has no `victory_shader::SOURCE_HASH`: the key is
   the executable's BLAKE3, the same bytes the shader cache keys its translations on
   (`crates/victory-gpu/src/shader_cache.rs`), and `VICTORY_LIBRARY_PRUNE=0` keeps every library.
-- **vitutu1** by **ZigZagBoi1** ([ZigZagBoi1/ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort),
-  GPL-3.0-or-later): the resolution and upscaler levers, which here are profile hooks and the
-  switches `VICTORY_RENDER_SCALE` / `VICTORY_OWN_UPSCALER` rather than code that names a title.
 
 - **fxceless/victory-fork [PR #1117](https://github.com/fxceless/victory-fork/pull/1117)** (Azemed),
   GPL-3.0: the title's views behind an `RwLock` (`views_read`/`views_write`, `crates/victory-gpu/src/inplace.rs`)

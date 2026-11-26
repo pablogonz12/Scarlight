@@ -32,8 +32,6 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
-#[cfg(windows)]
-mod fpsbox;
 pub mod dxgi;
 #[cfg(windows)]
 mod dxc;
