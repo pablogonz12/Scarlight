@@ -5501,6 +5501,38 @@ impl HostList {
         }
     }
 
+    /// As [`HostList::transition`], but a texture this list has no record of
+    /// is taken to rest in `assumed` and moved from there, so its first read
+    /// is ordered after a write another list made.
+    ///
+    /// [`HostList::transition`]'s first use records nothing because its
+    /// prelude is meant to bring the texture there; a texture the host wrote
+    /// (a copy destination, [#218]) is not brought anywhere by the prelude,
+    /// and reading it with no barrier returns what it held before the write:
+    /// zeros, about one run of an alias test in three on RADV.
+    pub(crate) fn transition_from(
+        &self,
+        resource: crate::object::This,
+        wanted: u32,
+        assumed: u32,
+    ) -> Option<(&'static ID3D12Resource, u32)> {
+        let texture = crate::resource::host_resource(resource)?;
+        let copy = crate::resource::host_copy(resource)?;
+        let wanted = legal_state(texture, wanted);
+        let assumed = legal_state(texture, assumed);
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((assumed, wanted, copy));
+                (assumed != wanted).then_some((texture, assumed))
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                (before != wanted).then_some((texture, before))
+            }
+        }
+    }
+
     /// Moves host texture `copy` to `wanted` (a host state) in this list,
     /// as [`HostList::transition`] does a title resource's host copy, and
     /// records the barrier: for textures that are not a title resource's

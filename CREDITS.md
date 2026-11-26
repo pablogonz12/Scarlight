@@ -151,6 +151,10 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
 - **AnyPS5** ([boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5)): the format of the
   source-counted progress page (reference instruction forms, history chart). No code taken.
 - **HUMAN** ([HumanlyDev/HUMAN](https://github.com/HumanlyDev/HUMAN)) by HumanlyDev and bdycounter-sudo,
+  GPL-3.0-or-later: a placed view aliased to a texture the host writes may cover a leading prefix of that
+  texture's mip chain (and its format may be block-compressed as well as texel-wise as wide), found by address
+  in the host-written table as well as by the placed table (`crates/victory-gpu/src/resource.rs` `alias_of`,
+  `texture.rs` `alias`/`with_host_written_at`); `VICTORY_ALIAS_WIDE=0` restores the narrower match.
   GPL-3.0-or-later: the pass that draws a depth plane's twin into the plane runs inline, in the list that
   wrote the twin (and that list replays the title's state after it), so a depth test in the same list sees
   what the shaders wrote (`crates/victory-gpu/src/host.rs` `twin_use`/`pass_plane`, `draw.rs` `replay`);
