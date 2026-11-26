@@ -22,6 +22,8 @@ pub(crate) enum C {
     QueryUs,
     MoveUs,
     Unmapped,
+    /// Bytes of a title destination a copy left alone (its pages are gone).
+    DestGone,
     /// Write-watch askings and their time.
     Watches,
     WatchUs,
@@ -100,9 +102,6 @@ pub(crate) enum C {
     /// nanoseconds the looks took, on every thread.
     WaitChecks,
     WaitCheckNs,
-    /// Title buffer copies that ran on the host GPU, and their bytes.
-    GpuCopies,
-    GpuBytes,
     /// Host lists made (`Host::new_list`: for the lists a queue holds and
     /// for the parts of lists cut at waits) and the nanoseconds that took.
     HostLists,
@@ -167,16 +166,10 @@ pub(crate) enum C {
     /// Shader resource views narrowed to their texture's resident mips.
     ViewNarrowed,
 }
-/// 88 (the live-switches base, async write-back's counters among them) plus
-/// intro-fix's seven and tex-resident's three, and the GPU copies' two.
-const COUNTERS: usize = 100;
+/// One past the last counter: derived, so a variant added by either side
+/// (this branch's `DestGone`) cannot leave the array short.
+const COUNTERS: usize = C::ViewNarrowed as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
-
-/// A title buffer copy of `len` bytes ran on the host GPU instead of the CPU.
-pub(crate) fn gpu_copy(len: usize) {
-    add(C::GpuCopies, 1);
-    add(C::GpuBytes, len as u64);
-}
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
@@ -1109,12 +1102,13 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
-         {:.2} MB unmapped; {:.0} copies as bytes {:.1} MB; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
+         {:.2} MB unmapped, {:.1} MB of a copy's destination gone; {:.0} copies as bytes {:.1} MB; \
+         {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed, {:.0} written behind the guard; \
          presented textures from title memory {:.0}, of them a submission old {:.0}; \
          put up at the present {:.0}; shown out of order {:.0}, their copy's source \
-         rewritten since {:.0}; {:.0} title copies on the host GPU {:.1} MB",
+         rewritten since {:.0}",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -1128,6 +1122,7 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::QueryUs as usize]),
         ms(c[C::MoveUs as usize]),
         mb(c[C::Unmapped as usize]),
+        mb(c[C::DestGone as usize]),
         c[C::Plain as usize],
         mb(c[C::PlainBytes as usize]),
         faults as f64 / frames,
@@ -1146,8 +1141,6 @@ pub(crate) fn log(frames: f64) {
         c[C::PresentRefilled as usize],
         c[C::PresentReorder as usize],
         c[C::PresentOverwritten as usize],
-        c[C::GpuCopies as usize],
-        mb(c[C::GpuBytes as usize]),
     );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \

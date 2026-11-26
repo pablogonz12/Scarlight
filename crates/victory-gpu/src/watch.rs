@@ -437,6 +437,194 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// The unit a write-back job holds and a copy guards: one page.
 pub(crate) const BLOCK: usize = PAGE;
 
+/// Title memory the runtime unmapped or remapped, as ranges (start, (end,
+/// generation)), since a copy took its bytes: the copy's snapshot of them is
+/// stale, so its copy-back leaves them alone ([`copy_back_skips_remapped`]).
+/// A copy that takes a range afresh clears it ([`remapped_taken`]), but only
+/// where the mark is no newer than the generation it saw before reading
+/// ([`remap_generation`]); a range no copy takes again costs one entry.
+static REMAPPED: Mutex<BTreeMap<usize, (usize, u64)>> = Mutex::new(BTreeMap::new());
+
+/// Numbers the remappings: a copy that sees the same number before and after
+/// reading title memory read it after every remapping recorded (see
+/// [`remapped_taken`]).
+static REMAP_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn remapped() -> std::sync::MutexGuard<'static, BTreeMap<usize, (usize, u64)>> {
+    REMAPPED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether a copy-back leaves blocks the runtime remapped alone
+/// (`VICTORY_SKIP_REMAPPED=0` puts back its bytes as before).
+pub(crate) fn copy_back_skips_remapped() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_REMAPPED").is_none_or(|v| v != "0"))
+}
+
+/// The remappings recorded so far: a copy takes this before it reads title
+/// memory and gives it to [`remapped_taken`], which clears only marks no
+/// newer than it (a remap that landed during the read stays marked).
+pub(crate) fn remap_generation() -> u64 {
+    REMAP_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Notes that title memory `[at, at + len)` was unmapped or remapped: what a
+/// copy took of it before is stale.
+fn remapped_range(at: usize, len: usize) {
+    if !copy_back_skips_remapped() {
+        return;
+    }
+    let (from, to) = (at, at.saturating_add(len));
+    if to <= from {
+        return;
+    }
+    let mut map = remapped();
+    // Under the map's lock, so a copy that reads the generation next sees
+    // this mark (or does not, if it cleared first).
+    let generation = REMAP_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let (mut start, mut end, mut generation) = (from, to, generation);
+    if let Some((&s, &(e, g))) = map.range(..=from).next_back()
+        && e >= from
+    {
+        (start, end, generation) = (s, end.max(e), generation.max(g));
+        map.remove(&s);
+    }
+    loop {
+        let next = map.range(start..).next().map(|(&s, &(e, g))| (s, e, g));
+        match next {
+            Some((s, e, g)) if s <= end => {
+                end = end.max(e);
+                // The newest remap of the range is the one a copy has to
+                // have read: a mark older than it must not clear it.
+                generation = generation.max(g);
+                map.remove(&s);
+            }
+            _ => break,
+        }
+    }
+    map.insert(start, (end, generation));
+}
+
+/// Whether any byte of `[at, at + len)` was unmapped or remapped by the
+/// runtime since a copy took it: the copy-back must not put the snapshot's
+/// bytes there.
+pub(crate) fn remapped_any(at: usize, len: usize) -> bool {
+    if !copy_back_skips_remapped() || len == 0 {
+        return false;
+    }
+    let map = remapped();
+    map.range(..at + len).next_back().is_some_and(|(_, &(e, _))| e > at)
+}
+
+/// The runs of `[at, at + len)` no byte of which was remapped since a copy
+/// took it: what a copy-back may write (an empty `Vec` when all of it is
+/// marked, `[(at, at + len)]` when none is).
+pub(crate) fn unremapped_runs(at: usize, len: usize) -> Vec<(usize, usize)> {
+    let to = at.saturating_add(len);
+    if to <= at {
+        return Vec::new();
+    }
+    if !remapped_any(at, len) {
+        return vec![(at, to)];
+    }
+    let map = remapped();
+    let mut runs = Vec::new();
+    let mut run = at;
+    // The one range that may start before `at`, then the ones that start
+    // inside: nothing below them can overlap.
+    let mut keys: Vec<usize> = Vec::new();
+    if let Some((&s, &(e, _))) = map.range(..=at).next_back()
+        && e > at
+    {
+        keys.push(s);
+    }
+    keys.extend(map.range(at..to).map(|(&s, _)| s));
+    for s in keys {
+        let e = map[&s].0;
+        if e <= run {
+            continue;
+        }
+        if s >= to {
+            break;
+        }
+        if s > run {
+            runs.push((run, s));
+        }
+        run = run.max(e);
+    }
+    if run < to {
+        runs.push((run, to));
+    }
+    runs
+}
+
+/// Takes the marks of `[from, to)` no newer than `generation` out of the
+/// map; the newer ones stay (a remap a copy did not read).
+fn clear_marks(map: &mut BTreeMap<usize, (usize, u64)>, from: usize, to: usize, generation: u64) {
+    if to <= from {
+        return;
+    }
+    // The one range that may start before `from`, then the ones that start
+    // inside: nothing below them can overlap.
+    let before = map.range(..=from).next_back().map(|(&s, &(e, g))| (s, e, g));
+    let covered: Vec<(usize, usize, u64)> = before
+        .filter(|&(_, e, _)| e > from)
+        .into_iter()
+        .chain(map.range(from..to).map(|(&s, &(e, g))| (s, e, g)))
+        .collect();
+    for (s, e, g) in covered {
+        if g > generation {
+            continue;
+        }
+        map.remove(&s);
+        if s < from {
+            map.insert(s, (from, g));
+        }
+        if e > to {
+            map.insert(to, (e, g));
+        }
+    }
+}
+
+/// A copy took the bytes of `[at, at + len)` afresh: what the runtime did to
+/// them before `generation` (taken with [`remap_generation`] before the read)
+/// is in its snapshot now; a remap after it is not.
+pub(crate) fn remapped_taken(generation: u64, at: usize, len: usize) {
+    if !copy_back_skips_remapped() {
+        return;
+    }
+    let (from, to) = (at, at.saturating_add(len));
+    if to <= from {
+        return;
+    }
+    // Blocks a write-back job holds have not been merged yet, and the merge
+    // reads the mark: it stands there until the job is done and a copy takes
+    // the blocks again.
+    let held: Vec<(usize, usize)> = {
+        let jobs = back();
+        jobs.range(from / BLOCK..to.div_ceil(BLOCK))
+            .map(|(&block, _)| (block * BLOCK, (block + 1) * BLOCK))
+            .collect()
+    };
+    let mut map = remapped();
+    let mut run = from;
+    for (held_from, held_to) in held {
+        if held_to <= run {
+            continue;
+        }
+        if held_from >= to {
+            break;
+        }
+        if held_from > run {
+            clear_marks(&mut map, run, held_from.min(to), generation);
+        }
+        run = run.max(held_to);
+    }
+    if run < to {
+        clear_marks(&mut map, run, to, generation);
+    }
+}
+
 struct Guards {
     /// Blocks we made read-only.
     protected: BTreeSet<usize>,
@@ -1144,6 +1332,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         g.protected.remove(&block);
         g.clean.remove(block);
     }
+    // A copy whose submission is still pending took what was here before:
+    // its copy-back must leave the new mapping's bytes alone.
+    remapped_range(at, len);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -2056,10 +2247,16 @@ mod tests {
 
 #[cfg(test)]
 mod mapping_tests {
-    use super::{title_memory_reading, title_memory_remapping};
+    use super::{
+        BLOCK, copy_back_skips_remapped, remapped, remapped_any, remapped_taken, title_memory_reading,
+        title_memory_remapped, title_memory_remapping,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
 
     /// A change of mapping waits for a read in place that is under way, and
     /// a read in place waits for a change of mapping.
@@ -2101,5 +2298,56 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+
+    /// A range the runtime unmapped or remapped is marked once, joined with
+    /// the marks next to it, until a copy takes it afresh: that is what keeps
+    /// a pending copy-back's bytes out of a new mapping.
+    #[test]
+    fn remapping_marks_blocks_until_a_copy_takes_them_again() {
+        if !copy_back_skips_remapped() {
+            return; // VICTORY_SKIP_REMAPPED=0: nothing is marked.
+        }
+        // SAFETY: two blocks of private memory, freed at the end.
+        let at = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(at, 0, "the pool allocates");
+        // Counted over this allocation only: other tests remap memory of
+        // their own, and the runner may have them in the air.
+        let marks = |at: usize| {
+            remapped().range(..at + 2 * BLOCK).filter(|&(&s, &(e, _))| e > at && s < at + 2 * BLOCK).count()
+        };
+        let saved = remapped().clone();
+        remapped().clear();
+        title_memory_remapped(at, BLOCK);
+        assert!(remapped_any(at, BLOCK), "a remapped range is marked");
+        assert!(!remapped_any(at + BLOCK, BLOCK), "the range after it is not");
+        assert_eq!(marks(at), 1, "one range holds both blocks");
+        remapped_taken(crate::watch::remap_generation(), at, BLOCK);
+        assert!(!remapped_any(at, BLOCK), "a copy that takes it clears the mark");
+        // Two ranges remapped apart join; a copy taking one leaves the other.
+        title_memory_remapped(at + BLOCK, BLOCK);
+        title_memory_remapped(at, BLOCK);
+        assert_eq!(marks(at), 1, "the marks next to each other join");
+        assert!(remapped_any(at, 2 * BLOCK));
+        remapped_taken(crate::watch::remap_generation(), at + BLOCK, BLOCK);
+        assert!(!remapped_any(at + BLOCK, BLOCK), "the taken bytes are current");
+        assert!(remapped_any(at, BLOCK), "the range no copy took stays marked");
+        assert_eq!(crate::watch::unremapped_runs(at, 2 * BLOCK), [(at + BLOCK, at + 2 * BLOCK)]);
+        remapped_taken(u64::MAX, at, 2 * BLOCK);
+        assert!(!remapped_any(at, 2 * BLOCK));
+        assert_eq!(crate::watch::unremapped_runs(at, 2 * BLOCK), [(at, at + 2 * BLOCK)]);
+        // A remap that lands after the copy read its bytes stays marked: the
+        // snapshot holds the old mapping's bytes.
+        let generation = crate::watch::remap_generation();
+        title_memory_remapped(at, BLOCK);
+        remapped_taken(generation, at, BLOCK);
+        assert!(remapped_any(at, BLOCK), "a mark the copy did not read stands");
+        remapped_taken(crate::watch::remap_generation(), at, BLOCK);
+        assert!(!remapped_any(at, BLOCK), "a copy that read it clears it");
+        *remapped() = saved;
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
 }

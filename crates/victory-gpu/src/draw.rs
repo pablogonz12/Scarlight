@@ -8,7 +8,6 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::resource::RootIndexedView;
@@ -438,40 +437,6 @@ pub(crate) fn drawn() -> u64 {
     DRAWN.load(Ordering::Relaxed)
 }
 
-/// Draws with no vertices or indices, or no instances, skipped before
-/// their state was prepared, since the last call.
-static EMPTY: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) fn take_empty() -> u64 {
-    EMPTY.swap(0, Ordering::Relaxed)
-}
-
-/// Whether a draw of `items` vertices or indices in `instances` instances
-/// draws nothing and is skipped: counted, and returned before its state is
-/// prepared, so it asks for no host pipeline and spends none of the frame's
-/// pipeline wait budget (upstream Marvisak/VIctory #2654).
-/// On by default; `VICTORY_EMPTY_DRAW_SKIP=0` prepares empty draws as before.
-fn empty_draw(items: u32, instances: u32) -> bool {
-    if !empty_draw_with(empty_draw_on(), items, instances) {
-        return false;
-    }
-    EMPTY.fetch_add(1, Ordering::Relaxed);
-    true
-}
-
-/// Whether the skip is on in this process ([`empty_draw`]'s switch), read
-/// once: `VICTORY_EMPTY_DRAW_SKIP=0` prepares empty draws as before.
-fn empty_draw_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_EMPTY_DRAW_SKIP").is_none_or(|v| v != "0"))
-}
-
-/// The decision [`empty_draw`] makes, for a given setting: `on` and the draw
-/// has no work. Pure, so a test can check both settings in one process.
-fn empty_draw_with(on: bool, items: u32, instances: u32) -> bool {
-    on && (items == 0 || instances == 0)
-}
-
 /// The draws traced since the last present (diagnostics builds, with
 /// debug logging for this module): logged when the frame comes out black.
 #[cfg(feature = "diagnostics")]
@@ -609,6 +574,34 @@ macro_rules! once {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
+}
+
+/// Whether the code of a program, whose used descriptors are `used`, names
+/// the unordered view of `rule` as an entry of a table (`crate::ambient`).
+fn names_view(used: &[UsedResource], rule: &crate::ambient::Rule) -> bool {
+    used.iter().any(|u| {
+        u.kind == ResourceType::Uav
+            && u.root == RootType::Table
+            && u.slot == rule.slot
+            && u.table_offset_dwords == rule.offset
+    })
+}
+
+/// A barrier over every unordered access: what a dispatch wrote before a
+/// stand-in's clear reads, and the clear before what comes after it.
+fn uav_barrier(texture: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                // SAFETY: a borrowed pointer, as `host::transition` takes it:
+                // the barrier never releases it, and the list keeps the host
+                // copy alive until it has run.
+                pResource: unsafe { std::mem::transmute_copy(texture) },
+            }),
+        },
+    }
 }
 
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
@@ -1678,8 +1671,6 @@ impl State {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1)
         });
-        let mut eligible: Vec<(&std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            Vec::with_capacity(spans.len());
         for (shadow, from, to) in spans.values() {
             // By the copy's number: a copy made where one let go was
             // (`shadow::let_go_idle`) has never been refreshed. It waits out
@@ -1691,12 +1682,10 @@ impl State {
             {
                 continue;
             }
-            eligible.push((shadow, *from, *to - *from));
+            shadow.refresh(list, *from, to - from);
         }
         sweep.end_pass();
         drop(sweep);
-        // All the spans in under one lock of the list: some 4,600 a frame.
-        crate::shadow::Shadow::refresh_many(list, eligible);
         self.heap_textures(list, heap, host);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -2286,7 +2275,181 @@ impl State {
             }
         }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.stand_ins(list, None);
         self.reflection(list, p);
+    }
+
+    /// The stand-ins `VICTORY_AMBIENT` sets for the bound program
+    /// (`crate::ambient`), after a dispatch ran: how many views were
+    /// cleared, `None` if no rule names the program. `indirect`: the
+    /// records a dispatch may run at most, and its count's buffer and
+    /// offset if it has one ([`Self::stand_ins_of`]).
+    fn stand_ins(
+        &mut self,
+        list: &HostList,
+        indirect: Option<(u32, Option<(ID3D12Resource, u64)>)>,
+    ) -> Option<usize> {
+        let rules = crate::ambient::rules();
+        if rules.is_empty() {
+            return None;
+        }
+        let p = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        let stage = p.stages.first()?;
+        let program = stage.shader.hash.as_str();
+        if !rules.iter().any(|r| r.program == program) {
+            return None;
+        }
+        let used = &stage.translated().used;
+        // The stand-ins follow shader work: no records at most (or none
+        // known to run), nothing to stand in for.
+        let (count, offset) = match indirect {
+            None => return Some(self.stand_in(list, program, used)),
+            Some((0, _)) => return None,
+            Some((_, Some((count, offset)))) => (count, offset),
+            Some((_, None)) => return Some(self.stand_in(list, program, used)),
+        };
+        let Some(word) = crate::host::host().and_then(|h| h.predicate_word()) else {
+            once!("ambient stand-in: no word to gate them on, so an indirect dispatch gets no clears");
+            for _ in rules.iter().filter(|r| r.program == program) {
+                crate::ambient::note(false);
+            }
+            return None;
+        };
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COPY_DEST as COPY_DEST;
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_PREDICATION as PREDICATION;
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
+        const COMMON: u32 = 0;
+        // SAFETY: an open list; a count read where the execution reads it,
+        // into the low half of our own word (zero elsewhere). The copy
+        // promotes the word to `COPY_DEST`, where the barrier finds it.
+        unsafe {
+            list.list.CopyBufferRegion(word, 0, &count, offset, 4);
+            list.list.ResourceBarrier(&[crate::host::transition(
+                word,
+                COPY_DEST,
+                PREDICATION,
+            )]);
+            list.list.SetPredication(word, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        }
+        let filled = self.stand_in(list, program, used);
+        // SAFETY: as above.
+        unsafe {
+            list.list.SetPredication(
+                None::<&ID3D12Resource>,
+                0,
+                D3D12_PREDICATION_OP_EQUAL_ZERO,
+            );
+            list.list.ResourceBarrier(&[crate::host::transition(
+                word,
+                PREDICATION,
+                State(COMMON as i32),
+            )]);
+        }
+        Some(filled)
+    }
+
+    /// The views of the rules that name `program`, whose code uses `used`,
+    /// cleared to their values ([`Self::clear_uav`]): how many were.
+    fn stand_in(&mut self, list: &HostList, program: &str, used: &[UsedResource]) -> usize {
+        let mut filled = 0;
+        for rule in crate::ambient::rules()
+            .iter()
+            .filter(|r| r.program == program)
+        {
+            let first = !rule.seen.swap(true, Ordering::Relaxed);
+            let uavs = || -> Vec<String> {
+                used.iter()
+                    .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table)
+                    .map(|u| format!("s{}+{}", u.slot, u.table_offset_dwords))
+                    .collect()
+            };
+            if !names_view(used, rule) {
+                if first {
+                    tracing::warn!(program, view = %rule.view(), views = ?uavs(), "ambient stand-in: the program has no such unordered view in a table");
+                }
+                crate::ambient::note(false);
+                continue;
+            }
+            let view = self.roots_ref(true).get(usize::from(rule.slot)).and_then(
+                |root| match root {
+                    Root::Table(table) => {
+                        crate::descriptor::view(*table + u64::from(rule.offset) * 4)
+                    }
+                    _ => None,
+                },
+            );
+            let Some(View::Unordered(resource, _, words)) = view else {
+                if first {
+                    tracing::warn!(program, view = %rule.view(), "ambient stand-in: not an unordered view of a resource there");
+                }
+                crate::ambient::note(false);
+                continue;
+            };
+            let resource = resource as This;
+            // The formats of the view and of the texture it views, the
+            // title's; the size, for the log.
+            let own = crate::resource::host_resource(resource).map(|texture| {
+                // SAFETY: a live resource, read for its description only.
+                unsafe { texture.GetDesc() }
+            });
+            let Some(own) = own else {
+                if first {
+                    tracing::warn!(program, view = %rule.view(), "ambient stand-in: no host texture there");
+                }
+                crate::ambient::note(false);
+                continue;
+            };
+            if crate::resource::buffer_bytes(resource).is_some() {
+                if first {
+                    tracing::warn!(program, view = %rule.view(), "ambient stand-in: a view of a buffer, which a clear of a view does not take");
+                }
+                crate::ambient::note(false);
+                continue;
+            }
+            if own.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 {
+                if first {
+                    tracing::warn!(program, view = %rule.view(), "ambient stand-in: a depth texture, whose views go to a colour twin and take no clear of this kind");
+                }
+                crate::ambient::note(false);
+                continue;
+            }
+            let (width, height, own) = (own.Width, own.Height, own.Format.0 as u32);
+            // The title's own description of the view, unless it leaves the
+            // format to the resource: then the resource's, whole.
+            let words = words.filter(|words| words[0] != 0);
+            let format = words.map_or(own, |words| words[0]);
+            let fill = crate::ambient::fill(rule.value, format, own);
+            if first {
+                tracing::info!(
+                    program,
+                    view = %rule.view(),
+                    views = ?uavs(),
+                    format,
+                    texture_format = own,
+                    size = ?(width, height),
+                    value = ?rule.value,
+                    ?fill,
+                    "ambient stand-in: first dispatch of the program"
+                );
+            }
+            let recorded = match fill {
+                Ok(crate::ambient::Fill::Float(rgba)) => {
+                    self.clear_uav(list, resource, words, rgba.map(f32::to_bits), true)
+                }
+                Ok(crate::ambient::Fill::Uint(fill)) => {
+                    self.clear_uav(list, resource, words, fill, false)
+                }
+                Err(why) => {
+                    if first {
+                        tracing::warn!(program, view = %rule.view(), format, texture_format = own, "ambient stand-in: {why}");
+                    }
+                    false
+                }
+            };
+            crate::ambient::note(recorded);
+            filled += usize::from(recorded);
+        }
+        filled
     }
 
     /// After a dispatch of `p`: the stand-in for ray-traced reflections
@@ -2324,7 +2487,84 @@ impl State {
         crate::reflection::after(list, mode, &stage.shader.hash, &uavs);
     }
 
-    /// What a draw or dispatch runs, for the device-removed report
+    /// Clears the whole of the texture `resource`, seen as the view the
+    /// title described (`words`, as [`Host::uav`] takes them; `None`: its
+    /// own format, whole), to `values` (a float clear's bits when `floats`):
+    /// our heap set for the clear and the title's again after it, the
+    /// texture in the state it was found in. False if the clear could not be
+    /// recorded.
+    fn clear_uav(
+        &mut self,
+        list: &HostList,
+        resource: This,
+        words: Option<[u32; 10]>,
+        values: [u32; 4],
+        floats: bool,
+    ) -> bool {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS as UNORDERED;
+        let Some(host) = crate::host::host() else {
+            return false;
+        };
+        let (Some(heap), Some((cpu, gpu))) = (host.uav_heap(), host.uav(resource, words)) else {
+            return false;
+        };
+        let Some(texture) = crate::resource::host_resource(resource) else {
+            return false;
+        };
+        // The state the list saw it in, also when that is the unordered one
+        // already (a dispatch reads and writes it): the clear is still owed
+        // a barrier of its own then.
+        let Some(before) = list.state_of(resource) else {
+            return false;
+        };
+        let unordered = before == UNORDERED.0 as u32;
+        // SAFETY: an open list, a live texture, our own descriptors and the
+        // heap they are in (the title's heaps are set again by the next
+        // bind, which this drops from the cache).
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap)]);
+            if !unordered {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    texture,
+                    D3D12_RESOURCE_STATES(before as i32),
+                    UNORDERED,
+                )]);
+            }
+            // What the dispatch wrote is ordered before the clear, and the
+            // clear before what reads the view next.
+            list.list.ResourceBarrier(&[uav_barrier(texture)]);
+            if floats {
+                list.list.ClearUnorderedAccessViewFloat(
+                    gpu,
+                    cpu,
+                    texture,
+                    &values.map(f32::from_bits),
+                    &[],
+                );
+            } else {
+                list.list
+                    .ClearUnorderedAccessViewUint(gpu, cpu, texture, &values, &[]);
+            }
+            list.list.ResourceBarrier(&[uav_barrier(texture)]);
+            if !unordered {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    texture,
+                    UNORDERED,
+                    D3D12_RESOURCE_STATES(before as i32),
+                )]);
+            }
+        }
+        if !unordered {
+            // The tracked state follows the barriers above: back to `before`.
+            let _ = list.transition(resource, before);
+        }
+        // The title's own heaps are not those of the clear: the next bind
+        // sets them again.
+        self.host_heaps = [0; 2];
+        true
+    }
+
+    /// What a draw or dispatch runs, for the device-removed report    /// What a draw or dispatch runs, for the device-removed report
     /// (diagnostics): the pipeline, then per stage the user data it gets
     /// (with the view at that heap index, if one is), the host addresses
     /// of its root views and the views its tables name.
@@ -2816,11 +3056,6 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
-        // Nothing to draw: preparing it would ask for its host pipeline and
-        // spend the frame's pipeline wait budget on it.
-        if empty_draw(vertices, instances) {
-            return;
-        }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -2961,10 +3196,6 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
-        // As an empty draw: nothing to draw, and no pipeline to ask for.
-        if empty_draw(indices, instances) {
-            return;
-        }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3224,6 +3455,12 @@ impl State {
         crate::indirect::done(list, &bounded);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            // The stand-in follows the records that ran: none at most, none
+            // with a count of zero.
+            let count = counter
+                .as_ref()
+                .map(|(s, at)| (s.buffer.clone(), s.offset(*at)));
+            self.stand_ins(list, Some((max, count)));
             self.reflection(list, p);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -3487,40 +3724,55 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{empty_draw, take_empty};
+    use super::names_view;
+    use victory_shader::{ResourceType, RootType, UsedResource};
 
-    /// An empty draw is skipped and counted, a draw with work is not: the
-    /// check sits above the state preparation, so nothing asks for its host
-    /// pipeline (upstream Marvisak/VIctory #2654). The decision is checked
-    /// under both settings of the switch, which this process cannot change.
+    /// A view a program names, as a table entry (the stand-in compares
+    /// root parameter and offset in dwords, `crate::ambient`).
+    fn used(kind: ResourceType, root: RootType, slot: u8, offset: u32) -> UsedResource {
+        UsedResource {
+            kind,
+            root,
+            table_offset_dwords: offset,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 4,
+            slot,
+        }
+    }
+
     #[test]
-    fn empty_draws_are_skipped_and_counted() {
-        use super::{empty_draw_on, empty_draw_with};
-        let _ = take_empty();
-        for (items, instances) in [(0, 1), (3, 0), (0, 0)] {
-            assert!(
-                empty_draw_with(true, items, instances),
-                "{items} items {instances} instances"
-            );
-            assert!(
-                !empty_draw_with(false, items, instances),
-                "the off switch prepares {items} items {instances} instances"
-            );
-        }
-        assert!(!empty_draw_with(true, 3, 1));
-        assert!(!empty_draw_with(true, 1, 1));
-        // What this process does with the setting it started with.
-        if empty_draw_on() {
-            for (items, instances) in [(0, 1), (3, 0), (0, 0)] {
-                assert!(empty_draw(items, instances), "{items} items {instances} instances");
-            }
-            assert_eq!(take_empty(), 3);
-            assert!(!empty_draw(3, 1));
-            assert!(!empty_draw(1, 1));
-        } else {
-            assert!(!empty_draw(0, 1));
-        }
-        assert_eq!(take_empty(), 0);
+    fn the_stand_in_names_a_view_of_a_table() {
+        let rule = crate::ambient::parse("0123456789abcdef:s1+176:0.5,0.5,0.5")
+            .unwrap()
+            .remove(0);
+        assert!(names_view(
+            &[used(ResourceType::Uav, RootType::Table, 1, 176)],
+            &rule
+        ));
+        // Another root parameter, offset or kind, or not a table: no.
+        assert!(!names_view(
+            &[used(ResourceType::Uav, RootType::Table, 2, 176)],
+            &rule
+        ));
+        assert!(!names_view(
+            &[used(ResourceType::Uav, RootType::Table, 1, 168)],
+            &rule
+        ));
+        assert!(!names_view(
+            &[used(ResourceType::Uav, RootType::Table, 1, 180)],
+            &rule
+        ));
+        assert!(!names_view(
+            &[used(ResourceType::Srv, RootType::Table, 1, 176)],
+            &rule
+        ));
+        assert!(!names_view(
+            &[used(ResourceType::Uav, RootType::Descriptor, 1, 176)],
+            &rule
+        ));
+        assert!(!names_view(&[], &rule));
     }
 
     use super::{

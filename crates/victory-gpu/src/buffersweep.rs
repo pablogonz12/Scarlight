@@ -15,6 +15,7 @@
 //! (18bdf7932).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Passes between the ones that look at every slot: a view of a released
