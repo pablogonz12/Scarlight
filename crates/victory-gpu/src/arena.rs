@@ -588,11 +588,16 @@ mod tests {
         let lo = 0x1_0000_0000u64;
         let big = 10 << 30;
         let part = PART & !((K64 as u64) - 1);
-        // The whole first part, and the second at 2 GiB.
+        // The whole first part holds everything up to 4 GiB - 64 KiB, so a
+        // range at 3 GiB is still in it, and one at 5 GiB is in the second.
         assert_eq!(grid_part(lo, lo + big, lo + 0x100, lo + 0x100 + PART / 2), Ok((lo, part)));
-        assert_eq!(grid_part(lo, lo + big, lo + (3 << 30), lo + (3 << 30) + 0x1000), Ok((lo + STRIDE, part)));
-        // A range over two parts' worth is served by the later one.
-        assert_eq!(grid_part(lo, lo + big, lo, lo + (5 << 30)), Ok((lo + STRIDE, part)));
+        assert_eq!(grid_part(lo, lo + big, lo + (3 << 30), lo + (3 << 30) + 0x1000), Ok((lo, part)));
+        assert_eq!(grid_part(lo, lo + big, lo + (5 << 30), lo + (5 << 30) + 0x1000), Ok((lo + STRIDE, part)));
+        // A range longer than a part is turned down: the part that holds it
+        // must begin at or before its first byte, so a range starting at the
+        // run's first byte has to fit the first part (the fork's rule, and a
+        // resident has to fit one part).
+        assert_eq!(grid_part(lo, lo + big, lo, lo + (5 << 30)), Err(Why::Size));
         // A range that no part of the run holds.
         assert_eq!(grid_part(lo, lo + part + 0x1000, lo, lo + part + 0x1000), Err(Why::Size));
         // Outside the run, and backwards.
@@ -654,7 +659,7 @@ mod tests {
             assert_eq!(resolved.title, at + K64 as u64 + 0x30);
             assert_eq!(resolved.offset, resolved.title - at, "the part begins at the run's first page");
             assert_eq!(resolved.gpu, resolved.resource.GetGPUVirtualAddress() + resolved.offset);
-            assert_eq!(resolved.left, bytes - resolved.offset);
+            assert_eq!(resolved.left, bytes - resolved.offset - 0x1000, "from the asked range's end to the part's end");
             // The GPU reads the title's bytes, and a write through the buffer
             // lands at the title's address.
             let mut rig = Rig::new(&device).unwrap();
@@ -727,6 +732,7 @@ mod tests {
         let mut state = State::default();
         let mut open_ms = 0.0f64;
         let mut resolved = Vec::new();
+        let mut bases = std::collections::BTreeSet::new();
         for (i, &at) in title.iter().enumerate() {
             state.committed(at, bytes as u64);
             let asked = std::time::Instant::now();
@@ -734,7 +740,8 @@ mod tests {
                 .resolve(&device, at + 0x100, 0x100, u64::MAX)
                 .unwrap_or_else(|why| panic!("region {i} not in place: {why:?}"));
             open_ms += asked.elapsed().as_secs_f64() * 1000.0;
-            assert_eq!(part.gpu - part.offset, at, "each region has its own part");
+            assert_eq!(part.title, at + 0x100, "the range sits in its own region");
+            assert!(bases.insert(part.gpu - part.offset), "each region has its own part");
             resolved.push(part);
         }
         let mut rig = Rig::new(&device).unwrap();
