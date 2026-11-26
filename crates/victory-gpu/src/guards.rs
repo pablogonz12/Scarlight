@@ -292,8 +292,11 @@ pub(crate) fn mark_mapped(first: usize, last: usize) {
     if first >= last {
         return;
     }
+    // The runs first: nothing proportional to the range is walked with the
+    // shards locked.
+    let runs: Vec<(usize, usize, usize)> = Runs::new(first, last).collect();
     let mut w = Writing::of_range(first, last);
-    for (s, lo, hi) in Runs::new(first, last) {
+    for (s, lo, hi) in runs {
         w.at(s).mapped.extend(lo..hi);
     }
 }
@@ -306,17 +309,19 @@ pub(crate) fn remapped(at: usize, len: usize) {
         return;
     }
     let mut w = Writing::of_range(first, last);
-    for (s, lo, hi) in Runs::new(first, last) {
-        let g = w.at(s);
-        let absent: Vec<usize> = g.absent.range(lo..hi).copied().collect();
+    // Each shard's set holds only its own blocks: the range is searched, not
+    // walked a stripe at a time (a 16 GiB remap is 16,384 stripes).
+    for (_, g) in &mut w.0 {
+        let g: &mut Guards = g;
+        let absent: Vec<usize> = g.absent.range(first..last).copied().collect();
         for block in absent {
             g.absent.remove(&block);
         }
-        let was: Vec<usize> = g.mapped.range(lo..hi).copied().collect();
+        let was: Vec<usize> = g.mapped.range(first..last).copied().collect();
         for block in was {
             g.mapped.remove(&block);
         }
-        let blocks: Vec<usize> = g.protected.range(lo..hi).copied().collect();
+        let blocks: Vec<usize> = g.protected.range(first..last).copied().collect();
         for block in blocks {
             g.protected.remove(&block);
             g.clean.remove(block);
