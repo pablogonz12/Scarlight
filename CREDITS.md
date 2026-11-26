@@ -28,8 +28,21 @@ wrothgaril, Yaekai.
 
 andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VIctory #2614), BlueKaiman, kais7654, pushkarreddyy, shh.
 
+## Ports of fork pull requests
+
+Code reimplemented here from a fork's pull request, because the fork's tree had diverged from ours;
+the design and the author are credited in the commit's `Co-authored-by:` and here.
+
+- **Marvisak/VIctory #2401** (Mumogg) — the Wine `ExitProcess` hook that makes a host driver
+  compiler crash cost one pipeline instead of the run ([`pipeline/wine.rs`](crates/victory-gpu/src/pipeline/wine.rs)),
+  adapted to our pipeline workers and library.
+
 ## Design notes
 
+- **fuzeofficial** ([Marvisak/VIctory #2608](https://github.com/Marvisak/VIctory/pull/2608)), GPL-3.0: the
+  idea of cutting a command list at its texture read-backs and running the part after one in a submission
+  of its own, so a copy or draw recorded behind a read-back is prepared after its bytes are in title
+  memory (`crate::list::cut_read_back`). Reimplemented on the parts a queue already runs.
 - **Marvisak/VIctory [#2478](https://github.com/Marvisak/VIctory/pull/2478)** (HoLa-Lee), GPL-3.0: the idea
   of reading a texture once every N frames at most, round-robin by the texture's address, its measurements
   (a frame of world entry at 6,814 ms of texture work, 145-522 ms at 8), and its name for the switch,
@@ -67,9 +80,6 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   pruned. Reimplemented against this tree's library, which has no `victory_shader::SOURCE_HASH`: the key is
   the executable's BLAKE3, the same bytes the shader cache keys its translations on
   (`crates/victory-gpu/src/shader_cache.rs`), and `VICTORY_LIBRARY_PRUNE=0` keeps every library.
-- **vitutu1** by **ZigZagBoi1** ([ZigZagBoi1/ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort),
-  GPL-3.0-or-later): the resolution and upscaler levers, which here are profile hooks and the
-  switches `VICTORY_RENDER_SCALE` / `VICTORY_OWN_UPSCALER` rather than code that names a title.
 
 - **fxceless/victory-fork [PR #1117](https://github.com/fxceless/victory-fork/pull/1117)** (Azemed),
   GPL-3.0: the title's views behind an `RwLock` (`views_read`/`views_write`, `crates/victory-gpu/src/inplace.rs`)
@@ -82,11 +92,6 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   the copy-back and the rest, the largest named (`crates/victory-gpu/src/frame_budget.rs`,
   `VICTORY_FRAME_BUDGET=0`). Reimplemented on this tree's counters and its own 50 ms budget: its
   per-command timestamps, memory-trait breakdown and slow-pipeline guard are not taken.
-- **fxceless/victory-fork [#1068](https://github.com/fxceless/victory-fork/pull/1068)** (UwUCammie), GPL-3.0: the
-  idea that the title buffers' table is read most of the time and so wants a read lock, and that one submission's
-  buffer refreshes go into the list in one batch (`crates/victory-gpu/src/shadow.rs`, `VICTORY_REFRESH_BATCH=0` puts
-  one step in per span again). Its `defer_refreshes` came over as written; our `lookup` re-checks under the write
-  lock, so a copy is made once.
 - **miatson/VIctory [#2801](https://github.com/miatson/VIctory/pull/2801)** (miatson), GPL-3.0: the idea that
   the console blends MIN/MAX into integer render targets, which the host refuses, so such a target is made to
   write unblended when the pipeline is built (`crates/victory-gpu/src/pipeline/host.rs`). Its twin pipeline
@@ -156,10 +161,20 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   `crates/victory-shader/src/dxbc.rs`; `Source::bytes()` for both the raw and the `SGD5` paths,
   `apps/victory/src/shader.rs`). Reimplemented on this tree's `victory translate`, which has no `warm` command.
 
+- **HUMAN** ([HumanlyDev/HUMAN](https://github.com/HumanlyDev/HUMAN)) by HumanlyDev and bdycounter-sudo,
+  GPL-3.0-or-later: one immediate sampler constant used both for normal and for comparison sampling takes two
+  static sampler slots (`crates/victory-shader/src/emit/lower.rs`, `samplers`/`cmp_samplers`), where our bit
+  per slot made the normal use sample with a comparison sampler.
 - **Marvisak/VIctory [`8ff791351`](https://github.com/Marvisak/VIctory/commit/8ff791351)** (Marvis),
   GPL-3.0: a rectangle list's fourth corner is completed opposite the right angle, wherever the three
   corners put it. This tree's geometry stage (`emit::rect_list_gs`) already finds the corner in any order; the
   rule is now in the CPU expansion too (`right_angle`, `right_corners` in `crates/victory-gpu/src/primitive.rs`).
+
+- **fxceless/victory-fork [PR #980](https://github.com/fxceless/victory-fork/pull/980)** (fxceless), GPL-3.0:
+  the arena, the layer a resident stands on: a title region opened as a D3D12 heap and a buffer placed over it, so
+  the GPU reads and writes the title's own memory (`crates/victory-gpu/src/arena.rs`, `VICTORY_ARENA=1`, off by
+  default). The part grid, the region registry, the budget and the canary are reimplemented on this tree's
+  `inplace`; the canary here proves each part **both ways** with our own `Rig` (#188), which the fork's tests do not.
 
 - **codec-d/CGBJ (codec-d/cool_fox [`ab75ac3e0`](https://github.com/codec-d/cool_fox/commit/ab75ac3e0),
   [`18bdf7932`](https://github.com/codec-d/cool_fox/commit/18bdf7932),
@@ -195,3 +210,11 @@ Missing or wrong name? Open an issue.
   (after fxceless/victory-fork [c36971b2](https://github.com/fxceless/victory-fork/commit/c36971b2)), GPL-3.0:
   `VICTORY_CARD_BUFFERS_MIN_KB`, so that title buffers' copies under the MiB floor can go into the card's memory
   (unset: the floor of before) (`crates/victory-gpu/src/shadow.rs`).
+- **Belobug/VIctory-Belobug-AMD [4d291d4](https://github.com/Belobug/VIctory-Belobug-AMD/commit/4d291d4)**
+  (davutsimsekk) via **Yoshi-233**, GPL-3.0: operandless VOP1 (`v_nop`, `v_pipeflush`, `v_clrexcp`) ignores its
+  source field, so a marker byte there is not an extra dword and no longer swallows the next instruction, and the
+  VOP3 encoding of `v_cmpx*` writes EXEC rather than its VDST, for both wave sizes
+  (`crates/victory-shader/src/gfx10/{mod.rs,fields.rs}`).
+- **Yoshi-233 [coolfox/main PR #7](https://github.com/Yoshi-233), from fxceless/victory-fork [9bf4a0f](https://github.com/fxceless/victory-fork/commit/9bf4a0f)**,
+  GPL-3.0: the RGB dump decodes the packed 16-bit BGR targets (B5G6R5, B5G5R5A1, B4G4R4A4, host formats 85, 86,
+  115) and keeps padded rows aligned (diagnostics only) (`crates/victory-gpu/src/capture.rs`).

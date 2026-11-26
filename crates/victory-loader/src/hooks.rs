@@ -44,19 +44,8 @@ pub(crate) unsafe fn apply_profile(base: usize, size: usize, hash: &blake3::Hash
         return 0;
     }
     let mut applied = 0;
-    // The switches a hook may depend on: one profile per process, so the
-    // environment's answer is asked once, here.
-    let scale = profile.render_scale();
-    let own = profile.own_upscaler();
     for hook in &profile.hooks {
-        if !hook.wanted(scale, own) {
-            tracing::debug!(what = hook.what, "hook skipped: its switch is off");
-            continue;
-        }
-        let (Ok(expect), Ok(new)) = (
-            hook.expected_at(base as u64),
-            hook.replacement_at(base as u64, scale),
-        ) else {
+        let (Ok(expect), Ok(new)) = (hook.expected(), hook.replacement()) else {
             tracing::warn!(what = hook.what, "hook skipped: its bytes do not decode");
             continue;
         };

@@ -50,6 +50,10 @@ pub(crate) struct Staging {
     ranges: Option<Vec<(u64, u64)>>,
     /// Mips per array slice.
     mips: u32,
+    /// The title's top mip levels the host copy lacks (memory pressure,
+    /// [`crate::resource::dropped_mips`]): subresource `i` holds the title's
+    /// mip `i + skipped` of its slice.
+    skipped: u32,
     /// Mips and array slices in one native plane.
     subresources_per_plane: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
@@ -1508,6 +1512,9 @@ impl Staging {
                 tracing::warn!(i, start, size = plane.layout.size, "a plane lies past the texture's memory");
                 return;
             };
+            // The title's top mips the host copy lacks (dropped_mips) are not
+            // subresources of a plane: they shift every mip it names.
+            let mip = mip + self.skipped;
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
@@ -2006,6 +2013,10 @@ fn planes_uploaded(
 
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
+    // Read (and make) the host copy first: `hosted` takes the texture's own
+    // lock, which `let_go_idle` holds while it calls `unstage` and so takes
+    // this one.
+    let skipped = crate::resource::dropped_mips(resource);
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize)) {
@@ -2139,6 +2150,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         layout,
         ranges,
         mips: u32::from(d.MipLevels),
+        skipped,
         subresources_per_plane,
         bytes: total,
         memory,
