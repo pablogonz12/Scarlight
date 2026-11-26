@@ -1620,6 +1620,9 @@ pub(crate) fn dred_on() -> bool {
 static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 static COMPUTE_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Indirect records that ran empty for want of their list's budget, and the
+/// largest cost of one (told from 2^22 on), likewise.
+static BUDGET_NOTES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
@@ -5564,6 +5567,38 @@ impl HostList {
         }
     }
 
+    /// As [`HostList::transition`], but a texture this list has no record of
+    /// is taken to rest in `assumed` and moved from there, so its first read
+    /// is ordered after a write another list made.
+    ///
+    /// [`HostList::transition`]'s first use records nothing because its
+    /// prelude is meant to bring the texture there; a texture the host wrote
+    /// (a copy destination, [#218]) is not brought anywhere by the prelude,
+    /// and reading it with no barrier returns what it held before the write:
+    /// zeros, about one run of an alias test in three on RADV.
+    pub(crate) fn transition_from(
+        &self,
+        resource: crate::object::This,
+        wanted: u32,
+        assumed: u32,
+    ) -> Option<(&'static ID3D12Resource, u32)> {
+        let texture = crate::resource::host_resource(resource)?;
+        let copy = crate::resource::host_copy(resource)?;
+        let wanted = legal_state(texture, wanted);
+        let assumed = legal_state(texture, assumed);
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((assumed, wanted, copy));
+                (assumed != wanted).then_some((texture, assumed))
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                (before != wanted).then_some((texture, before))
+            }
+        }
+    }
+
     /// Moves host texture `copy` to `wanted` (a host state) in this list,
     /// as [`HostList::transition`] does a title resource's host copy, and
     /// records the barrier: for textures that are not a title resource's
@@ -6275,7 +6310,8 @@ impl HostList {
             // The words after the budget hold what the clamp noted about the
             // list's last run (dispatch records: the largest group count
             // asked for and the groups asked in all, mesh in words 1 and 2,
-            // compute in words 3 and 4): taken, then zeroed.
+            // compute in words 3 and 4; the indirect records refused, the
+            // largest cost of one, in words 5 and 6): taken, then zeroed.
             deferred.copies.push(Step::Host(Box::new(move || unsafe {
                 let words = at as *mut u32;
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
@@ -6284,7 +6320,10 @@ impl HostList {
                 let (largest, all) = (words.add(3).read_volatile(), words.add(4).read_volatile());
                 COMPUTE_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 COMPUTE_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                for k in 0..5 {
+                let (refused, biggest) = (words.add(5).read_volatile(), words.add(6).read_volatile());
+                BUDGET_NOTES[0].fetch_add(u64::from(refused), Ordering::Relaxed);
+                BUDGET_NOTES[1].fetch_max(u64::from(biggest), Ordering::Relaxed);
+                for k in 0..7 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -7310,8 +7349,10 @@ impl Meter {
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         let compute_largest = COMPUTE_GROUPS[0].swap(0, Ordering::Relaxed);
         let compute_groups = COMPUTE_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+        let refused = BUDGET_NOTES[0].swap(0, Ordering::Relaxed) as f64 / frames;
+        let biggest = BUDGET_NOTES[1].swap(0, Ordering::Relaxed);
         tracing::info!(
-            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
+            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
         );
         tracing::info!(
             "indirect compute dispatches: the largest group count asked for {compute_largest} (clamped: at most 65535), {compute_groups:.0} groups asked per frame"

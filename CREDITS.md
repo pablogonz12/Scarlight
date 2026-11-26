@@ -151,6 +151,10 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
 - **AnyPS5** ([boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5)): the format of the
   source-counted progress page (reference instruction forms, history chart). No code taken.
 - **HUMAN** ([HumanlyDev/HUMAN](https://github.com/HumanlyDev/HUMAN)) by HumanlyDev and bdycounter-sudo,
+  GPL-3.0-or-later: a placed view aliased to a texture the host writes may cover a leading prefix of that
+  texture's mip chain (and its format may be block-compressed as well as texel-wise as wide), found by address
+  in the host-written table as well as by the placed table (`crates/victory-gpu/src/resource.rs` `alias_of`,
+  `texture.rs` `alias`/`with_host_written_at`); `VICTORY_ALIAS_WIDE=0` restores the narrower match.
   GPL-3.0-or-later: the pass that draws a depth plane's twin into the plane runs inline, in the list that
   wrote the twin (and that list replays the title's state after it), so a depth test in the same list sees
   what the shaders wrote (`crates/victory-gpu/src/host.rs` `twin_use`/`pass_plane`, `draw.rs` `replay`);
@@ -288,6 +292,10 @@ D
   per small upload, and idle upload storage given back at once under pressure. Reimplemented for our 16 GiB PC and
   16 GiB RADV card, where a refused import falls back silently, so only pool growth waits and no texture an
   on-demand upload needs is ever deferred (`crates/victory-gpu/src/residency.rs`, `VICTORY_RESIDENCY=0`).
+- **codec-d/cool_fox [`e05d4633a`](https://github.com/codec-d/cool_fox/commit/e05d4633a)**, GPL-3.0: a
+  `SetEventOnCompletion` with no event blocks the guest thread on the fence's value with `WaitOnAddress`, and
+  `Signal`/`Set` wakes it with `WakeByAddressAll` (`crates/victory-gpu/src/fence.rs`; the wait here is bounded
+  by `VICTORY_FENCE_BLOCK_MS` and lets the queue run what it holds between slices).
 - **codec-d/cool_fox [`8cc31ab37`](https://github.com/codec-d/cool_fox/commit/8cc31ab37)**, GPL-3.0: an XMA
   voice whose input the title publishes again while the context stays enabled decodes on instead of staying
   ended, and the decode pass publishes only whole blocks (a short one only as the flushed tail), trying a few
