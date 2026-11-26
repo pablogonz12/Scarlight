@@ -596,13 +596,13 @@ pub(crate) struct Plane {
 ///
 /// Runs submitted lists on the queue: cut at their waits, split, held behind
 /// what the queue holds, and submitted to the host.
-#[cfg(windows)]
 /// One submission at a time, whichever thread makes it: what a submission
 /// takes in (the flights of earlier ones, the pool of lists they give back) is
 /// not made for two threads at once.
 #[cfg(windows)]
 static SUBMITTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[cfg(windows)]
 pub(crate) fn submit_list(host: &crate::host::Host, this: This, lists: &[This]) {
     let _one_at_a_time = SUBMITTING.lock().unwrap_or_else(|e| e.into_inner());
     // A list that waits for a memory value not there yet: the queue
