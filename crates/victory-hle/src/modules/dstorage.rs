@@ -868,8 +868,10 @@ impl Lanes {
     /// page table, which the title fills for the batch in its own submit
     /// path, right before Submit, so until then they name no page or a page
     /// that now holds something else (a local profile names the title's
-    /// addresses). A status entry behind a held read waits with it. Off, its
-    /// default, a self-submission moves them like any other command.
+    /// addresses). A status entry behind a held read waits with it, unless
+    /// the self-submission carries the status itself: a title that enqueued
+    /// one means to poll it, so those reads run now. Off, its default, a
+    /// self-submission moves them like any other command.
     fn submit_as(&mut self, id: u64, explicit: bool) -> usize {
         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
             return 0;
@@ -886,7 +888,17 @@ impl Lanes {
         let Some(lane) = self.lanes.get_mut(&id) else {
             return 0;
         };
-        let explicit = explicit || !lane.held_reads;
+        // A self-submission that carries a status entry is a title that will
+        // poll it, so no Submit is guaranteed: its held reads run now, or
+        // the entry stays pending for ever (the loading-screen stall).
+        let polled = !explicit
+            && lane.held_reads
+            && lane
+                .held
+                .iter()
+                .chain(lane.unsubmitted.iter())
+                .any(|c| matches!(c, Command::Status(_)));
+        let explicit = explicit || !lane.held_reads || polled;
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
@@ -1136,7 +1148,7 @@ fn queue(this: QueueRef, command: Command) {
                 n,
                 capacity,
                 held,
-                "dstorage: a queue half full submitted itself; reads into physical pages wait for the title's Submit"
+                "dstorage: a queue half full submitted itself; reads into physical pages wait for the title's Submit unless it carries a status entry"
             );
         }
     }
@@ -2637,15 +2649,17 @@ mod tests {
         let array = status_array(1).cast::<Instance<StatusArray>>();
         read(&mut l, 0, PAGE_DESTINATION, 16);
         read(&mut l, 0, 0, 16);
-        add_ref_instance(array);
-        l.lanes.get_mut(&0).unwrap().unsubmitted.push(Command::Status(Status { array, index: 0 }));
         l.submit_as(0, false);
-        // Only the plain read starts; the status waits behind the held one.
+        // Only the plain read starts; the paged one waits for a Submit.
         let plain = l.start().unwrap();
         assert_eq!(plain.request.options, 0);
         assert!(l.start().is_none());
         let _ = l.finish(&plain, Ok(()));
-        assert_eq!(l.lanes[&0].held.len(), 2);
+        assert_eq!(l.lanes[&0].held.len(), 1);
+        // A status enqueued afterwards is not a self-submission: it waits
+        // for the Submit too, then behind the read it follows.
+        add_ref_instance(array);
+        l.lanes.get_mut(&0).unwrap().unsubmitted.push(Command::Status(Status { array, index: 0 }));
         l.submit(0);
         let paged = l.start().unwrap();
         assert_eq!(paged.request.options, PAGE_DESTINATION);
@@ -2653,6 +2667,49 @@ mod tests {
         assert!(!l.lanes[&0].statuses.is_empty());
         let _ = l.finish(&paged, Ok(()));
         assert!(l.lanes[&0].statuses.is_empty());
+    }
+
+    /// With held reads on, a self-submission that carries a status entry
+    /// must still complete it: the title that enqueued one polls it and may
+    /// never call Submit.
+    #[test]
+    fn a_self_submission_with_a_status_runs_its_held_reads() {
+        use crate::modules::xmem;
+        let (mut given, mut page) = (1usize, [0usize; 1]);
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut given, page.as_mut_ptr()),
+            1
+        );
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, page.as_ptr()), mapped);
+
+        let list = Box::leak(Box::new([page[0]]));
+        let plain = pattern(4096);
+        // Half of four: enqueueing the status submits the queue itself.
+        let (queue, array) = (new_queue_of(1, 4), status_array(1));
+        hold_reads(queue);
+        let r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            list.as_mut_ptr().cast(),
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        enqueue(queue, &r);
+        enqueue_status(queue, array, 0);
+        // No Submit: the entry the title polls must still complete.
+        assert_eq!(wait(array, 0), S_OK);
+        // SAFETY: the page is mapped read-write.
+        let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
+        assert_eq!(seen, plain);
     }
 
     #[test]
