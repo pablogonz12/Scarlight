@@ -322,8 +322,12 @@ pub(crate) fn ready(
             small /= 2;
             asks.push(small);
         }
+        // A run smaller than the one in hand is no growth: taking it would
+        // drop slots (and the copies they already hold) and use more heap for
+        // the rest of the list. A fresh heap (`run.slots` 0) takes any size.
         let grown = asks
             .into_iter()
+            .filter(|&slots| slots > run.slots)
             .find_map(|slots| heap.dynamic(slots).map(|base| (base, slots)));
         if let Some((base, slots)) = grown {
             if run.slots != 0 {
