@@ -2350,7 +2350,10 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
-        let cmp_samplers = std::mem::take(&mut self.s.cmp_samplers);
+        // Cloned, not taken: `finish` below reads them, and a slot an
+        // immediate sampler used for comparison must still be known as one
+        // there (an emptied list defaults every slot to plain sampling).
+        let cmp_samplers = self.s.cmp_samplers.clone();
         let samplers = self.samplers.into_iter().map(|(w, _)| w).collect();
         let wave_size = self.s.wave_size;
         #[cfg(test)]
