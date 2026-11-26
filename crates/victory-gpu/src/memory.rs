@@ -38,9 +38,9 @@
 //! memory module of the layer knows and this one does not ask yet.
 //!
 //! shortcut: a copy that is numbered is kept for the rest of the run, and
-//! there are at most [`COPIES`] of them (4 MiB windows mostly: 4 GiB at
-//! most). Every dispatch of such a shader brings all numbered copies up to
-//! date and, if it can store, declares all of them written (the bytes are
+//! each host view heap grows its run of descriptor slots as more copies are
+//! needed. Every dispatch of such a shader brings its addressable copies up
+//! to date and, if it can store, declares all of them written (the bytes are
 //! compared on the CPU afterwards, as for any unordered access view): a
 //! dirty-page mask written by the shader would bound both.
 
@@ -54,9 +54,10 @@ use crate::descriptor::host::HostHeap;
 use crate::host::{HostList, host};
 use crate::shadow::Shadow;
 
-/// Copies that can be numbered (the run of heap slots is one longer). A
-/// listed frame of the opening cutscene names about 50 windows.
-const COPIES: u32 = 1023;
+/// The smallest run of raw page views a heap reserves (one slot more: the
+/// null view). A listed frame of the opening cutscene names about 50
+/// windows, and a save reload of the world past a thousand.
+const FIRST_RAW_PAGE_SLOTS: u32 = 1024;
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
@@ -68,9 +69,11 @@ struct Memory {
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
-    /// Per host view heap (by address): the first slot of its run, and how
-    /// many copies have their view there.
-    heaps: HashMap<usize, (u32, u32)>,
+    /// A shadow's id to its copy number: stable for the run, including
+    /// after the title reuses its address.
+    numbers: HashMap<u64, usize>,
+    /// Per host view heap (by address): the run of raw page views made in it.
+    heaps: HashMap<usize, RawRun>,
     /// The frame the faults were last read in.
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
@@ -83,12 +86,24 @@ unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 
+/// The run of raw page views one view heap holds: slot `base` is the null
+/// view, copy `n`'s is `n` further, and `made` of them are made.
+#[derive(Clone, Copy)]
+struct RawRun {
+    base: u32,
+    slots: u32,
+    made: u32,
+}
+
 /// What a draw binds.
 pub(crate) struct Ready {
     pub(crate) directory: u64,
     pub(crate) faults: u64,
     /// The view heap slot of the null view; copy `n`'s view is `n` further.
     pub(crate) base: u32,
+    /// The last copy number this bind prepared. Recording threads can add
+    /// mappings to the directory after it, which this bind's slots lack.
+    pub(crate) count: u32,
 }
 
 impl Memory {
@@ -108,6 +123,7 @@ impl Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
             copies: Vec::new(),
+            numbers: HashMap::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -152,9 +168,16 @@ impl Memory {
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
             return;
         }
-        let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
-            Some(n) => n,
-            None if self.copies.len() < COPIES as usize => {
+        let n = match self.numbers.get(&shadow.id()) {
+            Some(&n) => n,
+            None => {
+                // The directory stores a one-based u32 slot; zero is the null
+                // view. A number that does not fit drops the page, which is
+                // then read as absent (and asked for again next frame).
+                if u32::try_from(self.copies.len()).is_err() {
+                    return;
+                }
+                self.numbers.insert(shadow.id(), self.copies.len());
                 self.copies.push(shadow.clone());
                 let n = self.copies.len() - 1;
                 // Every page the copy holds whole, not only the one asked
@@ -176,13 +199,6 @@ impl Memory {
                     at += PAGE;
                 }
                 n
-            }
-            None => {
-                static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| {
-                    tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
-                });
-                return;
             }
         };
         let offset = shadow.offset_in(start).unwrap_or(0);
@@ -239,6 +255,16 @@ impl Memory {
 /// has its view in `heap`'s run and is brought up to date when `list` is
 /// submitted (and, with `writes`, copied back after). None if the host
 /// cannot hold it; the draw is then dropped.
+/// The run of raw page views a bind of `needed` slots asks its heap for (the
+/// null view and a slot a copy): a power of two, never below
+/// [`FIRST_RAW_PAGE_SLOTS`]. Pure, for testing.
+fn run_slots(needed: u32) -> u32 {
+    needed
+        .checked_next_power_of_two()
+        .unwrap_or(u32::MAX)
+        .max(FIRST_RAW_PAGE_SLOTS)
+}
+
 pub(crate) fn ready(
     list: &HostList,
     heap: &HostHeap,
@@ -276,20 +302,53 @@ pub(crate) fn ready(
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
-    let (base, made) = match m.heaps.get(&key) {
-        Some(&run) => run,
-        None => {
-            // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
+    let mut run = m.heaps.get(&key).copied().unwrap_or(RawRun {
+        base: 0,
+        slots: 0,
+        made: 0,
+    });
+    // The null view and a slot per copy. The run is held for the heap's life
+    // (not given back with a list's slots), so a bigger one is a new run.
+    let needed = u32::try_from(m.copies.len())
+        .ok()
+        .and_then(|n| n.checked_add(1))?;
+    if run.slots < needed {
+        let slots = run_slots(needed);
+        // A fragmented heap can still expose its first slots: take what fits
+        // and grow on a later bind, when slots have been given back.
+        let grown = heap.dynamic(slots).or_else(|| heap.dynamic(needed));
+        if let Some(base) = grown {
+            if run.slots != 0 {
+                tracing::info!(previous = run.slots, slots, "grew the raw page view run");
+            }
             heap.null_raw_uav_at(base);
-            (base, 0)
+            run = RawRun {
+                base,
+                slots,
+                made: 0,
+            };
         }
-    };
-    for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
     }
-    m.heaps.insert(key, (base, m.copies.len() as u32));
+    if run.slots == 0 {
+        return None;
+    }
+    let count = needed.min(run.slots).saturating_sub(1);
+    if count + 1 < needed {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                needed,
+                count,
+                "raw page views are limited by the descriptor heap; later copies read zeros"
+            )
+        });
+    }
+    for n in run.made..count {
+        let (_, len) = m.copies[n as usize].span();
+        heap.raw_uav_at(run.base + 1 + n, &m.copies[n as usize].buffer, 0, len);
+    }
+    run.made = run.made.max(count);
+    m.heaps.insert(key, run);
     // Once per list, and for copies numbered since: the builder alone
     // dispatches hundreds of times a frame.
     // shortcut: a copy another list numbers meanwhile is brought up to date
@@ -314,6 +373,27 @@ pub(crate) fn ready(
     Some(Ready {
         directory: m.directory.2,
         faults: m.faults.2,
-        base,
+        base: run.base,
+        count,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FIRST_RAW_PAGE_SLOTS, run_slots};
+
+    /// A bind that outgrows its heap's run asks for one twice the size, so
+    /// the copies a reload numbers arrive without a bind an allocation.
+    #[test]
+    fn the_raw_page_run_grows_by_a_power_of_two() {
+        assert_eq!(run_slots(1), FIRST_RAW_PAGE_SLOTS);
+        assert_eq!(run_slots(FIRST_RAW_PAGE_SLOTS), FIRST_RAW_PAGE_SLOTS);
+        assert_eq!(
+            run_slots(FIRST_RAW_PAGE_SLOTS + 1),
+            2 * FIRST_RAW_PAGE_SLOTS
+        );
+        assert_eq!(run_slots(1_500), 2048);
+        assert_eq!(run_slots(2_049), 4096);
+        assert_eq!(run_slots(u32::MAX), u32::MAX);
+    }
 }

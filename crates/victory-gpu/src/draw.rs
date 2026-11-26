@@ -866,7 +866,7 @@ impl State {
     ) -> u32 {
         use victory_shader::emit::{USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
-            return memory.map_or(0, |m| m.base);
+            return memory.map_or(0, |m| if dword == 0 { m.base } else { m.count });
         }
         if kind == USER_GROUP_BASE {
             // The first group of the dispatch being bound: 0 until a split
