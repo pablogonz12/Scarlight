@@ -101,11 +101,15 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
                 }
             }
             // A null event means "block until reached", and the card does
-            // reach it: wait on the value itself, in short slices, and let the
-            // queue run what it holds between them (`crate::queue::release_held`).
-            // Bounded, because a submission can be refused and then nothing
-            // would ever wake this guest thread.
+            // reach it: wait on the value itself in short slices. Bounded,
+            // because a submission can be refused and then nothing would ever
+            // wake this guest thread.
             if block_ms() > 0 {
+                // Let what a queue holds run once, before sleeping: it may reach
+                // the value, and a release can execute a submission on this
+                // thread (`INFINITE` host-event wait), which inside the loop
+                // would overshoot the deadline.
+                crate::queue::release_held(false);
                 let deadline =
                     std::time::Instant::now() + std::time::Duration::from_millis(block_ms());
                 loop {
@@ -129,7 +133,6 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
                             ms,
                         );
                     }
-                    crate::queue::release_held(false);
                 }
                 GAVE_UP.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(value, "a blocking fence wait gave up");
