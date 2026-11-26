@@ -637,6 +637,50 @@ impl Layout {
         )
     }
 
+    /// Copies only the part of tiled memory that lies in `window` (the first
+    /// byte of `tiled` is texture offset `at`): the pages of a texture that
+    /// changed, rather than all of it. Linear offsets are as in
+    /// [`Layout::detile`], and elements outside the window are left alone.
+    #[allow(clippy::too_many_arguments)]
+    pub fn detile_window(
+        &self,
+        window: &[u8],
+        at: u64,
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        let end = at
+            .checked_add(window.len() as u64)
+            .filter(|&end| end <= self.size)
+            .ok_or(Error::TooSmall)?;
+        let linear_len = linear.len();
+        // The span walk visits absolute tiled offsets, so the window is cut
+        // out of each run where it passes: two comparisons a run, and no
+        // second copy of the tiling arithmetic. Whole detiles keep the run
+        // walk (the 32-byte chunks), which this windowed path does not need:
+        // it is only ever called for the 64 KiB pages that changed.
+        self.walk_spans(
+            self.size as usize,
+            mip,
+            slice,
+            linear_len,
+            row_pitch,
+            depth_pitch,
+            Some((at as usize, end as usize)),
+            |t, l, len| {
+                let from = t.max(at as usize);
+                let to = (t + len).min(end as usize);
+                if from < to {
+                    let n = to - from;
+                    linear[l + (from - t)..][..n]
+                        .copy_from_slice(&window[from - at as usize..][..n]);
+                }
+            },
+        )
+    }
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
     pub fn tile(
         &self,
@@ -826,9 +870,16 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk_spans(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
-        })
+        self.walk_spans(
+            tiled.len(),
+            mip,
+            slice,
+            linear.len(),
+            row_pitch,
+            depth_pitch,
+            None,
+            |t, l, len| linear[l..][..len].copy_from_slice(&tiled[t..][..len]),
+        )
     }
 
     /// [`Layout::detile_spans`] the other way round.
@@ -841,9 +892,16 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk_spans(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
-        })
+        self.walk_spans(
+            tiled.len(),
+            mip,
+            slice,
+            linear.len(),
+            row_pitch,
+            depth_pitch,
+            None,
+            |t, l, len| tiled[t..][..len].copy_from_slice(&linear[l..][..len]),
+        )
     }
 
     /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
@@ -856,6 +914,7 @@ impl Layout {
         linear_len: usize,
         row_pitch: usize,
         depth_pitch: usize,
+        window: Option<(usize, usize)>,
         mut copy: impl FnMut(usize, usize, usize),
     ) -> Result<(), Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
@@ -918,11 +977,26 @@ impl Layout {
             .first()
             .map(|run| run.2)
             .filter(|&len| body.iter().all(|run| run.2 == len));
+        // The span the rows are checked against: a windowed detile skips the
+        // rows whose tiled bytes all lie outside it, which is most of a big
+        // atlas when only a few pages changed.
+        let row_lo = runs.iter().map(|&(t, ..)| t).min().unwrap_or(0);
+        let row_hi = runs.iter().map(|&(t, _, len)| t + len).max().unwrap_or(bytes);
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
             for y in 0..m.height {
                 let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+                if let Some((lo, hi)) = window {
+                    let tiled_row = if linear {
+                        (base + u64::from(y) * u64::from(m.pitch) * n as u64) as usize
+                    } else {
+                        (base + self.row(m, y, inner)) as usize
+                    };
+                    if hi <= tiled_row + row_lo || lo >= tiled_row + row_hi {
+                        continue;
+                    }
+                }
                 if linear {
                     let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
                     copy(tiled_row as usize, linear_row, bytes);
@@ -1247,6 +1321,181 @@ mod tests {
                 let op = if detile { "detile" } else { "tile" };
                 println!("{name} {op}: {rate:.1} MB/s");
             }
+        }
+    }
+
+    /// A synthetic atlas refreshed with only a few of its 64 KiB pages
+    /// written, whole detile against windowed: bytes read and detiled a
+    /// refresh, and the rate of each:
+    /// `cargo test --release -p victory-formats atlas_window -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn atlas_window_throughput() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let d = Desc {
+            block: 4,
+            ..desc(4096, 4096, 1, 16, Swizzle::SW_64KB_D)
+        };
+        let l = Layout::new(&d).unwrap();
+        let Some(m) = l.mips.first().copied() else {
+            return;
+        };
+        let row = m.width as usize * d.element_bytes as usize;
+        let plane = row * m.height as usize;
+        let tiled = vec![0x5a; l.size as usize];
+        let mut linear = vec![0u8; plane];
+        // Every 128th page: a few scattered texel blocks of the atlas.
+        const PAGE: usize = 64 << 10;
+        let dirty = (l.size as usize).div_ceil(PAGE).div_ceil(128).max(1);
+        let bytes = dirty * PAGE;
+        for (name, window) in [("whole", None), ("dirty", Some(dirty))] {
+            let start = Instant::now();
+            let runs = if window.is_some() { 400 } else { 4 };
+            for i in 0..runs {
+                if let Some(pages) = window {
+                    let at = ((i + 1) * 137 % (l.size as usize / PAGE - pages).max(1)) * PAGE;
+                    let end = (at + bytes).min(l.size as usize);
+                    l.detile_window(
+                        black_box(&tiled[at..end]),
+                        at as u64,
+                        black_box(0),
+                        0,
+                        black_box(&mut linear),
+                        row,
+                        plane,
+                    )
+                    .unwrap();
+                } else {
+                    l.detile(
+                        black_box(&tiled),
+                        black_box(0),
+                        0,
+                        black_box(&mut linear),
+                        row,
+                        plane,
+                    )
+                    .unwrap();
+                }
+            }
+            let each = Instant::now().duration_since(start).as_secs_f64() / runs as f64;
+            let copied = if window.is_some() {
+                bytes.min(l.size as usize)
+            } else {
+                l.size as usize
+            };
+            println!(
+                "{name}: {copied} bytes a refresh, {:.3} ms, {:.1} MB/s",
+                each * 1e3,
+                copied as f64 / each / 1e6
+            );
+        }
+    }
+
+    /// A windowed detile writes exactly the elements whose tiled bytes lie in
+    /// the window and nothing else: the whole-texture window is the whole
+    /// detile, and any other window leaves the rest of the linear side as it
+    /// was (`Staging::refresh_pages` relies on it to touch only the pages
+    /// that changed).
+    #[test]
+    fn window_detiles_copy_exactly_what_lies_in_them() {
+        let mut seed = 0x51d3_9e7b_2c40_8fa1u64;
+        let next = |seed: &mut u64, m: u64| {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed % m
+        };
+        for swizzle in [
+            Swizzle::LINEAR,
+            Swizzle::SW_256B_S,
+            Swizzle::SW_256B_D,
+            Swizzle::SW_4KB_S,
+            Swizzle::SW_4KB_D,
+            Swizzle::SW_64KB_S,
+            Swizzle::SW_64KB_D,
+        ] {
+            let d = Desc {
+                dimension: Dimension::Tex2d,
+                width: 37,
+                height: 23,
+                depth: 1,
+                mips: 4,
+                element_bytes: 4,
+                block: 1,
+                samples: 1,
+                swizzle,
+            };
+            let l = Layout::new(&d).unwrap();
+            let a: Vec<u8> = (0..l.size).map(|_| next(&mut seed, 256) as u8).collect();
+            let b: Vec<u8> = (0..l.size).map(|_| next(&mut seed, 256) as u8).collect();
+            let n = d.element_bytes as usize;
+            for (mip, m) in l.mips.clone().into_iter().enumerate() {
+                let row = m.width as usize * n;
+                let plane = row * m.height as usize;
+                let len = plane * m.depth as usize;
+                // The window, in the middle of the texture's bytes.
+                let (at, window) = if l.size >= 256 {
+                    let at = (l.size / 2) & !0xff;
+                    let end = (at + 192).min(l.size);
+                    (at, &a[at as usize..end as usize])
+                } else {
+                    (0, &a[..])
+                };
+                let mut whole = vec![0xee; len];
+                l.detile(&a, mip as u32, 0, &mut whole, row, plane).unwrap();
+                // The whole texture as a window is the whole detile, for
+                // every mip.
+                let mut full = vec![0xee; len];
+                l.detile_window(&a, 0, mip as u32, 0, &mut full, row, plane)
+                    .unwrap();
+                assert_eq!(full, whole, "{d:?} mip {mip}: the whole window");
+                // The staging buffer holds the previous contents (a detile
+                // of `b`): only what lies in the window is replaced.
+                let full_b = {
+                    let mut out = vec![0xee; len];
+                    l.detile(&b, mip as u32, 0, &mut out, row, plane).unwrap();
+                    out
+                };
+                let mut windowed = full_b.clone();
+                l.detile_window(window, at, mip as u32, 0, &mut windowed, row, plane)
+                    .unwrap();
+                for y in 0..m.height {
+                    let tiled_row = if swizzle == Swizzle::LINEAR {
+                        (m.offset + u64::from(y) * u64::from(m.pitch) * n as u64) as usize
+                    } else {
+                        (m.offset + l.row(&m, y, 0)) as usize
+                    };
+                    for x in 0..m.width {
+                        let t = if swizzle == Swizzle::LINEAR {
+                            tiled_row + x as usize * n
+                        } else {
+                            tiled_row + l.column(&m, x) as usize
+                        };
+                        for j in 0..n {
+                            let inside =
+                                (t + j) as u64 >= at && ((t + j) as u64) < at + window.len() as u64;
+                            let want = if inside { a[t + j] } else { b[t + j] };
+                            let got = windowed[y as usize * row + x as usize * n + j];
+                            assert_eq!(
+                                got, want,
+                                "{d:?} mip {mip} at ({x}, {y}) byte {j}: in window {inside}"
+                            );
+                            if !inside {
+                                assert_eq!(got, full_b[y as usize * row + x as usize * n + j]);
+                            }
+                        }
+                    }
+                }
+            }
+            // A window past the texture's bytes is refused whole.
+            let mut out = vec![0u8; 64];
+            assert!(
+                l.detile_window(&[0u8; 16], l.size - 8, 0, 0, &mut out, 64, 64)
+                    .is_err(),
+                "{d:?}: a window past the end"
+            );
         }
     }
 
