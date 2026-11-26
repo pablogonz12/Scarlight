@@ -2295,8 +2295,6 @@ impl State {
                 unsafe { list.list.Dispatch(x.min(Self::MOST_GROUPS), y, z) };
             }
         }
-        // It ran (in pieces, when it asked for more groups than the host
-        // runs): no stand-in takes its place.
         self.dispatch_ran = true;
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         self.reflection(list, p);

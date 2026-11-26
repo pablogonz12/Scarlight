@@ -110,6 +110,7 @@ const _: () = assert!(size_of::<HeapDesc>() == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
 
 const BUFFER: u32 = 1;
+const TEXTURE_2D: u32 = 3;
 const TEXTURE_3D: u32 = 4;
 
 /// Bytes per element and the element's width in texels (4 for block
@@ -657,6 +658,130 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
     }
 }
 
+/// Whether a host texture of `desc` may give up top mip levels and still be
+/// used: a plain sampled 2D texture. A target, depth or unordered access
+/// texture is sized by the draws, clears and views that name it (a view can
+/// be no larger than its texture), and a multi-sampled one has one level.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn droppable(desc: &ResourceDesc) -> bool {
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    desc.dimension == TEXTURE_2D
+        && desc.sample_count <= 1
+        && desc.flags & TARGET_DEPTH_UNORDERED == 0
+}
+
+/// The most top mip levels a host copy of `desc` may lose, at most `wanted`:
+/// only whole blocks of a block-compressed texture (a 36×36 BC1 texture
+/// cannot lose one level, but can lose three), and never the last level.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn droppable_mips(desc: &ResourceDesc, wanted: u32) -> u32 {
+    if !droppable(desc) || wanted == 0 {
+        return 0;
+    }
+    let Some((_, block)) = element(desc.format) else {
+        return 0;
+    };
+    let most = wanted.min(mip_count(desc).saturating_sub(1));
+    (1..=most)
+        .rev()
+        .find(|&n| {
+            let (w, h) = ((desc.width >> n).max(1), u64::from(desc.height >> n).max(1));
+            block == 1 || (w % block == 0 && h % block == 0)
+        })
+        .unwrap_or(0)
+}
+
+/// `desc` without its `dropped` largest mip levels: smaller, and with fewer
+/// levels, as the host makes it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn without_top_mips(desc: &ResourceDesc, dropped: u32) -> ResourceDesc {
+    if dropped == 0 {
+        return *desc;
+    }
+    ResourceDesc {
+        width: (desc.width >> dropped).max(1),
+        height: (desc.height >> dropped).max(1),
+        mip_levels: (mip_count(desc) - dropped) as u16,
+        ..*desc
+    }
+}
+
+/// `VICTORY_MIP_RETRY=0` does not retry a texture the host refuses: it stays
+/// missing, as before.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn retry_mips() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MIP_RETRY").is_none_or(|v| v != "0"))
+}
+
+/// Makes a host texture through `create`, which answers `Err` with the
+/// host's failure. A texture the host refuses is retried with its mip chain
+/// halved (what is left of it at most, [`droppable_mips`]) down to one
+/// level: sampled small is better than missing. Returns what was made, the
+/// description it was made from, and the top mip levels it lost against
+/// `desc`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn create_with_fewer_mips<T, E>(
+    desc: &ResourceDesc,
+    retry: bool,
+    mut create: impl FnMut(&ResourceDesc) -> Result<T, E>,
+) -> Result<(T, ResourceDesc, u32), E> {
+    let mips = mip_count(desc);
+    let mut kept = mips;
+    loop {
+        let dropped = droppable_mips(desc, mips - kept);
+        let attempt = without_top_mips(desc, dropped);
+        match create(&attempt) {
+            Ok(made) => return Ok((made, attempt, dropped)),
+            Err(e) => {
+                if !retry {
+                    return Err(e);
+                }
+                let mut fewer = kept / 2;
+                // A drop that block compression makes illegal (36×36 BC1
+                // cannot lose two levels) gives way to the largest one
+                // below it, which keeps whole blocks.
+                while fewer > 0 && droppable_mips(desc, mips - fewer) == 0 {
+                    fewer -= 1;
+                }
+                if fewer == 0 {
+                    return Err(e);
+                }
+                kept = fewer;
+            }
+        }
+    }
+}
+
+/// A resident mip window `(first level, levels)` of a title texture, as the
+/// same levels of a host copy that lacks the title's top `dropped` ones: only
+/// its start moves, and it ends where the copy does. `(0, 0)` (nothing
+/// resident) stays.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn resident_in_host(resident: (u32, u32), dropped: u32, mips: u32) -> (u32, u32) {
+    let (first, count) = resident;
+    if count == 0 {
+        return (0, 0);
+    }
+    let first = first.saturating_sub(dropped);
+    (first, count.min(mips.saturating_sub(first)).max(1))
+}
+
+/// A view's `(most detailed level, levels)` of a title texture, as the same
+/// levels of a host copy that lacks the title's top `dropped` ones (see
+/// [`dropped_mips`]): its level `i` is the title's `i + dropped`. A view of
+/// every level (0 or `u32::MAX`) stays one; one that named only levels the
+/// host does not have shows the largest it has.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn rebase_mip_range(most_detailed: u32, levels: u32, dropped: u32) -> (u32, u32) {
+    let first = most_detailed.saturating_sub(dropped);
+    if levels == 0 || levels == u32::MAX {
+        return (first, levels);
+    }
+    let end = most_detailed.saturating_add(levels).saturating_sub(dropped);
+    (first, end.saturating_sub(first).max(1))
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
@@ -1130,6 +1255,10 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    /// The top mip levels of the title's texture the host could not give it
+    /// (memory pressure, [`create_with_fewer_mips`]): its level `i` is the
+    /// title's `i + dropped`. Views and copies clamp to what is left.
+    pub(crate) dropped: u32,
     /// The bytes the host gives it.
     bytes: u64,
     /// Whether its contents come from title memory ([`fills`]): counted in
@@ -1313,7 +1442,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-        let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
+        // A placed texture may alias a full-mip target or unordered access
+        // view in the same memory: it keeps every level.
+        let retry = !r.host.placed.load(Relaxed);
+        let Some((texture, dropped)) = host_texture(&r.desc, r.host.state, clear, retry) else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
@@ -1331,6 +1463,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
         let mut host = HostTexture::new(texture, state);
+        host.dropped = dropped;
         host.filled = fills(&r.desc);
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
@@ -1593,6 +1726,7 @@ impl HostTexture {
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
+            dropped: 0,
         }
     }
 }
@@ -1659,14 +1793,27 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
+/// How many top mip levels of title texture `this` its host copy lacks (made
+/// now if it is not there); 0 if it has them all or the host refuses it.
+#[cfg(windows)]
+pub(crate) fn dropped_mips(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    hosted(this, true).map_or(0, |made| made.0.dropped)
+}
+
 /// A host texture like the title's: same description, in GPU memory,
-/// without the console's layout and flags.
+/// without the console's layout and flags. A texture the host refuses for
+/// lack of memory is made with fewer top mip levels
+/// ([`create_with_fewer_mips`]); the count it lost comes back with it.
 #[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    retry: bool,
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -1720,31 +1867,54 @@ fn host_texture(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
-    let mut texture: Option<ID3D12Resource> = None;
-    // SAFETY: the description has the host layout (checked size, same
-    // fields); the out pointer is ours.
-    let made = unsafe {
-        host.device.CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(
-                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-            ),
-            // The same layout: format, then color or depth and stencil.
-            clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
-            &mut texture,
-        )
+    let create = |trial: &ResourceDesc| -> windows::core::Result<Option<ID3D12Resource>> {
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: the description has the host layout (checked size, same
+        // fields); the out pointer is ours.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    std::ptr::from_ref(trial).cast(),
+                    D3D12_RESOURCE_STATES(
+                        crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
+                    ),
+                    // The same layout: format, then color or depth and stencil.
+                    clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
+                    &mut texture,
+                )
+                .map(|()| texture)
+        }
     };
-    if let Err(e) = made {
-        tracing::warn!(error = %e, desc = ?d, "no host texture");
+    let (texture, attempt, dropped) =
+        match create_with_fewer_mips(&d, retry && retry_mips(), create) {
+            Ok(made) => made,
+            Err(e) => {
+                tracing::warn!(error = %e, desc = ?d, "no host texture");
+                return None;
+            }
+        };
+    if dropped > 0 {
+        // One line per texture, however many levels it took.
+        tracing::warn!(
+            dropped,
+            mip_levels = mip_count(&attempt),
+            width = attempt.width,
+            height = attempt.height,
+            desc = ?d,
+            "host texture made with fewer mip levels"
+        );
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+            format!(
+                "texture {}x{} f{} flags {:#x}",
+                attempt.width, attempt.height, attempt.format, attempt.flags
+            )
         });
     }
-    texture
+    texture.map(|texture| (texture, dropped))
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -1801,6 +1971,11 @@ fn hand_out_resource(
 ) -> HRESULT {
     #[cfg(not(windows))]
     let _ = (state, clear);
+    // A placed texture (and a texture made for a view the title placed in
+    // its own memory) may alias a full-mip target or unordered access view:
+    // it is known as one before its host copy can be made, lazy or not.
+    #[cfg(windows)]
+    let placed = matches!(&backing, Backing::Placed { .. } | Backing::Address(_));
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -1817,7 +1992,7 @@ fn hand_out_resource(
             used: std::sync::atomic::AtomicU64::new(0),
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
-            placed: std::sync::atomic::AtomicBool::new(false),
+            placed: std::sync::atomic::AtomicBool::new(placed),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
@@ -2188,10 +2363,6 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     }
     map.insert((address, *desc), out as usize);
     crate::texture::placed_in_host_written(address, desc);
-    resource(out)
-        .host
-        .placed
-        .store(true, std::sync::atomic::Ordering::Relaxed);
     Some(out)
 }
 
@@ -2426,6 +2597,100 @@ mod tests {
             layout: 0,
             ..buffer(0)
         }
+    }
+
+    #[test]
+    fn a_host_texture_the_host_refuses_is_retried_with_fewer_mips() {
+        // A 4096² BC1 texture with 13 levels on a card that gives no host
+        // copy of more than four: what the title asked for, then half the
+        // chain, then half of that.
+        let desc = texture(4096, 4096, 71, 13);
+        let mut asked = Vec::new();
+        let made = create_with_fewer_mips(&desc, true, |trial| {
+            asked.push(mip_count(trial));
+            (mip_count(trial) <= 4)
+                .then_some(trial.width)
+                .ok_or("no memory")
+        });
+        assert_eq!(asked, [13, 6, 3]);
+        let (width, attempt, dropped) = made.expect("made with fewer mips");
+        assert_eq!((width, mip_count(&attempt), dropped), (4, 3, 10));
+
+        // Off: the refusal is the end of it.
+        let mut asked = 0;
+        let refused = create_with_fewer_mips(&desc, false, |trial| {
+            asked += 1;
+            Err::<u64, u32>(mip_count(trial))
+        });
+        assert!(refused.is_err());
+        assert_eq!(asked, 1);
+
+        // A target keeps its size: the draws and clears that name it are
+        // sized by it (as depth and unordered access views are).
+        let mut target = texture(4096, 4096, 71, 13);
+        target.flags = 1;
+        let mut asked = 0;
+        assert!(
+            create_with_fewer_mips(&target, true, |_| {
+                asked += 1;
+                Err::<u64, &str>("no memory")
+            })
+            .is_err()
+        );
+        assert_eq!(asked, 1);
+    }
+
+    #[test]
+    fn an_illegal_retry_candidate_gives_way_to_a_smaller_one() {
+        // 36×36 BC1 with four levels: halving asks for two levels gone, which
+        // leaves 9×9 (not a whole block). The three-level drop (4×4) is tried.
+        let desc = texture(36, 36, 71, 4);
+        let mut asked = Vec::new();
+        let made = create_with_fewer_mips(&desc, true, |trial| {
+            asked.push(mip_count(trial));
+            (mip_count(trial) <= 1)
+                .then_some(trial.width)
+                .ok_or("no memory")
+        });
+        assert_eq!(asked, [4, 1]);
+        assert_eq!(made.map(|(width, _, dropped)| (width, dropped)), Ok((4, 3)));
+    }
+
+    #[test]
+    fn block_compressed_textures_lose_whole_levels_only() {
+        // 36×36 BC1 with six levels: three gone leaves 4×4, a whole block
+        // (one or two gone would leave 18×18 and 9×9).
+        assert_eq!(droppable_mips(&texture(36, 36, 71, 6), 3), 3);
+        // Uncompressed: any number of levels, never the last one.
+        assert_eq!(droppable_mips(&texture(64, 64, 28, 4), 9), 3);
+        // A 1-level texture has nothing to give.
+        assert_eq!(droppable_mips(&texture(64, 64, 28, 1), 1), 0);
+    }
+
+    #[test]
+    fn a_resident_window_moves_with_the_dropped_levels() {
+        // Seven levels gone from thirteen: the window the title holds at
+        // (10, 3) is (3, 3) of the copy's six.
+        assert_eq!(resident_in_host((10, 3), 7, 6), (3, 3));
+        // A window that starts inside the dropped levels shows the copy's
+        // largest.
+        assert_eq!(resident_in_host((1, 3), 7, 6), (0, 3));
+        // Nothing resident stays nothing; a window reaching past the copy's
+        // last level ends there.
+        assert_eq!(resident_in_host((0, 0), 7, 6), (0, 0));
+        assert_eq!(resident_in_host((4, 8), 2, 6), (2, 4));
+    }
+
+    #[test]
+    fn views_of_a_texture_that_lost_mips_keep_naming_the_same_levels() {
+        // Titles sample a level of their own chain; the host's level `i` is
+        // the title's `i + dropped`.
+        assert_eq!(rebase_mip_range(0, 0, 2), (0, 0));
+        assert_eq!(rebase_mip_range(0, 4, 2), (0, 2));
+        assert_eq!(rebase_mip_range(3, 4, 2), (1, 4));
+        assert_eq!(rebase_mip_range(1, 4, 2), (0, 3));
+        assert_eq!(rebase_mip_range(2, 1, 2), (0, 1));
+        assert_eq!(rebase_mip_range(0, 5, 0), (0, 5));
     }
 
     fn heap(size: u64) -> This {
