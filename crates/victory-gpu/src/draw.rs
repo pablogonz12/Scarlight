@@ -8,6 +8,7 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::resource::RootIndexedView;
@@ -437,6 +438,40 @@ pub(crate) fn drawn() -> u64 {
     DRAWN.load(Ordering::Relaxed)
 }
 
+/// Draws with no vertices or indices, or no instances, skipped before
+/// their state was prepared, since the last call.
+static EMPTY: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn take_empty() -> u64 {
+    EMPTY.swap(0, Ordering::Relaxed)
+}
+
+/// Whether a draw of `items` vertices or indices in `instances` instances
+/// draws nothing and is skipped: counted, and returned before its state is
+/// prepared, so it asks for no host pipeline and spends none of the frame's
+/// pipeline wait budget (upstream Marvisak/VIctory #2654).
+/// On by default; `VICTORY_EMPTY_DRAW_SKIP=0` prepares empty draws as before.
+fn empty_draw(items: u32, instances: u32) -> bool {
+    if !empty_draw_with(empty_draw_on(), items, instances) {
+        return false;
+    }
+    EMPTY.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Whether the skip is on in this process ([`empty_draw`]'s switch), read
+/// once: `VICTORY_EMPTY_DRAW_SKIP=0` prepares empty draws as before.
+fn empty_draw_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EMPTY_DRAW_SKIP").is_none_or(|v| v != "0"))
+}
+
+/// The decision [`empty_draw`] makes, for a given setting: `on` and the draw
+/// has no work. Pure, so a test can check both settings in one process.
+fn empty_draw_with(on: bool, items: u32, instances: u32) -> bool {
+    on && (items == 0 || instances == 0)
+}
+
 /// The draws traced since the last present (diagnostics builds, with
 /// debug logging for this module): logged when the frame comes out black.
 #[cfg(feature = "diagnostics")]
@@ -864,9 +899,14 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_GROUP_BASE {
+            // The first group of the dispatch being bound: 0 until a split
+            // dispatch sets it before each run but the first ([`State::dispatch`]).
+            return 0;
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -1097,10 +1137,8 @@ impl State {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
         let pixel_hash = (!compute)
             .then(|| {
@@ -1645,6 +1683,8 @@ impl State {
             std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
+        let mut eligible: Vec<(&std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
+            Vec::with_capacity(spans.len());
         for (shadow, from, to) in spans.values() {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
@@ -1665,8 +1705,10 @@ impl State {
                     }
                 }
             }
-            shadow.refresh(list, *from, to - from);
+            eligible.push((shadow, *from, *to - *from));
         }
+        // All the spans in under one lock of the list: some 4,600 a frame.
+        crate::shadow::Shadow::refresh_many(list, eligible);
         self.heap_textures(list, heap, host);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -2125,6 +2167,48 @@ impl State {
         });
     }
 
+    /// The most groups the host runs in one dimension of a dispatch. The
+    /// console's own limit is higher (a builder pass asks for 77,500 in
+    /// `x`): a dispatch beyond it is run as several ([`State::dispatch`]).
+    const MOST_GROUPS: u32 = 65_535;
+
+    /// The most groups a mesh dispatch runs in all (2^22, the host's grid
+    /// limit): a piece of a split mesh dispatch is cut to it as well.
+    const MOST_MESH_GROUPS: u32 = 1 << 22;
+
+    /// Where a compute or mesh stage's group-ID base is bound, if the stage
+    /// reads its group id: its user-data root parameter and the dword in it
+    /// (`victory_shader::emit::USER_GROUP_BASE`).
+    fn group_base_slot(p: &HostPipeline) -> Option<(u32, u32)> {
+        for stage in &p.stages {
+            let Some((param, _)) = stage.user_data else {
+                continue;
+            };
+            let t = stage.translated();
+            if let Some(u) = t
+                .host
+                .user_data
+                .iter()
+                .find(|u| u.root == RootType::Other(victory_shader::emit::USER_GROUP_BASE))
+            {
+                return Some((param, u.index));
+            }
+        }
+        None
+    }
+
+    /// Sets the group-ID base of the next run of a split dispatch.
+    fn set_group_base(list: &HostList, compute: bool, (param, dword): (u32, u32), base: u32) {
+        // SAFETY: an open list whose root signature has that parameter.
+        unsafe {
+            if compute {
+                list.list.SetComputeRoot32BitConstant(param, base, dword);
+            } else {
+                list.list.SetGraphicsRoot32BitConstant(param, base, dword);
+            }
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
@@ -2173,8 +2257,46 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        // The host runs at most 65,535 groups in a dimension. A console
+        // dispatch over that runs as several, each with the group id where it
+        // starts (`VICTORY_GROUP_SPLIT=0`: the first 65,535 groups only).
+        match Self::group_base_slot(p) {
+            Some(slot) if x > Self::MOST_GROUPS => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::info!(
+                        x,
+                        runs = x.div_ceil(Self::MOST_GROUPS),
+                        "a dispatch asks for more groups in x than the host runs: it runs in pieces, each told where its \
+                         groups start (VICTORY_GROUP_SPLIT=0: the first 65,535 groups only)"
+                    );
+                });
+                let mut at = 0;
+                while at < x {
+                    let n = (x - at).min(Self::MOST_GROUPS);
+                    if at != 0 {
+                        Self::set_group_base(list, true, slot, at);
+                    }
+                    // SAFETY: an open list with everything set.
+                    unsafe { list.list.Dispatch(n, y, z) };
+                    at += n;
+                }
+            }
+            _ => {
+                if x > Self::MOST_GROUPS {
+                    once!(
+                        x,
+                        "a dispatch asks for more groups in x than the host runs and its program reads no group id: \
+                         the groups after 65,535 do not run"
+                    );
+                }
+                // No group id to move: the groups after the host's limit
+                // cannot be run at all (a count over it the host does not
+                // give its driver either).
+                // SAFETY: an open list with everything set.
+                unsafe { list.list.Dispatch(x.min(Self::MOST_GROUPS), y, z) };
+            }
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         self.reflection(list, p);
     }
@@ -2328,8 +2450,47 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}x{y}x{z}"), false));
                     self.mesh_scissor(list, true);
-                    // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, y, z) };
+                    match crate::pipeline::host_pipeline(self.pipeline as This).and_then(Self::group_base_slot) {
+                        Some(slot) if x > Self::MOST_GROUPS => {
+                            static ONCE: std::sync::Once = std::sync::Once::new();
+                            ONCE.call_once(|| {
+                                tracing::info!(
+                                    x,
+                                    runs = x.div_ceil(Self::MOST_GROUPS),
+                                    "a mesh dispatch asks for more groups in x than the host runs: it runs in pieces, \
+                                     each told where its groups start (VICTORY_GROUP_SPLIT=0: the first 65,535 groups only)"
+                                );
+                            });
+                            // A mesh dispatch's pieces are bounded by the
+                            // grid's own limit too, in all three dimensions.
+                            let grid = y.saturating_mul(z).max(1);
+                            let piece = (Self::MOST_MESH_GROUPS / grid).clamp(1, Self::MOST_GROUPS);
+                            let mut at = 0;
+                            while at < x {
+                                let n = (x - at).min(piece);
+                                if at != 0 {
+                                    Self::set_group_base(list, false, slot, at);
+                                }
+                                // SAFETY: an open list with everything set.
+                                unsafe { l6.DispatchMesh(n, y, z) };
+                                at += n;
+                            }
+                        }
+                        _ => {
+                            if x > Self::MOST_GROUPS {
+                                once!(
+                                    x,
+                                    "a mesh dispatch asks for more groups in x than the host runs and its program \
+                                     reads no group id: the groups after 65,535 do not run"
+                                );
+                            }
+                            // As above: no group id to move, and a count
+                            // over the limit the host does not hand its
+                            // driver either.
+                            // SAFETY: an open list with everything set.
+                            unsafe { l6.DispatchMesh(x.min(Self::MOST_GROUPS), y, z) };
+                        }
+                    }
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -2667,6 +2828,11 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
+        // Nothing to draw: preparing it would ask for its host pipeline and
+        // spend the frame's pipeline wait budget on it.
+        if empty_draw(vertices, instances) {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -2711,6 +2877,27 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
+        let n = (count / 3) as usize;
+        // Where the `POSITION` element is read from, if the layout has one:
+        // every slot of a rectangle takes its right angle from there, so that
+        // the vertices it completes line up between buffers. Found once per
+        // draw, read at submission like the vertices themselves.
+        let position = p.inputs.iter().find(|e| e.position && !e.per_instance);
+        let position_src = position.and_then(|e| {
+            let v = self.vertex[e.slot as usize];
+            rectangle_vertex_range(v, count, first)
+                .filter(|&(from, src_bytes, _)| crate::shadow::find(from, src_bytes).is_some())
+                .map(|(from, _, _)| (from, v.stride, e.offset, e.format))
+        });
+        // A `POSITION` range the checks refuse rejects the whole draw here,
+        // before any slot registers a callback that would read it: the slots'
+        // callbacks run at submission even when the draw is dropped after
+        // them.
+        if position.is_some() && position_src.is_none() {
+            once!("rectangle vertices outside their buffer");
+            return false;
+        }
+        let corners = std::sync::Arc::new(std::sync::OnceLock::new());
         for slot in 0..32 {
             let elements: Vec<(u32, u32)> = p
                 .inputs
@@ -2732,6 +2919,7 @@ impl State {
                 return false;
             };
             let (from, to, stride) = (from as usize, to as usize, v.stride as usize);
+            let corners = corners.clone();
             list.defer_host(move || {
                 // The vertices are read in place, at submission: no change
                 // of mapping under the read (see
@@ -2745,7 +2933,24 @@ impl State {
                         std::slice::from_raw_parts_mut(to as *mut u8, dst_bytes as usize),
                     )
                 };
-                crate::primitive::expand_rects(src, dst, stride, &elements);
+                // Once for the whole draw, whichever slot runs first: the
+                // `POSITION` buffer's bytes are the rectangle's corners.
+                let corners = corners.get_or_init(|| match position_src {
+                    // SAFETY: the `POSITION` element's buffer was checked
+                    // the same way as this slot's, and it is read under the
+                    // same guard.
+                    Some((at, pstride, offset, format)) => unsafe {
+                        let src = std::slice::from_raw_parts(at as *const u8, n * 3 * pstride as usize);
+                        crate::primitive::right_corners(
+                            src,
+                            pstride as usize,
+                            n,
+                            (offset, format),
+                        )
+                    },
+                    None => Vec::new(),
+                });
+                crate::primitive::expand_rects(src, dst, stride, &elements, corners);
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
@@ -2768,6 +2973,10 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
+        // As an empty draw: nothing to draw, and no pipeline to ask for.
+        if empty_draw(indices, instances) {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3290,6 +3499,42 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::{empty_draw, take_empty};
+
+    /// An empty draw is skipped and counted, a draw with work is not: the
+    /// check sits above the state preparation, so nothing asks for its host
+    /// pipeline (upstream Marvisak/VIctory #2654). The decision is checked
+    /// under both settings of the switch, which this process cannot change.
+    #[test]
+    fn empty_draws_are_skipped_and_counted() {
+        use super::{empty_draw_on, empty_draw_with};
+        let _ = take_empty();
+        for (items, instances) in [(0, 1), (3, 0), (0, 0)] {
+            assert!(
+                empty_draw_with(true, items, instances),
+                "{items} items {instances} instances"
+            );
+            assert!(
+                !empty_draw_with(false, items, instances),
+                "the off switch prepares {items} items {instances} instances"
+            );
+        }
+        assert!(!empty_draw_with(true, 3, 1));
+        assert!(!empty_draw_with(true, 1, 1));
+        // What this process does with the setting it started with.
+        if empty_draw_on() {
+            for (items, instances) in [(0, 1), (3, 0), (0, 0)] {
+                assert!(empty_draw(items, instances), "{items} items {instances} instances");
+            }
+            assert_eq!(take_empty(), 3);
+            assert!(!empty_draw(3, 1));
+            assert!(!empty_draw(1, 1));
+        } else {
+            assert!(!empty_draw(0, 1));
+        }
+        assert_eq!(take_empty(), 0);
+    }
+
     use super::{
         VertexView, expanded_rectangle_vertices_guarded, rectangle_vertex_range_guarded,
         staging_budget_per_frame,

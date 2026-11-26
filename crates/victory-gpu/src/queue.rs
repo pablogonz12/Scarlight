@@ -793,24 +793,28 @@ extern "system" fn present(
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
-        let (drawn, dispatched) = {
+        let (drawn, dispatched, empty, demanded) = {
             static DRAWN: AtomicU64 = AtomicU64::new(0);
             static DISPATCHED: AtomicU64 = AtomicU64::new(0);
             let since = |last: &AtomicU64, now: u64| now - last.swap(now, Ordering::Relaxed);
             (
                 since(&DRAWN, crate::draw::drawn()),
                 since(&DISPATCHED, crate::draw::dispatched()),
+                crate::draw::take_empty(),
+                crate::pipeline::take_demanded(),
             )
         };
         #[cfg(not(windows))]
-        let (drawn, dispatched) = (0, 0);
+        let (drawn, dispatched, empty, demanded) = (0, 0, 0, 0);
         tracing::info!(
             frame,
             draws,
             drawn,
             dispatches,
             dispatched,
-            "frame presented (since the last line: draws and dispatches, and those run on the host)"
+            empty,
+            demanded,
+            "frame presented (since the last line: draws and dispatches, and those run on the host; empty draws skipped, and pipelines they would have asked for)"
         );
         #[cfg(windows)]
         if frame >= 256 {
