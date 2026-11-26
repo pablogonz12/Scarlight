@@ -2328,6 +2328,9 @@ impl Shadow {
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
+        // Before the snapshot's bytes are read: a remap this does not see
+        // stays marked, so the copy-back leaves those bytes alone.
+        let generation = crate::watch::remap_generation();
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
         if keeps() {
@@ -2346,10 +2349,15 @@ impl Shadow {
                     continue;
                 }
                 for piece in self.pieces(from, to) {
-                    if kept.0[piece] {
-                        continue;
-                    }
                     let (lo, hi) = self.piece(piece);
+                    if kept.0[piece] {
+                        // Kept until the runtime unmapped or remapped the
+                        // block: what is there now is not what was kept.
+                        if !crate::watch::remapped_any(self.start as usize + lo, hi - lo) {
+                            continue;
+                        }
+                        kept.0[piece] = false;
+                    }
                     let whole = from <= lo && hi <= to;
                     let (lo, hi) = (lo.max(from), hi.min(to));
                     // SAFETY: as below; `hi <= total`.
@@ -2357,9 +2365,17 @@ impl Shadow {
                         std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
                     }
                     kept.0[piece] = whole;
+                    crate::watch::remapped_taken(generation, self.start as usize + lo, hi - lo);
                 }
             }
             return;
+        }
+        // The parts' bytes are taken afresh: a remapping before them is in
+        // the snapshot now, so a copy-back may put the GPU's bytes back.
+        for &(from, to) in &parts {
+            if from < to {
+                crate::watch::remapped_taken(generation, self.start as usize + from, to - from);
+            }
         }
         if wide_back() {
             // Noted, and taken with the submission's other snapshots when
@@ -2443,6 +2459,14 @@ impl Shadow {
                 self.changed(at, at + n);
             }
             let mut title = vec![0u8; PIECE];
+            // The runtime's remapping is held off from each test to the last
+            // byte written, once for this copy-back and not once a piece: a
+            // remap already under way is waited for 2 ms only, since it may
+            // itself be waiting for the blocks this copy-back's job holds.
+            // The writes go on as before without the reading. Nothing
+            // differing means nothing to read or write: no guard asked for.
+            let _reading = (!differing.is_empty())
+                .then(|| crate::watch::title_memory_reading_within(std::time::Duration::from_millis(2)));
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
@@ -2490,9 +2514,25 @@ impl Shadow {
                 let held = unsafe { std::slice::from_raw_parts_mut(base.add(at), n) };
                 let differs = merge_back(host, held, title);
                 if differs {
-                    crate::watch::writing(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                    written += n;
+                    // Only the bytes the runtime did not unmap or remap
+                    // while the submission was pending: what it shows there
+                    // is someone else's now, so the copy's bytes stay out
+                    // (FIND-14).
+                    let base = start + at;
+                    if !crate::watch::remapped_any(base, n) {
+                        crate::watch::writing(base, n);
+                        crate::host::write_mapped(base as *mut u8, title.as_ptr(), n);
+                        written += n;
+                    } else {
+                        for (from, to) in crate::watch::unremapped_runs(base, n) {
+                            let (at, n) = (from - base, to - from);
+                            crate::watch::writing(from, n);
+                            // SAFETY: `at` is inside the bytes merged above.
+                            let bytes = unsafe { title.as_ptr().add(at) };
+                            crate::host::write_mapped(from as *mut u8, bytes, n);
+                            written += n;
+                        }
+                    }
                 }
             }
             // Our write shows as a title write at the copy's next refresh,
@@ -3350,9 +3390,13 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
-        // Rounded up so that views ending in the buffer's last 256 bytes fit.
-        // Shaders write some buffers (unordered access), so not upload memory.
-        let size = len.next_multiple_of(1 << 16);
+        // Rounded up to whole slots of the small buffers' pool, so that views
+        // ending in the buffer's last 256 bytes fit and a root descriptor's
+        // read past the title buffer's end stays in this copy up to the
+        // rounded width, none when the length is whole slots already
+        // (`Host::shared_buffer`). Shaders write some buffers (unordered
+        // access), so not upload memory.
+        let size = len.next_multiple_of(crate::placed::SLOT_BYTES);
         // In place, if asked for and the memory can be opened
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those

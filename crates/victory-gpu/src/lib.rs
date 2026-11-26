@@ -14,6 +14,9 @@
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
 //! share, [`console`] which console model the title sees. Planned: `present`
 //! (swap chain).
+
+#[cfg(windows)]
+mod ambient;
 #[cfg(any(windows, test))]
 mod bound;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -23,6 +26,11 @@ pub mod console;
 mod copystat;
 #[cfg(any(windows, test))]
 mod declareonce;
+// The arena is the layer a resident stands on (#980 Stage A); no resident
+// places anything yet, so only the tests exercise it (`notes/arena-lane.md`).
+#[allow(dead_code)]
+#[cfg(windows)]
+mod arena;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -48,6 +56,8 @@ pub mod pipeline;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) mod picked;
 #[cfg(windows)]
+#[cfg(windows)]
+mod placed;
 mod primitive;
 pub mod query;
 pub mod queue;
@@ -81,6 +91,8 @@ mod writeback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use arena::{title_memory_committed, title_memory_released};
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
