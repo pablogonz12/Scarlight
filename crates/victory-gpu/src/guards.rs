@@ -40,7 +40,7 @@ fn shards() -> usize {
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(16);
-        n.next_power_of_two().clamp(1, MAX_SHARDS)
+        n.clamp(1, MAX_SHARDS).next_power_of_two()
     })
 }
 
@@ -78,6 +78,27 @@ impl Iterator for Runs {
         let run = (shard(self.cur, self.n), self.cur, to);
         self.cur = to;
         Some(run)
+    }
+}
+
+/// The shards of a range held for writing, in ascending order: a change to a
+/// range's marks is one step, so no query sees half of it.
+struct Writing(Vec<(usize, RwLockWriteGuard<'static, Guards>)>);
+
+impl Writing {
+    fn of_range(first: usize, last: usize) -> Self {
+        let mut mask = Mask(0);
+        for (s, _, _) in Runs::new(first, last) {
+            mask.0 |= 1u128 << s;
+        }
+        let mut v = Vec::with_capacity(mask.0.count_ones() as usize);
+        mask.for_each(|s| v.push((s, slot(s))));
+        Self(v)
+    }
+
+    fn at(&mut self, s: usize) -> &mut Guards {
+        let i = self.0.binary_search_by_key(&s, |&(s, _)| s).expect("held");
+        &mut self.0[i].1
     }
 }
 
@@ -217,36 +238,50 @@ pub(crate) fn holds(at: usize) -> (bool, bool) {
     (g.protected.contains(&block), g.absent.contains(&block))
 }
 
+/// The shards of the range read-locked together, in ascending order: a range
+/// that spans several sees one state, never half of it.
+fn shared(first: usize, last: usize) -> Vec<(usize, RwLockReadGuard<'static, Guards>)> {
+    let mut mask = Mask(0);
+    for (s, _, _) in Runs::new(first, last) {
+        mask.0 |= 1u128 << s;
+    }
+    let mut held = Vec::with_capacity(mask.0.count_ones() as usize);
+    mask.for_each(|s| held.push((s, reading(s))));
+    held
+}
+
+/// One stripe's blocks under its one read lock, without building anything.
+fn one_stripe(first: usize, last: usize) -> Option<RwLockReadGuard<'static, Guards>> {
+    (first / STRIPE == (last - 1) / STRIPE).then(|| reading(shard(first, shards())))
+}
+
 /// Whether any block of `[first, last)` is read-only by our hand.
 pub(crate) fn any_protected(first: usize, last: usize) -> bool {
     if first >= last {
         return false;
     }
-    Runs::new(first, last).any(|(s, lo, hi)| reading(s).protected.range(lo..hi).next().is_some())
+    if let Some(g) = one_stripe(first, last) {
+        return g.protected.range(first..last).next().is_some();
+    }
+    let held = shared(first, last);
+    Runs::new(first, last).any(|(s, lo, hi)| {
+        let i = held.binary_search_by_key(&s, |&(s, _)| s).expect("held");
+        held[i].1.protected.range(lo..hi).next().is_some()
+    })
 }
 
-/// Whether every block of `[at, at + len)`'s range is known there: asked
-/// under one hold of their shards, so a range being unmapped meanwhile is
-/// never taken for one wholly there.
+/// Whether every block of `[first, last)` is known there: asked under one
+/// hold of their shards, so a range being unmapped meanwhile is never taken
+/// for one wholly there.
 pub(crate) fn all_mapped(first: usize, last: usize) -> bool {
     if first >= last {
         return false;
     }
-    let runs: Vec<(usize, usize, usize)> = Runs::new(first, last).collect();
-    if let [(s, lo, hi)] = runs[..] {
-        // One shard (a copy's block, most askings): one read lock.
-        let g = reading(s);
-        return (lo..hi).all(|block| g.mapped.contains(&block));
+    if let Some(g) = one_stripe(first, last) {
+        return (first..last).all(|block| g.mapped.contains(&block));
     }
-    // Several, held together and in ascending shard order: a range being
-    // unmapped meanwhile is not taken for one wholly there.
-    let mut mask = Mask(0);
-    for &(s, _, _) in &runs {
-        mask.0 |= 1u128 << s;
-    }
-    let mut held: Vec<(usize, RwLockReadGuard<'static, Guards>)> = Vec::new();
-    mask.for_each(|s| held.push((s, reading(s))));
-    runs.iter().all(|&(s, lo, hi)| {
+    let held = shared(first, last);
+    Runs::new(first, last).all(|(s, lo, hi)| {
         let i = held.binary_search_by_key(&s, |&(s, _)| s).expect("held");
         (lo..hi).all(|block| held[i].1.mapped.contains(&block))
     })
@@ -254,8 +289,12 @@ pub(crate) fn all_mapped(first: usize, last: usize) -> bool {
 
 /// A copy took all of `[first, last)`: every block of it is there.
 pub(crate) fn mark_mapped(first: usize, last: usize) {
+    if first >= last {
+        return;
+    }
+    let mut w = Writing::of_range(first, last);
     for (s, lo, hi) in Runs::new(first, last) {
-        slot(s).mapped.extend(lo..hi);
+        w.at(s).mapped.extend(lo..hi);
     }
 }
 
@@ -266,8 +305,9 @@ pub(crate) fn remapped(at: usize, len: usize) {
     if first >= last {
         return;
     }
+    let mut w = Writing::of_range(first, last);
     for (s, lo, hi) in Runs::new(first, last) {
-        let mut g = slot(s);
+        let g = w.at(s);
         let absent: Vec<usize> = g.absent.range(lo..hi).copied().collect();
         for block in absent {
             g.absent.remove(&block);
@@ -300,10 +340,11 @@ pub(crate) fn opened(blocks: &[usize]) {
 pub(crate) fn reguard(first: usize, last: usize) -> Vec<usize> {
     let alias = aliases();
     let mut written = Vec::new();
+    // One answer covers a whole uncommitted region, across stripes.
+    let mut uncommitted_until = first;
     for (s, lo, hi) in Runs::new(first, last) {
         let mut g = slot(s);
         let g = &mut *g;
-        let mut uncommitted_until = lo;
         for (from, to) in g.clean.uncovered(lo, hi) {
             let mut run = None;
             for block in from..to {
@@ -403,23 +444,45 @@ pub(crate) fn uncommitted_end(block: usize) -> usize {
 }
 
 /// Gives write access back to the guarded blocks of `[start, end)` and notes
-/// them written; true if any was guarded.
+/// them written; true if any was guarded. The destination answers of the
+/// blocks opened go: they are writable again by our hand.
 pub(crate) fn open(start: usize, end: usize) -> bool {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     if first >= last {
         return false;
     }
-    let mut opened = false;
+    let mut w = Writing::of_range(first, last);
+    let mut span: Option<(usize, usize)> = None;
     for (s, lo, hi) in Runs::new(first, last) {
-        if open_in(&mut slot(s), lo, hi).0 {
-            opened = true;
+        if let Some((from, to)) = open_in(w.at(s), lo, hi) {
+            span = Some(match span {
+                Some((f, t)) => (f.min(from), t.max(to)),
+                None => (from, to),
+            });
         }
     }
-    opened
+    let Some((from, to)) = span else {
+        return false;
+    };
+    crate::watch::forget(from * BLOCK, (to - from) * BLOCK);
+    true
 }
 
-/// [`open`] of one shard's run: the blocks opened, and whether any was.
-fn open_in(g: &mut Guards, lo: usize, hi: usize) -> (bool, Option<(usize, usize)>) {
+/// The block of `at` opened as [`open`] does, or whether something else may
+/// write it (`foreign`, asked under the same hold of its shard): the two
+/// answers cannot disagree with a copy guarding the block meanwhile.
+pub(crate) fn open_block(at: usize, foreign: impl FnOnce() -> bool) -> bool {
+    let block = at / BLOCK;
+    let mut g = slot(shard(block, shards()));
+    if open_in(&mut g, block, block + 1).is_some() {
+        crate::watch::forget(block * BLOCK, BLOCK);
+        return true;
+    }
+    foreign()
+}
+
+/// [`open`] of one shard's run: the blocks opened, first and end.
+fn open_in(g: &mut Guards, lo: usize, hi: usize) -> Option<(usize, usize)> {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let blocks: Vec<usize> = g.protected.range(lo..hi).copied().collect();
     for &block in &blocks {
@@ -431,18 +494,13 @@ fn open_in(g: &mut Guards, lo: usize, hi: usize) -> (bool, Option<(usize, usize)
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
-    let first = blocks.first().copied();
-    let last = blocks.last().copied();
-    let range = first.zip(last).map(|(first, last)| (first, last + 1));
-    (!blocks.is_empty(), range)
+    blocks.first().zip(blocks.last()).map(|(a, b)| (*a, b + 1))
 }
 
 /// [`open`] of blocks within one shard's run, forgetting the destination
-/// answers for the range they cover.
+/// answers of the span they cover (a copy's guard given back).
 fn open_blocks(g: &mut Guards, lo: usize, hi: usize) {
-    let (any, range) = open_in(g, lo, hi);
-    if any && let Some((from, to)) = range {
-        // Writable again by our hand.
+    if let Some((from, to)) = open_in(g, lo, hi) {
         crate::watch::forget(from * BLOCK, (to - from) * BLOCK);
     }
 }
@@ -453,16 +511,17 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    /// Two block numbers of different shards, with the count in use.
-    fn two_shards() -> Option<(usize, usize)> {
-        (shards() > 1).then_some((16, 16 + STRIPE))
+    /// Two block numbers of different shards from `base`, if there is more
+    /// than one shard.
+    fn two_shards(base: usize) -> Option<(usize, usize)> {
+        (shards() > 1).then_some((base, base + STRIPE))
     }
 
     /// The read path a copy takes ([`all_mapped`]) and the write path a
     /// fault or a remap takes ([`remapped`]) as a range's blocks change.
     #[test]
     fn marks_of_one_shard_are_seen_in_another() {
-        let Some((a, b)) = two_shards() else {
+        let Some((a, b)) = two_shards(4_000_000) else {
             panic!("sharding off (VICTORY_GUARD_SHARDS=1): every guard waits for every other");
         };
         mark_mapped(a, a + 1);
@@ -481,7 +540,7 @@ mod tests {
     /// fails the test instead of hanging the suite.
     #[test]
     fn a_held_shard_does_not_stop_another() {
-        let Some((a, b)) = two_shards() else {
+        let Some((a, b)) = two_shards(6_000_000) else {
             panic!("sharding off (VICTORY_GUARD_SHARDS=1): every guard waits for every other");
         };
         let (holding, held) = mpsc::channel();
@@ -531,7 +590,7 @@ mod tests {
         for t in 0..8 {
             let tx = tx.clone();
             std::thread::spawn(move || {
-                let base = 1_000 + t * 4 * STRIPE;
+                let base = 1_000_000 + t * 8 * STRIPE;
                 for i in 0..2_000 {
                     let block = base + i % (4 * STRIPE);
                     let _ = all_mapped(block, block + 1);
@@ -584,32 +643,34 @@ mod tests {
     }
 
     /// What a guard costs: the read path a copy takes ([`all_mapped`], one
-    /// block) and the write path a remap or fault takes ([`remapped`], one
-    /// block), alone and on eight threads of their own blocks.
+    /// block) and the write path a remap or a fault takes ([`remapped`], one
+    /// block), alone and on eight threads of blocks of their own.
     /// `VICTORY_GUARD_SHARDS=1` measures the single lock.
     #[test]
     fn guard_acquisition_cost_alone_and_on_eight_threads() {
         const OPS: usize = 100_000;
+        const READS: usize = 8_000_000;
+        const WRITES: usize = 16_000_000;
         let n = shards();
-        let read = |i: usize| {
-            let block = 1_000_000 + i % (1 << 20);
+        let read = |t: usize, i: usize| {
+            let block = READS + t * (1 << 20) + i;
             let _ = all_mapped(block, block + 1);
         };
-        let write = |i: usize| remapped((2_000_000 + i % (1 << 20)) * BLOCK, BLOCK);
-        let alone = |f: &dyn Fn(usize)| {
+        let write = |t: usize, i: usize| remapped((WRITES + t * (1 << 20) + i) * BLOCK, BLOCK);
+        let alone = |f: &dyn Fn(usize, usize)| {
             let started = Instant::now();
             for i in 0..OPS {
-                f(i);
+                f(0, i);
             }
             started.elapsed().as_nanos() as f64 / OPS as f64
         };
-        let eight = |f: &(dyn Fn(usize) + Sync)| {
+        let eight = |f: &(dyn Fn(usize, usize) + Sync)| {
             let started = Instant::now();
             std::thread::scope(|s| {
                 for t in 0..8 {
                     s.spawn(move || {
                         for i in 0..OPS / 8 {
-                            f(t * (1 << 20) + i);
+                            f(t, i);
                         }
                     });
                 }

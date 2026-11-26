@@ -1141,12 +1141,11 @@ fn install() {
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
-        if crate::guards::open(at, at + 1) {
+        // Both answers under the block's one shard lock: another thread
+        // cannot open it and a copy guard it again between them.
+        if crate::guards::open_block(at, || writable_now(at)) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        if writable_now(at) {
             EXCEPTION_CONTINUE_EXECUTION
         } else {
             // Not a block we hold and not memory the title may write: say who
