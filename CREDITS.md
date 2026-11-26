@@ -28,6 +28,15 @@ wrothgaril, Yaekai.
 
 andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VIctory #2614), BlueKaiman, kais7654, pushkarreddyy, shh.
 
+## Ports of fork pull requests
+
+Code reimplemented here from a fork's pull request, because the fork's tree had diverged from ours;
+the design and the author are credited in the commit's `Co-authored-by:` and here.
+
+- **Marvisak/VIctory #2401** (Mumogg) — the Wine `ExitProcess` hook that makes a host driver
+  compiler crash cost one pipeline instead of the run ([`pipeline/wine.rs`](crates/victory-gpu/src/pipeline/wine.rs)),
+  adapted to our pipeline workers and library.
+
 ## Design notes
 
 - **fuzeofficial** ([Marvisak/VIctory #2608](https://github.com/Marvisak/VIctory/pull/2608)), GPL-3.0: the
@@ -157,6 +166,12 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   corners put it. This tree's geometry stage (`emit::rect_list_gs`) already finds the corner in any order; the
   rule is now in the CPU expansion too (`right_angle`, `right_corners` in `crates/victory-gpu/src/primitive.rs`).
 
+- **fxceless/victory-fork [PR #980](https://github.com/fxceless/victory-fork/pull/980)** (fxceless), GPL-3.0:
+  the arena, the layer a resident stands on: a title region opened as a D3D12 heap and a buffer placed over it, so
+  the GPU reads and writes the title's own memory (`crates/victory-gpu/src/arena.rs`, `VICTORY_ARENA=1`, off by
+  default). The part grid, the region registry, the budget and the canary are reimplemented on this tree's
+  `inplace`; the canary here proves each part **both ways** with our own `Rig` (#188), which the fork's tests do not.
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
@@ -182,3 +197,11 @@ Missing or wrong name? Open an issue.
   (after fxceless/victory-fork [c36971b2](https://github.com/fxceless/victory-fork/commit/c36971b2)), GPL-3.0:
   `VICTORY_CARD_BUFFERS_MIN_KB`, so that title buffers' copies under the MiB floor can go into the card's memory
   (unset: the floor of before) (`crates/victory-gpu/src/shadow.rs`).
+- **Belobug/VIctory-Belobug-AMD [4d291d4](https://github.com/Belobug/VIctory-Belobug-AMD/commit/4d291d4)**
+  (davutsimsekk) via **Yoshi-233**, GPL-3.0: operandless VOP1 (`v_nop`, `v_pipeflush`, `v_clrexcp`) ignores its
+  source field, so a marker byte there is not an extra dword and no longer swallows the next instruction, and the
+  VOP3 encoding of `v_cmpx*` writes EXEC rather than its VDST, for both wave sizes
+  (`crates/victory-shader/src/gfx10/{mod.rs,fields.rs}`).
+- **Yoshi-233 [coolfox/main PR #7](https://github.com/Yoshi-233), from fxceless/victory-fork [9bf4a0f](https://github.com/fxceless/victory-fork/commit/9bf4a0f)**,
+  GPL-3.0: the RGB dump decodes the packed 16-bit BGR targets (B5G6R5, B5G5R5A1, B4G4R4A4, host formats 85, 86,
+  115) and keeps padded rows aligned (diagnostics only) (`crates/victory-gpu/src/capture.rs`).
