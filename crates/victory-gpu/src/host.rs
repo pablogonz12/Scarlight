@@ -59,6 +59,10 @@ pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
+    /// The copy queue a texture's first upload runs on (`crate::texture::
+    /// ahead`, `VICTORY_UPLOAD_AHEAD`) and its fence; `None` when the device
+    /// would not make one, and then such uploads are the list's, as before.
+    copy: Option<(ID3D12CommandQueue, ID3D12Fence)>,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     event: HANDLE,
@@ -712,6 +716,27 @@ fn create() -> windows::core::Result<Host> {
             ..Default::default()
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+        // The queue family a texture's first upload runs in, beside the
+        // drawing queue (`VICTORY_UPLOAD_AHEAD`): copies there run while this
+        // thread prepares the frame. A device that will not make one leaves
+        // the uploads on the lists.
+        let copy = match device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+            Type: D3D12_COMMAND_LIST_TYPE_COPY,
+            ..Default::default()
+        }) {
+            Ok(queue) => match device.CreateFence(0, D3D12_FENCE_FLAG_NONE) {
+                Ok(fence) => Some((queue, fence)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no fence for the copy queue");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "no copy queue: texture uploads stay on the lists");
+                None
+            }
+        };
+        tracing::info!(copy = copy.is_some(), "host queues (drawing, copy)");
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -742,6 +767,7 @@ fn create() -> windows::core::Result<Host> {
             device,
             queue,
             fence,
+            copy,
             submitted: Mutex::new(0),
             event,
             rtvs,
@@ -1887,7 +1913,7 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
-    uploads: Vec<ID3D12Resource>,
+    uploads: Vec<crate::upload_pool::Entry>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
     /// Host objects the list's commands name (pipelines, root signatures,
@@ -1903,6 +1929,9 @@ struct Deferred {
     /// memory (host copy, address, bytes): declaring them again would
     /// change nothing.
     gpu_written: crate::declareonce::Written,
+    /// Scratch memory [`HostList::fill_scratch`] fills since the list last
+    /// wrote title memory (source, bytes): its host address.
+    filled: crate::scratchfill::Filled,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -1941,15 +1970,16 @@ impl Deferred {
     fn title_written(&mut self) {
         self.refreshed.clear();
         self.gpu_written.forget();
+        self.filled.forget();
     }
 
-    /// Holds `buffer` (`size` bytes of upload memory) until the list is
+    /// Holds `entry` (an upload buffer of its class size) until the list is
     /// reset.
-    fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
+    fn hold_upload(&mut self, entry: crate::upload_pool::Entry) {
         ALIVE[6].fetch_add(1, Ordering::Relaxed);
-        ALIVE[7].fetch_add(size, Ordering::Relaxed);
-        self.upload_bytes += size;
-        self.uploads.push(buffer);
+        ALIVE[7].fetch_add(entry.bytes(), Ordering::Relaxed);
+        self.upload_bytes += entry.bytes();
+        self.uploads.push(entry);
     }
 }
 
@@ -1957,6 +1987,12 @@ impl Drop for Deferred {
     fn drop(&mut self) {
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        // The buffers go back to the pool through `retire`: kept while any
+        // submission in the air could still read them, and only then kept
+        // for the next copy (crate::upload_pool).
+        if !self.uploads.is_empty() {
+            retire(std::mem::take(&mut self.uploads));
+        }
     }
 }
 
@@ -3187,6 +3223,56 @@ impl Host {
             tracing::info!(supported, "host depth bounds support");
             supported
         })
+    }
+
+    /// Runs a closed list of ours on the drawing queue and waits for it: the
+    /// list-path side of the upload microbench (`crate::texture::ahead`).
+    #[cfg(test)]
+    pub(crate) fn run_raw(&self, list: &ID3D12CommandList) -> bool {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        *submitted += 1;
+        let value = *submitted;
+        // SAFETY: a closed list of ours; the fence and event are the host's.
+        match unsafe {
+            self.queue.ExecuteCommandLists(&[Some(list.clone())]);
+            self.queue
+                .Signal(&self.fence, value)
+                .and_then(|()| self.fence.SetEventOnCompletion(value, self.event))
+        } {
+            Ok(()) => {
+                // SAFETY: a plain wait on our event.
+                unsafe { WaitForSingleObject(self.event, INFINITE) };
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "the drawing queue would not run a list");
+                false
+            }
+        }
+    }
+
+    /// The copy queue made beside the drawing one, and its fence: where a
+    /// texture's first upload runs ahead of the frame (`crate::texture::
+    /// ahead`, `VICTORY_UPLOAD_AHEAD`).
+    pub(crate) fn copy_queue(&self) -> Option<(&ID3D12CommandQueue, &ID3D12Fence)> {
+        self.copy.as_ref().map(|(queue, fence)| (queue, fence))
+    }
+
+    /// The drawing queue waits on the copy queue's `value`: what a submission
+    /// samples after an upload ahead is there when its lists run
+    /// (`VICTORY_SHOW_AFTER`).
+    pub(crate) fn wait_copy(&self, value: u64) -> bool {
+        let Some((_, fence)) = self.copy.as_ref() else {
+            return false;
+        };
+        // SAFETY: our queues and fence; the copy queue signals `value`.
+        match unsafe { self.queue.Wait(fence, value) } {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, value, "the drawing queue will not wait for the copy queue");
+                false
+            }
+        }
     }
 
     /// A new list, open for recording.
@@ -4440,6 +4526,11 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // A texture's first upload may have been started ahead, on the copy
+        // queue (`VICTORY_UPLOAD_AHEAD`): this submission's lists see it only
+        // once the copies have run (`VICTORY_SHOW_AFTER`,
+        // `crate::texture::ahead`).
+        crate::texture::ahead::synchronise();
         crate::watch::ask_once_end();
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
@@ -5685,6 +5776,23 @@ impl HostList {
             .push(Step::Fill(dst as usize, src as usize, len));
     }
 
+    /// The host address of `len` bytes of scratch memory that hold the title
+    /// memory at `src` as of the list's submission: one fill for every ask
+    /// until the list next writes title memory.
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let once = crate::scratchfill::on();
+        let key = (src as usize, len as usize);
+        if once && let Some(known) = self.deferred().filled.known(key) {
+            return Some(known);
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, src, len as usize);
+        if once {
+            self.deferred().filled.note(key, gpu);
+        }
+        Some(gpu)
+    }
+
     /// Brings `[address, address + len)` of a buffer's host copy up to date
     /// when the list is submitted (once per range until a title copy
     /// intervenes), keeping the copy alive until the list is reset.
@@ -5755,13 +5863,18 @@ impl HostList {
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// reset: kept by its size class and reused by the next copy that asks
+    /// for it ([`crate::upload_pool`], `VICTORY_UPLOAD_POOL=0` off).
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().hold_upload(buffer.clone(), size);
+        let entry = crate::upload_pool::take(size, |class| {
+            let (buffer, data) = host.upload_buffer(class)?;
+            name(&buffer, || format!("list upload {class:#x}"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            Some((buffer, data, gpu))
+        })?;
+        let (buffer, data) = (entry.resource(), entry.data());
+        self.deferred().hold_upload(entry);
         Some((buffer, data))
     }
 
@@ -5772,11 +5885,15 @@ impl HostList {
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
-            name(&buffer, || format!("list scratch {len:#x}"));
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            self.deferred().hold_upload(buffer, len);
+            let entry = crate::upload_pool::take(len, |class| {
+                let (buffer, data) = host.upload_buffer(class)?;
+                name(&buffer, || format!("list scratch {class:#x}"));
+                // SAFETY: a live buffer.
+                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                Some((buffer, data, gpu))
+            })?;
+            let (gpu, data) = (entry.gpu(), entry.data());
+            self.deferred().hold_upload(entry);
             return Some((gpu, data));
         }
         // The chunk in use while `len` fits in what is left of it, else the
@@ -5881,6 +5998,24 @@ impl HostList {
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
         self.deferred().textures.insert(key)
+    }
+
+    /// Whether a step this list has recorded writes part of
+    /// `[start, start + len)` of title memory when the list is submitted: an
+    /// upload of that memory started ahead of the submission would copy the
+    /// bytes such a step replaces (the list's own upload runs after it).
+    pub(crate) fn writes_title(&self, start: usize, len: usize) -> bool {
+        let end = start.saturating_add(len);
+        let overlaps = |dst: usize, n: usize| dst < end && start < dst.saturating_add(n);
+        let deferred = self.deferred();
+        deferred
+            .copies
+            .iter()
+            .any(|step| matches!(step, Step::Copy(dst, _, n) if overlaps(*dst, *n)))
+            || deferred
+                .writes
+                .iter()
+                .any(|&(dst, _, n)| overlaps(dst, n))
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
