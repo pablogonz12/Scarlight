@@ -116,7 +116,8 @@ pub fn program(image: &[u8]) -> Result<NativeProgram, ShaderError> {
     let (size_xy, size_z, rsrc1, rsrc2) = (word(3), word(4), word(5), word(6));
     let wave64 = size_z >> 16 & FLAG_WAVE32 == 0;
     let threads = [size_xy & 0xFFFF, size_xy >> 16, size_z & 0xFFFF];
-    if threads.contains(&0) || threads.iter().product::<u32>() > 1024 {
+    // A wider product: [32768, 32768, 4] wraps to 0 in `u32` and would pass.
+    if threads.contains(&0) || threads.iter().map(|&t| u64::from(t)).product::<u64>() > 1024 {
         return Err(Malformed("implausible FSPX thread-group size"));
     }
     // COMPUTE_PGM_RSRC1 bits 0-5: VGPR granules less one, of 4 VGPRs in
@@ -298,6 +299,23 @@ mod tests {
         out.extend(dir);
         out.extend(body);
         out
+    }
+
+    /// A thread-group product that wraps to zero in `u32` must be refused,
+    /// not accepted as a group of no threads (32768 x 32768 x 4).
+    #[test]
+    fn an_overflowing_thread_group_is_refused() {
+        let mut img = image();
+        // The config section is the first body section, 16 bytes of header
+        // and one 16-byte directory entry each before it.
+        for (dword, value) in [(3, 0x8000_8000u32), (4, 0x10_0004)] {
+            let at = 64 + 4 * dword;
+            img[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        assert!(matches!(
+            program(&img),
+            Err(ShaderError::Malformed("implausible FSPX thread-group size"))
+        ));
     }
 
     #[test]

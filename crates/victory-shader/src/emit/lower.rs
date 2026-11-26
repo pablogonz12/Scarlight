@@ -8592,8 +8592,11 @@ impl<'a> Lower<'a> {
             return Err("an image access with tfe or lwe");
         }
         let name = inst.name();
-        // A load or sample with no channel enabled returns the first.
-        let dmask = if *dmask == 0 { &1 } else { dmask };
+        // A load or sample with no channel enabled returns the first; a store
+        // or atomic with no channel is a mask the console does not have, so
+        // each is refused below.
+        let reading = !name.contains("_store") && !name.contains("_atomic");
+        let dmask = if *dmask == 0 && reading { &1 } else { dmask };
         let site = (b, i);
         let guard = self.guard(b, i)?;
         let c = self.cur;
