@@ -5860,8 +5860,14 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 /// wherever it can be, not dropped whole for one hole.
 fn write_regions(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
+        PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
     };
+    // No mapping changes under the queries and the fallback writes: a region
+    // found there stays there (see `crate::watch::title_memory_reading`). Not
+    // taken when a remap is under way or a caller holds it: the copy still
+    // runs, page by page.
+    let _mapped = crate::watch::title_memory_reading_now();
     let mut offset = 0;
     while offset < len {
         let to = dst.wrapping_add(offset);
@@ -5876,9 +5882,16 @@ fn write_regions(dst: *mut u8, src: *const u8, len: usize) {
         if size != size_of_val(&info) || n == 0 {
             break;
         }
+        // A destination page this writes to must take the write: a committed
+        // read-only or execute-only page is left alone, as an unmapped one is
+        // (a write there is an access violation, and `read_pieces` leaves no
+        // zeros in it either).
         let there = info.State == MEM_COMMIT
             && (info.Protect & PAGE_GUARD) == 0
-            && (info.Protect & 0xff) != PAGE_NOACCESS;
+            && matches!(
+                info.Protect & 0xff,
+                PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+            );
         if there {
             let from = src.wrapping_add(offset);
             if !read(from, to, n, true) {
