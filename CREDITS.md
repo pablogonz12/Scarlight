@@ -52,6 +52,9 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
 - **xcl** ([ivall/xcl](https://github.com/ivall/xcl) and its fork Bathyal), GPL-2.0-only: the
   wave-pairing approach and the NVIDIA wave lane-assignment report used in
   [docs/wave64-on-wave32.md](docs/wave64-on-wave32.md). No code taken.
+- **ESAT** ([Marvisak/VIctory#2472](https://github.com/Marvisak/VIctory/pull/2472)), GPL-3.0: hoisting
+  indirect argument clamps into the list's submission prelude as one batched compute pass
+  (`crates/victory-gpu/src/indirect.rs`, `draw.rs`, `host.rs`), adopted from that PR.
 - **JMAN730/victory** ([project-flamingo#672](https://github.com/JMAN730/project-flamingo/pull/672)),
   GPL-3.0: narrowing a host shader resource view of a streamed texture to the mips whose memory is
   there, and remaking it when more levels arrive or a host copy fills the chain

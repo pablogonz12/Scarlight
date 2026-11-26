@@ -16,14 +16,25 @@
 //! run empty, saturating without 32-bit wraparound so a list of thousands of
 //! garbage records cannot run for seconds either.
 //!
+//! The budget is device-local memory: D3D12 refuses an unordered access view
+//! on host-visible memory (a real driver faults on it, WARP and CI's runner
+//! included), and the batched clamp passes write these words once per draw,
+//! which across PCIe on a discrete card is slow. Each list's prelude copies
+//! zeroes over them on the card at each submission, and a small list behind
+//! the submission copies them into readback memory: the CPU reads what a
+//! submission left once that submission has been waited for, a submission
+//! late, and nothing needs them sooner (they count what the clamp noted, for
+//! the frame line). The words of a submission sent ahead
+//! (`VICTORY_LATE_WAIT`) are not read at all.
+//!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension and 2^20 per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::core::{Interface, PCSTR, s};
 
-use crate::dxc::compile;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
@@ -145,6 +156,176 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+const BATCH_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+cbuffer Batch : register(b0) { uint first_job; uint job_count; uint unused0; uint unused1; };
+// Packed 32-byte job descriptors:
+//   j0 = uint4(kind, stride, records, src_offset)
+//   j1 = uint4(dst_offset, 0, 0, 0)
+ByteAddressBuffer jobs : register(t0);
+ByteAddressBuffer src_args : register(t1);
+RWByteAddressBuffer dst_args : register(u0);
+RWByteAddressBuffer budget : register(u1);
+static const uint BUDGET = 1u << 27;
+static const uint GROUPS = 1u << 20;
+static const uint PAST = 0xffffffffu;
+groupshared uint costs[64];
+groupshared uint single_run;
+
+uint compute_clamped(uint kind, uint src_at, out uint2 draw_counts, out uint3 groups) {
+    draw_counts = uint2(0, 0);
+    groups = uint3(0, 0, 0);
+    [branch]
+    if (kind <= 1) {
+        uint count = min(src_args.Load(src_at), 1u << 24);
+        uint instances = min(src_args.Load(src_at + 4), (1u << 26) / max(count, 1u));
+        draw_counts = uint2(count, instances);
+        return count * instances;
+    } else if (kind == 2) {
+        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+        if (g.z != 0) {
+            if (g.x * g.y > GROUPS / max(g.z, 1u)) {
+                g = uint3(0, 0, 0);
+            }
+        }
+        groups = g;
+        return g.x * g.y * g.z * 64u;
+    } else {
+        uint3 g = src_args.Load3(src_at);
+        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        groups = g;
+        return g.x * g.y * g.z * 128u;
+    }
+}
+
+// A record the budget cannot pay for runs empty, every count word of it
+// zeroed: the words the per-record clamp zeroes (`SOURCE`), so a hoisted
+// record and an inline-clamped one come out the same.
+void write_record(uint kind, uint stride, uint src_at, uint dst_at, bool over, uint2 draw_counts, uint3 groups) {
+    if (kind <= 1) {
+        if (over) {
+            draw_counts = uint2(0, 0);
+        }
+        dst_args.Store2(dst_at, draw_counts);
+        for (uint off = 8; off < stride; off += 4) {
+            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        }
+    } else {
+        if (over) {
+            groups = uint3(0, 0, 0);
+        }
+        dst_args.Store3(dst_at, groups);
+        for (uint off = 12; off < stride; off += 4) {
+            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        }
+    }
+}
+
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint lane : SV_GroupIndex) {
+    uint left = 0;
+    if (lane == 0) {
+        left = BUDGET - min(budget.Load(0), BUDGET);
+    }
+    uint j = first_job;
+    uint end = first_job + job_count;
+    while (j < end) {
+        // Fast path: clamp up to 64 consecutive single-record jobs in one wave.
+        // Guard root-SRV loads with `[branch]` so inactive tail lanes never
+        // load past the end of `jobs` (root descriptors have no HW bounds check).
+        uint4 j0 = uint4(0, 0, 0, 0);
+        uint4 j1 = uint4(0, 0, 0, 0);
+        [branch]
+        if (j + lane < end) {
+            j0 = jobs.Load4((j + lane) * 32);
+            j1 = jobs.Load4((j + lane) * 32 + 16);
+        }
+        costs[lane] = j0.z;
+        GroupMemoryBarrierWithGroupSync();
+        if (lane == 0) {
+            uint run = 0;
+            // Avoid `&&` here: FXC evaluates both sides, which would read
+            // `costs[64]` past the 64-element groupshared array.
+            [loop]
+            while (run < 64) {
+                if (costs[run] != 1) {
+                    break;
+                }
+                run++;
+            }
+            single_run = run;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        uint run = single_run;
+        if (run > 0) {
+            uint cost = 0;
+            uint2 draw_counts = uint2(0, 0);
+            uint3 groups = uint3(0, 0, 0);
+            [branch]
+            if (lane < run) {
+                cost = compute_clamped(j0.x, j0.w, draw_counts, groups);
+            }
+            costs[lane] = cost;
+            GroupMemoryBarrierWithGroupSync();
+            if (lane == 0) {
+                for (uint i = 0; i < run; i++) {
+                    if (costs[i] > left) {
+                        costs[i] = PAST;
+                        left = 0;
+                    } else {
+                        left -= costs[i];
+                    }
+                }
+            }
+            GroupMemoryBarrierWithGroupSync();
+            [branch]
+            if (lane < run) {
+                write_record(j0.x, j0.y, j0.w, j1.x, costs[lane] == PAST, draw_counts, groups);
+            }
+            j += run;
+        } else {
+            uint4 m0 = jobs.Load4(j * 32);
+            uint4 m1 = jobs.Load4(j * 32 + 16);
+            uint tiles = m0.z / 64 + min(m0.z % 64, 1u);
+            for (uint tile = 0; tile < tiles; tile++) {
+                uint record = tile * 64 + lane;
+                uint src_at = m0.w + record * m0.y;
+                uint dst_at = m1.x + record * m0.y;
+                uint cost = 0;
+                uint2 draw_counts = uint2(0, 0);
+                uint3 groups = uint3(0, 0, 0);
+                [branch]
+                if (record < m0.z) {
+                    cost = compute_clamped(m0.x, src_at, draw_counts, groups);
+                }
+                costs[lane] = cost;
+                GroupMemoryBarrierWithGroupSync();
+                if (lane == 0) {
+                    for (uint i = 0; i < 64; i++) {
+                        if (costs[i] > left) {
+                            costs[i] = PAST;
+                            left = 0;
+                        } else {
+                            left -= costs[i];
+                        }
+                    }
+                }
+                GroupMemoryBarrierWithGroupSync();
+                [branch]
+                if (record < m0.z) {
+                    write_record(m0.x, m0.y, src_at, dst_at, costs[lane] == PAST, draw_counts, groups);
+                }
+            }
+            j += 1;
+        }
+    }
+    if (lane == 0) {
+        budget.Store(0, BUDGET - left);
+    }
+}
+"#;
+
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
@@ -158,7 +339,7 @@ unsafe impl Sync for Clamp {}
 fn clamp() -> Option<&'static Clamp> {
     static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
     CLAMP
-        .get_or_init(|| match make() {
+        .get_or_init(|| match compile(SOURCE, s!("clamp")) {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
@@ -168,14 +349,42 @@ fn clamp() -> Option<&'static Clamp> {
         .as_ref()
 }
 
-fn make() -> windows::core::Result<Clamp> {
-    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    make_for(device)
+fn batch_clamp() -> Option<&'static Clamp> {
+    static BATCH: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    BATCH
+        .get_or_init(|| match compile(BATCH_SOURCE, s!("batch_clamp")) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(error = %e, "no batched argument clamp: falling back to inline");
+                None
+            }
+        })
+        .as_ref()
 }
 
-fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
-    let bytes = compile(SOURCE, "main", "cs_5_1")?;
+fn compile(source: &str, _name: PCSTR) -> windows::core::Result<Clamp> {
+    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+    let bytes = crate::dxc::compile(source, "main", "cs_5_1")?;
     make_clamp(device, &bytes)
+}
+
+/// Whether indirect argument clamps are hoisted into the list's submission
+/// prelude (`VICTORY_HOIST_INDIRECT=0` records the inline clamp before each
+/// draw, as before).
+pub(crate) fn hoisting() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOIST_INDIRECT").is_none_or(|v| v != "0"))
+}
+
+/// Compute passes recorded to clamp indirect arguments: one per draw of the
+/// inline clamp, one per run of jobs of the batched prelude. The dispatch
+/// count the hoisted clamp saves, for its test.
+static CLAMP_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`CLAMP_PASSES`] now.
+#[cfg(test)]
+pub(crate) fn clamp_passes() -> u64 {
+    CLAMP_PASSES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The clamp's root signature and pipeline over compiled `bytes`.
@@ -204,6 +413,342 @@ fn min_stride(kind: u32) -> Option<u32> {
         2 | 10 => Some(12),
         _ => None,
     }
+}
+
+const HOIST_CHUNK: u64 = 256 << 10;
+
+struct Job {
+    src_gpu: u64,
+    dst_gpu: u64,
+}
+
+struct JobUpload {
+    _buffer: ID3D12Resource,
+    mapped: usize,
+    gpu: u64,
+    capacity: usize,
+}
+
+// SAFETY: `mapped` is a persistent upload mapping written only under the
+// list's `HoistedClamps` mutex while the list is open for recording.
+unsafe impl Send for JobUpload {}
+
+/// Indirect argument clamps hoisted from a [`HostList`]'s initial non-writing
+/// prefix into its submission prelude. Each hoisted draw reads the title's
+/// argument buffer through an SRV (never transitioning or mutating it) and
+/// writes clamped records into the list's own scratch chunks, which move
+/// `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT` in the prelude and back
+/// to `COMMON` once at [`Self::end`] (or [`HostList::close`]).
+pub(crate) struct HoistedClamps {
+    hoistable: bool,
+    restored: bool,
+    jobs: Vec<Job>,
+    payload: Vec<[u32; 8]>,
+    upload: Option<JobUpload>,
+    chunks: Vec<ID3D12Resource>,
+    used: usize,
+    at: u64,
+    kept: Vec<ID3D12Resource>,
+}
+
+// SAFETY: D3D12 resources are free-threaded; mutated under the list's mutex.
+unsafe impl Send for HoistedClamps {}
+
+impl Default for HoistedClamps {
+    fn default() -> Self {
+        Self {
+            hoistable: true,
+            restored: false,
+            jobs: Vec::new(),
+            payload: Vec::new(),
+            upload: None,
+            chunks: Vec::new(),
+            used: 0,
+            at: 0,
+            kept: Vec::new(),
+        }
+    }
+}
+
+impl HoistedClamps {
+    pub(crate) fn reset(&mut self) {
+        self.hoistable = true;
+        self.restored = false;
+        self.jobs.clear();
+        self.payload.clear();
+        self.used = 0;
+        self.at = 0;
+        self.kept.clear();
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.jobs.is_empty()
+    }
+
+    fn min_stride(kind: u32) -> Option<u32> {
+        match kind {
+            0 => Some(16),
+            1 => Some(20),
+            2 | 10 => Some(12),
+            _ => None,
+        }
+    }
+
+    fn byte_len(gpu: u64, (kind, stride, records): (u32, u32, u32)) -> Option<u64> {
+        let min = Self::min_stride(kind)?;
+        if records == 0 || stride < min || !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
+            return None;
+        }
+        let len = u64::from(stride).checked_mul(u64::from(records))?;
+        let aligned = len.checked_next_multiple_of(16)?;
+        (aligned <= HOIST_CHUNK).then_some(len)
+    }
+
+    pub(crate) fn can_accept(&self, gpu: u64, spec: (u32, u32, u32)) -> bool {
+        self.hoistable
+            && u32::try_from(self.jobs.len()).is_ok()
+            && batch_clamp().is_some()
+            && Self::byte_len(gpu, spec).is_some()
+    }
+
+    fn keep_once(&mut self, resource: &ID3D12Resource) {
+        let raw = resource.as_raw();
+        if !self.kept.iter().any(|r| r.as_raw() == raw) {
+            self.kept.push(resource.clone());
+        }
+    }
+
+    fn alloc_room(&mut self, bytes: u64) -> Option<(ID3D12Resource, u64)> {
+        let aligned = bytes.next_multiple_of(16);
+        if aligned > HOIST_CHUNK {
+            return None;
+        }
+        if self.used > 0 && self.at + aligned <= HOIST_CHUNK {
+            let at = self.at;
+            self.at += aligned;
+            return Some((self.chunks[self.used - 1].clone(), at));
+        }
+        if self.used == self.chunks.len() {
+            // Device-local: the chunks are written as unordered access and read
+            // as indirect arguments by the card (a host-visible shared heap is
+            // neither, on a real D3D12 driver).
+            let buffer = host()?.uav_buffer(HOIST_CHUNK)?;
+            crate::host::name(&buffer, || "hoisted indirect arguments".into());
+            self.chunks.push(buffer);
+        }
+        let i = self.used;
+        self.used += 1;
+        self.at = aligned;
+        Some((self.chunks[i].clone(), 0))
+    }
+
+    fn ensure_upload(&mut self, needed_jobs: usize) -> bool {
+        if self.upload.as_ref().is_some_and(|u| u.capacity >= needed_jobs) {
+            return true;
+        }
+        let Some(host) = host() else {
+            return false;
+        };
+        let capacity = needed_jobs.next_power_of_two().max(256);
+        let Some(bytes) = (capacity as u64).checked_mul(32) else {
+            return false;
+        };
+        let Some((buffer, data)) = host.upload_buffer(bytes) else {
+            return false;
+        };
+        crate::host::name(&buffer, || format!("hoisted clamp jobs ({capacity})"));
+        // SAFETY: a live upload buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        if self.upload.is_some() && !self.payload.is_empty() {
+            // SAFETY: `data` has room for `capacity >= self.payload.len()` 32-byte jobs.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.payload.as_ptr().cast::<u8>(),
+                    data,
+                    self.payload.len() * 32,
+                );
+            }
+        }
+        self.upload = Some(JobUpload {
+            _buffer: buffer,
+            mapped: data as usize,
+            gpu,
+            capacity,
+        });
+        true
+    }
+
+    pub(crate) fn push(
+        &mut self,
+        src_buf: &ID3D12Resource,
+        gpu: u64,
+        spec: (u32, u32, u32),
+    ) -> Option<(ID3D12Resource, u64)> {
+        if !self.can_accept(gpu, spec) {
+            return None;
+        }
+        let len = Self::byte_len(gpu, spec)?;
+        let slot = self.jobs.len();
+        if !self.ensure_upload(slot + 1) {
+            return None;
+        }
+        let (dst, dst_at) = self.alloc_room(len)?;
+        // SAFETY: live D3D12 buffers.
+        let (buf_gpu, dst_gpu) = unsafe { (src_buf.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+        let (src_gpu, src_offset) = match gpu.checked_sub(buf_gpu) {
+            Some(rel) if rel.checked_add(len).is_some_and(|e| e <= u64::from(u32::MAX)) => (buf_gpu, rel as u32),
+            _ => (gpu, 0),
+        };
+        self.keep_once(src_buf);
+        let (kind, stride, records) = spec;
+        let words = [kind, stride, records, src_offset, dst_at as u32, 0, 0, 0];
+        if let Some(u) = &self.upload {
+            // SAFETY: `ensure_upload(slot + 1)` guarantees `[slot * 32 .. (slot + 1) * 32)`
+            // lies within the persistent mapped upload buffer.
+            unsafe {
+                (u.mapped as *mut [u32; 8]).add(slot).write(words);
+            }
+        }
+        self.payload.push(words);
+        self.jobs.push(Job { src_gpu, dst_gpu });
+        Some((dst, dst_at))
+    }
+
+    /// Ends the hoistable prefix on `list`: transitions every used scratch
+    /// chunk back from `INDIRECT_ARGUMENT` to `COMMON` once, and blocks
+    /// further hoisting on this list until `reset()`.
+    pub(crate) fn end(&mut self, list: &ID3D12GraphicsCommandList) {
+        self.hoistable = false;
+        if self.restored || self.used == 0 {
+            return;
+        }
+        self.restored = true;
+        let barriers: Vec<D3D12_RESOURCE_BARRIER> = self.chunks[..self.used]
+            .iter()
+            .map(|b| {
+                transition(
+                    b,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )
+            })
+            .collect();
+        // SAFETY: an open list and live scratch chunks in `INDIRECT_ARGUMENT`.
+        unsafe { list.ResourceBarrier(&barriers) };
+    }
+
+    /// Records the list's budget renewal into `prelude` (its words start at
+    /// zero on the card each submission, and this prelude runs before the
+    /// list and before its own batched passes) and then the batched hoisted
+    /// clamp pass(es), moving each used scratch chunk
+    /// `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
+    pub(crate) fn record_prelude(
+        &self,
+        prelude: &ID3D12GraphicsCommandList,
+        budget: &crate::host::Budget,
+    ) -> bool {
+        let renew = [
+            transition(
+                &budget.resource,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            ),
+        ];
+        let cleared = [
+            transition(
+                &budget.resource,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            ),
+        ];
+        // SAFETY: an open prelude list; the budget and the zeroed upload
+        // memory are live. The words are zeroed whole: what the last
+        // submission's clamp noted goes into readback memory behind that
+        // submission instead.
+        unsafe {
+            prelude.ResourceBarrier(&renew);
+            prelude.CopyBufferRegion(&budget.resource, 0, &budget.zero, 0, crate::host::BUDGET_BYTES);
+            prelude.ResourceBarrier(&cleared);
+        }
+        if self.jobs.is_empty() || self.used == 0 {
+            return false;
+        }
+        let (Some(c), Some(upload)) = (batch_clamp(), &self.upload) else {
+            return false;
+        };
+        let mut pre = Vec::with_capacity(self.used + 1);
+        // Earlier lists' shader writes (the budget's among them) first.
+        pre.push(uav_barrier_of(None));
+        for chunk in &self.chunks[..self.used] {
+            pre.push(transition(
+                chunk,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            ));
+        }
+        // SAFETY: an open prelude list; root signature, PSO, job buffer,
+        // budget buffer, title source buffers (`kept`) and scratch chunks all
+        // live through the submission.
+        unsafe {
+            prelude.ResourceBarrier(&pre);
+            prelude.SetComputeRootSignature(&c.root);
+            prelude.SetPipelineState(&c.pso);
+            prelude.SetComputeRootShaderResourceView(1, upload.gpu);
+            prelude.SetComputeRootUnorderedAccessView(4, budget.gpu());
+            let mut run_start = 0usize;
+            while run_start < self.jobs.len() {
+                let key = (self.jobs[run_start].src_gpu, self.jobs[run_start].dst_gpu);
+                let mut run_end = run_start + 1;
+                while run_end < self.jobs.len()
+                    && (self.jobs[run_end].src_gpu, self.jobs[run_end].dst_gpu) == key
+                {
+                    run_end += 1;
+                }
+                if run_start > 0 {
+                    // Full UAV barrier between runs: keeps both `budget` and
+                    // adjacent 16-byte-aligned slices of the same scratch
+                    // chunk coherent on wide-cache-line GPUs.
+                    prelude.ResourceBarrier(&[uav_barrier_of(None)]);
+                }
+                let constants = [run_start as u32, (run_end - run_start) as u32, 0, 0];
+                prelude.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+                prelude.SetComputeRootShaderResourceView(2, key.0);
+                prelude.SetComputeRootUnorderedAccessView(3, key.1);
+                CLAMP_PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                prelude.Dispatch(1, 1, 1);
+                run_start = run_end;
+            }
+            let mut post = Vec::with_capacity(self.used + 1);
+            post.push(uav_barrier_of(Some(&budget.resource)));
+            for chunk in &self.chunks[..self.used] {
+                post.push(transition(
+                    chunk,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                ));
+            }
+            prelude.ResourceBarrier(&post);
+        }
+        true
+    }
+}
+
+/// Whether `spec` at `gpu` can be hoisted into `list`'s prelude.
+pub(crate) fn can_hoist(list: &HostList, gpu: u64, spec: (u32, u32, u32)) -> bool {
+    list.hoisted().can_accept(gpu, spec)
+}
+
+/// Queues `spec` at `gpu` in `src_buf` to be clamped in `list`'s prelude into
+/// one of `list`'s own scratch chunks. Returns `(chunk, offset)` ready to be
+/// read in `INDIRECT_ARGUMENT`, or `None` if hoisting is unavailable.
+pub(crate) fn hoist(
+    list: &HostList,
+    src_buf: &ID3D12Resource,
+    gpu: u64,
+    spec: (u32, u32, u32),
+) -> Option<(ID3D12Resource, u64)> {
+    list.budget()?;
+    list.hoisted().push(src_buf, gpu, spec)
 }
 
 /// The record's argument bytes (its payload): the least stride of `kind`.
@@ -381,6 +926,7 @@ fn record_clamp_as(
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
         if records > 0 {
+            CLAMP_PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
             l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
@@ -413,12 +959,19 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+    uav_barrier_of(None)
+}
+
+fn uav_barrier_of(resource: Option<&ID3D12Resource>) -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
             UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                pResource: std::mem::ManuallyDrop::new(None),
+                pResource: std::mem::ManuallyDrop::new(resource.map(|r| {
+                    // SAFETY: a borrowed pointer; the barrier never releases it.
+                    unsafe { std::mem::transmute_copy(r) }
+                })),
             }),
         },
     }
@@ -443,6 +996,27 @@ void main() {
     hits.InterlockedAdd(0, 1, prev);
 }
 "#;
+
+    /// A test's indirect-work budget: device-local, as the layer's is, with
+    /// the zeroed upload memory that clears it on the card and the readback
+    /// memory its words are copied into for the CPU.
+    struct TestBudget {
+        buffer: ID3D12Resource,
+        zero: ID3D12Resource,
+        readback: ID3D12Resource,
+        ptr: *mut u8,
+        gpu: u64,
+    }
+
+    impl TestBudget {
+        /// Word `i` of what the budget held at the copy `budget_read` recorded:
+        /// 0 is the work charged, 1 and 2 what the mesh clamp noted.
+        fn word(&self, i: usize) -> u32 {
+            // SAFETY: mapped readback memory, four words long, after the
+            // submission that copied into it was waited for.
+            unsafe { (self.ptr.cast::<u32>()).add(i).read_volatile() }
+        }
+    }
 
     /// A D3D12 device, queue, allocator, list and fence for one test, on the
     /// adapter `VICTORY_TEST_ADAPTER` picks (WARP, or the card under Wine).
@@ -477,7 +1051,7 @@ void main() {
                     .ok()?;
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
                 let event = CreateEventW(None, false, false, None).ok()?;
-                let clamp = make_for(&device).expect("clamp shader must compile on the test device");
+                let clamp = compile(SOURCE, s!("clamp")).expect("clamp shader must compile on the test device");
                 let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
                 Some(Self {
                     device,
@@ -573,6 +1147,99 @@ void main() {
             buffer.unwrap()
         }
 
+        /// A list's indirect-work budget in a test: device-local, as the
+        /// layer's is (D3D12 refuses a host-visible resource as a UAV), with
+        /// the zeroed upload memory that clears it on the card and the
+        /// readback memory its words are copied into.
+        fn budget(&self) -> TestBudget {
+            let buffer = self.default_uav(256);
+            // The zeroes come from upload memory, as the layer's do: a copy
+            // source the device may read without a state of its own.
+            let zero = self.upload(256);
+            let (readback, ptr, _) = self.shared_buffer(256);
+            // SAFETY: plain creation of a mapping, and a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            TestBudget { buffer, zero, readback, ptr, gpu }
+        }
+
+        /// An upload buffer of `size` zero bytes (mapped, not kept).
+        fn upload(&self, size: u64) -> ID3D12Resource {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_UPLOAD,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size.max(4),
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut buffer: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: plain creation and persistent CPU mapping of an upload
+            // buffer, written once here and read by the card only.
+            unsafe {
+                self.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_GENERIC_READ,
+                        None,
+                        &mut buffer,
+                    )
+                    .unwrap();
+                let made = buffer.as_ref().unwrap();
+                made.Map(0, None, Some(&mut data)).unwrap();
+                std::ptr::write_bytes(data, 0, size as usize);
+            }
+            buffer.unwrap()
+        }
+
+        /// Records the budget's clearing on the card (`zero` holds zeroes).
+        fn budget_zero(&self, list: &ID3D12GraphicsCommandList, budget: &TestBudget) {
+            // SAFETY: an open list; live buffers.
+            unsafe {
+                list.ResourceBarrier(&[transition(
+                    &budget.buffer,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                list.CopyBufferRegion(&budget.buffer, 0, &budget.zero, 0, 256);
+                list.ResourceBarrier(&[transition(
+                    &budget.buffer,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+        }
+
+        /// Records the copy of the budget's words into readback memory, for a
+        /// read after the submission has been waited for.
+        fn budget_read(&self, list: &ID3D12GraphicsCommandList, budget: &TestBudget) {
+            // SAFETY: an open list; live buffers.
+            unsafe {
+                list.ResourceBarrier(&[transition(
+                    &budget.buffer,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                list.CopyBufferRegion(&budget.readback, 0, &budget.buffer, 0, 256);
+                list.ResourceBarrier(&[transition(
+                    &budget.buffer,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+        }
+
         fn signature(&self, kind: u32, stride: u32) -> ID3D12CommandSignature {
             let arg = D3D12_INDIRECT_ARGUMENT_DESC {
                 Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
@@ -613,7 +1280,7 @@ void main() {
     }
 
     fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-        make_clamp(device, &compile(source, "main", "cs_5_1")?)
+        make_clamp(device, &crate::dxc::compile(source, "main", "cs_5_1")?)
     }
 
     /// The compare of copies in the card's memory (`crate::host`), on the
@@ -706,6 +1373,7 @@ void main() {
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
+        let _once = crate::warptest::lock();
         if super::host().is_none() {
             return; // no host GPU here
         }
@@ -760,7 +1428,7 @@ void main() {
         let src_bytes = ARGS_OFFSET + (STRIDE as usize) * (MAX as usize) + 64;
         let (src_buf, src_ptr, _) = harness.shared_buffer(src_bytes as u64);
         let (count_buf, count_ptr, _) = harness.shared_buffer(512);
-        let (_budget_buf, budget_ptr, budget_gpu) = harness.shared_buffer(256);
+        let budget = harness.budget();
         let (_hits_buf, hits_ptr, hits_gpu) = harness.shared_buffer(256);
         let (readback_buf, readback_ptr, _) = harness.shared_buffer((STRIDE * 8) as u64);
         let dst_buf = harness.default_uav(u64::from(STRIDE) * u64::from(MAX));
@@ -813,7 +1481,7 @@ void main() {
         unsafe {
             std::ptr::copy_nonoverlapping(initial_src.as_ptr(), src_ptr, src_bytes);
             std::ptr::copy_nonoverlapping(initial_count.as_ptr(), count_ptr, 512);
-            (budget_ptr as *mut u32).write_volatile(0);
+            harness.budget_zero(&harness.list, &budget);
             (hits_ptr as *mut u32).write_volatile(0);
             std::ptr::write_bytes(readback_ptr, 0, (STRIDE * 8) as usize);
         }
@@ -825,7 +1493,7 @@ void main() {
             &harness.clamp,
             &harness.list,
             &dst_buf,
-            budget_gpu,
+            budget.gpu,
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_1 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
@@ -870,7 +1538,7 @@ void main() {
             &harness.clamp,
             &harness.list,
             &dst_buf,
-            budget_gpu,
+            budget.gpu,
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_2 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
@@ -890,13 +1558,14 @@ void main() {
             );
         }
         done_on(&harness.list, &dst_buf);
+        harness.budget_read(&harness.list, &budget);
 
         harness.submit_and_wait();
 
         // SAFETY: GPU execution finished; read mapped host results.
         let (hits, spent, after_src, after_count, clamped_words) = unsafe {
             let hits = (hits_ptr as *const u32).read_volatile();
-            let spent = (budget_ptr as *const u32).read_volatile();
+            let spent = budget.word(0);
             let after_src = std::slice::from_raw_parts(src_ptr.cast_const(), src_bytes).to_vec();
             let after_count = std::slice::from_raw_parts(count_ptr.cast_const(), 512).to_vec();
             let words = std::slice::from_raw_parts(
@@ -976,21 +1645,21 @@ void main() {
         }
         for ahead in [true, false] {
             let (src_buf, src_ptr, _) = harness.shared_buffer(total as u64);
-            let (_budget_buf, budget_ptr, budget_gpu) = harness.shared_buffer(256);
+            let budget = harness.budget();
             let (readback_buf, readback_ptr, _) = harness.shared_buffer(total as u64);
             let dst_buf = harness.default_uav(total as u64);
 
             // SAFETY: mapped buffers of these sizes.
             unsafe {
                 std::ptr::copy_nonoverlapping(src.as_ptr(), src_ptr, total);
-                std::ptr::write_bytes(budget_ptr, 0, 256);
                 std::ptr::write_bytes(readback_ptr, 0, total);
             }
+            harness.budget_zero(&harness.list, &budget);
             assert!(record_clamp_as(
                 &harness.clamp,
                 &harness.list,
                 &dst_buf,
-                budget_gpu,
+                budget.gpu,
                 (&src_buf, 0),
                 None,
                 (KIND_MESH, STRIDE, RECORDS),
@@ -1011,12 +1680,13 @@ void main() {
                     D3D12_RESOURCE_STATE_COMMON,
                 )]);
             }
+            harness.budget_read(&harness.list, &budget);
             harness.submit_and_wait();
             // SAFETY: the work is done; mapped buffers.
             let (spent, largest, out) = unsafe {
                 (
-                    (budget_ptr as *const u32).read_volatile(),
-                    (budget_ptr as *const u32).add(1).read_volatile(),
+                    budget.word(0),
+                    budget.word(1),
                     std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), total / 4).to_vec(),
                 )
             };
@@ -1066,7 +1736,7 @@ void main() {
 
         let total_bytes = (STRIDE * RECORDS) as usize;
         let (src_buf, src_ptr, _) = harness.shared_buffer(total_bytes as u64);
-        let (_budget_buf, budget_ptr, budget_gpu) = harness.shared_buffer(256);
+        let budget = harness.budget();
         let (readback_buf, readback_ptr, _) = harness.shared_buffer(total_bytes as u64);
         let dst_buf = harness.default_uav(total_bytes as u64);
 
@@ -1089,15 +1759,15 @@ void main() {
         // SAFETY: mapped buffers have sufficient capacity.
         unsafe {
             std::ptr::copy_nonoverlapping(initial_src.as_ptr(), src_ptr, total_bytes);
-            (budget_ptr as *mut u32).write_volatile(0);
             std::ptr::write_bytes(readback_ptr, 0, total_bytes);
         }
+        harness.budget_zero(&harness.list, &budget);
 
         assert!(record_clamp(
             &harness.clamp,
             &harness.list,
             &dst_buf,
-            budget_gpu,
+            budget.gpu,
             (&src_buf, 0),
             None,
             (KIND_INDEXED, STRIDE, RECORDS),
@@ -1119,11 +1789,12 @@ void main() {
                 D3D12_RESOURCE_STATE_COMMON,
             )]);
         }
+        harness.budget_read(&harness.list, &budget);
         harness.submit_and_wait();
 
         // SAFETY: GPU work completed.
         let (spent, after_src, out_words) = unsafe {
-            let spent = (budget_ptr as *const u32).read_volatile();
+            let spent = budget.word(0);
             let after_src = std::slice::from_raw_parts(src_ptr.cast_const(), total_bytes).to_vec();
             let out_words = std::slice::from_raw_parts(
                 readback_ptr.cast::<u32>().cast_const(),
@@ -1167,6 +1838,9 @@ void main() {
     /// and `HostList::reset` end-to-end on the host device.
     #[test]
     fn host_list_reuses_and_grows_scratch_across_submissions() {
+        // The one device at a time every test that opens one takes (`#137`:
+        // parallel WARP devices crash CI).
+        let _once = crate::warptest::lock();
         let Some(host) = super::host() else {
             return;
         };
@@ -1223,5 +1897,478 @@ void main() {
         list.close();
         host.execute(&[&list]);
         list.reset();
+    }
+
+    #[test]
+    fn batch_argument_clamp_builds() {
+        let _once = crate::warptest::lock();
+        if super::host().is_none() {
+            return;
+        }
+        assert!(super::batch_clamp().is_some());
+    }
+
+    /// Reads `words` 32-bit words from `buf` at byte offset `at` after execution.
+    fn read_words(buf: &super::ID3D12Resource, at: u64, words: usize) -> Vec<u32> {
+        let Some(host) = super::host() else {
+            return Vec::new();
+        };
+        let bytes = (words * 4) as u64;
+        let (read, ptr) = host.shared_buffer(bytes).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: open list; the chunk is in `INDIRECT_ARGUMENT` (hoisted, or
+        // `done` left it there); the readback is a mapped shared buffer.
+        unsafe {
+            list.list.ResourceBarrier(&[super::transition(
+                buf,
+                super::D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                super::D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list.CopyBufferRegion(&read, 0, buf, at, bytes);
+            list.list.ResourceBarrier(&[super::transition(
+                buf,
+                super::D3D12_RESOURCE_STATE_COPY_SOURCE,
+                super::D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            )]);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: GPU completed; mapped shared buffer.
+        unsafe {
+            let base = ptr.cast::<u32>();
+            (0..words).map(|i| base.add(i).read_volatile()).collect()
+        }
+    }
+
+    /// Hoisted batched clamping matches inline per-draw clamping word-for-word
+    /// across >64 single-record draws, mixed kinds (`0, 1, 2, 10`), a multi-
+    /// record (>64) draw, and mid-wave `BUDGET` exhaustion — while leaving the
+    /// title's source buffer completely unmodified.
+    #[test]
+    fn hoisted_clamps_match_inline_bounds_and_budget_order() {
+        let _once = crate::warptest::lock();
+        let Some(host) = super::host() else {
+            return;
+        };
+        const SRC_BYTES: usize = 64 << 10;
+        let (src, src_ptr) = host.shared_buffer(SRC_BYTES as u64).unwrap();
+        let mut initial = vec![0xA5u8; SRC_BYTES];
+        let put = |buf: &mut [u8], off: usize, v: u32| {
+            buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        };
+
+        struct Spec {
+            off: u64,
+            kind: u32,
+            stride: u32,
+            records: u32,
+        }
+        let mut specs = Vec::new();
+        let mut cur = 64usize;
+        // 75 consecutive single-record jobs (spanning >1 full 64-lane wave).
+        for i in 0..75u32 {
+            let (kind, stride) = match i % 4 {
+                0 => (0u32, 16u32),
+                1 => (1u32, 20u32),
+                2 => (2u32, 12u32),
+                _ => (10u32, 12u32),
+            };
+            match kind {
+                0 => {
+                    put(&mut initial, cur, 5000 + i * 11);
+                    put(&mut initial, cur + 4, 3);
+                    put(&mut initial, cur + 8, 10 + i);
+                    put(&mut initial, cur + 12, 20 + i);
+                }
+                1 => {
+                    put(&mut initial, cur, 7000 + i * 13);
+                    put(&mut initial, cur + 4, 2);
+                    put(&mut initial, cur + 8, 100 + i);
+                    put(&mut initial, cur + 12, (-30i32 + i as i32) as u32);
+                    put(&mut initial, cur + 16, 200 + i);
+                }
+                2 => {
+                    put(&mut initial, cur, 10 + (i % 7));
+                    put(&mut initial, cur + 4, 2);
+                    put(&mut initial, cur + 8, 1);
+                }
+                _ => {
+                    // First mesh tests 65,535 clamp; remaining stay small so BUDGET crosses in the tail.
+                    put(&mut initial, cur, if i == 3 { 70_000 } else { 8 + (i % 5) });
+                    put(&mut initial, cur + 4, 4); // clamps to 1
+                    put(&mut initial, cur + 8, 3); // clamps to 1
+                }
+            }
+            specs.push(Spec {
+                off: cur as u64,
+                kind,
+                stride,
+                records: 1,
+            });
+            cur += stride as usize;
+        }
+        // Multi-record (>64) indexed draw.
+        let multi_off = cur;
+        for r in 0..70u32 {
+            let b = multi_off + (r * 20) as usize;
+            put(&mut initial, b, 3000 + r);
+            put(&mut initial, b + 4, 2);
+            put(&mut initial, b + 8, r);
+            put(&mut initial, b + 12, r * 2);
+            put(&mut initial, b + 16, r * 3);
+        }
+        specs.push(Spec {
+            off: multi_off as u64,
+            kind: 1,
+            stride: 20,
+            records: 70,
+        });
+        cur += 70 * 20;
+        // 80 heavy indexed draws that exhaust BUDGET mid-wave (4,000,000 each).
+        for i in 0..80u32 {
+            put(&mut initial, cur, 1_000_000);
+            put(&mut initial, cur + 4, 4);
+            put(&mut initial, cur + 8, 700 + i);
+            put(&mut initial, cur + 12, 800 + i);
+            put(&mut initial, cur + 16, 900 + i);
+            specs.push(Spec {
+                off: cur as u64,
+                kind: 1,
+                stride: 20,
+                records: 1,
+            });
+            cur += 20;
+        }
+
+        // SAFETY: mapped `SRC_BYTES` shared buffer; live buffer.
+        let base_gpu = unsafe {
+            std::ptr::copy_nonoverlapping(initial.as_ptr(), src_ptr, SRC_BYTES);
+            src.GetGPUVirtualAddress()
+        };
+
+        // Hoisted path.
+        let list_hoisted = host.new_list().unwrap();
+        let mut hoisted_locs = Vec::with_capacity(specs.len());
+        for s in &specs {
+            let loc = super::hoist(
+                &list_hoisted,
+                &src,
+                base_gpu + s.off,
+                (s.kind, s.stride, s.records),
+            )
+            .unwrap();
+            hoisted_locs.push(loc);
+        }
+        list_hoisted.close();
+        host.execute(&[&list_hoisted]);
+
+        // Inline reference path (one submission per readback, sharing one list budget).
+        let list_inline = host.new_list().unwrap();
+        let (rb_inline, rb_ptr) = host.shared_buffer(SRC_BYTES as u64).unwrap();
+        let mut rb_offsets = Vec::with_capacity(specs.len());
+        let mut rb_cur = 0u64;
+        for s in &specs {
+            let out = super::bound(&list_inline, (&src, s.off), None, (s.kind, s.stride, s.records)).unwrap();
+            let bytes = u64::from(s.stride * s.records);
+            // SAFETY: open list; `out` is in `INDIRECT_ARGUMENT` after `bound`.
+            unsafe {
+                list_inline.list.ResourceBarrier(&[super::transition(
+                    &out,
+                    super::D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    super::D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                list_inline.list.CopyBufferRegion(&rb_inline, rb_cur, &out, 0, bytes);
+                list_inline.list.ResourceBarrier(&[super::transition(
+                    &out,
+                    super::D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    super::D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                )]);
+            }
+            super::done(&list_inline, &out);
+            rb_offsets.push((rb_cur, bytes as usize));
+            rb_cur += bytes;
+        }
+        list_inline.close();
+        host.execute(&[&list_inline]);
+
+        // SAFETY: GPU completed; verify title copy untouched and outputs identical.
+        let after_src = unsafe { std::slice::from_raw_parts(src_ptr.cast_const(), SRC_BYTES).to_vec() };
+        assert_eq!(after_src, initial, "title argument buffer must never be modified");
+
+        let mut tail_kept = 0usize;
+        let mut tail_zeroed = 0usize;
+        for (idx, ((dst, at), (rb_off, bytes))) in hoisted_locs.iter().zip(rb_offsets.iter()).enumerate() {
+            let got = read_words(dst, *at, *bytes / 4);
+            // SAFETY: within mapped `rb_inline`.
+            let expected = unsafe {
+                let p = rb_ptr.add(*rb_off as usize).cast::<u32>();
+                (0..*bytes / 4).map(|i| p.add(i).read_volatile()).collect::<Vec<_>>()
+            };
+            assert_eq!(got, expected, "job {idx} hoisted output must match inline bound()");
+            if idx >= 76 {
+                if got[0] == 1_000_000 {
+                    tail_kept += 1;
+                } else {
+                    assert_eq!(got[0], 0);
+                    tail_zeroed += 1;
+                }
+            }
+        }
+        assert!(tail_kept > 0 && tail_zeroed > 0, "tail must cross BUDGET mid-wave");
+    }
+
+    /// Multiple source buffers and >256 KiB chunk rollover preserve strict
+    /// draw-order budget saturation across dispatch runs and reuse both chunks
+    /// and upload buffer across `HostList::reset()`.
+    #[test]
+    fn hoisted_clamps_across_multiple_buffers_and_chunks_preserve_budget_order() {
+        let _once = crate::warptest::lock();
+        use windows::core::Interface;
+        let Some(host) = super::host() else {
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let (src_a, ptr_a) = host.shared_buffer(4096).unwrap();
+        let (src_b, ptr_b) = host.shared_buffer(4096).unwrap();
+        // SAFETY: mapped 4096-byte shared buffers; live buffers.
+        let (gpu_a, gpu_b) = unsafe {
+            let write = |p: *mut u8, off: usize, count: u32, inst: u32, tag: u32| {
+                let w = p.add(off).cast::<u32>();
+                w.write(count);
+                w.add(1).write(inst);
+                w.add(2).write(tag);
+                w.add(3).write(0);
+                w.add(4).write(0);
+            };
+            write(ptr_a, 0, 0, 1, 0xAAAA);
+            write(ptr_a, 32, 1 << 22, 4, 0x1111); // BUDGET / 8
+            write(ptr_b, 32, 1 << 22, 4, 0x2222); // BUDGET / 8
+            (src_a.GetGPUVirtualAddress(), src_b.GetGPUVirtualAddress())
+        };
+
+        for cycle in 0..2u32 {
+            let mut probes = Vec::new();
+            for i in 0..4u32 {
+                let (s, g) = if i % 2 == 0 { (&src_a, gpu_a) } else { (&src_b, gpu_b) };
+                probes.push(super::hoist(&list, s, g + 32, (1, 20, 1)).unwrap());
+            }
+            // Spill across 256 KiB chunk boundary (8,192 * 32B = 256 KiB).
+            let mut spilled = false;
+            let first_chunk = probes[0].0.as_raw();
+            for _ in 0..8_250 {
+                let (c, _) = super::hoist(&list, &src_a, gpu_a, (1, 20, 1)).unwrap();
+                if c.as_raw() != first_chunk {
+                    spilled = true;
+                }
+            }
+            assert!(spilled, "must span at least two 256 KiB hoisted scratch chunks");
+            for i in 0..6u32 {
+                let (s, g) = if i % 2 == 0 { (&src_a, gpu_a) } else { (&src_b, gpu_b) };
+                probes.push(super::hoist(&list, s, g + 32, (1, 20, 1)).unwrap());
+            }
+            list.close();
+            host.execute(&[&list]);
+
+            for (idx, (dst, at)) in probes.iter().enumerate() {
+                let w = read_words(dst, *at, 5);
+                if idx < 8 {
+                    assert_eq!((w[0], w[1]), (1 << 22, 4), "cycle {cycle} probe {idx} must fit");
+                } else {
+                    assert_eq!(w[0], 0, "cycle {cycle} probe {idx} must zero past BUDGET");
+                }
+            }
+            list.reset();
+        }
+    }
+
+    /// Re-submitting the same closed hoisted list twice re-clamps cleanly into
+    /// its own scratch chunks without mutating the title's source buffer.
+    #[test]
+    fn hoisted_list_resubmitted_twice_reclamps_cleanly() {
+        let _once = crate::warptest::lock();
+        let Some(host) = super::host() else {
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let (src, ptr) = host.shared_buffer(256).unwrap();
+        // SAFETY: mapped buffer; live buffer.
+        let gpu = unsafe {
+            let p = ptr.cast::<u32>();
+            p.write(u32::MAX);
+            p.add(1).write(u32::MAX);
+            p.add(2).write(42);
+            p.add(3).write(7);
+            p.add(4).write(99);
+            src.GetGPUVirtualAddress()
+        };
+        let (dst, at) = super::hoist(&list, &src, gpu, (1, 20, 1)).unwrap();
+        list.close();
+        for _ in 0..2 {
+            host.execute(&[&list]);
+            assert_eq!(read_words(&dst, at, 5), vec![1 << 24, 4, 42, 7, 99]);
+            // SAFETY: title buffer untouched.
+            assert_eq!(unsafe { ptr.cast::<u32>().read_volatile() }, u32::MAX);
+        }
+    }
+
+    /// An earlier list's compute write to a title argument buffer is visible
+    /// to the hoisted prelude of the following list.
+    #[test]
+    fn hoisted_prelude_orders_after_earlier_list_compute_write() {
+        let _once = crate::warptest::lock();
+        let Some(host) = super::host() else {
+            return;
+        };
+        const WRITER: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    dst.Store3(0, uint3(90000, 1, 1));
+}
+"#;
+        let writer = super::compile(WRITER, super::s!("writer")).unwrap();
+        let (src, ptr) = host.shared_buffer(256).unwrap();
+        // SAFETY: mapped buffer; live buffer.
+        let gpu = unsafe {
+            std::ptr::write_bytes(ptr, 0, 256);
+            src.GetGPUVirtualAddress()
+        };
+        let write_list = host.new_list().unwrap();
+        // SAFETY: open list, live compute pipeline and UAV buffer.
+        unsafe {
+            write_list.list.SetComputeRootSignature(&writer.root);
+            write_list.list.SetPipelineState(&writer.pso);
+            write_list.list.SetComputeRootUnorderedAccessView(0, gpu);
+            write_list.list.Dispatch(1, 1, 1);
+        }
+        write_list.close();
+
+        let hoisted_list = host.new_list().unwrap();
+        let (dst, at) = super::hoist(&hoisted_list, &src, gpu, (2, 12, 1)).unwrap();
+        hoisted_list.close();
+
+        host.execute(&[&write_list, &hoisted_list]);
+        assert_eq!(read_words(&dst, at, 3), vec![65_535, 1, 1]);
+    }
+
+    /// The dispatch count the hoisted clamp saves: the inline clamp records
+    /// one compute pass per draw, the batched prelude one per run of draws
+    /// reading the same argument buffer into the same scratch chunk.
+    #[test]
+    fn hoisted_clamps_cost_one_pass_per_run_of_draws() {
+        let _once = crate::warptest::lock();
+        let Some(host) = super::host() else {
+            return;
+        };
+        const DRAWS: usize = 1024;
+        const STRIDE: u32 = 20;
+        let (src, ptr) = host.shared_buffer((DRAWS * STRIDE as usize) as u64).unwrap();
+        // SAFETY: mapped buffer; live buffer.
+        let base_gpu = unsafe {
+            for i in 0..DRAWS {
+                let p = ptr.add(i * STRIDE as usize).cast::<u32>();
+                p.write(300);
+                p.add(1).write(1);
+                p.add(2).write(0);
+                p.add(3).write(0);
+                p.add(4).write(0);
+            }
+            src.GetGPUVirtualAddress()
+        };
+
+        let list = host.new_list().unwrap();
+        let before = super::clamp_passes();
+        for i in 0..DRAWS {
+            let out = super::bound(&list, (&src, (i * STRIDE as usize) as u64), None, (1, STRIDE, 1)).unwrap();
+            super::done(&list, &out);
+        }
+        let inline = super::clamp_passes() - before;
+
+        list.budget().unwrap();
+        let mut hoisted_locs = Vec::with_capacity(DRAWS);
+        for i in 0..DRAWS {
+            hoisted_locs.push(
+                super::hoist(&list, &src, base_gpu + (i * STRIDE as usize) as u64, (1, STRIDE, 1)).unwrap(),
+            );
+        }
+        let prelude = host.new_list().unwrap();
+        let before = super::clamp_passes();
+        assert!(list.hoisted().record_prelude(&prelude.list, list.budget_resource().unwrap()));
+        let hoisted = super::clamp_passes() - before;
+
+        assert_eq!(inline, DRAWS as u64, "the inline clamp records a pass per draw");
+        assert_eq!(hoisted, 1, "the batched prelude records one pass for the run");
+    }
+
+    /// Release benchmark comparing inline `bound()` + `done()` vs prelude-
+    /// hoisted batched clamping across 9,000 indirect indexed draws.
+    ///
+    /// Run with:
+    /// `cargo test --release -p victory-gpu --locked -- --ignored --nocapture benchmark_hoisted_vs_inline_indirect_clamps`
+    #[test]
+    #[ignore = "benchmark"]
+    fn benchmark_hoisted_vs_inline_indirect_clamps() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let list_inline = host.new_list().unwrap();
+        let list_hoisted = host.new_list().unwrap();
+        const DRAWS: usize = 9_000;
+        const STRIDE: u32 = 20;
+        let (src, ptr) = host.shared_buffer((DRAWS * STRIDE as usize) as u64).unwrap();
+        // SAFETY: mapped buffer; live buffer.
+        let base_gpu = unsafe {
+            for i in 0..DRAWS {
+                let p = ptr.add(i * STRIDE as usize).cast::<u32>();
+                p.write(300);
+                p.add(1).write(1);
+                p.add(2).write(0);
+                p.add(3).write(0);
+                p.add(4).write(0);
+            }
+            src.GetGPUVirtualAddress()
+        };
+
+        let run_inline = || {
+            for i in 0..DRAWS {
+                let out = super::bound(&list_inline, (&src, (i * STRIDE as usize) as u64), None, (1, STRIDE, 1)).unwrap();
+                super::done(&list_inline, &out);
+            }
+            list_inline.close();
+            host.execute(&[&list_inline]);
+            list_inline.reset();
+        };
+        let run_hoisted = || {
+            for i in 0..DRAWS {
+                let _ = super::hoist(&list_hoisted, &src, base_gpu + (i * STRIDE as usize) as u64, (1, STRIDE, 1)).unwrap();
+            }
+            list_hoisted.close();
+            host.execute(&[&list_hoisted]);
+            list_hoisted.reset();
+        };
+
+        for _ in 0..3 {
+            run_inline();
+            run_hoisted();
+        }
+        const ITERS: u32 = 20;
+        let t0 = std::time::Instant::now();
+        for _ in 0..ITERS {
+            run_inline();
+        }
+        let inline_ms = t0.elapsed().as_secs_f64() * 1e3 / f64::from(ITERS);
+
+        let t1 = std::time::Instant::now();
+        for _ in 0..ITERS {
+            run_hoisted();
+        }
+        let hoisted_ms = t1.elapsed().as_secs_f64() * 1e3 / f64::from(ITERS);
+
+        eprintln!(
+            "{DRAWS} indirect draw clamps: inline {inline_ms:.2} ms/frame vs hoisted {hoisted_ms:.2} ms/frame ({:.1}x)",
+            inline_ms / hoisted_ms.max(1e-6)
+        );
     }
 }

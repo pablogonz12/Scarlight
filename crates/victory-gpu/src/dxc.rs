@@ -380,6 +380,7 @@ void main() { b.Store(8, b.Load(0) + b.Load(4)); }
 
     #[test]
     fn a_shader_the_system_compiler_refuses_is_compiled_by_dxc() {
+        let _once = crate::warptest::lock();
         match system(SOURCE, "main", "cs_5_1") {
             Ok(_) => println!("the system compiler compiled it: DXC is not exercised here"),
             Err(e) => println!("the system compiler refused it: {e}"),
