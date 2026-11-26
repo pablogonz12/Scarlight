@@ -1972,6 +1972,20 @@ mod barycentric_tests {
         assert!(swizzle(mov_dpp8(sel ^ 4)).is_err(), "lane 0 now reads lane 7");
     }
 
+    /// An exchange permutation (lane ^ 1, ^ 2, ^ 3) already names the lane
+    /// it reads: each two-bit group of the pattern is that lane (0xb1 lane 0
+    /// reads 1 and lane 2 reads 3; 0x4e is ^ 2; 0x1b is ^ 3), which is why
+    /// `quad_pick` reads the source as it finds it and must not XOR it again.
+    #[test]
+    fn an_exchange_pattern_names_its_lane() {
+        for p in [0xb1u8, 0x4e, 0x1b] {
+            for lane in 0..4u32 {
+                let read = u32::from(p >> (2 * lane)) & 3;
+                assert_eq!(read, lane ^ u32::from(p & 3), "{p:#04x}, lane {lane}");
+            }
+        }
+    }
+
     /// Two kinds of barycentrics read directly: one element per mode.
     #[test]
     fn two_barycentric_modes_get_two_elements() {
