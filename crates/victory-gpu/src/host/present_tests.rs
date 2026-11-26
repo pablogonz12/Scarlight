@@ -116,6 +116,14 @@ fn assert_pixels(
     );
 }
 
+/// A host texture of `resource` in the state the tests leave it in.
+fn source(resource: &ID3D12Resource) -> std::sync::Arc<crate::resource::HostTexture> {
+    std::sync::Arc::new(crate::resource::HostTexture::new(
+        resource.clone(),
+        SOURCE_STATE,
+    ))
+}
+
 fn check_present(
     host: &Host,
     primary: &ID3D12Resource,
@@ -126,9 +134,12 @@ fn check_present(
     case: &str,
 ) {
     let mut inspected = false;
-    let result = host.present_planes(
-        primary,
+    let primary = std::sync::Arc::new(crate::resource::HostTexture::new(
+        primary.clone(),
         SOURCE_STATE,
+    ));
+    let result = host.present_planes(
+        &primary,
         Presenting {
             overlay: Some((overlay, SOURCE_STATE)),
             fill: None,
@@ -166,7 +177,7 @@ fn present_overlay_composites_pixels_and_recovers_from_initialization_failure() 
     host.execute(&[&list]);
 
     assert_ne!(
-        host.present(std::ptr::null_mut(), &red, SOURCE_STATE, 1, false),
+        host.present(std::ptr::null_mut(), &source(&red), 1, false),
         Some(true),
         "PRESENTX_GPU_NO_SINGLE_PLANE_FRAME: initial copy-only presentation"
     );
@@ -199,7 +210,7 @@ fn present_overlay_composites_pixels_and_recovers_from_initialization_failure() 
         "during backoff the base plane still presents",
     );
     assert_ne!(
-        host.present(std::ptr::null_mut(), &red, SOURCE_STATE, 4, false),
+        host.present(std::ptr::null_mut(), &source(&red), 4, false),
         Some(true),
         "copy-only presentation after a compositor initialization failure"
     );

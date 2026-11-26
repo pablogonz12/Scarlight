@@ -83,6 +83,9 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
+    /// The first dynamic slot: the title's slots, then unused ones up to
+    /// this, then the dynamic range (see [`view_layout`]).
+    base: u32,
     /// Dynamic slots past `count`: [`DYNAMIC`] in view heaps, none in
     /// sampler heaps. (Upstream falls back to 2^16 on a capped host heap;
     /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
@@ -674,6 +677,37 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// The title slots a view heap that the title asked `requested` slots of has
+/// room for, the first dynamic slot, and the heap's size; `null` is the last
+/// slot of the heap, which shaders clamp view indices to (0: no host limit
+/// probed).
+///
+/// The dynamic slots sit a fixed distance below the null slot, not right
+/// after the title's: shaders are translated before the title makes its heap
+/// and clamp the view slots the title made itself below them
+/// (`victory_shader`'s `title_view_limit`), so a title heap larger than the
+/// room left must not put the title's slots where the dynamic ones are.
+/// Upstream PR #2628 (moe-miau) for the same layout.
+fn view_layout(requested: u32, null: u32, dynamic: u32) -> (u32, u32, u32) {
+    view_layout_with(requested, null, dynamic, victory_shader::emit::title_view_clamp())
+}
+
+/// [`view_layout`], with the dynamic slots the heap keeps (`dynamic`: none in
+/// sampler heaps) and the title clamp's switch given.
+fn view_layout_with(requested: u32, null: u32, dynamic: u32, clamp: bool) -> (u32, u32, u32) {
+    if null == 0 || dynamic == 0 {
+        return (requested, requested, requested + dynamic);
+    }
+    let size = null + 1;
+    let base = null.saturating_sub(dynamic);
+    if !clamp {
+        // Switched off: the dynamic slots follow the title's, as before.
+        let fitted = if requested + dynamic <= null { requested } else { base };
+        return (fitted, fitted, size);
+    }
+    (requested.min(base), base, size)
+}
+
 /// A slot the host made from a view narrowed to a part-resident texture's
 /// mips ([`narrow_to_resident`]): the texture, the window the title asked
 /// for and the one the host view names.
@@ -722,30 +756,18 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
-        let (heap, count, size) = if null == 0 {
-            match make(count + extra) {
-                Ok(heap) => (heap, count, count + extra),
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
-                }
-            }
-        } else {
-            let size = null + 1;
-            let fitted = if count + extra <= null {
-                count
-            } else {
-                // shortcut: descriptors past the host's limit are left out; a title that reaches
-                // them needs remapping. They read the null slot instead.
-                tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
-                null - extra
-            };
-            match make(size) {
-                Ok(heap) => (heap, fitted, size),
-                Err(e) => {
-                    tracing::warn!(error = %e, count, size, "no host view heap");
-                    return None;
-                }
+        let requested = count;
+        let (count, base, size) = view_layout(requested, null, extra);
+        if null != 0 && count < requested {
+            // shortcut: descriptors past the host's limit are left out; a title that reaches
+            // them needs remapping. They read the null slot instead.
+            tracing::warn!(requested, count, size, "host view heap capped at {size}; views past it read a null slot");
+        }
+        let heap = match make(size) {
+            Ok(heap) => heap,
+            Err(e) => {
+                tracing::warn!(error = %e, count, size, sampler, "no host descriptor heap");
+                return None;
             }
         };
         // SAFETY: a live heap.
@@ -782,13 +804,14 @@ impl HostHeap {
             cpu,
             step,
             count,
+            base,
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             made_fast: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             narrowed: Mutex::default(),
             narrowed_count: std::sync::atomic::AtomicUsize::new(0),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
+            kept: Mutex::new(vec![None; size as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -926,7 +949,7 @@ impl HostHeap {
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % DYNAMIC as usize) as u32;
-        Some(self.count + first as u32)
+        Some(self.base + first as u32)
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -1256,7 +1279,7 @@ impl HostHeap {
     ///
     /// [`dynamic`]: HostHeap::dynamic
     pub(crate) fn release(&self, first: u32, n: u32) {
-        let Some(at) = first.checked_sub(self.count) else {
+        let Some(at) = first.checked_sub(self.base) else {
             return;
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
@@ -1467,9 +1490,13 @@ impl HostHeap {
         };
         // SAFETY: a live resource while a slot still shows it.
         let mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+        // The same window as `narrow_to_resident` narrowed to: in the host
+        // copy's levels, which may lack the title's top ones.
+        let dropped = crate::resource::dropped_mips(n.resource);
         let want = crate::texture::wanted(
             n.asked,
-            crate::texture::resident(n.resource),
+            crate::texture::resident(n.resource)
+                .map(|window| crate::resource::resident_in_host(window, dropped, mips)),
             mips,
             crate::texture::is_host_written(n.resource),
         );
@@ -1669,6 +1696,11 @@ fn narrow_to_resident(
     }
     // SAFETY: a live resource.
     let mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+    // A copy that lost the title's top mips names its own levels (the view
+    // was rebased before this): the window resident in title memory moves
+    // with them.
+    let dropped = crate::resource::dropped_mips(resource);
+    let resident = crate::resource::resident_in_host(resident, dropped, mips);
     let asked = match desc.ViewDimension {
         D3D12_SRV_DIMENSION_TEXTURE2D => {
             // SAFETY: the union member of a 2D view.
@@ -1716,6 +1748,58 @@ fn narrow_to_resident(
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::ViewNarrowed, 1);
     Some((first, count))
+}
+
+/// A shader view of a title texture, rebased onto its host copy, which may
+/// lack the title's top `dropped` mip levels
+/// ([`crate::resource::dropped_mips`]): the levels the view names, and its
+/// minimum level of detail, are the title's.
+fn drop_mips(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, dropped: u32) {
+    if dropped == 0 {
+        return;
+    }
+    let rebase = |most: &mut u32, levels: &mut u32, clamp: &mut f32| {
+        (*most, *levels) = crate::resource::rebase_mip_range(*most, *levels, dropped);
+        *clamp = (*clamp - dropped as f32).max(0.0);
+    };
+    // SAFETY: each arm reads the union member the view dimension selects.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let v = &mut desc.Anonymous.Texture2D;
+                rebase(
+                    &mut v.MostDetailedMip,
+                    &mut v.MipLevels,
+                    &mut v.ResourceMinLODClamp,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let v = &mut desc.Anonymous.Texture2DArray;
+                rebase(
+                    &mut v.MostDetailedMip,
+                    &mut v.MipLevels,
+                    &mut v.ResourceMinLODClamp,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let v = &mut desc.Anonymous.TextureCube;
+                rebase(
+                    &mut v.MostDetailedMip,
+                    &mut v.MipLevels,
+                    &mut v.ResourceMinLODClamp,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let v = &mut desc.Anonymous.TextureCubeArray;
+                rebase(
+                    &mut v.MostDetailedMip,
+                    &mut v.MipLevels,
+                    &mut v.ResourceMinLODClamp,
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 /// A view description from its words, with the format as the host has it.
@@ -2218,6 +2302,51 @@ fn casts_typed() -> bool {
     })
 }
 
+/// Whether [`fits`] refuses unordered access views in formats the host
+/// cannot store to. On by default; `VICTORY_TYPED_UAV=0` lets such a view
+/// reach the host (as before), which then removes the device.
+fn typed_uav_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TYPED_UAV").is_none_or(|v| v != "0"))
+}
+
+/// Whether the host creates a typed unordered access view in `format`,
+/// asked once per format. Hosts refuse some (B8G8R8X8_UNORM and the block
+/// formats on NVIDIA: no typed store there) by removing the device rather
+/// than failing the call, so [`fits`] leaves such a view's slot null. A
+/// host that stores to `format` (RADV through vkd3d-proton does, B8G8R8X8
+/// as B8G8R8A8 with the alpha ignored) keeps every view it had.
+fn typed_store(format: DXGI_FORMAT) -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    // 0: not asked, 1: refused, 2: stored to.
+    static SUPPORT: [AtomicU8; 256] = [const { AtomicU8::new(0) }; 256];
+    let Some(state) = usize::try_from(format.0).ok().and_then(|f| SUPPORT.get(f)) else {
+        return false;
+    };
+    match state.load(Relaxed) {
+        0 => {}
+        known => return known == 2,
+    }
+    let asked = host().is_some_and(|host| {
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: format,
+            ..Default::default()
+        };
+        // SAFETY: a plain query into our own structure.
+        let asked = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        };
+        asked.is_ok()
+            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+    });
+    state.store(if asked { 2 } else { 1 }, Relaxed);
+    asked
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -2262,7 +2391,16 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        return !typeless;
+        if typeless {
+            return false;
+        }
+        // A default view of a texture in a format the host cannot store to
+        // removes the device: leave the slot null instead.
+        if unordered && typed_uav_check() && !typed_store(d.Format) {
+            once!(own, "an unordered view in a format the host cannot store");
+            return false;
+        }
+        return true;
     }
     // A view of a target whose format the host refuses, in the title's
     // format: in the stand-in the host copy has.
@@ -2279,9 +2417,19 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     let twin = crate::resource::SRGB
         .iter()
         .any(|&(s, l)| (s, l) == (view, own) || (l, s) == (view, own));
+    let casts = twin && casts_typed();
+    // The format the host makes the view in: the texture's (the title's the
+    // host takes as it is), or the view's for a typeless texture and for the
+    // twins the host casts. A host that cannot store to it removes the
+    // device for a write there, so the slot stays null instead.
+    let created = if !typeless && !casts { own } else { view };
+    if unordered && typed_uav_check() && !typed_store(DXGI_FORMAT(created as i32)) {
+        once!(view = created, own, "an unordered view in a format the host cannot store");
+        return false;
+    }
     if let Some(format) = format
+        && !casts
         && !typeless
-        && !(twin && casts_typed())
     {
         *format = d.Format;
     }
@@ -2410,6 +2558,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 let mut desc = desc.as_ref().map(srv_desc);
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
+                }
+                if let Some(d) = desc.as_mut() {
+                    drop_mips(d, crate::resource::dropped_mips(resource));
                 }
                 // A texture only part of which is mapped (streaming in):
                 // sample the mips that are there, not the zeros of the ones
@@ -2746,6 +2897,31 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    /// The host's dynamic slots sit below the null slot that shaders clamp
+    /// view indices to, never right after the title's, so an index the title
+    /// made itself past its slots cannot name one of them. The count shaders
+    /// assume is the GPU's `DYNAMIC`.
+    #[test]
+    fn dynamic_slots_sit_below_the_null_slot() {
+        assert_eq!(DYNAMIC, victory_shader::emit::DYNAMIC_VIEWS);
+        let limit = (1 << 21) - 1;
+        // A title heap that fits: its own slots stay, the dynamic ones below null.
+        assert_eq!(view_layout_with(1_245_184, limit, DYNAMIC, true), (1_245_184, limit - DYNAMIC, limit + 1));
+        // A capped host (1,000,000 slots): the title's slots give way.
+        let portable = 1_000_000 - 1;
+        let (count, base, size) = view_layout_with(1_245_184, portable, DYNAMIC, true);
+        assert_eq!((count, base, size), (portable - DYNAMIC, portable - DYNAMIC, portable + 1));
+        // A small title heap: the dynamic slots still lie below null.
+        assert_eq!(view_layout_with(100, limit, DYNAMIC, true), (100, limit - DYNAMIC, limit + 1));
+        // No host heap probed: the dynamic slots follow the title's.
+        assert_eq!(view_layout_with(100, 0, DYNAMIC, true), (100, 100, 100 + DYNAMIC));
+        // Switched off: as before, the dynamic slots follow the title's.
+        assert_eq!(view_layout_with(100, limit, DYNAMIC, false), (100, 100, limit + 1));
+        // A sampler heap keeps none, whatever the host's view limit.
+        assert_eq!(view_layout_with(100, 0, 0, true), (100, 100, 100));
+        assert_eq!(view_layout_with(100, limit, 0, true), (100, 100, 100));
+    }
+
     /// A subscriber that only counts the lines said: what a diagnostic's cost
     /// comes to offline.
     #[derive(Clone, Default)]
@@ -2875,6 +3051,111 @@ mod tests {
         let View::Placed(_, resource, desc) = low.clone() else { unreachable!() };
         assert!(!same_placed_texture(&low, &View::Placed(true, resource, desc)));
         assert!(!same_placed_texture(&low, &View::Shader(0, None)));
+    }
+
+    /// Unordered views in formats the host cannot store to stay null
+    /// instead of removing the device, for shared sRGB render targets and
+    /// their linear twins as for default views: `fits` gives the host's own
+    /// answer for the format the view is made in.
+    #[test]
+    fn unordered_views_follow_the_hosts_typed_store_support() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let stores = |format: u32| {
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: DXGI_FORMAT(format as i32),
+                ..Default::default()
+            };
+            // SAFETY: a plain query into our own structure.
+            let asked = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of_val(&support) as u32,
+                )
+            };
+            asked.is_ok()
+                && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+        };
+        let texture = |format: DXGI_FORMAT| -> Option<ID3D12Resource> {
+            let mut tex: Option<ID3D12Resource> = None;
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 64,
+                Height: 64,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+                    | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            // SAFETY: plain committed texture creation.
+            unsafe {
+                host.device.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut tex,
+                )
+            }
+            .ok()?;
+            tex
+        };
+        // The title's shared pair: an sRGB render target the host makes
+        // typeless and a linear unordered access texture over it.
+        let Some(bgra) = texture(DXGI_FORMAT_B8G8R8A8_TYPELESS) else {
+            return; // no such texture on this host
+        };
+        let pair = |own: DXGI_FORMAT, view: Option<u32>| {
+            let tex = texture(own)?;
+            let mut format = view.map(|v| DXGI_FORMAT(v as i32));
+            let fits = fits(&tex, format.as_mut(), true);
+            let made = match format {
+                Some(f) => f,
+                // A default view names the texture's own format.
+                None => own,
+            };
+            Some((fits, stores(made.0 as u32)))
+        };
+        // RGBA8 and BGRA8 sRGB views are rewritten to their linear twins,
+        // whose typed store every host has.
+        for (own, view) in [
+            (DXGI_FORMAT_B8G8R8A8_TYPELESS, Some(91)),
+            (DXGI_FORMAT_B8G8R8A8_TYPELESS, Some(87)),
+            (DXGI_FORMAT_B8G8R8X8_TYPELESS, Some(93)),
+            (DXGI_FORMAT_B8G8R8X8_TYPELESS, Some(88)),
+            (DXGI_FORMAT_R8G8B8A8_TYPELESS, Some(29)),
+            (DXGI_FORMAT_R8G8B8A8_TYPELESS, Some(28)),
+        ] {
+            let Some((fits, stores)) = pair(own, view) else {
+                continue; // a texture this host cannot create
+            };
+            assert_eq!(fits, stores, "texture {own:?}, view {view:?}");
+        }
+        // A typed texture's default unordered view follows its own format.
+        for own in [
+            DXGI_FORMAT_B8G8R8X8_UNORM,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+        ] {
+            let Some((fits, stores)) = pair(own, None) else {
+                continue;
+            };
+            assert_eq!(fits, stores, "texture {own:?}, default view");
+        }
+        // A view of a texture without the unordered access flag is refused
+        // whatever the format, and a typeless one with no view format too.
+        assert!(!fits(&bgra, None, true));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// A null 3D UAV made on the real device leaves it alive.
@@ -3160,13 +3441,15 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
+        // The dynamic slots start at `base`, not right after the title's 4.
+        let base = heap.base;
         let a = heap.dynamic(heap.dynamic - 100).unwrap();
         let b = heap.dynamic(60).unwrap();
-        assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
+        assert_eq!((a, b), (base, base + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
         heap.release(a, 50);
-        assert_eq!(heap.dynamic(50), Some(4));
-        assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+        assert_eq!(heap.dynamic(50), Some(base));
+        assert_eq!(heap.dynamic(40), Some(base + heap.dynamic - 40));
     }
 }

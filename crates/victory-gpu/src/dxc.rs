@@ -32,7 +32,7 @@ use windows::Win32::Graphics::Direct3D::Dxc::{
     CLSID_DxcCompiler, DXC_CP_UTF8, DxcBuffer, IDxcCompiler3, IDxcIncludeHandler, IDxcResult,
 };
 use windows::Win32::System::LibraryLoader::{
-    GetModuleFileNameW, GetProcAddress, LOAD_LIBRARY_SEARCH_APPLICATION_DIR,
+    GetModuleFileNameW, GetModuleHandleA, GetProcAddress, LOAD_LIBRARY_SEARCH_APPLICATION_DIR,
     LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
     LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
@@ -42,6 +42,20 @@ use windows::core::{GUID, HSTRING, Interface, PCWSTR, s, w};
 /// the system's compiler or, if it refuses or leaves the root signature out,
 /// with DXC (see the module docs).
 pub(crate) fn compile(source: &str, entry: &str, target: &str) -> windows::core::Result<Vec<u8>> {
+    let wants_signature = asks_for_root_signature(source, entry);
+    // Under Wine the system compiler is vkd3d-shader, which refuses part of
+    // this source (`E5005`: no `Load` on `RWByteAddressBuffer`) and drops the
+    // root signature: DXC first, so a helper costs one compile and never
+    // depends on Wine's compiler. Where DXC is no use (absent, or a shader
+    // that asks for no root signature of its own), the system compiler still
+    // has its say, as on Windows.
+    if under_wine() {
+        match dxc(source, entry, target) {
+            Ok(bytes) if !wants_signature || carries_root_signature(&bytes) => return Ok(bytes),
+            Ok(_) => tracing::info!(entry, target, "DXC left out the root signature: trying the system compiler"),
+            Err(e) => tracing::warn!(error = %e, entry, target, "DXC is no use under Wine: trying the system compiler"),
+        }
+    }
     let bytes = match system(source, entry, target) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -59,7 +73,7 @@ pub(crate) fn compile(source: &str, entry: &str, target: &str) -> windows::core:
     // for, and D3D12 refuses those bytes. A shader with no root signature of
     // its own (a vertex shader whose pixel shader carries it) keeps the
     // system's bytes: neither compiler has one to give.
-    if !asks_for_root_signature(source, entry) || carries_root_signature(&bytes) {
+    if !wants_signature || carries_root_signature(&bytes) {
         return Ok(bytes);
     }
     tracing::info!(
@@ -75,6 +89,19 @@ pub(crate) fn compile(source: &str, entry: &str, target: &str) -> windows::core:
             Ok(bytes)
         }
     }
+}
+
+/// Whether this process runs under Wine (its `ntdll` exports
+/// `wine_get_version`): the system compiler is then vkd3d-shader, and every
+/// helper shader would first be refused by it.
+fn under_wine() -> bool {
+    static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WINE.get_or_init(|| {
+        // SAFETY: an export of a loaded module (ntdll is ours).
+        let ntdll = unsafe { GetModuleHandleA(s!("ntdll.dll")) };
+        let Ok(ntdll) = ntdll else { return false };
+        unsafe { GetProcAddress(ntdll, s!("wine_get_version")) }.is_some()
+    })
 }
 
 /// Whether the container holds the root signature the shader asked for: both
@@ -245,11 +272,15 @@ fn dxc(source: &str, entry: &str, target: &str) -> windows::core::Result<Vec<u8>
 fn library() -> windows::core::Result<HMODULE> {
     let mut paths: Vec<PathBuf> = Vec::new();
     if let Some(p) = std::env::var_os("VICTORY_DXC").map(PathBuf::from) {
-        paths.push(if p.is_dir() {
+        let p = if p.is_dir() {
             p.join("dxcompiler.dll")
         } else {
             p
-        });
+        };
+        // `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` wants a fully qualified path, so
+        // a relative one (`VICTORY_DXC=.\sdk`) is resolved against this
+        // process's working directory first.
+        paths.push(std::path::absolute(&p).unwrap_or(p));
     }
     if let Some(dir) = victory_shader::emit::validator::Validator::default_path()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))

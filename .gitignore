@@ -70,6 +70,11 @@
 *.7z
 *.rar
 
+# Release output: tools/steam-compat/package.sh writes dist/Scarlight-<version>.tar.gz
+# from a build and the DLLs; a tarball is never committed, only attached to a release.
+*.tar.gz
+/dist/
+
 # Editor / OS noise
 .vs/
 .idea/
@@ -83,3 +88,7 @@ vkd3d-proton.cache*
 # Scratch space for tools and tests (local wine symlinks etc.); never commit
 # local paths or binaries here.
 /tools/tmp/
+__pycache__/
+# Run logs land here when a Wine test or the layer is redirected into a file;
+# never commit them (cargo xtask policy refuses the extension).
+/logs/
