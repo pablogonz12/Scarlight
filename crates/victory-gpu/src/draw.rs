@@ -2857,7 +2857,7 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
+        if let Some(view) = host.mirror_required(index, handle, true) {
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
@@ -2970,7 +2970,10 @@ impl State {
             if n > crate::descriptor::host::DYNAMIC
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
+                // No span for it: the draw must not run with the title's own
+                // offsets (slots never made for it); `bind` drops it.
                 once!(slot, n, "fresh descriptor table exceeds the available span");
+                made.push((slot, u32::MAX));
                 continue;
             }
             // The table and what its entries hold (record words and alias

@@ -155,11 +155,43 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Whether any shader-visible heap has a title-slot view held back for a
+/// newly-allocated host resource that a draw needs before the next
+/// submission runs (the caller settles first).
+#[cfg(windows)]
+pub(crate) fn has_required_deferred_views() -> bool {
+    let finished = crate::host::finished();
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    heaps.iter().any(|&(_, _, at)| {
+        // SAFETY: registered heaps are live (removed in `Drop`).
+        let heap = unsafe { &*(at as *const Heap) };
+        heap.host
+            .get()
+            .and_then(Option::as_ref)
+            .is_some_and(|host| host.has_required_deferred(finished))
+    })
+}
+
+/// Publishes the title-slot views each shader-visible heap held back whose
+/// earlier submissions have finished on the card; their slots were never
+/// pointed at the new resource before that.
+#[cfg(windows)]
+pub(crate) fn flush_deferred_views() {
+    let finished = crate::host::finished();
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed in `Drop`).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let Some(Some(host)) = heap.host.get() {
+            host.flush_deferred(finished);
+        }
+    }
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()

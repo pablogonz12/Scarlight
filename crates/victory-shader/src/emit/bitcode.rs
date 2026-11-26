@@ -1094,6 +1094,41 @@ mod tests {
         assert_eq!(value(&s.m, b), i64::from((limit - DYNAMIC_VIEWS - 1) as i32));
     }
 
+    /// A view index just past the end of the heap is bounded to the null
+    /// slot, never read past it (a hand-built index there removed the device
+    /// on RADV), and the translation counts it: what a game session's log
+    /// says, where main clamps without a count.
+    #[test]
+    fn a_bounded_view_index_is_counted_for_the_frame_line() {
+        use crate::emit::DYNAMIC_VIEWS;
+        use crate::emit::shader::{Shader, BOUNDED_INDICES};
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let mut s = Shader::new(false);
+        // No host heap probed: nothing is bounded, nothing counted.
+        let past = s.m.i32(DYNAMIC_VIEWS + 4);
+        let before = BOUNDED_INDICES.load(Relaxed);
+        assert_eq!(s.clamp_title_heap_index(s.entry, past), past);
+        assert_eq!(BOUNDED_INDICES.load(Relaxed), before);
+        // A heap whose last slot is 1,000,000: the index just past the
+        // title's slots reads the null slot, and is counted.
+        let limit = 1_000_000 - 1;
+        s.view_limit = limit;
+        let title = s.m.i32(limit - DYNAMIC_VIEWS + 1);
+        let V::Inst(selected) = s.clamp_title_heap_index(s.entry, title) else {
+            panic!("a select")
+        };
+        assert_eq!(BOUNDED_INDICES.load(Relaxed), before + 1, "counted");
+        let Op::Select(_, t, _) = s.m.insts[selected as usize].op else {
+            panic!("a select")
+        };
+        let V::Const(target) = t else { panic!("the null slot's constant") };
+        let Const::Int(null) = s.m.consts[target as usize].1 else {
+            panic!("an integer constant")
+        };
+        assert_eq!(null, i64::from(limit as i32), "the heap's null slot, not past it");
+    }
+
     #[test]
     fn vbr_and_blocks() {
         let mut w = Writer::default();

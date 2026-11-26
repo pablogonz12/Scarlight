@@ -163,6 +163,12 @@ fn title_view_limit_of(limit: u32) -> u32 {
     if limit > super::DYNAMIC_VIEWS + 1 { limit - super::DYNAMIC_VIEWS } else { 0 }
 }
 
+/// View indices a translated shader bounds to the title's slots before it
+/// reads a view ([`Shader::clamp_title_heap_index`]), since the start: what a
+/// game session's log counts where it would otherwise have read past its
+/// heap. A diagnostic only (the clamps themselves are in the DXIL).
+pub static BOUNDED_INDICES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
@@ -445,6 +451,7 @@ impl Shader {
         let null = self.m.i32(self.view_limit);
         let v = self.m.select(block, over, null, index);
         self.m.tag(v, super::bitcode::Tag::Clamp);
+        BOUNDED_INDICES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         v
     }
 
