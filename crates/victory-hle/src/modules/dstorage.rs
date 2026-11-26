@@ -659,8 +659,8 @@ impl Lanes {
         let id = reservation
             .map(|(id, _)| id)
             .or_else(|| self.next_lane(|_| true))?;
-        let (head, request, submitted) = self.lanes.get(&id)?.reads.front()?;
-        let (head, submitted) = (*head, *submitted);
+        let (head, request, _) = self.lanes.get(&id)?.reads.front()?;
+        let head = *head;
         let available = self.staging.saturating_sub(self.staged);
         let id = if self.staged > 0 && self.staged + staging_bytes(&request.request) > self.staging {
             self.starved = true;
@@ -679,7 +679,9 @@ impl Lanes {
             id
         };
         let lane = self.lanes.get_mut(&id)?;
-        let (seq, request, _) = lane.reads.pop_front()?;
+        // The read chosen here, not the blocked head: `submitted` is what
+        // its queue wait is charged from ([`Self::finish`]).
+        let (seq, request, submitted) = lane.reads.pop_front()?;
         let staging = staging_bytes(&request.request);
         let class = lane.class;
         lane.running.insert(seq);
@@ -1776,7 +1778,7 @@ mod tests {
         }
         read(&mut l, 0, ZLIB, 60);
         l.submit(0);
-        let active = l.start().unwrap();
+        let active = l.start_with(true).unwrap();
 
         for (id, size) in [(1, 80), (2, 20), (3, 20)] {
             read(&mut l, id, ZLIB, size);
@@ -1784,17 +1786,17 @@ mod tests {
         }
 
         let small = l
-            .start()
+            .start_with(true)
             .expect("another queue can use the free staging space");
         assert_eq!((small.lane, l.staged), (2, 80));
-        assert!(l.start().is_none(), "keep space for the blocked read");
+        assert!(l.start_with(true).is_none(), "keep space for the blocked read");
         l.finish(&small, Ok(()));
-        assert!(l.start().is_none(), "the same blocked read gets only one bypass");
+        assert!(l.start_with(true).is_none(), "the same blocked read gets only one bypass");
 
         l.finish(&active, Ok(()));
-        let large = l.start().unwrap();
+        let large = l.start_with(true).unwrap();
         assert_eq!((large.lane, l.staged), (1, 80));
-        assert_eq!(l.start().unwrap().lane, 3);
+        assert_eq!(l.start_with(true).unwrap().lane, 3);
         assert_eq!(l.staged, 100);
     }
 
@@ -1833,10 +1835,10 @@ mod tests {
             l.submit(id);
         }
 
-        assert_eq!(l.start().unwrap().lane, 0);
-        assert_eq!(l.start().unwrap().lane, 2);
+        assert_eq!(l.start_with(true).unwrap().lane, 0);
+        assert_eq!(l.start_with(true).unwrap().lane, 2);
         l.lanes.get_mut(&1).unwrap().reads.clear();
-        assert_eq!(l.start().unwrap().lane, 3);
+        assert_eq!(l.start_with(true).unwrap().lane, 3);
         assert_eq!(l.staged, 90);
     }
 
