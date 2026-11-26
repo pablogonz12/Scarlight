@@ -79,6 +79,9 @@ fn say_slot_past(
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
+    /// The pass over this heap's buffer views, kept here rather than in a
+    /// table keyed by the heap's address (`crate::buffersweep`).
+    sweep: std::sync::Mutex<crate::buffersweep::Sweep>,
     cpu: usize,
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
@@ -801,6 +804,7 @@ impl HostHeap {
             .flatten();
         let h = HostHeap {
             heap,
+            sweep: Mutex::default(),
             cpu,
             step,
             count,
@@ -956,6 +960,11 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// This heap's pass over its buffer views (`crate::buffersweep`).
+    pub(crate) fn buffer_sweep(&self) -> std::sync::MutexGuard<'_, crate::buffersweep::Sweep> {
+        self.sweep.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The GPU address of the table of element strides by title slot (view

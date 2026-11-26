@@ -1596,74 +1596,50 @@ impl State {
         // frame (2026-11-24, run 11).
         // shortcut: what the title writes into such buffers between lists
         // of one frame is seen a frame late.
-        static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+        let started = std::time::Instant::now();
+        // Per host heap, on the heap: the host copy and range each slot's
+        // buffer view reads, kept from pass to pass, and the frame its pass
+        // last ran in (`crate::buffersweep`). Only the slots written since
+        // the last pass are looked at again (83,000 slots a pass otherwise,
+        // 0.1 s at best); all of them every `full_every` passes, because a
+        // view of a released resource goes stale without a write, and a slot
+        // written before its memory had a host copy is only made then.
         let frame = crate::frame::current();
-        if FRAME.swap(frame, Ordering::Relaxed) == frame {
+        let mut sweep = host.buffer_sweep();
+        if !sweep.frame_due(frame) {
             return Some(gpu);
         }
-        let started = std::time::Instant::now();
-        // Per host heap: the host copy and range each slot's buffer view
-        // reads, kept from pass to pass. Only the slots written since the
-        // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every `full_every` passes, because a view of
-        // a released resource goes stale without a write.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        /// Slots whose view could not be made ready yet (no host copy), with
-        /// the passes left to ask again.
-        type Pending = std::collections::HashMap<u32, u8>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges, Pending)>>> =
-            std::sync::Mutex::new(None);
-        let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges, pending) = kept
-            .get_or_insert_with(Default::default)
-            .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new(), Pending::new()));
         let changed = host.buffer_changes();
-        static FULL_EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let full_every = (*FULL_EVERY.get_or_init(|| {
-            std::env::var("VICTORY_HEAP_FULL_EVERY")
-                .ok()
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .unwrap_or(128)
-        }))
-        .clamp(1, 4096);
         // A slot first seen before its memory had a host copy is asked again
         // for a few passes: a full scan alone would leave a dynamic index
-        // reading a stale or missing view until `full_every` came round (112
-        // extra passes at the default of 128). `VICTORY_HEAP_RETRY=0` goes
-        // back to waiting for the full scan.
-        static RETRY: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-        let retry = *RETRY.get_or_init(|| {
-            std::env::var("VICTORY_HEAP_RETRY")
-                .ok()
-                .and_then(|v| v.trim().parse::<u8>().ok())
-                .unwrap_or(8)
-        });
-        let slots = if *passes % full_every == 0 {
-            ranges.clear();
-            pending.clear();
+        // reading a stale or missing view until `full_every` came round.
+        // `VICTORY_HEAP_RETRY=0` goes back to waiting for the full scan.
+        let retry = crate::buffersweep::retry();
+        let (_, all) = sweep.pass(crate::buffersweep::full_every());
+        let slots = if all {
+            sweep.ranges.clear();
+            sweep.pending.clear();
             host.buffer_slots()
         } else {
             let mut slots = changed;
-            slots.extend(pending.keys().copied());
+            slots.extend(sweep.pending.keys().copied());
             slots
         };
         // What this pass could not make ready, for the next one.
-        let mut again = Pending::new();
-        *passes += 1;
+        let mut again: std::collections::HashMap<u32, u8> = std::collections::HashMap::new();
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive =
             !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
+            sweep.ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
             // The budget a slot has left: a new one where this pass is the
             // one that found it, else what the pass before it stored.
-            let left = pending.get(&index).copied().unwrap_or(retry);
+            let left = sweep.pending.get(&index).copied().unwrap_or(retry);
             let Some(view) = host.mirror(index, handle, true) else {
                 if left > 0 {
                     again.insert(index, left - 1);
@@ -1706,16 +1682,16 @@ impl State {
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            sweep.ranges.insert(index, (shadow, address, address + len));
         }
-        *pending = again;
-        let views = ranges.len() as u32;
+        sweep.pending = again;
+        let views = sweep.ranges.len() as u32;
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<
             usize,
             (std::sync::Arc<crate::shadow::Shadow>, u64, u64),
         > = std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
+        for (shadow, from, to) in sweep.ranges.values() {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
             let span = spans
                 .entry(key)
@@ -1723,7 +1699,6 @@ impl State {
             span.1 = span.1.min(*from);
             span.2 = span.2.max(*to);
         }
-        drop(kept);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
@@ -1732,32 +1707,29 @@ impl State {
         // the garbage ended runs (the card stopped answering 14-90 frames
         // into the opening cutscene; with every frame it ran on). The pass
         // costs some 30 ms a frame this way.
-        static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> =
-            std::sync::Mutex::new(None);
-        let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
-        let whole = whole.get_or_insert_with(Default::default);
+        // `VICTORY_UNWATCHED_FRAMES` sets the interval (1: every frame).
+        static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let every = *EVERY.get_or_init(|| {
+            std::env::var("VICTORY_UNWATCHED_FRAMES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1)
+        });
         for (shadow, from, to) in spans.values() {
-            if shadow.unwatched() {
-                // By the copy's number: a copy made where one let go was
-                // (`shadow::let_go_idle`) has never been refreshed.
-                let key = shadow.id() as usize;
-                // `VICTORY_UNWATCHED_FRAMES` sets the interval (1: every frame).
-                static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-                let every = *EVERY.get_or_init(|| {
-                    std::env::var("VICTORY_UNWATCHED_FRAMES")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(1)
-                });
-                match whole.get(&key) {
-                    Some(&last) if frame < last + every => continue,
-                    _ => {
-                        whole.insert(key, frame);
-                    }
-                }
+            // By the copy's number: a copy made where one let go was
+            // (`shadow::let_go_idle`) has never been refreshed. It waits out
+            // the interval only while its views read inside the span its last
+            // refresh covered (`crate::buffersweep`).
+            if every > 1
+                && shadow.unwatched()
+                && !sweep.due(shadow.id(), frame, every, *from, *to)
+            {
+                continue;
             }
             shadow.refresh(list, *from, to - from);
         }
+        sweep.end_pass();
+        drop(sweep);
         self.heap_textures(list, heap, host);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
