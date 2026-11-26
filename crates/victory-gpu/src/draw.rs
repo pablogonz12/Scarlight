@@ -2237,7 +2237,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            crate::pipeline::note_drop(self.pipeline as This);
+            crate::pipeline::note_skipped(self.pipeline as This);
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
@@ -2245,11 +2245,14 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
-                crate::pipeline::note_why(
-                    "a stage of the ray-tracing structure builder, which is off".to_owned(),
+                crate::pipeline::note_design_why(
+                    "a stage of the ray-tracing structure builder (VICTORY_BVH_BUILDER is not 1)"
+                        .to_owned(),
                 );
                 self.list_dropped_roots([x, y, z]);
             }
+            #[cfg(not(feature = "diagnostics"))]
+            crate::pipeline::note_design();
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -3283,7 +3286,7 @@ impl State {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            crate::pipeline::note_drop(self.pipeline as This);
+            crate::pipeline::note_skipped(self.pipeline as This);
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
