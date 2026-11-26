@@ -827,6 +827,13 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut g = guards();
     let mut written = Vec::new();
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // A block whose bytes another view of the same section shows too is
+    // never made read-only: a write through that view would go unseen, and
+    // the block would stay `clean` for good. One atomic load while the title
+    // has mapped nothing twice (`inplace::aliased`).
+    let aliased = |at: usize| aliases() && crate::inplace::aliased(at);
+    // (`open` is a block's name below, so the giving back goes through this.)
+    let give_back = |g: &mut Guards, at: usize, to: usize| open(g, at, to);
     // Large heaps are usually clean. Walk only gaps between clean runs.
     let mut uncommitted_until = first;
     for (from, to) in g.clean.uncovered(first, last) {
@@ -844,7 +851,12 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                     g.absent.remove(&block);
                 }
             }
-            if open {
+            if open && aliased(block * BLOCK) {
+                // Given back if an earlier pass guarded it; never guarded
+                // again, and never clean.
+                give_back(&mut g, block * BLOCK, (block + 1) * BLOCK);
+                written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+            } else if open {
                 written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
                 if g.protected.contains(&block) {
                     // Written through the runtime, still read-only.
@@ -987,6 +999,35 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         forget(first * BLOCK, (last + 1 - first) * BLOCK);
     }
     !blocks.is_empty()
+}
+
+/// Whether a view mapped beside others (`opened_beside`) has its guards
+/// taken off: `VICTORY_GUARD_ALIASES=0` leaves them (a start-up switch).
+fn aliases() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_ALIASES").is_none_or(|v| v != "0"))
+}
+
+/// The runtime mapped views of bytes we hold view guards on, at other
+/// addresses than the ones guarded (a section shown twice): every guarded
+/// block of them is given back to write. A page guarded read-only at one
+/// address can be written through another, where no handler of ours sees
+/// it, so the guard of such a page covers nothing and the copies through it
+/// must go to the kernel (after avatarmanz 2be0515c).
+pub fn opened_beside(views: &[(usize, usize)]) {
+    if views.is_empty() || !aliases() {
+        return;
+    }
+    let mut g = guards();
+    let mut opened = Vec::new();
+    for &(at, len) in views {
+        if len != 0 && open(&mut g, at, at.saturating_add(len)) {
+            opened.push((at, len));
+        }
+    }
+    if !opened.is_empty() {
+        tracing::info!(?opened, "views opened beside guarded ones (VICTORY_GUARD_ALIASES)");
+    }
 }
 
 /// Whether every 64 KiB block of `[at, at + len)` is title memory the layer

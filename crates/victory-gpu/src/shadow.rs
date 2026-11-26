@@ -188,16 +188,26 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
 }
 
 /// Resolve `(min_bytes, max_bytes)` from the adapter's local VRAM budget and
-/// optional explicit MiB overrides from `VICTORY_CARD_BUFFERS_MIN_MB` /
-/// `VICTORY_CARD_BUFFERS_MB`.
+/// optional explicit overrides: `VICTORY_CARD_BUFFERS_MIN_MB` (or the finer
+/// `VICTORY_CARD_BUFFERS_MIN_KB`) and `VICTORY_CARD_BUFFERS_MB`.
 fn resolve_card_limits(
     local_vram_budget: Option<u64>,
     min_mb_override: Option<u64>,
+    min_kb_override: Option<u64>,
     max_mb_override: Option<u64>,
 ) -> (u64, u64) {
     const MIB: u64 = 1 << 20;
+    const KIB: u64 = 1 << 10;
     let (default_min_mb, default_max_mb) = default_card_limits_mb(local_vram_budget);
-    let min_bytes = min_mb_override.unwrap_or(default_min_mb).saturating_mul(MIB).max(MIB);
+    // A floor of a MiB is not a floor of the copies: nearly all of them are
+    // smaller (few bytes each), and in the PC's memory every load, store and
+    // atomic a shader does on one crosses the bus. MIN_KB says the least in
+    // KiB, so that 64 puts every title buffer's copy on the card (after
+    // fxceless c36971b2); unset, the floor is the one of before.
+    let min_bytes = match (min_kb_override, min_mb_override) {
+        (Some(kib), _) => kib.saturating_mul(KIB),
+        (None, mb) => mb.unwrap_or(default_min_mb).saturating_mul(MIB).max(MIB),
+    };
     let max_bytes = max_mb_override.unwrap_or(default_max_mb).saturating_mul(MIB);
     (min_bytes, max_bytes)
 }
@@ -205,7 +215,8 @@ fn resolve_card_limits(
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB`.
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (or `VICTORY_CARD_BUFFERS_MIN_KB`, which
+/// can go under a MiB) and `VICTORY_CARD_BUFFERS_MB`.
 /// Defaults scale with the adapter's local VRAM budget (1 MiB / 1024 MB on
 /// `<= 12 GiB` budgets, 1 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
 /// on `>= 20 GiB` budgets), and explicit env vars always override. Both are
@@ -225,11 +236,12 @@ fn card_limits() -> (u64, u64) {
         let (min_bytes, max_bytes) = resolve_card_limits(
             vram_budget,
             env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
+            env_mb("VICTORY_CARD_BUFFERS_MIN_KB"),
             env_mb("VICTORY_CARD_BUFFERS_MB"),
         );
         tracing::info!(
             vram_budget_mb = vram_budget.map(|b| b >> 20),
-            card_buffers_min_mb = min_bytes >> 20,
+            card_buffers_min_kb = min_bytes >> 10,
             card_buffers_max_mb = max_bytes >> 20,
             "card buffer limits"
         );
@@ -3636,10 +3648,17 @@ mod window_tests {
         assert_eq!(default_card_limits_mb(Some(48 * GIB)), (1, 8192));
 
         // Explicit env overrides always win, clamp min to >= 1 MiB, and saturate on overflow.
-        assert_eq!(resolve_card_limits(Some(32 * GIB), Some(8), Some(4096)), (8 * MIB, 4096 * MIB));
-        assert_eq!(resolve_card_limits(Some(12 * GIB), Some(0), Some(1024)), (MIB, 1024 * MIB));
-        assert_eq!(resolve_card_limits(None, Some(u64::MAX), Some(u64::MAX)), (u64::MAX, u64::MAX));
-        assert_eq!(resolve_card_limits(None, None, None), (MIB, 1024 * MIB));
+        assert_eq!(resolve_card_limits(Some(32 * GIB), Some(8), None, Some(4096)), (8 * MIB, 4096 * MIB));
+        assert_eq!(resolve_card_limits(Some(12 * GIB), Some(0), None, Some(1024)), (MIB, 1024 * MIB));
+        assert_eq!(resolve_card_limits(None, Some(u64::MAX), None, Some(u64::MAX)), (u64::MAX, u64::MAX));
+        assert_eq!(resolve_card_limits(None, None, None, None), (MIB, 1024 * MIB));
+        // MIN_KB goes under the MiB the MiB switch cannot: 64 KiB puts every
+        // title buffer's copy on the card, 0 has none at all, and it wins
+        // over MIN_MB when both are set.
+        assert_eq!(resolve_card_limits(None, None, Some(64), None), (64 << 10, 1024 * MIB));
+        assert_eq!(resolve_card_limits(None, None, Some(0), None), (0, 1024 * MIB));
+        assert_eq!(resolve_card_limits(None, Some(8), Some(64), None), (64 << 10, 1024 * MIB));
+        assert_eq!(resolve_card_limits(None, None, Some(u64::MAX), None), (u64::MAX, 1024 * MIB));
     }
 
     /// An ask that may take any window takes the longest that holds all of
