@@ -2812,7 +2812,8 @@ mod tests {
             ..texture(4, 4, 29, 1)
         };
         // SAFETY: a texture description of ours, and no clear value.
-        let texture = host_texture(&desc, 4, std::ptr::null()).expect("a texture the host makes");
+        let (texture, _) = host_texture(&desc, 4, std::ptr::null(), false)
+            .expect("a texture the host makes");
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
         assert_eq!(
