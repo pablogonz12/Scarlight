@@ -342,8 +342,9 @@ mod tests {
         assert!(!admitted(total, floor + MIB, 2 * MIB, false));
         assert!(admitted(total, floor + 2 * MIB, 2 * MIB, false));
         let growth = growth_floor(total);
-        assert!(admitted(total, growth, 64 * MIB, true));
-        assert!(!admitted(total, growth - 1, 64 * MIB, true));
+        assert!(admitted(total, growth + 64 * MIB, 64 * MIB, true));
+        assert!(!admitted(total, growth + 64 * MIB - 1, 64 * MIB, true));
+        assert!(!admitted(total, growth, 64 * MIB, true));
         // Room for a small upload is not room for a block.
         assert!(!admitted(total, floor + 64 * MIB, 64 * MIB, true));
     }
@@ -357,9 +358,11 @@ mod tests {
         assert!(next_pressure(false, total, total / 10, total));
         assert!(next_pressure(false, total, total, total / 8));
         assert!(!next_pressure(false, total, total / 9, total / 7));
-        // Leaving: both above a sixth/fifth.
-        assert!(next_pressure(true, total, total / 6, total));
-        assert!(next_pressure(true, total, total, total / 5));
+        // Leaving: both above a sixth/fifth, so one at the line is not enough.
+        assert!(next_pressure(true, total, total / 6 - 1, total));
+        assert!(!next_pressure(true, total, total / 6, total));
+        assert!(next_pressure(true, total, total, total / 5 - 1));
+        assert!(!next_pressure(true, total, total, total / 5));
         assert!(!next_pressure(true, total, total / 5, total / 4));
         // The state is sticky in one direction only.
         for total in [SMALL, OURS, BIG] {
