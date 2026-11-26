@@ -64,6 +64,63 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 /// call that resets written pages costs 30-70 microseconds whatever the
 /// range).
 const AHEAD_GAP: usize = (8 << 20) / PAGE;
+
+/// The gap one asking of a submission's **textures** may bridge, in pages
+/// (`VICTORY_ASK_TEXTURE_GAP_KB`, default 256; 0 asks each span alone).
+///
+/// The cost of an asking is its *span*, not the pages found in it: 0.4-1.7
+/// us a megabyte in a quiet process, **163 us a megabyte** while the
+/// title's threads map and unmap (the kernel walks page tables under the
+/// mapping lock, `xcl-bin/notes/copy-bandwidth.md`), and 30-70 us a call.
+/// [`AHEAD_GAP`]'s 8 MB is the quiet process's break-even; under churn it
+/// costs 1.3 ms of span to save a 50 us call. Textures in one pool lie
+/// megabytes apart, so a merged asking walked most of the pool: the run of
+/// 26 Nov 13:20 spent 58.9 ms a frame *asking* (a texture the journal
+/// answered costs microseconds), 85 % of the 69.1 ms of its refreshes and
+/// 66 % of its 89.2 ms frame. At 256 KiB the span walked is the textures
+/// themselves plus 64 pages a piece, which is what a call saves.
+fn texture_gap() -> usize {
+    static PAGES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let kb = crate::switches::u64v(
+        "VICTORY_ASK_TEXTURE_GAP_KB",
+        *PAGES.get_or_init(|| {
+            std::env::var("VICTORY_ASK_TEXTURE_GAP_KB")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(256)
+        }) as u64,
+    );
+    ((kb as usize) << 10) / PAGE
+}
+
+/// [`texture_gap`] in KiB, for the frame line.
+pub(crate) fn texture_gap_kb() -> u64 {
+    (texture_gap() * PAGE / 1024) as u64
+}
+
+/// Since the last frame line, of the write-watch askings: kernel calls the
+/// refreshes (and the copies) made themselves, the pages their spans
+/// covered, their microseconds, answers out of the journal (a range the
+/// submission asked ahead: microseconds), kernel calls that failed (the
+/// range is not write-watched, or crosses a reservation), and kernel calls
+/// the submission's ahead asking made, with their span.
+///
+/// The frame line's "asking the write watch and the guards" was 58.9 ms of
+/// one 69.1 ms of refreshes (run of 26 Nov 13:20) and nothing said whether
+/// that was a few wide askings or many narrow ones. These do.
+pub(crate) static ASKS: [std::sync::atomic::AtomicU64; 9] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+
+/// [`ASKS`]'s places.
+pub(crate) const ASK_OWN: usize = 0;
+pub(crate) const ASK_OWN_PAGES: usize = 1;
+pub(crate) const ASK_OWN_US: usize = 2;
+pub(crate) const ASK_JOURNAL: usize = 3;
+pub(crate) const ASK_JOURNAL_US: usize = 4;
+pub(crate) const ASK_FAILED: usize = 5;
+pub(crate) const ASK_AHEAD: usize = 6;
+pub(crate) const ASK_AHEAD_PAGES: usize = 7;
+pub(crate) const ASK_AHEAD_US: usize = 8;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
@@ -74,6 +131,18 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    ask_more(ranges, AHEAD_GAP, true);
+}
+
+/// [`ask_ahead`] for ranges asked after it in the same submission (its
+/// textures, [`texture_gap`]): they join the asking it numbered instead of
+/// numbering a new one, so everything the submission asks is answered by
+/// the journal under one asking.
+pub(crate) fn ask_ahead_apart(ranges: &[(usize, usize)], gap: usize) {
+    ask_more(ranges, gap, false);
+}
+
+fn ask_more(ranges: &[(usize, usize)], gap: usize, fresh: bool) {
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         .filter(|r| r.0 < r.1)
@@ -90,16 +159,21 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     if j.kept {
         return;
     }
-    j.asked += 1;
-    j.ahead_asked = j.asked;
-    j.ahead.clear();
+    if fresh {
+        j.asked += 1;
+        j.ahead_asked = j.asked;
+        j.ahead.clear();
+    } else if j.asked == 0 {
+        j.asked += 1;
+        j.ahead_asked = j.asked;
+    }
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
         let mut last = pieces[i].1;
         let mut k = i + 1;
         while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
+            && pieces[k].0 <= last + gap
             && last.max(pieces[k].1) - first <= AHEAD_MAX
         {
             last = last.max(pieces[k].1);
@@ -171,12 +245,15 @@ pub(crate) fn once() -> bool {
 /// With [`once`]: asks about `ranges` (everything a submission's lists
 /// refresh) as [`ask_ahead`] does, and lets that asking stand until
 /// [`ask_once_end`].
-pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
+pub(crate) fn ask_once(ranges: &[(usize, usize)], textures: &[(usize, usize)]) {
     if !once() {
         return;
     }
     ask_once_end();
     ask_ahead(ranges);
+    // The textures are asked about apart ([`texture_gap`]): one asking for
+    // them merged walked the megabytes between them in the title's pools.
+    ask_ahead_apart(textures, texture_gap());
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     if j.ahead.is_empty() {
@@ -189,7 +266,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
-    for &(start, end) in ranges {
+    for &(start, end) in ranges.iter().chain(textures) {
         if start >= end {
             continue;
         }
@@ -232,15 +309,21 @@ pub(crate) fn wrote(at: usize, len: usize) {
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
-/// write-watched does. A piece alone is left to [`writes`].
+/// write-watched does. A piece on its own is asked too: left to [`writes`]
+/// it was asked once per refresh of the texture or copy it spans (a
+/// texture a submission samples in three lists: three times), where one
+/// asking ahead answers all of them from the journal.
 fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
-    if pieces.len() < 2 {
+    if pieces.is_empty() {
         return;
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
     if ask_kernel(j, first, last) {
         j.ahead.push((first, last));
+        return;
+    }
+    if pieces.len() == 1 {
         return;
     }
     let (a, b) = pieces.split_at(pieces.len() / 2);
@@ -257,7 +340,6 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
@@ -271,8 +353,13 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         )
     } != 0;
     if failed {
+        ASKS[ASK_FAILED].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return false;
     }
+    use std::sync::atomic::Ordering::Relaxed;
+    ASKS[ASK_AHEAD].fetch_add(1, Relaxed);
+    ASKS[ASK_AHEAD_PAGES].fetch_add((last - first) as u64, Relaxed);
+    ASKS[ASK_AHEAD_US].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
@@ -287,7 +374,6 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     }
     true
 }
-
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
 /// the range lies in one asked ahead ([`ask_ahead`], [`ask_once`]): the
 /// pages written since tracking began and the asking that last found each
@@ -370,23 +456,28 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let started = std::time::Instant::now();
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if covers(&j.ahead, first, last) {
-        return Some((
+        let found = (
             j.ahead_asked,
             j.written
                 .range(first..last)
                 .map(|(&p, &w)| (p, w))
                 .collect(),
-        ));
+        );
+        ASKS[ASK_JOURNAL].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ASKS[ASK_JOURNAL_US].fetch_add(
+            started.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        return Some(found);
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -400,6 +491,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     } != 0;
     let guarded = if failed {
         count = 0;
+        ASKS[ASK_FAILED].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if !guarded {
             return None;
         }
@@ -410,6 +502,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
         written?
     } else {
+        use std::sync::atomic::Ordering::Relaxed;
+        ASKS[ASK_OWN].fetch_add(1, Relaxed);
+        ASKS[ASK_OWN_PAGES].fetch_add((last - first) as u64, Relaxed);
+        ASKS[ASK_OWN_US].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         Vec::new()
     };
     #[cfg(feature = "diagnostics")]
@@ -1364,6 +1460,169 @@ mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// A submission's textures are asked about apart from each other: two
+    /// spans a pool leaves a hundred pages apart cost two askings over
+    /// their own pages, not one asking that walks the pool between them
+    /// (the same bytes, on every refresh of either, out of the journal).
+    /// The old asking merged them (`AHEAD_GAP`, 8 MB) and walked 108 pages
+    /// for 16: 58.9 ms of a 69.1 ms frame of refreshes at the 163 us a
+    /// megabyte a churned process walks (26 Nov).
+    #[test]
+    fn a_submissions_textures_ask_their_own_spans() {
+        use std::sync::atomic::Ordering::Relaxed;
+        const SPAN: usize = 8;
+        // SAFETY: a fresh write-watched allocation of 128 pages, freed at
+        // the end; the two textures are the first and the last 8 of them.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                128 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let (a, b) = (p, p + 100 * PAGE);
+        forget_askings();
+        ASKS[ASK_AHEAD_PAGES].swap(0, Relaxed);
+        // What the asking for the copies did, and still does: one range
+        // over both, whose pages between them are in the pool.
+        ask_ahead(&[(a, a + SPAN * PAGE), (b, b + SPAN * PAGE)]);
+        let walked = ASKS[ASK_AHEAD_PAGES].swap(0, Relaxed);
+        assert_eq!(
+            walked,
+            (b / PAGE + SPAN - a / PAGE) as u64,
+            "the merged asking walks the pool between the two textures"
+        );
+        // The submission's askings for its textures: apart, so the kernel
+        // walks their pages only.
+        // SAFETY: committed pages of ours; one page written in each span.
+        // (After the asking above: an asking clears the kernel's bits.)
+        unsafe {
+            ((a + 2 * PAGE + 8) as *mut u8).write(0xab);
+            ((b + PAGE + 8) as *mut u8).write(0xcd);
+        }
+        forget_askings();
+        ASKS[ASK_AHEAD].swap(0, Relaxed);
+        ask_ahead_apart(&[(a, a + SPAN * PAGE), (b, b + SPAN * PAGE)], texture_gap());
+        assert_eq!(
+            ASKS[ASK_AHEAD_PAGES].swap(0, Relaxed),
+            (2 * SPAN) as u64,
+            "an asking a texture walks that texture's pages"
+        );
+        assert_eq!(ASKS[ASK_AHEAD].swap(0, Relaxed), 2, "an asking a texture");
+        // Both refreshes are answered from the journal: the kernel is not
+        // asked again, and the pages reported are the same either way.
+        let own = ASKS[ASK_OWN].load(Relaxed);
+        let (_, written_a) = writes(a, a + SPAN * PAGE, false).expect("watched");
+        let (_, written_b) = writes(b, b + SPAN * PAGE, false).expect("watched");
+        assert_eq!(
+            ASKS[ASK_OWN].load(Relaxed),
+            own,
+            "the journal answers a texture the submission asked about"
+        );
+        assert_eq!(written_a.len(), 1);
+        assert_eq!(written_a[0].0, a / PAGE + 2);
+        assert_eq!(written_b.len(), 1);
+        assert_eq!(written_b[0].0, b / PAGE + 1);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// **Microbench**, not a game run: what the two asking shapes cost the
+    /// kernel, 3 samples each, in a quiet process and beside eight threads
+    /// that map and unmap 32 MB blocks (the title churns its address space
+    /// every frame, `xcl-bin/notes/copy-bandwidth.md`). One asking over two
+    /// texture spans 100 pages apart walks 108 pages; asking them apart
+    /// walks 8 twice. Run:
+    /// `wine t.exe --ignored --nocapture --test-threads=1 bench_a_textures_askings`.
+    #[test]
+    #[ignore]
+    fn bench_a_textures_askings_walk_their_spans_not_the_pools_gap() {
+        use std::sync::atomic::AtomicBool;
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        const RESET: u32 = 1;
+        // SAFETY: a fresh write-watched allocation of 128 pages, freed at
+        // the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                128 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let ask = |pages: usize, at: usize| -> u128 {
+            let mut found = vec![0usize; pages * PAGE / 4096];
+            let mut count = found.len();
+            let mut granularity = 0;
+            let started = std::time::Instant::now();
+            // SAFETY: the answer buffer holds `count` entries.
+            let failed = unsafe {
+                GetWriteWatch(
+                    RESET,
+                    at as *const _,
+                    pages * PAGE,
+                    found.as_mut_ptr().cast(),
+                    &mut count,
+                    &mut granularity,
+                )
+            } != 0;
+            assert!(!failed, "write-watched memory");
+            started.elapsed().as_micros()
+        };
+        let run = |label: &str| {
+            for sample in 1..=5 {
+                let merged = ask(108, p);
+                let mut apart = 0u128;
+                for _ in 0..2 {
+                    apart += ask(8, p);
+                }
+                println!(
+                    "{label} sample {sample}: merged (108 pages) {:.2} ms, apart (2 x 8 pages) {:.2} ms",
+                    merged as f64 / 1e3,
+                    apart as f64 / 1e3
+                );
+            }
+        };
+        run("quiet");
+        // Eight threads mapping and uncommitting 32 MB blocks, as the
+        // title's do.
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let churn: Vec<_> = (0..8)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        // SAFETY: a block of our own, given back at once.
+                        // Committing and releasing it (not writing it) is
+                        // the page-table churn that stalls the mapping lock.
+                        unsafe {
+                            let b = VirtualAlloc(
+                                std::ptr::null(),
+                                32 << 20,
+                                MEM_RESERVE | MEM_COMMIT,
+                                0x04, // PAGE_READWRITE
+                            );
+                            if !b.is_null() {
+                                VirtualFree(b, 0, MEM_RELEASE);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        run("churned");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for t in churn {
+            let _ = t.join();
+        }
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
     /// A range no asking of the submission since reported written is known
     /// clean from the journal, and the write it did report is not taken for
     /// a write in another range of the same asking: a copy is clean while
@@ -1385,7 +1644,7 @@ mod tests {
         forget_askings();
         let (a, b) = (p, p + 2 * PAGE);
         let (c, d) = (p + 2 * PAGE, p + 4 * PAGE);
-        ask_once(&[(a, b), (c, d)]);
+        ask_once(&[(a, b), (c, d)], &[]);
         let (since, pages) = asked(a, b).expect("asked ahead");
         assert!(pages.is_empty(), "nothing written yet");
         assert_eq!(written_since(a, b, since), Some(false));
@@ -1394,7 +1653,7 @@ mod tests {
         unsafe { ((c + 8) as *mut u8).write_volatile(7) };
         // The submission asks again: the write is the new asking's, and it
         // is the other range's.
-        ask_once(&[(a, b), (c, d)]);
+        ask_once(&[(a, b), (c, d)], &[]);
         let (now, _) = asked(a, b).expect("asked again");
         assert!(now > since);
         assert_eq!(written_since(a, b, since), Some(false), "another range's write");
@@ -1463,7 +1722,7 @@ mod tests {
             assert_ne!(p, 0);
             forget_askings();
             let ranges: Vec<(usize, usize)> = (0..pages).map(|i| (p + i * PAGE, p + (i + 1) * PAGE)).collect();
-            ask_once(&ranges);
+            ask_once(&ranges, &[]);
             let (since, _) = asked(ranges[0].0, ranges[0].1).expect("asked ahead");
             // The refresh's ask, as `copy_stale` makes it.
             let started = Instant::now();

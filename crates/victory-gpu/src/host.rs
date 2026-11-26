@@ -4642,11 +4642,13 @@ impl Host {
                     }
                 }
             }
-            let mut ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
             textures.sort_unstable();
             textures.dedup();
-            ranges.append(&mut textures);
-            crate::watch::ask_once(&ranges);
+            // The textures are asked about apart from the copies and from
+            // each other ([`crate::watch::texture_gap`]): one merged asking
+            // walked the megabytes the title's pools leave between them.
+            crate::watch::ask_once(&ranges, &textures);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
@@ -4655,7 +4657,7 @@ impl Host {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
-                crate::watch::ask_once(&ranges);
+                crate::watch::ask_once(&ranges, &textures);
             }
         } else if behind && stale_under_flights(runs) {
             let settling = std::time::Instant::now();
@@ -7276,6 +7278,43 @@ impl Meter {
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
                      is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
+                );
+            }
+            // What the refreshes did, and what the askings cost: the split
+            // above says how much of the time was asking the write watch,
+            // these say how many refreshes asked, what the ones the journal
+            // answered cost, and what each reason read.
+            let [unchanged, pages, whole, partial, unlocked] = [0, 1, 2, 3, 4]
+                .map(|i| crate::texture::REASONS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let refreshes = unchanged + pages + whole + partial + unlocked;
+            let [pages_mb, whole_mb, partial_mb, unlocked_mb] = [1, 2, 3, 4]
+                .map(|i| crate::texture::REASON_BYTES[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
+            let written = crate::texture::PAGES_WRITTEN.swap(0, Ordering::Relaxed) as f64 / frames;
+            let read_pages = crate::texture::PAGES_READ.swap(0, Ordering::Relaxed) as f64 / frames;
+            let runs = crate::texture::RUNS_READ.swap(0, Ordering::Relaxed) as f64 / frames;
+            let aliases = crate::texture::ALIASES.swap(0, Ordering::Relaxed) as f64 / frames;
+            let [own_asks, own_pages, own_us, journal, journal_us, failed, ahead, ahead_pages, ahead_us] =
+                [0, 1, 2, 3, 4, 5, 6, 7, 8].map(|i| crate::watch::ASKS[i].swap(0, Ordering::Relaxed));
+            if refreshes + journal as f64 + ahead as f64 + own_asks as f64 > 0.0 {
+                tracing::info!(
+                    "texture refreshes per frame, by what they found: {refreshes:.0} refreshes ({unchanged:.1} unchanged, \
+                     {whole:.1} the whole texture {whole_mb:.1} MB, {partial:.1} partly mapped {partial_mb:.1} MB, \
+                     {unlocked:.1} through the kernel {unlocked_mb:.1} MB), {pages:.0} reading and detiling only the 64 KiB \
+                     pages the title wrote ({pages_mb:.1} MB): {written:.0} pages written, {read_pages:.0} read in {runs:.1} \
+                     runs; {aliases:.0} copies into a view of another format",
+                );
+                tracing::info!(
+                    "the write watch per frame: {journal:.0} answers out of the journal ({:.1} ms), {own_asks:.0} kernel askings of \
+                     a refresh or a copy over {:.1} MB ({:.1} ms), {:.0} askings that failed (not write-watched, or across a \
+                     reservation); the submission's ahead asking: {ahead:.0} kernel askings over {:.1} MB ({:.1} ms, \
+                     VICTORY_ASK_TEXTURE_GAP_KB {} for a texture's span alone)",
+                    journal_us as f64 / 1e3 / frames,
+                    own_pages as f64 * crate::watch::PAGE as f64 / 1e6 / frames,
+                    own_us as f64 / 1e3 / frames,
+                    failed as f64 / frames,
+                    ahead_pages as f64 * crate::watch::PAGE as f64 / 1e6 / frames,
+                    ahead_us as f64 / 1e3 / frames,
+                    crate::watch::texture_gap_kb(),
                 );
             }
             let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);

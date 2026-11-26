@@ -462,6 +462,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         D3D12_RESOURCE_STATE_COPY_SOURCE,
         D3D12_RESOURCE_STATE_COPY_DEST,
     );
+    ALIASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "diagnostics")]
     list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
     // SAFETY: an open list and live resources; the buffer is as big as
@@ -547,6 +548,79 @@ pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] =
 /// These say for what.
 pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Since the last frame line, why each refresh took what it took, and the
+/// bytes of title memory it read: it found the texture unchanged (nothing
+/// read), it read and detiled only the 64 KiB pages the title wrote
+/// (`refresh_pages`, #211), it read the whole texture from its first
+/// refresh or through the copy, it read a partly mapped texture, or it read
+/// through the kernel because the runtime was remapping title memory
+/// ([`refresh_unlocked`]).
+///
+/// The frame line's "textures" is seconds a frame in some runs and a
+/// tenths in others for the same megabytes, and the split it has says only
+/// how much of it was asking the write watch; these say what the refreshes
+/// did with what the asking found. Counted always, not only with the
+/// diagnostics feature: the run that showed the split (26 Nov, 69.1 ms a
+/// frame) was built without it.
+pub(crate) static REASONS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The bytes of title memory the refreshes of each [`REASONS`] place read.
+pub(crate) static REASON_BYTES: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// [`REASONS`]'s places.
+pub(crate) const REASON_UNCHANGED: usize = 0;
+pub(crate) const REASON_PAGES: usize = 1;
+pub(crate) const REASON_WHOLE: usize = 2;
+pub(crate) const REASON_PARTIAL: usize = 3;
+pub(crate) const REASON_UNLOCKED: usize = 4;
+
+/// Since the last frame line: the 64 KiB pages the write watch named as
+/// written within the textures refreshed, the runs read for them, and the
+/// bytes the copy of a whole texture read for its hash (the same bytes as
+/// the read, counted apart so that a refresh that read the whole texture to
+/// find one page changed shows what it cost).
+pub(crate) static PAGES_WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PAGES_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static RUNS_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Copies `source`'s texels through a buffer into the texture of a view the
+/// title placed in its memory in another format ([`alias`]).
+pub(crate) static ALIASES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One refresh counted under its reason when it ends, whatever its returns
+/// set it to. `REASON_WHOLE` until the refresh says otherwise: reading the
+/// whole texture is what it does when nothing else is decided.
+struct Noted {
+    reason: usize,
+    bytes: u64,
+}
+
+impl Default for Noted {
+    fn default() -> Self {
+        Noted {
+            reason: REASON_WHOLE,
+            bytes: 0,
+        }
+    }
+}
+
+impl Noted {
+    /// This refresh took `reason`.
+    fn took(&mut self, reason: usize) {
+        self.reason = reason;
+    }
+}
+
+impl Drop for Noted {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        REASONS[self.reason].fetch_add(1, Relaxed);
+        REASON_BYTES[self.reason].fetch_add(self.bytes, Relaxed);
+    }
+}
 
 /// How many microseconds a thread's texture refreshes may wait for title
 /// memory to hold still in one frame before they read through the kernel
@@ -682,6 +756,62 @@ fn dirty_runs(
         }
     }
     runs
+}
+
+/// Detiles `window`, the bytes of one run of a texture's title memory
+/// starting at offset `run_at` from the texture's first byte, into the part
+/// of subresource `sub` that the run covers.
+///
+/// `staging` is the mapped staging buffer, `offset`, `pitch`, `rows` and
+/// `depth` the subresource's copyable footprint in it, and `ranges` the
+/// bytes of the texture each subresource covers ([`Staging::refresh_pages`]).
+/// Kept apart from the refresh so that the test that reads one texture two
+/// ways — the 64 KiB pages that changed, and the whole texture — compares
+/// the staging buffer both leave, without a device.
+#[allow(clippy::too_many_arguments)]
+fn detile_into_subresource(
+    layout: &victory_formats::texture::Texture,
+    sub: usize,
+    mips: u32,
+    subresources_per_plane: u32,
+    ranges: &[(u64, u64)],
+    window: &[u8],
+    run_at: u64,
+    staging: *mut u8,
+    offset: u64,
+    pitch: usize,
+    rows: usize,
+    depth: u32,
+) {
+    let Some(&(rs, re)) = ranges.get(sub) else {
+        return;
+    };
+    let a = rs.max(run_at);
+    let b = re.min(run_at + window.len() as u64);
+    if a >= b {
+        return;
+    }
+    let len = pitch * rows * depth as usize;
+    // SAFETY: the subresource's part of the mapped staging buffer.
+    let linear = unsafe { std::slice::from_raw_parts_mut(staging.add(offset as usize), len) };
+    let (plane_index, mip, slice) = plane_of(sub as u32, mips, subresources_per_plane);
+    let Some(plane) = layout.planes.get(plane_index) else {
+        return;
+    };
+    let window = &window[(a - run_at) as usize..(b - run_at) as usize];
+    // `ranges` and the runs are texture-relative; a plane's layout numbers
+    // its own bytes from its offset.
+    if let Err(e) = plane.layout.detile_window(
+        window,
+        a - plane.offset,
+        mip,
+        slice,
+        linear,
+        pitch,
+        pitch * rows,
+    ) {
+        tracing::warn!(?e, mip, slice, "texture not detiled");
+    }
 }
 
 /// Whether a changed texture is detiled only where it changed, the 64 KiB
@@ -1280,7 +1410,9 @@ impl Staging {
     /// Returns the bytes of title memory read.
     fn refresh_now(&self) -> usize {
         let whole = std::time::Instant::now();
-        let read = self.refresh_timed();
+        let mut noted = Noted::default();
+        let read = self.refresh_timed(&mut noted);
+        noted.bytes = read as u64;
         REFRESH_WAITS[3].fetch_add(
             whole.elapsed().as_micros() as u64,
             std::sync::atomic::Ordering::Relaxed,
@@ -1288,7 +1420,7 @@ impl Staging {
         read
     }
 
-    fn refresh_timed(&self) -> usize {
+    fn refresh_timed(&self, noted: &mut Noted) -> usize {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
@@ -1296,7 +1428,11 @@ impl Staging {
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false))
         {
             let previous = last.asked;
+            // What the asking found: the pages the title wrote since the
+            // last one, whether they are read or not.
+            PAGES_WRITTEN.fetch_add(written.len() as u64, std::sync::atomic::Ordering::Relaxed);
             if previous != 0 && written.iter().all(|&(_, w)| w <= previous) {
+                noted.took(REASON_UNCHANGED);
                 return 0;
             }
             last.asked = now;
@@ -1307,6 +1443,7 @@ impl Staging {
             if previous != 0
                 && let Some(read) = self.refresh_pages(&written, previous)
             {
+                noted.took(REASON_PAGES);
                 return read;
             }
             // Read through the copy, which stands unmapped pages: memory of
@@ -1351,6 +1488,7 @@ impl Staging {
                 std::env::var_os("VICTORY_TEXTURE_GUARD_TRUST").is_some_and(|v| v == "1")
             });
             if unwritten && !turn && (trust || !last.missed) {
+                noted.took(REASON_UNCHANGED);
                 return 0;
             }
         }
@@ -1375,6 +1513,7 @@ impl Staging {
             waited_out(started.elapsed().as_micros() as u64);
             got
         }) else {
+            noted.took(REASON_UNLOCKED);
             return self.refresh_unlocked(last, size);
         };
         if !committed(self.memory, size) {
@@ -1408,6 +1547,7 @@ impl Staging {
             } else {
                 partial_frames()
             };
+            noted.took(REASON_PARTIAL);
             let frame = crate::frame::current();
             if last.partial.is_some_and(|at| frame < at + wait) {
                 return 0;
@@ -1469,6 +1609,7 @@ impl Staging {
                 Some(hash) if last.hash == Some(hash) => {
                     // Nothing changed: no copy, no detile, nothing at all.
                     drop(_mapped);
+                    noted.took(REASON_UNCHANGED);
                     return size;
                 }
                 Some(hash) => {
@@ -1486,6 +1627,7 @@ impl Staging {
                 // looks again, and the texture shows what it showed.
                 None => {
                     drop(_mapped);
+                    noted.took(REASON_UNCHANGED);
                     return size;
                 }
             }
@@ -1576,46 +1718,36 @@ impl Staging {
         let mut read = 0usize;
         for &(run_at, run_len) in &runs {
             let run_start = start + run_at as usize;
-            // SAFETY: a buffer of our own, filled by the copy.
-            let mut buf = vec![0u8; run_len];
-            // Read through the copy, which stands unmapped pages.
-            crate::host::copy_mapped(buf.as_mut_ptr(), run_start as *const u8, run_len, false);
-            for (sub, &(rs, re)) in ranges.iter().enumerate() {
-                let a = rs.max(run_at);
-                let b = re.min(run_at + run_len as u64);
-                if a >= b {
-                    continue;
+            // The thread's own read buffer, as the whole-texture read uses
+            // it: a buffer an allocation a run here was a `Vec` made and
+            // freed at every refresh of every changed texture.
+            let mut got = 0usize;
+            with_read(run_len, |buf| {
+                // Read through the copy, which stands unmapped pages.
+                crate::host::copy_mapped(buf.as_mut_ptr(), run_start as *const u8, run_len, false);
+                for sub in 0..ranges.len() {
+                    let footprint = &self.footprints[sub];
+                    let f = footprint.Footprint;
+                    detile_into_subresource(
+                        &self.layout,
+                        sub,
+                        self.mips,
+                        self.subresources_per_plane,
+                        ranges,
+                        buf,
+                        run_at,
+                        self.data,
+                        footprint.Offset,
+                        f.RowPitch as usize,
+                        self.rows[sub] as usize,
+                        f.Depth,
+                    );
                 }
-                let footprint = &self.footprints[sub];
-                let f = footprint.Footprint;
-                let pitch = f.RowPitch as usize;
-                let rows = self.rows[sub] as usize;
-                let len = pitch * rows * f.Depth as usize;
-                // SAFETY: the subresource's part of the mapped staging buffer.
-                let linear = unsafe {
-                    std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
-                };
-                let (plane_index, mip, slice) =
-                    plane_of(sub as u32, self.mips, self.subresources_per_plane);
-                let Some(plane) = self.layout.planes.get(plane_index) else {
-                    continue;
-                };
-                let window = &buf[(a - run_at) as usize..(b - run_at) as usize];
-                // `ranges` and the runs are texture-relative; a plane's
-                // layout numbers its own bytes from its offset.
-                if let Err(e) = plane.layout.detile_window(
-                    window,
-                    a - plane.offset,
-                    mip,
-                    slice,
-                    linear,
-                    pitch,
-                    pitch * rows,
-                ) {
-                    tracing::warn!(?e, mip, slice, "texture not detiled");
-                }
-            }
-            read += run_len;
+                got = run_len;
+            });
+            read += got;
+            RUNS_READ.fetch_add(1, Relaxed);
+            PAGES_READ.fetch_add((run_len / crate::watch::PAGE) as u64, Relaxed);
         }
         // The diagnostics' content generation (`Present`) is noted for whole
         // detiles only: the picture and the upload's `dirty` do not need it.
@@ -2381,6 +2513,160 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod dirty_page_tests {
+    use super::{detile_into_subresource, dirty_runs};
+    use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+
+    /// The staging buffer a host copy of `layout` has: each subresource's
+    /// rows at a 256-byte row pitch, one after another (`Staging`'s
+    /// footprints, which D3D12 would give a device).
+    struct Host {
+        layout: Texture,
+        mips: u32,
+        /// Row pitch, rows and depth of each subresource, and where its
+        /// bytes start.
+        subs: Vec<(u64, usize, usize, u32)>,
+        /// The bytes of the texture each subresource covers.
+        ranges: Vec<(u64, u64)>,
+        /// The bytes of the staging buffer.
+        staging: Vec<u8>,
+    }
+
+    fn host(bytes_per_texel: usize, width: u32, height: u32, mips: u32) -> Host {
+        let layout = Texture::new(&TextureDesc {
+            dimension: Dimension::Tex2d,
+            width,
+            height,
+            depth_or_array: 1,
+            mips,
+            format: 28, // R8G8B8A8_UNORM
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_Z_X,
+        })
+        .expect("a layout");
+        let mut subs = Vec::new();
+        let mut ranges = Vec::new();
+        let mut at = 0u64;
+        for plane in &layout.planes {
+            let extents = plane.layout.mip_extents();
+            for (mip, &(start, end)) in extents.iter().enumerate() {
+                let w = (width >> mip).max(1) as usize;
+                let h = (height >> mip).max(1) as usize;
+                let pitch = (w * bytes_per_texel).div_ceil(256) * 256;
+                subs.push((at, pitch, h, 1));
+                at += (pitch * h) as u64;
+                ranges.push((plane.offset + start, plane.offset + end));
+            }
+        }
+        let mips = layout.planes[0].layout.mips.len() as u32;
+        Host {
+            layout,
+            mips,
+            subs,
+            ranges,
+            staging: vec![0u8; at as usize],
+        }
+    }
+
+    impl Host {
+        /// The whole texture, as [`Staging::detile`] does it.
+        fn detile_whole(&self, tiled: &[u8], out: &mut [u8]) {
+            let ssp = self.mips;
+            for (sub, &(offset, pitch, rows, _)) in self.subs.iter().enumerate() {
+                let (plane_index, mip, slice) = super::plane_of(sub as u32, self.mips, ssp);
+                let plane = &self.layout.planes[plane_index];
+                let start = plane.offset as usize;
+                let len = pitch * rows;
+                plane
+                    .layout
+                    .detile(
+                        &tiled[start..start + plane.layout.size as usize],
+                        mip,
+                        slice,
+                        &mut out[offset as usize..offset as usize + len],
+                        pitch,
+                        pitch * rows,
+                    )
+                    .expect("a whole detile");
+            }
+        }
+
+        /// Only the runs `written` names, as [`Staging::refresh_pages`]
+        /// does it: the same buffer, and the same bytes for them.
+        fn detile_runs(&self, tiled: &[u8], out: &mut [u8], written: &[(usize, u64)], previous: u64) {
+            let runs = dirty_runs(written, previous, 0, self.layout.size as usize);
+            assert!(!runs.is_empty(), "the pages the title wrote are runs");
+            let ssp = self.mips;
+            for &(run_at, run_len) in &runs {
+                let window = &tiled[run_at as usize..run_at as usize + run_len];
+                for (sub, &(offset, pitch, rows, depth)) in self.subs.iter().enumerate() {
+                    // SAFETY: the staging buffer is ours and as big as the
+                    // footprints say (no device: a plain `Vec`'s bytes).
+                    detile_into_subresource(
+                        &self.layout,
+                        sub,
+                        self.mips,
+                        ssp,
+                        &self.ranges,
+                        window,
+                        run_at,
+                        out.as_mut_ptr(),
+                        offset,
+                        pitch,
+                        rows,
+                        depth,
+                    );
+                }
+            }
+        }
+    }
+
+    /// A texture whose 64 KiB pages the title wrote a few of is detiled to
+    /// the bytes the whole detile gives: the dirty-page path (#211) puts
+    /// the same texels in the staging buffer as reading all of it, so no
+    /// page boundary, subresource edge or mip's window loses or keeps a
+    /// byte. A wrong window here is a silently corrupt texture, not a slow
+    /// one.
+    #[test]
+    fn the_pages_the_title_wrote_detile_to_the_whole_textures_bytes() {
+        const PAGE: usize = crate::watch::PAGE;
+        let h = host(4, 512, 512, 0);
+        let size = h.layout.size as usize;
+        assert!(size > 4 * PAGE, "a texture of several pages: {size} bytes");
+        // The texture's memory: a pattern, not zeros, so that a byte taken
+        // from the wrong place shows.
+        let mut tiled: Vec<u8> = (0..size).map(|i| (i * 31 + 7) as u8).collect();
+        let mut whole = vec![0u8; h.staging.len()];
+        h.detile_whole(&tiled, &mut whole);
+        // The title writes two pages: one in the middle of the texture, one
+        // at its end (where a subresource boundary is).
+        let pages = [3usize, size / PAGE - 1];
+        let previous = 1u64;
+        let written: Vec<(usize, u64)> = pages.iter().map(|&p| (p, 2)).collect();
+        for &p in &pages {
+            for b in &mut tiled[p * PAGE..(p + 1) * PAGE] {
+                *b = b.wrapping_mul(3).wrapping_add(11);
+            }
+        }
+        // What the upload must show: the whole texture as it is now.
+        let mut expected = vec![0u8; h.staging.len()];
+        h.detile_whole(&tiled, &mut expected);
+        // What the refresh makes of it, from the buffer the last upload
+        // left (the texture as it was before the write).
+        let mut dirty = whole.clone();
+        h.detile_runs(&tiled, &mut dirty, &written, previous);
+        assert!(
+            dirty != whole,
+            "the pages the title wrote reached the staging buffer"
+        );
+        assert_eq!(
+            dirty, expected,
+            "the dirty pages detile to the whole texture's bytes, byte for byte"
+        );
+    }
 }
 
 #[cfg(test)]
