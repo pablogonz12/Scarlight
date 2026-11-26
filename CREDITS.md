@@ -168,6 +168,11 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   its own late-free lists and present fill. It supersedes the same idea in fxceless/victory-fork
   [#188](https://github.com/fxceless/victory-fork/pull/188) (sagouindupm), GPL-3.0, which bundled it with an
   `ffxDispatch` stand-in that our #162 now makes unnecessary.
+- **codec-d/CGBJ (cool_fox) `1ad6e67aa`**, GPL-3.0: the retail two-plane present's plane stride is 72 bytes
+  (`RetailPlane`, asserted at compile time) and not the common parameter prefix's size; and no barrier is
+  recorded into the state a presented texture is already in (`COPY_SOURCE -> COPY_SOURCE` is illegal, and
+  that is where a title leaves one). The second rule is in `host::moved` (`crates/victory-gpu/src/host.rs`);
+  the stride was already ours (`queue::second_plane_resource`, 0x48).
 
 ## Tools
 
