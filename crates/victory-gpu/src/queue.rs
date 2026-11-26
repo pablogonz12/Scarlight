@@ -553,7 +553,8 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         // With list calls written down (`VICTORY_THIN=1`), the lists are
         // translated into lists of ours first, and those are submitted as any
-        // other (where a wait for a memory value cuts them, they are cut then).
+        // other: cut at their waits, split, or held behind what the queue
+        // holds.
         if crate::list::thin::on() {
             if behind::on() {
                 // The line translates them and submits them; the title goes on.
@@ -562,18 +563,10 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             }
             let recordings = crate::list::thin::submitted(lists);
             let backs = recordings.ready();
-            submit_list(host, this, &backs);
+            dispatch(host, this, &backs);
             return;
         }
-        if cuts() && !this.is_null() {
-            submit_cut(this, lists);
-            return;
-        }
-        if waits() && split() && !this.is_null() {
-            submit_split(this, lists);
-            return;
-        }
-        submit_list(host, this, lists);
+        dispatch(host, this, lists);
         return;
     }
     let _ = this;
@@ -581,6 +574,24 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if !ONCE.swap(true, Ordering::Relaxed) {
         tracing::warn!(count, "command lists submitted; no host GPU runs them");
     }
+}
+
+/// Runs lists of ours on the queue: cut at their waits, split into the parts
+/// before the first one, or held behind what the queue holds. The same routes
+/// a title's lists take, for the lists of ours a translated recording went to
+/// as much as for the title's own: a wait a stream wrote down cuts them where
+/// it stands, and a list before it does not wait for it.
+#[cfg(windows)]
+fn dispatch(host: &crate::host::Host, this: This, lists: &[This]) {
+    if cuts() && !this.is_null() {
+        submit_cut(this, lists);
+        return;
+    }
+    if waits() && split() && !this.is_null() {
+        submit_split(this, lists);
+        return;
+    }
+    submit_list(host, this, lists);
 }
 
 /// The start of a present plane: frame token, then the plane's resources.
