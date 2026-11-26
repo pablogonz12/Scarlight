@@ -620,7 +620,9 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         ));
         let mut last = None;
         for (waits, detached) in pieces {
-            let read_backs = detached.host().has_read_backs();
+            // The switch ([`read_back_cuts`]) turns every read-back-specific
+            // submission off; a part's waits keep their own boundary.
+            let read_backs = read_back_cuts() && detached.host().has_read_backs();
             if starts_entry(!waits.is_empty(), flush) {
                 parts.push((waits, Vec::new(), Vec::new()));
             }
