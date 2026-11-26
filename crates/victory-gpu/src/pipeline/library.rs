@@ -57,8 +57,8 @@
 //! with first, which are the ones the measured scene needs — and the tail
 //! of its creation order is dropped, not put in the place of older keys,
 //! so its own workers still make them. Both [`save`] and the first read of
-//! the list say how many keys were listed, the cap, and how many were
-//! dropped, so a run never truncates in silence.
+//! the list say how many keys were listed, the cap, and how many requests
+//! were refused, so a run never truncates in silence.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -558,7 +558,7 @@ const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most. A title that asks
 /// for more keeps the first this many keys (the ones drawn with first) and
-/// loses the tail; `save` logs how many were dropped. Our own lists are
+/// loses the tail; `save` logs how many requests were refused. Our own lists are
 /// 2,238 keys and 1,785 buildable pipelines, so nothing measured is near
 /// it: the cap is a guard against a title whose keys never repeat, not a
 /// tuning value, and it moves only with a measurement of a list that
@@ -800,7 +800,7 @@ pub(crate) fn save(now: bool) {
             early = used.len(),
             cap = EARLY_MAX,
             truncated = dropped > 0,
-            dropped,
+            refused = dropped,
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
@@ -850,7 +850,9 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
 static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
-/// Keys refused since the start because the list was at [`EARLY_MAX`].
+/// Requests refused since the start because the list was at [`EARLY_MAX`].
+/// Per request, not per key: two pipelines of one refused key each reach
+/// [`note_used`] once, so the same key counts once for each of them.
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
@@ -910,7 +912,7 @@ pub(crate) fn note_used(key: &str) {
             tracing::warn!(
                 cap = EARLY_MAX,
                 "early pipeline list at its cap: further keys are dropped, not listed \
-                 (logged once; the count is in the next save)"
+                 (logged once; the refused count is in the next save, per request)"
             );
         }
     }
