@@ -115,6 +115,11 @@ struct Card {
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
     sent: Mutex<Vec<(usize, usize, u64)>>,
+    /// Offsets of the copy whose bytes went to the card's side at least
+    /// once, sorted and disjoint: a buffer made in the card's memory holds
+    /// whatever it had (D3D12 promises no zeros), so the bytes never given
+    /// go whole rather than by what differs ([`Shadow::copy_changed`]).
+    given: Mutex<Vec<(usize, usize)>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -1711,6 +1716,50 @@ fn changed_chunks(now: &[u8], was: &[u8], chunk: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// `spans` (offset, bytes), in order, merged where they touch or overlap
+/// ([`joined`], on the ranges they are).
+fn joined_runs(spans: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    joined(spans.into_iter().map(|(at, len)| (at, at + len)).collect())
+        .into_iter()
+        .map(|(at, end)| (at, end - at))
+        .collect()
+}
+
+/// The stretches of `[a, b)` that `given` (ranges in order, disjoint, as
+/// [`note_given`] leaves them) does not hold, as ranges in order.
+fn uncovered(given: &[(usize, usize)], a: usize, b: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut at = a;
+    for &(g0, g1) in given {
+        if g1 <= at {
+            continue;
+        }
+        if g0 >= b {
+            break;
+        }
+        if g0 > at {
+            out.push((at, g0.min(b)));
+        }
+        at = at.max(g1);
+        if at >= b {
+            break;
+        }
+    }
+    if at < b {
+        out.push((at, b));
+    }
+    out
+}
+
+/// Notes that `[a, b)` of the copy went to the card's side: `given` stays
+/// sorted and disjoint.
+fn note_given(given: &mut Vec<(usize, usize)>, a: usize, b: usize) {
+    if a >= b {
+        return;
+    }
+    *given = joined(given.iter().copied().chain(std::iter::once((a, b))).collect());
+}
+
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
@@ -1786,7 +1835,29 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod merge_tests {
-    use super::{changed_chunks, changed_runs, merge_back, merge_piece};
+    use super::{changed_chunks, changed_runs, joined_runs, merge_back, merge_piece, note_given, uncovered};
+
+    #[test]
+    fn a_stretch_the_card_never_had_goes_whole() {
+        // Nothing given yet: the whole range does, whatever the chunk
+        // comparison says (a card buffer holds no promise of zeros).
+        let mut given = Vec::new();
+        assert_eq!(uncovered(&given, 0, 4096), vec![(0, 4096)]);
+        // Given piece by piece: only the rest goes, in order.
+        note_given(&mut given, 1024, 2048);
+        assert_eq!(uncovered(&given, 0, 4096), vec![(0, 1024), (2048, 4096)]);
+        note_given(&mut given, 4096, 8192);
+        assert_eq!(given, vec![(1024, 2048), (4096, 8192)]);
+        assert_eq!(uncovered(&given, 0, 4096), vec![(0, 1024), (2048, 4096)]);
+        assert_eq!(uncovered(&given, 2048, 4096), vec![(2048, 4096)]);
+        assert_eq!(uncovered(&given, 1024, 2048), vec![]);
+        // Touching and overlapping go as one, and stay disjoint.
+        note_given(&mut given, 0, 1024);
+        note_given(&mut given, 2040, 3000);
+        assert_eq!(given, vec![(0, 3000), (4096, 8192)]);
+        assert_eq!(uncovered(&given, 0, 8192), vec![(3000, 4096)]);
+        assert_eq!(joined_runs(vec![(8, 4), (0, 4), (10, 2), (40, 1), (12, 3)]), vec![(0, 4), (8, 7), (40, 1)]);
+    }
 
     #[test]
     fn changed_chunks_hold_every_changed_byte() {
@@ -3065,7 +3136,23 @@ impl Shadow {
             // the buffer); nothing else writes the CPU side of these bytes
             // while a refresh has them (a refresh is one thread's).
             let held = unsafe { std::slice::from_raw_parts(self.data.add(from - start).cast_const(), n) };
-            let stretches = changed_chunks(&now[..n], held, COPY_CHANGED_CHUNK);
+            // What the card's side has not been given yet goes whole: a
+            // buffer made in the card's memory holds whatever it had there
+            // (D3D12 promises no zeros), so a chunk that matches the CPU's
+            // side is no word on what the card holds. Only later refreshes
+            // go by what differs.
+            let (a, b) = (from - start, from - start + n);
+            let mut stretches = changed_chunks(&now[..n], held, COPY_CHANGED_CHUNK);
+            if let Some(card) = &self.card {
+                let mut given = card.given.lock().unwrap_or_else(|e| e.into_inner());
+                for (at, end) in uncovered(&given, a, b) {
+                    stretches.push((at - a, end - at));
+                }
+                stretches = joined_runs(stretches);
+                for &(at, len) in &stretches {
+                    note_given(&mut given, a + at, a + at + len);
+                }
+            }
             let mut sent = 0;
             for &(at, len) in &stretches {
                 // SAFETY: as above; the stretch lies inside both.
@@ -3437,6 +3524,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
+                    given: Mutex::default(),
                     size,
                 };
                 (on_card, Some(card))
@@ -3653,6 +3741,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                given: Mutex::default(),
                 size: len,
             };
             (on_card, Some(card))
