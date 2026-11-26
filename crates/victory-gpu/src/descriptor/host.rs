@@ -1545,8 +1545,12 @@ impl HostHeap {
         }
     }
 
+    /// Makes host slot `index` from the record the title has at `handle` if
+    /// it changed since. A view of a host resource allocated while an
+    /// earlier submission is still on the card waits for it here too: a
+    /// title's descriptor write is where such a view first appears.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
-        self.mirror_as(index, handle, for_draw, false, false)
+        self.mirror_as(index, handle, for_draw, false, true)
     }
 
     /// [`HostHeap::mirror`] for a draw that binds the title slot directly
@@ -1668,9 +1672,9 @@ impl HostHeap {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
             }
-            made[index as usize] = if later { 0 } else { key };
-            self.made_fast[index as usize].store(if later { 0 } else { key }, std::sync::atomic::Ordering::Release);
             if later {
+                made[index as usize] = 0;
+                self.made_fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
                 self.forget_narrowed(index);
                 self.keep(index, None);
                 return Some(view);
@@ -1682,11 +1686,17 @@ impl HostHeap {
             let max_born = (defer_now && defer_new_views()).then(crate::host::finished);
             match make_checked(&view, self.cpu(index), max_born) {
                 Make::Deferred(born_after) => {
+                    // Neither key is recorded: the flush that finds the
+                    // submission finished must make the slot, and the hit path
+                    // would hand back the old view for good.
                     DEFERRED_VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.deferred.push(index, handle, for_draw, born_after, required);
                     return Some(view);
                 }
                 Make::Made(kept) => {
+                    made[index as usize] = key;
+                    self.made_fast[index as usize]
+                        .store(key, std::sync::atomic::Ordering::Release);
                     self.note_narrowed(index);
                     self.keep(index, kept);
                 }
@@ -2689,6 +2699,12 @@ enum Make {
 /// [`make`], or [`Make::Deferred`] when `max_born` is `Some(finished)` and
 /// the host resource `view` shows was allocated after that submission.
 fn make_checked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, max_born: Option<u64>) -> Make {
+    // A host copy this call would make was allocated now (`make`'s
+    // `host_resource`, its `shadow::find`): make it first, so the check is
+    // made on the copy's own allocation before the descriptor is written.
+    if max_born.is_some() {
+        prepare(view);
+    }
     let born_after = view_born_after(view);
     if must_defer(born_after, max_born) {
         return Make::Deferred(born_after);
@@ -2696,6 +2712,44 @@ fn make_checked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, max_born: Option<u
     match make(view, at) {
         Some(kept) => Make::Made(kept),
         None => Make::None,
+    }
+}
+
+/// Makes the host copy `view`'s descriptor will name (`make`), without
+/// writing a descriptor: a table's view of a resource with no copy yet is
+/// the one whose allocation this submission is; it must be held back before
+/// the slot is written, not after.
+fn prepare(view: &View) {
+    match view {
+        &View::Constant(address, size) => {
+            let _ = crate::shadow::find(address, u64::from(size));
+        }
+        View::Shader(resource, desc) | View::Unordered(resource, _, desc) => {
+            let resource = *resource as crate::object::This;
+            if crate::resource::host_resource(resource).is_some() {
+                return;
+            }
+            if desc.is_some()
+                && let Some((data, len)) = crate::resource::buffer_bytes(resource)
+            {
+                let _ = crate::shadow::find(data as u64, len);
+            }
+        }
+        View::Placed(unordered, resource, desc) => {
+            if let Some(inner) = placed_texture(view) {
+                prepare(&inner);
+                return;
+            }
+            const BUFFER: u32 = 1;
+            if resource[0] != BUFFER {
+                return;
+            }
+            let _ = unordered;
+            let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let _ = crate::shadow::find(address, len);
+        }
+        View::Sampler(_) | View::ConsoleSampler(_) => {}
     }
 }
 

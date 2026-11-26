@@ -1053,6 +1053,10 @@ impl Writer {
 mod tests {
     use super::*;
 
+    /// One at a time for the tests that read `BOUNDED_INDICES`, a counter
+    /// the whole test process shares: the lowering tests clamp too.
+    static COUNTER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A view slot the title made itself, on a host heap whose dynamic slots
     /// follow the title's, reads the heap's null slot instead of one of the
     /// host's tables (upstream PR #2628, moe-miau).
@@ -1060,6 +1064,9 @@ mod tests {
     fn title_view_indices_past_the_title_slots_read_the_null_slot() {
         use crate::emit::DYNAMIC_VIEWS;
         use crate::emit::shader::Shader;
+        // `BOUNDED_INDICES` is one counter for the whole process: the two
+        // tests that clamp take the same lock (`COUNTER`).
+        let _one = COUNTER.lock().unwrap_or_else(|e| e.into_inner());
 
         let mut s = Shader::new(false);
         let index = s.m.undef(s.t.i32);
@@ -1101,8 +1108,10 @@ mod tests {
     #[test]
     fn a_bounded_view_index_is_counted_for_the_frame_line() {
         use crate::emit::DYNAMIC_VIEWS;
-        use crate::emit::shader::{Shader, BOUNDED_INDICES};
+        use crate::emit::shader::{BOUNDED_INDICES, Shader};
         use std::sync::atomic::Ordering::Relaxed;
+
+        let _one = COUNTER.lock().unwrap_or_else(|e| e.into_inner());
 
         let mut s = Shader::new(false);
         // No host heap probed: nothing is bounded, nothing counted.
