@@ -2359,6 +2359,7 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             blocks: self.s.m.blocks(),
+            #[cfg(test)]
             rovs: self.s.rovs,
             #[cfg(test)]
             rov_flag: self.s.flags & flags::ROVS != 0,
