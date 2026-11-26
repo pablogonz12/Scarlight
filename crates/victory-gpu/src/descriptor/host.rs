@@ -1591,6 +1591,15 @@ impl HostHeap {
                 self.note_narrowed(index);
                 kept
             };
+            // A view that could not be made yet (its host copy or its host
+            // resource is not there) does not record its key: the fast path
+            // would hand back the null descriptor for good, and the draw that
+            // reads the slot would see nothing until the title rewrote it.
+            // The next call makes it again, for as long as it is not there.
+            if kept.is_none() {
+                made[index as usize] = 0;
+                self.made_fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
+            }
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
