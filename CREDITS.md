@@ -179,6 +179,15 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   title memory in the console's layout, by kind (`VICTORY_TEXTURE_BACK`, off by default), with each read-back's
   allocation and fence tracked so a remapped or released allocation is not landed
   (`crates/victory-gpu/src/texback.rs`).
+- **fxceless/victory-fork [PR #1024](https://github.com/fxceless/victory-fork/pull/1024),
+  [#1030](https://github.com/fxceless/victory-fork/pull/1030),
+  [#1036](https://github.com/fxceless/victory-fork/pull/1036),
+  [#1040](https://github.com/fxceless/victory-fork/pull/1040),
+  [#1042](https://github.com/fxceless/victory-fork/pull/1042)** (Bartosz), GPL-3.0: four lowerings and a
+  hardware rule from the console line, ported: a cube texture's level query in a pixel program
+  (`image_get_lod`), an inactive compute lane's swizzle read as zero (`VICTORY_SHADER_SWIZZLE_ZERO=0` turns it
+  off), 16-bit compares that ignore `op_sel` as RDNA2 does, `v_div_fixup_f16`, and saturating `v.clamp` on the
+  packed 16-bit integer add/sub/mad (`crates/victory-shader/src/emit/`).
 
 - **fxceless/victory-fork [PR #976](https://github.com/fxceless/victory-fork/pull/976)** (MoscaLosca), GPL-3.0: a
   compute or mesh dispatch asking for more than the host's 65,535 groups in `x` runs as pieces, each told where
