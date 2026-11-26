@@ -211,6 +211,20 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   GPL-3.0: a rectangle list's fourth corner is completed opposite the right angle, wherever the three
   corners put it. This tree's geometry stage (`emit::rect_list_gs`) already finds the corner in any order; the
   rule is now in the CPU expansion too (`right_angle`, `right_corners` in `crates/victory-gpu/src/primitive.rs`).
+D
+- **JMAN730/project-flamingo [#734](https://github.com/JMAN730/project-flamingo/pull/734)** (Yaekai, with swarm,
+  Blitz Studios and axknxla), GPL-3.0: the two-plane present compositor for the Series S menu -- the fullscreen
+  triangle, its premultiplied blend, the explicit root signature for Wine, the retry after an initialization that
+  failed, and the pair check that leaves every other present on the base-only path -- reimplemented for this
+  tree's presenter (`crates/victory-gpu/src/present_compositor.rs`, `Host::present_overlay`), whose present keeps
+  its own late-free lists and present fill. It supersedes the same idea in fxceless/victory-fork
+  [#188](https://github.com/fxceless/victory-fork/pull/188) (sagouindupm), GPL-3.0, which bundled it with an
+  `ffxDispatch` stand-in that our #162 now makes unnecessary.
+- **codec-d/CGBJ (cool_fox) `1ad6e67aa`**, GPL-3.0: the retail two-plane present's plane stride is 72 bytes
+  (`RetailPlane`, asserted at compile time) and not the common parameter prefix's size; and no barrier is
+  recorded into the state a presented texture is already in (`COPY_SOURCE -> COPY_SOURCE` is illegal, and
+  that is where a title leaves one). The second rule is in `host::moved` (`crates/victory-gpu/src/host.rs`);
+  the stride was already ours (`queue::second_plane_resource`, 0x48).
 - **avatarmanz/VIctory-7900XTX [350c68648](https://github.com/avatarmanz/VIctory-7900XTX/commit/350c68648)** (avatarmanz), GPL-3.0: a texture's first upload started ahead on a copy queue of its own (`texture/ahead.rs`) and a slot shown only once that upload ran (`descriptor/host.rs::show_after`, 3bab23c06), which there ended a device loss every ~16 minutes. Reimplemented on this tree's texture path: `crates/victory-gpu/src/texture/ahead.rs`, the copy queue made at device creation and a submission's wait on its fence in `crates/victory-gpu/src/host.rs`, `VICTORY_UPLOAD_AHEAD=1` and `VICTORY_SHOW_AFTER`.
 
 - **fxceless/victory-fork [PR #980](https://github.com/fxceless/victory-fork/pull/980)** (fxceless), GPL-3.0:
