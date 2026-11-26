@@ -161,6 +161,13 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   corners put it. This tree's geometry stage (`emit::rect_list_gs`) already finds the corner in any order; the
   rule is now in the CPU expansion too (`right_angle`, `right_corners` in `crates/victory-gpu/src/primitive.rs`).
 
+- **codec-d/cool_fox [`18bdf7932`](https://github.com/codec-d/cool_fox/commit/18bdf7932)**, GPL-3.0: the
+  buffer-view pass keeps its slot table, its once-a-frame gate and the refresh interval of unwatched host
+  copies on the heap that owns them rather than in process-wide tables keyed by the heap's address, and an
+  unwatched copy keeps its interval only while its views read inside the span the last refresh copied.
+  Reimplemented in `crates/victory-gpu/src/buffersweep.rs` (this tree has no deferred list refresh to scope,
+  so its `strides_gpu` filter has nothing to guard here).
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is

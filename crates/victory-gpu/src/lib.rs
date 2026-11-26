@@ -16,6 +16,7 @@
 //! (swap chain).
 #[cfg(any(windows, test))]
 mod bound;
+mod buffersweep;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
