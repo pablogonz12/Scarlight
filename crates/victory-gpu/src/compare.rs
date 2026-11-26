@@ -35,6 +35,7 @@ fn vector() -> bool {
     *HAS.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
 }
 
+/// [`vector`] where there is no AVX2 to ask about: the scalar walks only.
 #[cfg(not(target_arch = "x86_64"))]
 fn vector() -> bool {
     false
@@ -47,8 +48,10 @@ pub(crate) fn equal(a: &[u8], b: &[u8]) -> bool {
 
 /// [`equal`], with the switch given (the tests work both paths).
 fn equal_on(use_vector: bool, a: &[u8], b: &[u8]) -> bool {
+    let _ = use_vector;
     let n = a.len().min(b.len());
     let (a, b) = (&a[..n], &b[..n]);
+    #[cfg(target_arch = "x86_64")]
     if use_vector && vector() {
         // SAFETY: this CPU has `avx2` (`vector`).
         return unsafe { vector::same(a, b) };
@@ -63,7 +66,9 @@ pub(crate) fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
 
 /// [`first_difference`], with the switch given.
 fn first_difference_on(use_vector: bool, a: &[u8], b: &[u8]) -> Option<usize> {
+    let _ = use_vector;
     let n = a.len().min(b.len());
+    #[cfg(target_arch = "x86_64")]
     if use_vector && vector() {
         // SAFETY: this CPU has `avx2` (`vector`).
         return unsafe { vector::first(&a[..n], &b[..n]) };
@@ -84,7 +89,9 @@ pub(crate) fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
 
 /// [`last_difference`], with the switch given.
 fn last_difference_on(use_vector: bool, a: &[u8], b: &[u8]) -> Option<usize> {
+    let _ = use_vector;
     let n = a.len().min(b.len());
+    #[cfg(target_arch = "x86_64")]
     if use_vector && vector() {
         // SAFETY: this CPU has `avx2` (`vector`).
         return unsafe { vector::last(&a[..n], &b[..n]) };
@@ -114,7 +121,9 @@ pub(crate) fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 
 /// [`changed_runs`], with the switch given.
 fn changed_runs_on(use_vector: bool, now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    let _ = use_vector;
     let n = now.len().min(was.len());
+    #[cfg(target_arch = "x86_64")]
     if use_vector && vector() {
         // SAFETY: this CPU has `avx2` (`vector`).
         return unsafe { vector::runs(&now[..n], &was[..n]) };
