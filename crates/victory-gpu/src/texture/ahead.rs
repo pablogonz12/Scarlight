@@ -62,6 +62,10 @@ pub(crate) const NONE: u8 = 0;
 pub(crate) const PENDING: u8 = 1;
 /// It has run: the host texture holds the staging buffer's contents.
 pub(crate) const DONE: u8 = 2;
+/// A list recorded the upload itself (its copies are in a drawing list's
+/// submission): no upload ahead may claim it until that submission has run,
+/// or two queues would write one texture without a fence between them.
+pub(crate) const LIST: u8 = 3;
 
 /// Bytes of staging buffers on their way at most: past it an upload is the
 /// list's, as before (his bound).
@@ -562,10 +566,6 @@ fn submit(copy: &Copy, worker: &Worker, jobs: &[Arc<Job>], value: u64) -> window
 
 /// The jobs' copies have run (or could not be recorded: then not).
 fn finish(jobs: &[Arc<Job>], ran: bool) {
-    {
-        let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
-        way.retain(|job| !jobs.iter().any(|done| Arc::ptr_eq(job, done)));
-    }
     let mut us = 0;
     if ran {
         let n = STATS[RAN].fetch_add(jobs.len() as u64, Relaxed) + jobs.len() as u64;
@@ -593,19 +593,28 @@ fn finish(jobs: &[Arc<Job>], ran: bool) {
     for job in jobs {
         BYTES.fetch_sub(job.upload.bytes, Relaxed);
         *job.ran_with.lock().unwrap_or_else(|e| e.into_inner()) = ran;
-        *job.ran.lock().unwrap_or_else(|e| e.into_inner()) = true;
-        job.ran_now.notify_all();
         if !ran {
             // Its copies never ran: the texture keeps what it holds, and the
             // list that asked is told so (it claims it again next time).
             STATS[FAILED].fetch_add(1, Relaxed);
             tracing::warn!("an upload ahead did not run: its texture stays as it was");
         }
-        let then = std::mem::take(&mut *job.then.lock().unwrap_or_else(|e| e.into_inner()));
-        for f in then {
+        // The callbacks run before any waiter is released, and the job stays
+        // in the registry until they have: a refresh woken here would detile
+        // newer contents and set `dirty` again, and a callback that then
+        // cleared it would hide them. (`then` holds this lock while it reads
+        // `done`, so a callback registered now waits for `ran` below.)
+        let mut then = job.then.lock().unwrap_or_else(|e| e.into_inner());
+        let pending = std::mem::take(&mut *then);
+        for f in pending {
             f(ran);
         }
+        *job.ran.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        job.ran_now.notify_all();
+        drop(then);
     }
+    let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
+    way.retain(|job| !jobs.iter().any(|done| Arc::ptr_eq(job, done)));
 }
 
 /// A drawing list of ours, for the microbench's list-path side.

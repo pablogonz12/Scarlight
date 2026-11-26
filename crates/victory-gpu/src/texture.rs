@@ -1105,6 +1105,12 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
+    if ahead::on() {
+        // This list records the upload: no upload ahead may claim it until
+        // this one has run (`ahead::LIST`), or the copy queue would write the
+        // texture beside a drawing list's copy, with no fence between them.
+        staging.ahead.store(ahead::LIST, Relaxed);
+    }
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging buffer lives as long as `staging`, which the deferred
@@ -1164,6 +1170,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         list.defer_host(move || {
             staging.uploaded.store(true, Relaxed);
             staging.dirty.store(false, Relaxed);
+            if ahead::on() {
+                staging.ahead.store(ahead::DONE, Relaxed);
+            }
         });
     }
     // Once per submission however many of its lists sample the texture.
