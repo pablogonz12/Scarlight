@@ -90,7 +90,7 @@ mod dump_tests;
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
-mod lower;
+pub(crate) mod lower;
 mod own_bits;
 mod rect;
 mod sampler;
@@ -270,9 +270,12 @@ pub const SWITCHES: &[&str] = &[
     "VICTORY_GROUP_SPLIT",
     "VICTORY_GROUP_SYNC",
     "VICTORY_MESH_OUTPUT_STRICT",
+    "VICTORY_SHADER_CFG_PRUNE",
     "VICTORY_SHADER_LOOP_LIMIT",
     "VICTORY_SHADER_LOOP_LIMIT_CS",
+    "VICTORY_SHADER_OMOD_ZERO",
     "VICTORY_SHADER_OPT",
+    "VICTORY_SHADER_SBUFFER_TERM",
     "VICTORY_STRICT_JOINS",
     "VICTORY_WAVE_DEEP_SKIPS",
     "VICTORY_WAVE_LOCAL",

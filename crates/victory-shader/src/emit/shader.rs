@@ -139,6 +139,9 @@ pub fn view_heap_limit() -> u32 {
 
 pub(crate) struct Shader {
     pub m: Module,
+    /// Test builds: constant byte offsets of `s_buffer_load_dword*`.
+    #[cfg(test)]
+    pub smem_buffer_bytes: Vec<u32>,
     pub t: Types,
     pub pixel: bool,
     pub inputs: Vec<SigElement>,
@@ -195,6 +198,8 @@ impl Shader {
         let entry = m.new_block();
         Shader {
             m,
+            #[cfg(test)]
+            smem_buffer_bytes: Vec::new(),
             t: Types {
                 void,
                 i1,

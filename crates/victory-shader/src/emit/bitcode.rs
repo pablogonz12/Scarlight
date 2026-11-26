@@ -423,6 +423,14 @@ impl Module {
     pub fn cast(&mut self, block: usize, op: Cast, v: V, to: Ty) -> V {
         self.push(block, to, Op::Cast(op, v))
     }
+    /// Whether the program compares with `pred` anywhere (tests read the
+    /// lowering's choice of DXIL ops through this).
+    #[cfg(test)]
+    pub fn has_cmp(&self, pred: u8) -> bool {
+        self.insts
+            .iter()
+            .any(|i| matches!(i.op, Op::Cmp(p, ..) if p == pred))
+    }
     pub fn cmp(&mut self, block: usize, pred: u8, a: V, b: V) -> V {
         let t = self.int(1);
         self.push(block, t, Op::Cmp(pred, a, b))

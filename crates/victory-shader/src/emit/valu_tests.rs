@@ -1744,6 +1744,45 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         }    }
 }
 
+#[test]
+fn write_f_omod_flushes_neg_zero() {
+    // The fix has to be on for this test, whatever the environment says.
+    lower::switches::force(lower::switches::OMOD_ZERO, Some(true));
+    // v_add_f32_e64 v0, v1, v2 with omod: RDNA2 flushes -0.0 to +0.0 after
+    // the scale (mul:2/mul:4/div:2), while IEEE FMul keeps the sign of zero.
+    // VOP3 opcode 0x103 is VOP2 v_add_f32 (0x003) on the VOP2-in-VOP3 base.
+    let f = f32::to_bits;
+    let nz = f(-0.0);
+    let pz = f(0.0);
+    for (omod, scale) in [(1u8, 2.0f32), (2, 4.0), (3, 0.5)] {
+        let shader = build_valu_cs(&vop3_mod(0x103, 0, vgpr(1), vgpr(2), 0, 0, 0, omod, false));
+        let cases: &[([u32; 4], u32)] = &[
+            // -0 + -0 = -0; the omod must yield +0, not IEEE -0.
+            ([nz, nz, 0, 0], pz),
+            ([f(1.0), f(1.0), 0, 0], f(2.0 * scale)),
+            ([f(-1.0), f(0.0), 0, 0], f(-scale)),
+        ];
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend}: v_add_f32 omod={omod}({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1]
+            );
+        });
+    }
+    // Without an omod the sign of zero is kept: -0 + -0 is -0.
+    let plain = build_valu_cs(&vop3(0x103, 0, vgpr(1), vgpr(2), 0));
+    run_cases(&plain, &[[nz, nz, 0, 0]], |backend, _, _, got| {
+        assert_eq!(
+            got, nz,
+            "{backend}: v_add_f32(-0, -0) without omod must keep -0 ({got:#010x})"
+        );
+    });
+    lower::switches::force(lower::switches::OMOD_ZERO, None);
+}
+
 /// `v_mad_u32_u16` / `v_mad_i32_i16` (op_sel[0:1] pick the halves of src0/src1,
 /// src2 is a full-width addend) and `v_lerp_u8` (a 4×8-bit average whose rounding
 /// bit is src2's low bit per byte) were decoded but unsupported (#405).
