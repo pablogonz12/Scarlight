@@ -537,6 +537,7 @@ type Out = *mut *const c_void;
 
 /// The DLL's only export (ordinal 1): the input object, static and shared.
 pub extern "system" fn GameInputCreate(out: *mut This) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("gameinput::GameInputCreate").enter(format_args!(""));
     tracing::info!("GameInputCreate");
     if out.is_null() {
         return E_INVALIDARG;
@@ -574,15 +575,18 @@ fn hand(out: Out, reading: Option<&Ref>) -> HRESULT {
 }
 
 extern "system" fn no_interface(_: *const c_void, _iid: *const c_void, out: Out) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("gameinput::no_interface").enter(format_args!(""));
     tracing::warn!("input QueryInterface not implemented");
     fail(out, E_NOINTERFACE)
 }
 /// The input object and devices live as long as the process.
 extern "system" fn add_ref(_: *const c_void) -> u32 {
+    let _stall = victory_gpu::stall_site!("gameinput::add_ref").enter(format_args!(""));
     1
 }
 
 extern "system" fn timestamp(_: This) -> u64 {
+    let _stall = victory_gpu::stall_site!("gameinput::timestamp").enter(format_args!(""));
     now()
 }
 
@@ -592,6 +596,7 @@ extern "system" fn current_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("gameinput::current_reading").enter(format_args!(""));
     let hub = hub(this);
     let state = hub.state();
     let newest = |i: usize| {
@@ -675,6 +680,7 @@ extern "system" fn next_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("gameinput::next_reading").enter(format_args!(""));
     relative(this, reference, kind, device, out, true)
 }
 extern "system" fn previous_reading(
@@ -684,6 +690,7 @@ extern "system" fn previous_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("gameinput::previous_reading").enter(format_args!(""));
     relative(this, reference, kind, device, out, false)
 }
 /// The device's reading at `time`, among those still kept.
@@ -693,6 +700,7 @@ extern "system" fn temporal_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("gameinput::temporal_reading").enter(format_args!(""));
     let hub = hub(this);
     let Some(index) = hub.index(device) else {
         return fail(out, E_INVALIDARG);
@@ -723,6 +731,7 @@ extern "system" fn register_reading(
     _callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("gameinput::register_reading").enter(format_args!(""));
     tracing::warn!("input reading callbacks are never called");
     token(out)
 }
@@ -741,6 +750,7 @@ extern "system" fn register_device(
     callback: Option<DeviceCallback>,
     out: *mut u64,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("gameinput::register_device").enter(format_args!(""));
     let Some(callback) = callback else {
         return E_INVALIDARG;
     };
@@ -789,6 +799,7 @@ extern "system" fn register_other(
     _callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("gameinput::register_other").enter(format_args!(""));
     token(out)
 }
 
@@ -798,12 +809,14 @@ fn forget(this: This, token: u64) {
     state.pending.retain(|e| e.registration.token != token);
 }
 extern "system" fn stop_callback(this: This, token: u64) {
+    let _stall = victory_gpu::stall_site!("gameinput::stop_callback").enter(format_args!(""));
     forget(this, token);
 }
 /// Stops the callback, then waits up to `timeout` µs for a call of it that
 /// is running; false on time-out, or from inside that callback (it cannot
 /// wait for itself), as documented. Either way it is never called again.
 extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> bool {
+    let _stall = victory_gpu::stall_site!("gameinput::unregister_callback").enter(format_args!(""));
     forget(this, token);
     let hub = hub(this);
     let me = std::thread::current().id();
@@ -832,14 +845,17 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
 
 /// Dispatcher and aggregate device: no title of ours asks for them.
 extern "system" fn create_dispatcher(_: This, out: Out) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("gameinput::create_dispatcher").enter(format_args!(""));
     tracing::warn!("input dispatcher not implemented");
     fail(out, E_NOTIMPL)
 }
 extern "system" fn create_aggregate(_: This, _kind: u32, out: Out) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("gameinput::create_aggregate").enter(format_args!(""));
     tracing::warn!("aggregate input device not implemented");
     fail(out, E_NOTIMPL)
 }
 extern "system" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("gameinput::find_by_id").enter(format_args!(""));
     if id.is_null() || out.is_null() {
         return fail(out, E_INVALIDARG);
     }
@@ -857,6 +873,7 @@ extern "system" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRES
 /// Lookup by object, platform handle or platform string: our devices have
 /// none of these.
 extern "system" fn find_device(_: This, _value: *const c_void, out: Out) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("gameinput::find_device").enter(format_args!(""));
     fail(out, DEVICE_NOT_FOUND)
 }
 extern "system" fn enable_oem_device(
@@ -866,6 +883,7 @@ extern "system" fn enable_oem_device(
     _interface: u8,
     _collection: u8,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("gameinput::enable_oem_device").enter(format_args!(""));
     S_OK
 }
 extern "system" fn set_focus_policy(_: This, _policy: u32) {}
@@ -896,10 +914,12 @@ static INPUT: Table<22> = Table([
 ]);
 
 extern "system" fn device_info(this: *const Device) -> *const DeviceInfo {
+    let _stall = victory_gpu::stall_site!("gameinput::set_focus_policy").enter(format_args!(""));
     // SAFETY: one of our devices.
     unsafe { &(*this).info }
 }
 extern "system" fn device_status(this: *const Device) -> u32 {
+    let _stall = victory_gpu::stall_site!("gameinput::device_status").enter(format_args!(""));
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.hub().state().slots[device.index].connected {
@@ -913,6 +933,7 @@ extern "system" fn device_status(this: *const Device) -> u32 {
 // `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
 // diagnostics builds; the title sends trigger levels in slot 0x50.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
+    let _stall = victory_gpu::stall_site!("gameinput::set_rumble").enter(format_args!(""));
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.index >= PADS {
@@ -928,6 +949,7 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("gameinput::unsupported").enter(format_args!(""));
     tracing::warn!(
         slot = format_args!("{SLOT:#x}"),
         "input device method not implemented"
@@ -964,9 +986,11 @@ fn reading<'a>(this: *const Reading) -> &'a Reading {
     unsafe { &*this }
 }
 extern "system" fn reading_add_ref(this: *const Reading) -> u32 {
+    let _stall = victory_gpu::stall_site!("gameinput::reading_add_ref").enter(format_args!(""));
     reading(this).refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 extern "system" fn reading_release(this: *const Reading) -> u32 {
+    let _stall = victory_gpu::stall_site!("gameinput::reading_release").enter(format_args!(""));
     let left = reading(this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if left == 0 {
         // SAFETY: the last reference is gone; `Ref::new` boxed it.
@@ -975,9 +999,11 @@ extern "system" fn reading_release(this: *const Reading) -> u32 {
     left
 }
 extern "system" fn input_kind(this: *const Reading) -> u32 {
+    let _stall = victory_gpu::stall_site!("gameinput::input_kind").enter(format_args!(""));
     reading(this).kind()
 }
 extern "system" fn sequence_number(this: *const Reading, kind: u32) -> u64 {
+    let _stall = victory_gpu::stall_site!("gameinput::sequence_number").enter(format_args!(""));
     let reading = reading(this);
     if reading.kind() & kind != 0 {
         reading.sequence
@@ -986,21 +1012,25 @@ extern "system" fn sequence_number(this: *const Reading, kind: u32) -> u64 {
     }
 }
 extern "system" fn reading_timestamp(this: *const Reading) -> u64 {
+    let _stall = victory_gpu::stall_site!("gameinput::reading_timestamp").enter(format_args!(""));
     reading(this).timestamp
 }
 extern "system" fn reading_device(this: *const Reading, out: *mut *const Device) {
+    let _stall = victory_gpu::stall_site!("gameinput::reading_device").enter(format_args!(""));
     if !out.is_null() {
         // SAFETY: checked non-null; devices need no reference.
         unsafe { out.write(reading(this).device) };
     }
 }
 extern "system" fn key_count(this: *const Reading) -> u32 {
+    let _stall = victory_gpu::stall_site!("gameinput::key_count").enter(format_args!(""));
     match &reading(this).value {
         Value::Keys(keys) => keys.len() as u32,
         Value::Pad(_) => 0,
     }
 }
 extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyState) -> u32 {
+    let _stall = victory_gpu::stall_site!("gameinput::key_state").enter(format_args!(""));
     let Value::Keys(keys) = &reading(this).value else {
         return 0;
     };
@@ -1013,6 +1043,7 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
     n as u32
 }
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
+    let _stall = victory_gpu::stall_site!("gameinput::gamepad_state").enter(format_args!(""));
     match &reading(this).value {
         Value::Pad(state) if !out.is_null() => {
             // SAFETY: checked non-null.
@@ -1024,6 +1055,7 @@ extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bo
 }
 /// Kinds our devices do not have: no count, no state.
 extern "system" fn nothing(_: *const c_void) -> usize {
+    let _stall = victory_gpu::stall_site!("gameinput::nothing").enter(format_args!(""));
     0
 }
 
@@ -1340,6 +1372,7 @@ mod tests {
         current: u32,
         previous: u32,
     ) {
+        let _stall = victory_gpu::stall_site!("gameinput::record").enter(format_args!(""));
         // SAFETY: the test passes its log and one of the hub's devices.
         let (log, index) = unsafe { (&*(context as *const Log), (*device).index) };
         log.lock().unwrap().push((index, current, previous));
@@ -1559,6 +1592,7 @@ mod tests {
             _: u32,
             _: u32,
         ) {
+            let _stall = victory_gpu::stall_site!("gameinput::slow").enter(format_args!(""));
             // From inside its own callback, unregistering fails at once.
             let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(context, 0x68);
             if !unregister(context.cast(), token, 0) {

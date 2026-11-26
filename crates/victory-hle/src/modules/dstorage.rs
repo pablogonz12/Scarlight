@@ -55,6 +55,7 @@ type Out = *mut *mut c_void;
 static FACTORY_OBJECT: Object = Object::new("dstorage factory", &FACTORY_VTABLE);
 
 pub extern "system" fn DStorageGetFactory(iid: *const Guid, out: Out) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("dstorage::DStorageGetFactory").enter(format_args!(""));
     // SAFETY: the title passes a GUID (null tolerated).
     match unsafe { iid.as_ref() } {
         Some(&iid) if iid == FACTORY => {
@@ -88,11 +89,13 @@ impl<T> Instance<T> {
 }
 
 extern "system" fn add_ref_instance<T>(this: *const Instance<T>) -> u32 {
+    let _stall = victory_gpu::stall_site!("dstorage::add_ref_instance").enter(format_args!(""));
     // SAFETY: an instance we created and the title still holds.
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 extern "system" fn release<T>(this: *mut Instance<T>) -> u32 {
+    let _stall = victory_gpu::stall_site!("dstorage::release").enter(format_args!(""));
     // SAFETY: as above.
     let left = unsafe { &*this }.refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if left == 0 {
@@ -121,6 +124,7 @@ type Factory = *const Object;
 /// Opens `path` for reading; the file object owns the handle. The handle is
 /// overlapped, so the workers' reads of one file run at once.
 extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("dstorage::open_file").enter(format_args!(""));
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
     const OPEN_EXISTING: u32 = 3;
@@ -165,6 +169,7 @@ extern "system" fn create_status_array(
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("dstorage::create_status_array").enter(format_args!(""));
     tracing::info!(
         capacity,
         name = text(name),
@@ -196,6 +201,7 @@ extern "system" fn create_queue(
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("dstorage::create_queue").enter(format_args!(""));
     // SAFETY: the title passes its description (null tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
@@ -255,6 +261,7 @@ fn staging_checked() -> bool {
 /// what this module answers for out-of-range values elsewhere, not a verified
 /// code.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("dstorage::set_staging_buffer_size").enter(format_args!(""));
     tracing::info!(size, "dstorage: staging buffer size");
     let Some(capacity) = staging_capacity(size, staging_checked()) else {
         REFUSAL_LOGGED.call_once(|| {
@@ -342,6 +349,7 @@ type Array = *mut Instance<StatusArray>;
 /// The result of the requests before entry `index`: pending, the first
 /// failure, or success.
 extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("dstorage::status_result").enter(format_args!("array={this:p} index={index}"));
     // SAFETY: an array we created and the title still holds.
     let entries = &unsafe { &*this }.state.entries;
     entries
@@ -352,6 +360,7 @@ extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
 /// The title polls this (entry 0, a `Sleep(1)` loop) and never
 /// reads the result itself.
 extern "system" fn is_complete(this: Array, index: u32) -> bool {
+    let _stall = victory_gpu::stall_site!("dstorage::is_complete").enter(format_args!("array={this:p} index={index}"));
     status_result(this, index) != E_PENDING
 }
 
@@ -1060,6 +1069,7 @@ impl Status {
 }
 
 extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
+    let _stall = victory_gpu::stall_site!("dstorage::enqueue_request").enter(format_args!("queue={this:p} request={request:p}"));
     // SAFETY: the title passes its request (null tolerated).
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
@@ -1068,6 +1078,7 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
+    let _stall = victory_gpu::stall_site!("dstorage::enqueue_status").enter(format_args!(""));
     // SAFETY: the title passes an array we created (null tolerated).
     let Some(entries) = (unsafe { array.as_ref() }).map(|a| &a.state.entries) else {
         return;
@@ -1135,6 +1146,7 @@ fn queue(this: QueueRef, command: Command) {
 }
 
 extern "system" fn submit(this: QueueRef) {
+    let _stall = victory_gpu::stall_site!("dstorage::submit").enter(format_args!("queue={this:p}"));
     // SAFETY: as above.
     let id = unsafe { &*this }.state.id;
     let Some(scheduler) = scheduler() else {
@@ -1150,6 +1162,7 @@ extern "system" fn submit(this: QueueRef) {
 /// completes, and this returns once the reads already running have
 /// finished. The title calls this, not `Release`.
 extern "system" fn close(this: QueueRef) {
+    let _stall = victory_gpu::stall_site!("dstorage::close").enter(format_args!(""));
     // SAFETY: as above.
     close_lane(unsafe { &*this }.state.id);
 }

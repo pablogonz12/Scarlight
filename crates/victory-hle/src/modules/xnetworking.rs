@@ -64,6 +64,7 @@ const OFFLINE: ConnectivityHint = ConnectivityHint {
 type This = *const Object;
 
 extern "system" fn udp_port(_: This, out: *mut u16) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xnetworking::udp_port").enter(format_args!(""));
     put(out, UDP_PORT)
 }
 
@@ -71,9 +72,11 @@ extern "system" fn udp_port(_: This, out: *mut u16) -> HRESULT {
 static PORT: u8 = 0;
 
 extern "system" fn udp_port_async(_: This, block: *mut AsyncBlock) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xnetworking::udp_port_async").enter(format_args!(""));
     xasync::finished_with(block, (&raw const PORT).cast(), Ok(xasync::bytes(UDP_PORT)))
 }
 extern "system" fn udp_port_result(_: This, block: *mut AsyncBlock, out: *mut u16) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xnetworking::udp_port_result").enter(format_args!(""));
     xasync::result(block, (&raw const PORT).cast(), out)
 }
 
@@ -85,6 +88,7 @@ extern "system" fn security_info_async(
     url: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xnetworking::security_info_async").enter(format_args!(""));
     tracing::debug!(
         url = text(url).unwrap_or_default(),
         "security information: offline"
@@ -92,6 +96,7 @@ extern "system" fn security_info_async(
     xasync::finished(block, (&raw const SECURITY).cast(), UNREACHABLE)
 }
 extern "system" fn security_info_size(_: This, block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xnetworking::security_info_size").enter(format_args!(""));
     xasync::XAsyncGetResultSize(block, out)
 }
 extern "system" fn security_info_result(
@@ -102,6 +107,7 @@ extern "system" fn security_info_result(
     buffer: *mut u8,
     _info: *mut *const c_void,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xnetworking::security_info_result").enter(format_args!(""));
     xasync::XAsyncGetResult(
         block,
         (&raw const SECURITY).cast(),
@@ -117,10 +123,12 @@ extern "system" fn verify_certificate(
     _request: *mut c_void,
     _info: *const c_void,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xnetworking::verify_certificate").enter(format_args!(""));
     UNREACHABLE
 }
 
 extern "system" fn connectivity_hint(_: This, out: *mut ConnectivityHint) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xnetworking::connectivity_hint").enter(format_args!(""));
     put(out, OFFLINE)
 }
 
@@ -132,9 +140,11 @@ extern "system" fn register(
     _callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xnetworking::register").enter(format_args!(""));
     put(out, token())
 }
 extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
+    let _stall = victory_gpu::stall_site!("xnetworking::unregister").enter(format_args!(""));
     true
 }
 

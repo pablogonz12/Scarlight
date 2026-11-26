@@ -38,6 +38,7 @@ pub extern "system" fn RegisterAppStateChangeNotification(
     context: *mut c_void,
     registration: *mut usize,
 ) -> u32 {
+    let _stall = victory_gpu::stall_site!("lifecycle::RegisterAppStateChangeNotification").enter(format_args!(""));
     let Some(routine) = routine else {
         return ERROR_INVALID_PARAMETER;
     };
@@ -53,6 +54,7 @@ pub extern "system" fn RegisterAppStateChangeNotification(
 }
 
 pub extern "system" fn UnregisterAppStateChangeNotification(registration: usize) {
+    let _stall = victory_gpu::stall_site!("lifecycle::UnregisterAppStateChangeNotification").enter(format_args!(""));
     routines().retain(|&(id, ..)| id != registration);
 }
 
@@ -73,6 +75,7 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
+    let _stall = victory_gpu::stall_site!("lifecycle::CreateWindowExW").enter(format_args!(""));
     let (x, y, width, height) = fit(parent, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
@@ -99,6 +102,7 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
+    let _stall = victory_gpu::stall_site!("lifecycle::CreateWindowExA").enter(format_args!(""));
     let (x, y, width, height) = fit(parent, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
@@ -168,6 +172,7 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    let _stall = victory_gpu::stall_site!("lifecycle::window_proc").enter(format_args!(""));
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
@@ -317,6 +322,7 @@ mod tests {
 
     #[test]
     fn registrations_come_and_go() {
+        let _stall = victory_gpu::stall_site!("lifecycle::noop").enter(format_args!(""));
         let (mut a, mut b) = (0, 0);
         assert_eq!(
             RegisterAppStateChangeNotification(Some(noop), std::ptr::null_mut(), &mut a),
@@ -389,6 +395,7 @@ mod tests {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        let _stall = victory_gpu::stall_site!("lifecycle::recording").enter(format_args!(""));
         if message == wm::WM_SYSCOMMAND {
             COMMANDS.with(|c| c.borrow_mut().push(wparam & 0xFFF0));
             return 0;
