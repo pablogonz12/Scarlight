@@ -177,10 +177,23 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
 /// when free physical RAM is low and at once when the host-memory guard says
 /// the PC is under pressure. Never returns less than 2,000 ms.
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
+    ram_idle_for(avail_phys, crate::total_system_ram_bytes())
+}
+
+/// [`ram_idle_ms`] for a PC of `total_ram` bytes, so a test states the PC it
+/// means instead of measuring the one it runs on.
+pub(crate) fn ram_idle_for(avail_phys: Option<u64>, total_ram: Option<u64>) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
+    const NORMAL_MS: u64 = 10_000;
     const MODERATE_MS: u64 = 5_000;
     const HIGH_MS: u64 = 2_000;
-    let budget = crate::residency::budgets(crate::total_system_ram_bytes()).idle_ms;
+    // Off, the idle timeout is the one of before: the guard's smaller budget
+    // for a small PC is part of what VICTORY_RESIDENCY=0 turns off.
+    let budget = if crate::residency::enabled() {
+        crate::residency::budgets(total_ram).idle_ms
+    } else {
+        NORMAL_MS
+    };
     if crate::residency::pressured() {
         return budget.min(crate::residency::PRESSURE_IDLE_MS);
     }
@@ -222,6 +235,20 @@ fn sweep() {
     crate::inplace::tick();
     // Host-memory pressure and the refusal backoff ([`crate::residency`]).
     crate::residency::tick();
+    if crate::residency::pressured() {
+        // A pool that already holds idle chunks gives them back now, not at the
+        // next give (`0` above only stops new ones being kept).
+        let gone = {
+            let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::replace(&mut *spare, Spare::new())
+        };
+        if gone.bytes > 0 {
+            ALIVE[3].fetch_sub(gone.kept.len() as u64, Ordering::Relaxed);
+            ALIVE[4].fetch_sub(gone.bytes, Ordering::Relaxed);
+            tracing::debug!(bytes = gone.bytes, "idle upload chunks freed under host-memory pressure");
+        }
+        drop(gone);
+    }
     let deferred = crate::residency::take_deferred();
     if deferred > 0 {
         tracing::debug!(
@@ -7827,8 +7854,9 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
     #[test]
     fn ram_idle_ms_scales_with_pressure() {
-        use super::ram_idle_ms;
         let gib = 1024 * 1024 * 1024;
+        // Stated: a 30 GiB desktop, whatever the machine running the test has.
+        let ram_idle_ms = |avail| super::ram_idle_for(avail, Some(30 * gib));
         // Normal (>= 4 GiB)
         assert_eq!(ram_idle_ms(Some(8 * gib)), 10_000);
         assert_eq!(ram_idle_ms(Some(4 * gib)), 10_000);

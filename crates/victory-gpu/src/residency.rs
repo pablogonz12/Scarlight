@@ -173,6 +173,7 @@ pub(crate) fn refused() -> bool {
 /// stays low (a floor that never clears would otherwise mean never uploaded).
 const MAX_UPLOAD_DEFERRALS: u64 = 16;
 static UPLOAD_DEFERRALS: AtomicU64 = AtomicU64::new(0);
+static GROWTH_DEFERRALS: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the starvation valve is open after `deferrals` refusals in a row.
 fn starved(deferrals: u64) -> bool {
@@ -214,17 +215,19 @@ pub(crate) fn admit_upload(bytes: u64) -> bool {
 /// ranges inside blocks already committed are not this: they cost nothing.
 pub(crate) fn admit_growth(bytes: u64) -> bool {
     if !enabled() {
+        GROWTH_DEFERRALS.store(0, Ordering::Relaxed);
         return true;
-    }
-    if refused() {
-        note_deferred();
-        return false;
     }
     let total = crate::total_system_ram_bytes().unwrap_or(0);
-    if total == 0 {
-        return true;
+    let deferred = GROWTH_DEFERRALS.load(Ordering::Relaxed);
+    let admit = total == 0 || starved(deferred) || (!refused() && admitted(total, sampled_commit(), bytes, true));
+    if admit {
+        GROWTH_DEFERRALS.store(0, Ordering::Relaxed);
+    } else {
+        GROWTH_DEFERRALS.fetch_add(1, Ordering::Relaxed);
+        note_deferred();
     }
-    admitted(total, sampled_commit(), bytes, true)
+    admit
 }
 
 /// The commit sample, refreshed at most every 32 ms: a texture sweep runs for
