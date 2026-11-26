@@ -434,8 +434,196 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     ))
 }
 
-/// Guarded blocks of view memory.
-const BLOCK: usize = PAGE;
+/// The unit a write-back job holds and a copy guards: one page.
+pub(crate) const BLOCK: usize = PAGE;
+
+/// Title memory the runtime unmapped or remapped, as ranges (start, (end,
+/// generation)), since a copy took its bytes: the copy's snapshot of them is
+/// stale, so its copy-back leaves them alone ([`copy_back_skips_remapped`]).
+/// A copy that takes a range afresh clears it ([`remapped_taken`]), but only
+/// where the mark is no newer than the generation it saw before reading
+/// ([`remap_generation`]); a range no copy takes again costs one entry.
+static REMAPPED: Mutex<BTreeMap<usize, (usize, u64)>> = Mutex::new(BTreeMap::new());
+
+/// Numbers the remappings: a copy that sees the same number before and after
+/// reading title memory read it after every remapping recorded (see
+/// [`remapped_taken`]).
+static REMAP_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn remapped() -> std::sync::MutexGuard<'static, BTreeMap<usize, (usize, u64)>> {
+    REMAPPED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether a copy-back leaves blocks the runtime remapped alone
+/// (`VICTORY_SKIP_REMAPPED=0` puts back its bytes as before).
+pub(crate) fn copy_back_skips_remapped() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_REMAPPED").is_none_or(|v| v != "0"))
+}
+
+/// The remappings recorded so far: a copy takes this before it reads title
+/// memory and gives it to [`remapped_taken`], which clears only marks no
+/// newer than it (a remap that landed during the read stays marked).
+pub(crate) fn remap_generation() -> u64 {
+    REMAP_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Notes that title memory `[at, at + len)` was unmapped or remapped: what a
+/// copy took of it before is stale.
+fn remapped_range(at: usize, len: usize) {
+    if !copy_back_skips_remapped() {
+        return;
+    }
+    let (from, to) = (at, at.saturating_add(len));
+    if to <= from {
+        return;
+    }
+    let mut map = remapped();
+    // Under the map's lock, so a copy that reads the generation next sees
+    // this mark (or does not, if it cleared first).
+    let generation = REMAP_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let (mut start, mut end, mut generation) = (from, to, generation);
+    if let Some((&s, &(e, g))) = map.range(..=from).next_back()
+        && e >= from
+    {
+        (start, end, generation) = (s, end.max(e), generation.max(g));
+        map.remove(&s);
+    }
+    loop {
+        let next = map.range(start..).next().map(|(&s, &(e, g))| (s, e, g));
+        match next {
+            Some((s, e, g)) if s <= end => {
+                end = end.max(e);
+                // The newest remap of the range is the one a copy has to
+                // have read: a mark older than it must not clear it.
+                generation = generation.max(g);
+                map.remove(&s);
+            }
+            _ => break,
+        }
+    }
+    map.insert(start, (end, generation));
+}
+
+/// Whether any byte of `[at, at + len)` was unmapped or remapped by the
+/// runtime since a copy took it: the copy-back must not put the snapshot's
+/// bytes there.
+pub(crate) fn remapped_any(at: usize, len: usize) -> bool {
+    if !copy_back_skips_remapped() || len == 0 {
+        return false;
+    }
+    let map = remapped();
+    map.range(..at + len).next_back().is_some_and(|(_, &(e, _))| e > at)
+}
+
+/// The runs of `[at, at + len)` no byte of which was remapped since a copy
+/// took it: what a copy-back may write (an empty `Vec` when all of it is
+/// marked, `[(at, at + len)]` when none is).
+pub(crate) fn unremapped_runs(at: usize, len: usize) -> Vec<(usize, usize)> {
+    let to = at.saturating_add(len);
+    if to <= at {
+        return Vec::new();
+    }
+    if !remapped_any(at, len) {
+        return vec![(at, to)];
+    }
+    let map = remapped();
+    let mut runs = Vec::new();
+    let mut run = at;
+    // The one range that may start before `at`, then the ones that start
+    // inside: nothing below them can overlap.
+    let mut keys: Vec<usize> = Vec::new();
+    if let Some((&s, &(e, _))) = map.range(..=at).next_back()
+        && e > at
+    {
+        keys.push(s);
+    }
+    keys.extend(map.range(at..to).map(|(&s, _)| s));
+    for s in keys {
+        let e = map[&s].0;
+        if e <= run {
+            continue;
+        }
+        if s >= to {
+            break;
+        }
+        if s > run {
+            runs.push((run, s));
+        }
+        run = run.max(e);
+    }
+    if run < to {
+        runs.push((run, to));
+    }
+    runs
+}
+
+/// Takes the marks of `[from, to)` no newer than `generation` out of the
+/// map; the newer ones stay (a remap a copy did not read).
+fn clear_marks(map: &mut BTreeMap<usize, (usize, u64)>, from: usize, to: usize, generation: u64) {
+    if to <= from {
+        return;
+    }
+    // The one range that may start before `from`, then the ones that start
+    // inside: nothing below them can overlap.
+    let before = map.range(..=from).next_back().map(|(&s, &(e, g))| (s, e, g));
+    let covered: Vec<(usize, usize, u64)> = before
+        .filter(|&(_, e, _)| e > from)
+        .into_iter()
+        .chain(map.range(from..to).map(|(&s, &(e, g))| (s, e, g)))
+        .collect();
+    for (s, e, g) in covered {
+        if g > generation {
+            continue;
+        }
+        map.remove(&s);
+        if s < from {
+            map.insert(s, (from, g));
+        }
+        if e > to {
+            map.insert(to, (e, g));
+        }
+    }
+}
+
+/// A copy took the bytes of `[at, at + len)` afresh: what the runtime did to
+/// them before `generation` (taken with [`remap_generation`] before the read)
+/// is in its snapshot now; a remap after it is not.
+pub(crate) fn remapped_taken(generation: u64, at: usize, len: usize) {
+    if !copy_back_skips_remapped() {
+        return;
+    }
+    let (from, to) = (at, at.saturating_add(len));
+    if to <= from {
+        return;
+    }
+    // Blocks a write-back job holds have not been merged yet, and the merge
+    // reads the mark: it stands there until the job is done and a copy takes
+    // the blocks again.
+    let held: Vec<(usize, usize)> = {
+        let jobs = back();
+        jobs.range(from / BLOCK..to.div_ceil(BLOCK))
+            .map(|(&block, _)| (block * BLOCK, (block + 1) * BLOCK))
+            .collect()
+    };
+    let mut map = remapped();
+    let mut run = from;
+    for (held_from, held_to) in held {
+        if held_to <= run {
+            continue;
+        }
+        if held_from >= to {
+            break;
+        }
+        if held_from > run {
+            clear_marks(&mut map, run, held_from.min(to), generation);
+        }
+        run = run.max(held_to);
+    }
+    if run < to {
+        clear_marks(&mut map, run, to, generation);
+    }
+}
 
 struct Guards {
     /// Blocks we made read-only.
@@ -521,6 +709,100 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Regions of title memory the destination check ([`writable`]) has asked
+/// about: the first block it asked at → (the first block after the region,
+/// whether every page of it is committed read-write). A region's pages share
+/// their state and protection, so one answer covers every copy inside it;
+/// it is forgotten when the range's protection changes ([`title_memory_remapped`],
+/// our own guards and write-back jobs) or a kernel write into it fails.
+static DESTINATIONS: Mutex<BTreeMap<usize, (usize, bool)>> = Mutex::new(BTreeMap::new());
+
+/// Forgets the destination answers that overlap `[at, at + len)`: what was
+/// asked there no longer holds. Every answer whose region reaches into the
+/// range goes, not only the one asked at its first block: an answer asked at
+/// an earlier block (`[0, 4)` after one at `[2, 4)`) still covers blocks of
+/// the range and would otherwise stay positive for a page that changed.
+fn forget(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    let mut regions = DESTINATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let stale: Vec<usize> = regions
+        .range(..last)
+        .filter(|&(_, &(end, _))| end > first)
+        .map(|(&start, _)| start)
+        .collect();
+    for start in stale {
+        regions.remove(&start);
+    }
+}
+
+/// Whether every 64 KiB block of `[at, at + len)` is committed read-write
+/// now: the destination of a plain copy into title memory. `VirtualQuery`
+/// walks the page tables to the end of the region sharing `at`'s state
+/// (milliseconds in the title's big pools), so its answer is kept per region
+/// ([`DESTINATIONS`]) instead of being asked at every copy. A copy that
+/// cannot tell writes through the kernel instead, which fails per page
+/// rather than faulting.
+pub(crate) fn writable(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
+    };
+    if len == 0 {
+        return false;
+    }
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    // A block our own guard made read-only is not writable until it is
+    // opened for the write ([`writing`]).
+    if guards().protected.range(first..last).next().is_some() {
+        return false;
+    }
+    let mut regions = DESTINATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut block = first;
+    while block < last {
+        if let Some((_, &(end, ok))) = regions.range(..=block).next_back()
+            && end > block
+        {
+            if !ok {
+                return false;
+            }
+            block = end;
+            continue;
+        }
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            return false;
+        }
+        let end = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            / BLOCK;
+        // Only whole blocks are kept: a region that ends inside one says
+        // nothing about the block as a whole, and the copy asks again (a
+        // title whose protections differ inside a block is rare).
+        if end <= block {
+            return false;
+        }
+        let ok = info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE;
+        regions.insert(block, (end, ok));
+        if !ok {
+            return false;
+        }
+        block = end;
+    }
+    true
+}
+
+/// A kernel write into title memory `[at, at + len)` failed: a title may
+/// have made the range read-only without telling us, so what the destination
+/// check knew of it is not trusted and the next copy asks again.
+pub(crate) fn write_failed(at: usize, len: usize) {
+    forget(at, len);
+}
+
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
@@ -545,6 +827,13 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut g = guards();
     let mut written = Vec::new();
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // A block whose bytes another view of the same section shows too is
+    // never made read-only: a write through that view would go unseen, and
+    // the block would stay `clean` for good. One atomic load while the title
+    // has mapped nothing twice (`inplace::aliased`).
+    let aliased = |at: usize| aliases() && crate::inplace::aliased(at);
+    // (`open` is a block's name below, so the giving back goes through this.)
+    let give_back = |g: &mut Guards, at: usize, to: usize| open(g, at, to);
     // Large heaps are usually clean. Walk only gaps between clean runs.
     let mut uncommitted_until = first;
     for (from, to) in g.clean.uncovered(first, last) {
@@ -562,7 +851,12 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                     g.absent.remove(&block);
                 }
             }
-            if open {
+            if open && aliased(block * BLOCK) {
+                // Given back if an earlier pass guarded it; never guarded
+                // again, and never clean.
+                give_back(&mut g, block * BLOCK, (block + 1) * BLOCK);
+                written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+            } else if open {
                 written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
                 if g.protected.contains(&block) {
                     // Written through the runtime, still read-only.
@@ -650,6 +944,8 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         // The kernel only made committed memory read-only: it is there.
         g.mapped.extend(from..to);
     };
+    // Made read-only by our hand: not a plain copy's destination now.
+    forget(from * BLOCK, (to - from) * BLOCK);
     if set(from, to) {
         note(g, from, to);
         return;
@@ -698,7 +994,40 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
+    if let (Some(first), Some(last)) = (blocks.first(), blocks.last()) {
+        // Writable again by our hand.
+        forget(first * BLOCK, (last + 1 - first) * BLOCK);
+    }
     !blocks.is_empty()
+}
+
+/// Whether a view mapped beside others (`opened_beside`) has its guards
+/// taken off: `VICTORY_GUARD_ALIASES=0` leaves them (a start-up switch).
+fn aliases() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_ALIASES").is_none_or(|v| v != "0"))
+}
+
+/// The runtime mapped views of bytes we hold view guards on, at other
+/// addresses than the ones guarded (a section shown twice): every guarded
+/// block of them is given back to write. A page guarded read-only at one
+/// address can be written through another, where no handler of ours sees
+/// it, so the guard of such a page covers nothing and the copies through it
+/// must go to the kernel (after avatarmanz 2be0515c).
+pub fn opened_beside(views: &[(usize, usize)]) {
+    if views.is_empty() || !aliases() {
+        return;
+    }
+    let mut g = guards();
+    let mut opened = Vec::new();
+    for &(at, len) in views {
+        if len != 0 && open(&mut g, at, at.saturating_add(len)) {
+            opened.push((at, len));
+        }
+    }
+    if !opened.is_empty() {
+        tracing::info!(?opened, "views opened beside guarded ones (VICTORY_GUARD_ALIASES)");
+    }
 }
 
 /// Whether every 64 KiB block of `[at, at + len)` is title memory the layer
@@ -779,6 +1108,9 @@ pub(crate) fn back_begin(done: &std::sync::Arc<Done>, from: usize, to: usize) ->
                 map.insert(block, (done.clone(), old));
                 held.push(block);
             }
+            drop(map);
+            // Inaccessible now: not a plain copy's destination.
+            forget(a * BLOCK, (b - a) * BLOCK);
             return 0;
         }
         -1
@@ -846,9 +1178,14 @@ pub(crate) fn back_open(at: usize, len: usize) {
     // kernel's write did not fault into `open`.
     if !opened.is_empty() {
         let mut g = guards();
-        for block in opened {
-            g.protected.remove(&block);
-            g.clean.remove(block);
+        for block in &opened {
+            g.protected.remove(block);
+            g.clean.remove(*block);
+        }
+        drop(g);
+        // Opened writable for a kernel write.
+        if let (Some(first), Some(last)) = (opened.first(), opened.last()) {
+            forget(first * BLOCK, (last + 1 - first) * BLOCK);
         }
     }
 }
@@ -872,6 +1209,8 @@ pub(crate) fn back_release(blocks: &[usize], done: &std::sync::Arc<Done>) {
         let mut was = 0;
         // SAFETY: a block the job made inaccessible.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut was) };
+        // Its protection is the job's again: ask before a plain copy.
+        forget(block * BLOCK, BLOCK);
     }
 }
 
@@ -966,6 +1305,7 @@ pub fn title_memory_reading_within(limit: std::time::Duration) -> Option<Reading
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::texback::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -973,6 +1313,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
+    // What the destination check knew of the range (committed, writable)
+    // may be the old mapping's.
+    forget(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
@@ -989,6 +1332,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         g.protected.remove(&block);
         g.clean.remove(block);
     }
+    // A copy whose submission is still pending took what was here before:
+    // its copy-back must leave the new mapping's bytes alone.
+    remapped_range(at, len);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -1047,7 +1393,7 @@ fn install() {
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
-        if writable(at) {
+        if writable_now(at) {
             EXCEPTION_CONTINUE_EXECUTION
         } else {
             // Not a block we hold and not memory the title may write: say who
@@ -1086,8 +1432,8 @@ fn install() {
     });
 }
 
-/// Whether `at` is committed read-write memory now.
-fn writable(at: usize) -> bool {
+/// Whether `at` is committed read-write memory now (asked every time).
+fn writable_now(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
     };
@@ -1139,11 +1485,11 @@ mod tests {
         let done = std::sync::Arc::new(Done::default());
         let blocks = back_begin(&done, at, at + 2 * BLOCK);
         assert_eq!(blocks, [at / BLOCK, at / BLOCK + 1]);
-        assert!(!writable(at), "held inaccessible while the job runs");
+        assert!(!writable_now(at), "held inaccessible while the job runs");
         assert!(back_pending(at + BLOCK).is_some());
         done.finish();
         back_release(&blocks, &done);
-        assert!(writable(at), "given back after the job");
+        assert!(writable_now(at), "given back after the job");
         assert!(back_pending(at).is_none());
         // SAFETY: the memory allocated above.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
@@ -1171,10 +1517,10 @@ mod tests {
         assert_eq!(taken_again, [at / BLOCK], "the later job takes the block");
         first.finish();
         back_release(&taken, &first);
-        assert!(!writable(at), "still inaccessible: the later job's bytes are not in");
+        assert!(!writable_now(at), "still inaccessible: the later job's bytes are not in");
         second.finish();
         back_release(&taken_again, &second);
-        assert!(writable(at), "given back by the job that last held it");
+        assert!(writable_now(at), "given back by the job that last held it");
         // SAFETY: the memory allocated above.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
@@ -1199,7 +1545,7 @@ mod tests {
         let done = std::sync::Arc::new(Done::default());
         let held = back_begin(&done, at, at + 2 * BLOCK);
         assert_eq!(held, [at / BLOCK, at / BLOCK + 1]);
-        assert!(!writable(at), "held inaccessible while the job runs");
+        assert!(!writable_now(at), "held inaccessible while the job runs");
         // The job finishes while the title's store is on its way (as the
         // worker does: the blocks are given back, then the job is done).
         let job = {
@@ -1222,7 +1568,7 @@ mod tests {
             ((at + BLOCK - 4) as *mut u32).write_volatile(0x9abc_def0);
         }
         job.join().expect("the job's thread");
-        assert!(writable(at));
+        assert!(writable_now(at));
         assert!(back_pending(at).is_none());
         // SAFETY: our memory, written just above.
         assert_eq!(unsafe { ((at + BLOCK - 4) as *const u32).read() }, 0x9abc_def0);
@@ -1526,7 +1872,7 @@ mod tests {
 
         commit(late, KERNEL_PAGE); // Ordinary commit, without a runtime mapping notification.
         for at in [early, late] {
-            assert!(writable(at));
+            assert!(writable_now(at));
             // SAFETY: each address is inside its committed read-write page.
             unsafe { (at as *mut u8).write_volatile(1) };
         }
@@ -1718,14 +2064,199 @@ mod tests {
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
     }
+
+    /// The destination check's answers, from hand-built regions: committed
+    /// read-write is a destination, reserved or read-only is not, and a
+    /// runtime remap (or a failed kernel write) makes it ask again.
+    #[test]
+    fn a_destination_is_writable_only_where_the_region_is_committed_read_write() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        // SAFETY: a fresh allocation of ours, freed at the end.
+        let at = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * BLOCK,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(at, 0);
+        assert!(writable(at, 4 * BLOCK));
+        assert!(writable(at + BLOCK, BLOCK), "a range inside the region");
+        assert!(!writable(at, 0), "an empty range is never a destination");
+        // Reserved but not committed: no destination, and the copy falls
+        // back to the kernel (which fails) instead of faulting.
+        // SAFETY: a fresh reservation of ours, freed at the end.
+        let hole = unsafe {
+            VirtualAlloc(std::ptr::null(), BLOCK, MEM_RESERVE, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(hole, 0);
+        assert!(!writable(hole, BLOCK));
+        assert!(!writable(hole - BLOCK, 2 * BLOCK), "a range reaching into it");
+        // The title commits it with no notification: the old answer stands
+        // until a failed write says otherwise.
+        // SAFETY: committing our own reservation.
+        let committed = unsafe { VirtualAlloc(hole as *mut _, BLOCK, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(committed as usize, hole);
+        assert!(!writable(hole, BLOCK));
+        write_failed(hole, BLOCK);
+        assert!(writable(hole, BLOCK), "asked again after a failed write");
+        // The runtime makes a block of the first region read-only: it asks
+        // again and the block is no destination.
+        let mut old = 0;
+        assert_ne!(
+            unsafe { VirtualProtect((at + 2 * BLOCK) as *mut _, BLOCK, PAGE_READONLY, &mut old) },
+            0
+        );
+        title_memory_remapped(at + 2 * BLOCK, BLOCK);
+        assert!(writable(at, 2 * BLOCK), "the blocks before it are still so");
+        assert!(!writable(at, 3 * BLOCK), "a read-only block in the range");
+        assert!(!writable(at + 2 * BLOCK, BLOCK));
+        // SAFETY: the allocations above.
+        unsafe {
+            title_memory_remapped(at, 4 * BLOCK);
+            title_memory_remapped(hole, BLOCK);
+            VirtualFree(at as *mut _, 0, MEM_RELEASE);
+            VirtualFree(hole as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// An answer kept for a later block does not hide a change in a block
+    /// that an earlier answer also covers.
+    #[test]
+    fn a_change_forgets_every_answer_that_reaches_into_it() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        // SAFETY: a fresh allocation of ours, freed at the end.
+        let at = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * BLOCK,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(at, 0);
+        // An answer asked at the second block, then one asked at the first
+        // that covers it too: two entries, `[2, 4)` and `[0, 4)`.
+        assert!(writable(at + 2 * BLOCK, 2 * BLOCK));
+        assert!(writable(at, 4 * BLOCK));
+        // The title makes the last block read-only and tells us: both
+        // answers reach into it and must go.
+        let mut old = 0;
+        assert_ne!(
+            unsafe { VirtualProtect((at + 3 * BLOCK) as *mut _, BLOCK, PAGE_READONLY, &mut old) },
+            0
+        );
+        title_memory_remapped(at + 3 * BLOCK, BLOCK);
+        assert!(!writable(at + 3 * BLOCK, BLOCK), "the `[0, 4)` answer must go too");
+        assert!(writable(at, 3 * BLOCK), "what did not change is still known");
+        // SAFETY: the allocation above.
+        unsafe {
+            title_memory_remapped(at, 4 * BLOCK);
+            VirtualFree(at as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// A block our own guard made read-only is no destination until a write
+    /// opens it ([`writing`]).
+    #[test]
+    fn a_guarded_block_is_no_destination_until_the_write_opens_it() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        assert!(guard(view, view + 2 * BLOCK).is_some());
+        assert!(!writable(view, BLOCK), "read-only by our hand");
+        assert!(!writable(view, 2 * BLOCK));
+        // The kernel write's announcement opens it first.
+        writing(view, BLOCK);
+        assert!(writable(view, BLOCK));
+        assert!(!writable(view, 2 * BLOCK), "the other block stays guarded");
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ });
+        }
+        title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    /// The cached destination check costs well under 2 % of the copy it
+    /// guards (the perf ledger has the numbers): 64 cached answers against
+    /// copies of the same 16 MiB range.
+    #[test]
+    fn the_destination_check_costs_under_two_percent_of_the_copy() {
+        use std::time::Instant;
+        const N: usize = 16 << 20;
+        const ROUNDS: u32 = 64;
+        // SAFETY: two regions of ours, freed at the end.
+        let (src, dst) = unsafe {
+            (
+                VirtualAlloc(std::ptr::null(), N, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+                    .cast::<u8>(),
+                VirtualAlloc(std::ptr::null(), N, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+                    .cast::<u8>(),
+            )
+        };
+        assert!(!src.is_null() && !dst.is_null());
+        assert!(writable(dst as usize, N), "the first answer asks");
+        let started = Instant::now();
+        let mut all = true;
+        for _ in 0..ROUNDS {
+            all &= writable(dst as usize, N);
+        }
+        let check = started.elapsed();
+        let started = Instant::now();
+        for _ in 0..ROUNDS {
+            // SAFETY: two mapped regions of ours, apart; the source is read
+            // and the destination written.
+            unsafe { std::ptr::copy_nonoverlapping(src, dst, N) };
+        }
+        let copy = started.elapsed();
+        assert!(all);
+        println!(
+            "destination check {} ns a copy, {N} bytes copied in {} us, {:.4} % of the copy",
+            check.as_nanos() / ROUNDS as u128,
+            copy.as_micros() / ROUNDS as u128,
+            check.as_nanos() as f64 / copy.as_nanos() as f64 * 100.0,
+        );
+        assert!(
+            check * 50 < copy,
+            "the check costs {check:?} of {copy:?} in copies"
+        );
+        // SAFETY: the allocations above.
+        unsafe {
+            title_memory_remapped(dst as usize, N);
+            VirtualFree(src as *mut _, 0, MEM_RELEASE);
+            VirtualFree(dst as *mut _, 0, MEM_RELEASE);
+        }
+    }
 }
 
 #[cfg(test)]
 mod mapping_tests {
-    use super::{title_memory_reading, title_memory_remapping};
+    use super::{
+        BLOCK, copy_back_skips_remapped, remapped, remapped_any, remapped_taken, title_memory_reading,
+        title_memory_remapped, title_memory_remapping,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
 
     /// A change of mapping waits for a read in place that is under way, and
     /// a read in place waits for a change of mapping.
@@ -1767,5 +2298,56 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+
+    /// A range the runtime unmapped or remapped is marked once, joined with
+    /// the marks next to it, until a copy takes it afresh: that is what keeps
+    /// a pending copy-back's bytes out of a new mapping.
+    #[test]
+    fn remapping_marks_blocks_until_a_copy_takes_them_again() {
+        if !copy_back_skips_remapped() {
+            return; // VICTORY_SKIP_REMAPPED=0: nothing is marked.
+        }
+        // SAFETY: two blocks of private memory, freed at the end.
+        let at = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(at, 0, "the pool allocates");
+        // Counted over this allocation only: other tests remap memory of
+        // their own, and the runner may have them in the air.
+        let marks = |at: usize| {
+            remapped().range(..at + 2 * BLOCK).filter(|&(&s, &(e, _))| e > at && s < at + 2 * BLOCK).count()
+        };
+        let saved = remapped().clone();
+        remapped().clear();
+        title_memory_remapped(at, BLOCK);
+        assert!(remapped_any(at, BLOCK), "a remapped range is marked");
+        assert!(!remapped_any(at + BLOCK, BLOCK), "the range after it is not");
+        assert_eq!(marks(at), 1, "one range holds both blocks");
+        remapped_taken(crate::watch::remap_generation(), at, BLOCK);
+        assert!(!remapped_any(at, BLOCK), "a copy that takes it clears the mark");
+        // Two ranges remapped apart join; a copy taking one leaves the other.
+        title_memory_remapped(at + BLOCK, BLOCK);
+        title_memory_remapped(at, BLOCK);
+        assert_eq!(marks(at), 1, "the marks next to each other join");
+        assert!(remapped_any(at, 2 * BLOCK));
+        remapped_taken(crate::watch::remap_generation(), at + BLOCK, BLOCK);
+        assert!(!remapped_any(at + BLOCK, BLOCK), "the taken bytes are current");
+        assert!(remapped_any(at, BLOCK), "the range no copy took stays marked");
+        assert_eq!(crate::watch::unremapped_runs(at, 2 * BLOCK), [(at + BLOCK, at + 2 * BLOCK)]);
+        remapped_taken(u64::MAX, at, 2 * BLOCK);
+        assert!(!remapped_any(at, 2 * BLOCK));
+        assert_eq!(crate::watch::unremapped_runs(at, 2 * BLOCK), [(at, at + 2 * BLOCK)]);
+        // A remap that lands after the copy read its bytes stays marked: the
+        // snapshot holds the old mapping's bytes.
+        let generation = crate::watch::remap_generation();
+        title_memory_remapped(at, BLOCK);
+        remapped_taken(generation, at, BLOCK);
+        assert!(remapped_any(at, BLOCK), "a mark the copy did not read stands");
+        remapped_taken(crate::watch::remap_generation(), at, BLOCK);
+        assert!(!remapped_any(at, BLOCK), "a copy that read it clears it");
+        *remapped() = saved;
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
 }
