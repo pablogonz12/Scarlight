@@ -88,3 +88,7 @@ vkd3d-proton.cache*
 # Scratch space for tools and tests (local wine symlinks etc.); never commit
 # local paths or binaries here.
 /tools/tmp/
+__pycache__/
+# Run logs land here when a Wine test or the layer is redirected into a file;
+# never commit them (cargo xtask policy refuses the extension).
+/logs/

@@ -70,16 +70,14 @@ pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
     if !code.len().is_multiple_of(4) {
         return Err(isa(code.len(), "code size is not a multiple of 4"));
     }
-    let mut found = BTreeMap::new();
+    let mut found = Decoded::Ascending(Vec::new());
     let mut pending = vec![0usize];
     while let Some(mut offset) = pending.pop() {
-        while !found.contains_key(&offset) {
+        while !found.contains(offset) {
             let inst = instruction(code, offset)?;
             let next = offset + 4 * inst.words.len();
-            let flow = control(&inst, code.len(), |at| {
-                found.range(..at).next_back().map(|(_, i)| i)
-            })?;
-            found.insert(offset, inst);
+            let flow = control(&inst, code.len(), |at| found.before(at))?;
+            found.insert(inst);
             match flow {
                 Flow::Next => offset = next,
                 Flow::Stop => break,
@@ -91,7 +89,10 @@ pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
             }
         }
     }
-    let list: Vec<Instruction> = found.into_values().collect();
+    let list = match found {
+        Decoded::Ascending(list) => list,
+        Decoded::Unordered(map) => map.into_values().collect(),
+    };
     if let Some(w) = list
         .windows(2)
         .find(|w| w[0].offset + 4 * w[0].words.len() > w[1].offset)
@@ -99,6 +100,48 @@ pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
         return Err(isa(w[1].offset, "a branch lands inside an instruction"));
     }
     Ok(list)
+}
+
+// The vector holds unique instructions in strictly increasing offset order.
+// Switch to a tree only when a new instruction must be inserted out of order.
+enum Decoded {
+    Ascending(Vec<Instruction>),
+    Unordered(BTreeMap<usize, Instruction>),
+}
+
+impl Decoded {
+    fn contains(&self, offset: usize) -> bool {
+        match self {
+            Self::Ascending(list) => {
+                list.last().is_some_and(|last| offset <= last.offset)
+                    && list.binary_search_by_key(&offset, |i| i.offset).is_ok()
+            }
+            Self::Unordered(map) => map.contains_key(&offset),
+        }
+    }
+
+    fn before(&self, at: usize) -> Option<&Instruction> {
+        match self {
+            Self::Ascending(list) => list[..list.partition_point(|i| i.offset < at)].last(),
+            Self::Unordered(map) => map.range(..at).next_back().map(|(_, i)| i),
+        }
+    }
+
+    fn insert(&mut self, inst: Instruction) {
+        match self {
+            Self::Ascending(list) if list.last().is_none_or(|last| last.offset < inst.offset) => {
+                list.push(inst);
+            }
+            Self::Ascending(list) => {
+                let mut map: BTreeMap<_, _> = list.drain(..).map(|i| (i.offset, i)).collect();
+                map.insert(inst.offset, inst);
+                *self = Self::Unordered(map);
+            }
+            Self::Unordered(map) => {
+                map.insert(inst.offset, inst);
+            }
+        }
+    }
 }
 
 /// Where execution goes after an instruction.
@@ -208,7 +251,12 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
         // Literal constant, SDWA, DPP16, DPP8, DPP8 with fetch-inactive.
         let extra = usize::from(matches!(src0, 0xFF | 0xF9 | 0xFA | 0xE9 | 0xEA));
         match w >> 25 {
-            0x3F => (Encoding::Vop1, (w >> 9) & 0xFF, 1 + extra),
+            0x3F => {
+                let opcode = (w >> 9) & 0xFF;
+                // v_nop, v_pipeflush and v_clrexcp ignore SRC0.
+                let len = if matches!(opcode, 0x00 | 0x1b | 0x41) { 1 } else { 1 + extra };
+                (Encoding::Vop1, opcode, len)
+            }
             0x3E => (Encoding::Vopc, (w >> 17) & 0xFF, 1 + extra),
             op => {
                 let mk_ak = name(Encoding::Vop2, op as u16).is_some_and(|n| {
@@ -350,6 +398,212 @@ mod tests {
             .iter()
             .map(|i| (i.offset, i.words.len(), i.name().unwrap_or("?")))
             .collect()
+    }
+
+    #[test]
+    fn operandless_vop1_preserves_the_following_instruction() {
+        for (opcode, name) in [(0, "v_nop"), (0x1b, "v_pipeflush"), (0x41, "v_clrexcp")] {
+            for src in [0xe9, 0xea, 0xf9, 0xfa, 0xff] {
+                let word = 0x7e00_0000 | (opcode << 9) | src;
+                assert_eq!(summary(&[word, S_ENDPGM]), [(0, 1, name), (4, 1, "s_endpgm")]);
+            }
+        }
+        assert_eq!(summary(&[0x7e00_02ff, 123, S_ENDPGM]), [(0, 2, "v_mov_b32"), (8, 1, "s_endpgm")]);
+    }
+
+    #[test]
+    fn vop3_cmpx_writes_the_active_exec_lanes() {
+        let code = bytes(&[0xd411_0005, 0x0001_e501, S_ENDPGM]);
+        let decoded = decode(&code).unwrap();
+        assert_eq!(decoded[0].name(), Some("v_cmpx_lt_f32"));
+        for (wave64, dwords) in [(false, 1), (true, 2)] {
+            let Fields::Valu(v) = decoded[0].fields(wave64) else { panic!("expected a vector instruction") };
+            assert_eq!(v.dst, Some(Operand::Scalar { code: 126, dwords }));
+        }
+    }
+
+    // cargo test --release -p victory-shader gfx10_decode_throughput -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark"]
+    fn gfx10_decode_throughput() {
+        use std::{hint::black_box, time::Instant};
+
+        // A synthetic shader block with a reconverging conditional branch,
+        // scalar and vector ALU, memory, interpolation and export instructions.
+        let block = [
+            0xBE80_03FF,
+            0x3F80_0000, // s_mov_b32 with a literal
+            0x8001_8100,
+            0xBF00_0100,
+            0xB002_0004, // SOP2, SOPC, SOPK
+            sopp(4, 1),  // conditional branch over v_mov_b32
+            0x7E00_0201,
+            0x0600_0100,
+            0x7C04_0100, // v_add_f32, v_cmp_eq_f32
+            0xD54B_0000,
+            0x03FE_0000,
+            0x4000_0000, // v_fma_f32 with a literal
+            0xCC02_0000,
+            0x0402_0100, // packed vector add
+            0xF400_0000,
+            0x0000_0004, // scalar load
+            0xE000_0000,
+            0x8001_0203,
+            0xE800_0000,
+            0x8001_0203, // buffer loads
+            0xF080_0F0A,
+            0x0000_0201,
+            0x0000_0003, // image sample with NSA
+            0xD800_0000,
+            0x0000_0201,
+            0xDC30_0000,
+            0x0000_0001, // DS, FLAT
+            0xC800_0000,
+            0xF800_000F,
+            0x0302_0100, // interpolation, export
+        ];
+        let mut words = block.repeat(32);
+        words.push(S_ENDPGM);
+        let code = bytes(&words);
+        let decoded = decode(&code).unwrap();
+        let count = 18 * 32 + 1;
+        assert_eq!(decoded.len(), count);
+        assert!(decoded.iter().all(|i| i.name().is_some()));
+        drop(decoded);
+
+        const RUNS: usize = 1024;
+        let mut samples = [std::time::Duration::ZERO; 7];
+        for sample in &mut samples {
+            let start = Instant::now();
+            for _ in 0..RUNS {
+                black_box(decode(black_box(&code)).unwrap());
+            }
+            *sample = start.elapsed();
+        }
+        samples.sort_unstable();
+        let seconds = samples[samples.len() / 2].as_secs_f64();
+        println!(
+            "{:.3} M inst/s, {:.3} MB/s (median of {} samples)",
+            (count * RUNS) as f64 / seconds / 1e6,
+            (code.len() * RUNS) as f64 / seconds / 1e6,
+            samples.len()
+        );
+    }
+
+    // Keep the original tree-only traversal as an independent reference for decode.
+    fn reference_decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
+        if !code.len().is_multiple_of(4) {
+            return Err(isa(code.len(), "code size is not a multiple of 4"));
+        }
+        let mut found = BTreeMap::new();
+        let mut pending = vec![0usize];
+        while let Some(mut offset) = pending.pop() {
+            while !found.contains_key(&offset) {
+                let inst = instruction(code, offset)?;
+                let next = offset + 4 * inst.words.len();
+                let flow = control(&inst, code.len(), |at| {
+                    found.range(..at).next_back().map(|(_, i)| i)
+                })?;
+                found.insert(offset, inst);
+                match flow {
+                    Flow::Next => offset = next,
+                    Flow::Stop => break,
+                    Flow::Jump(target) => offset = target,
+                    Flow::Branch(target) => {
+                        pending.push(target);
+                        offset = next;
+                    }
+                }
+            }
+        }
+        let list: Vec<Instruction> = found.into_values().collect();
+        if let Some(w) = list
+            .windows(2)
+            .find(|w| w[0].offset + 4 * w[0].words.len() > w[1].offset)
+        {
+            return Err(isa(w[1].offset, "a branch lands inside an instruction"));
+        }
+        Ok(list)
+    }
+
+    fn assert_same_decode(code: &[u8]) {
+        assert_eq!(
+            decode(code),
+            reference_decode(code),
+            "decoder mismatch for {code:x?}"
+        );
+    }
+
+    #[test]
+    fn matches_tree_decoder_across_encodings_and_truncations() {
+        // Vary all nine leading bits, the payload (including literal and DPP
+        // selectors), and each possible instruction length through five dwords.
+        for prefix in 0..512 {
+            for payload in [0, 0xE9, 0xEA, 0xF9, 0xFA, 0xFF, 0x55_FF02, 0x7F_FFFF] {
+                let code = bytes(&[prefix << 23 | payload, 0x03FE_0000, 1, 2, 3, S_ENDPGM]);
+                for len in (0..=code.len()).step_by(4) {
+                    assert_same_decode(&code[..len]);
+                }
+            }
+        }
+        assert_same_decode(&[1, 2, 3]);
+    }
+
+    #[test]
+    fn matches_tree_decoder_across_opcode_ranges() {
+        for (base, shift, opcodes) in [
+            (0x8000_0000, 23, 128),
+            (0xB000_0000, 23, 32),
+            (0xBE80_0000, 8, 256),
+            (0xBF00_0000, 16, 128),
+            (0xBF80_0000, 16, 128),
+            (0xF400_0000, 18, 256),
+            (0, 25, 64),
+            (0x7E00_0000, 9, 256),
+            (0x7C00_0000, 17, 256),
+            (0xD400_0000, 16, 1024),
+            (0xCC00_0000, 16, 128),
+            (0xC800_0000, 16, 4),
+            (0xD800_0000, 18, 256),
+            (0xE000_0000, 18, 256),
+            (0xE800_0000, 16, 8),
+            (0xF000_0000, 18, 128),
+            (0xDC00_0000, 18, 128),
+            (0xF800_0000, 0, 1),
+        ] {
+            for op in 0..opcodes {
+                for (flags, w1) in [(0, 0), (1, 1 << 21), (1 << 14, 0xFF), (2 << 14, 0)] {
+                    assert_same_decode(&bytes(&[
+                        base | op << shift | flags,
+                        w1,
+                        S_ENDPGM,
+                        S_ENDPGM,
+                    ]));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matches_tree_decoder_across_branch_targets() {
+        // Conditional and unconditional edges, including backward jumps,
+        // revisits, holes, out-of-range targets and jumps into literal data.
+        for op in [2, 4] {
+            for a in -2..=9 {
+                for b in -8..=4 {
+                    assert_same_decode(&bytes(&[
+                        sopp(op, a),
+                        0xBE80_03FF,
+                        S_ENDPGM,
+                        sopp(2, 2),
+                        sopp(4, -4),
+                        S_ENDPGM,
+                        sopp(op, b),
+                        S_ENDPGM,
+                    ]));
+                }
+            }
+        }
     }
 
     #[test]

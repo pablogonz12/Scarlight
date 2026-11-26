@@ -12,8 +12,9 @@
 //!
 //! shortcut: a change detiles the whole texture, not the pages written.
 //! Only textures read through descriptor tables are brought up to date
-//! (directly indexed views are not known per draw); plane 0 is uploaded
-//! (every mip and array slice), depth and stencil planes are not.
+//! (directly indexed views are not known per draw); uploads cover each
+//! compatible plane, mip and array slice (a depth-stencil texture's stencil
+//! plane too, where the host's layout is the console's).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -30,6 +31,8 @@ macro_rules! once {
     }};
 }
 
+pub(crate) mod ahead;
+
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
@@ -40,9 +43,21 @@ pub(crate) struct Staging {
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
-    layout: victory_formats::texture::Layout,
+    layout: victory_formats::texture::Texture,
+    /// The bytes of the texture each subresource (mip `+` slice times
+    /// `mips`) covers, for detiling only the 64 KiB pages that changed
+    /// ([`Staging::refresh_pages`]). `None` for a 3D texture, whose depth
+    /// slices interleave, and when the counts disagree; then a change
+    /// detiles the whole texture, as before.
+    ranges: Option<Vec<(u64, u64)>>,
     /// Mips per array slice.
     mips: u32,
+    /// The title's top mip levels the host copy lacks (memory pressure,
+    /// [`crate::resource::dropped_mips`]): subresource `i` holds the title's
+    /// mip `i + skipped` of its slice.
+    skipped: u32,
+    /// Mips and array slices in one native plane.
+    subresources_per_plane: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     memory: *const u8,
@@ -61,6 +76,10 @@ pub(crate) struct Staging {
     /// of 1,120 textures in one frame of run 18.)
     dirty: std::sync::atomic::AtomicBool,
     uploaded: std::sync::atomic::AtomicBool,
+    /// What the texture's first upload is doing when it was started ahead on
+    /// the copy queue (`ahead`, `VICTORY_UPLOAD_AHEAD`): 0 nothing, 1 on its
+    /// way, 2 it has run.
+    ahead: std::sync::atomic::AtomicU8,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
     /// The frame of its last refresh, `NEVER` if it has had none: what
@@ -405,17 +424,19 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
-    let before = list.transition(source, COPY_SOURCE).map(|(texture, before)| {
-        let state = crate::host::legal_state(texture, COPY_SOURCE);
-        let barrier = crate::host::transition(
-            texture,
-            D3D12_RESOURCE_STATES(before as i32),
-            D3D12_RESOURCE_STATES(state as i32),
-        );
-        // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
-        before
-    });
+    let before = list
+        .transition(source, COPY_SOURCE)
+        .map(|(texture, before)| {
+            let state = crate::host::legal_state(texture, COPY_SOURCE);
+            let barrier = crate::host::transition(
+                texture,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(state as i32),
+            );
+            // SAFETY: an open list and a live texture.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+            before
+        });
     if !first && before.is_none() {
         return true;
     }
@@ -507,7 +528,8 @@ fn no_wait() -> bool {
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
 /// through the kernel because title memory was being remapped, and those
 /// left for the next refresh because a page was not there.
-pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Since the last frame-rate line, of texture refreshes on every thread, in
 /// microseconds: waiting for the texture's own lock (another thread is
@@ -523,7 +545,8 @@ pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sy
 /// submitting thread is not running while it lasts (run 93: 240-310 ms of
 /// its own time a frame beside 1,100-1,800 ms of "textures"): it waits.
 /// These say for what.
-pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// How many microseconds a thread's texture refreshes may wait for title
 /// memory to hold still in one frame before they read through the kernel
@@ -542,7 +565,10 @@ fn wait_us() -> u64 {
     crate::switches::u64v(
         "VICTORY_TEXTURE_WAIT_US",
         *US.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_WAIT_US").ok().and_then(|v| v.parse().ok()).unwrap_or(8_000)
+            std::env::var("VICTORY_TEXTURE_WAIT_US")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8_000)
         }),
     )
 }
@@ -579,7 +605,14 @@ fn waited_out(us: u64) {
     let frame = crate::frame::current();
     WAITED.with(|w| {
         let (at, spent) = w.get();
-        w.set((frame, if at == frame { spent.saturating_add(us) } else { us }));
+        w.set((
+            frame,
+            if at == frame {
+                spent.saturating_add(us)
+            } else {
+                us
+            },
+        ));
     });
 }
 
@@ -613,6 +646,52 @@ fn unmapped_frames() -> u64 {
     })
 }
 
+/// The runs of whole 64 KiB pages of title memory `[start, end)` written
+/// after asking `previous`, as `(offset from `start`, bytes)`: pages outside
+/// the texture are cut away and pages that meet are one run, read in one
+/// call. Offsets are texture-relative because that is the space the
+/// subresource ranges and [`victory_formats::texture::Layout::detile_window`]
+/// use; the address itself is only for the read.
+fn dirty_runs(
+    written: &[(usize, u64)],
+    previous: u64,
+    start: usize,
+    end: usize,
+) -> Vec<(u64, usize)> {
+    let mut pages: Vec<usize> = written
+        .iter()
+        .filter(|&&(_, w)| w > previous)
+        .map(|&(p, _)| p)
+        .collect();
+    if pages.is_empty() {
+        return Vec::new();
+    }
+    pages.sort_unstable();
+    pages.dedup();
+    let mut runs: Vec<(u64, usize)> = Vec::new();
+    for page in pages {
+        let lo = (page * crate::watch::PAGE).max(start);
+        let hi = ((page + 1) * crate::watch::PAGE).min(end);
+        if lo >= hi {
+            continue;
+        }
+        let at = (lo - start) as u64;
+        match runs.last_mut() {
+            Some(last) if last.0 + last.1 as u64 == at => last.1 += hi - lo,
+            _ => runs.push((at, hi - lo)),
+        }
+    }
+    runs
+}
+
+/// Whether a changed texture is detiled only where it changed, the 64 KiB
+/// pages the title wrote since the last asking (`VICTORY_DETILE_DIRTY=0`
+/// detiles the whole texture at every change, as before).
+fn detile_dirty() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DETILE_DIRTY").is_none_or(|v| v != "0"))
+}
+
 /// Frames between two looks at a texture at most (`VICTORY_TEXTURE_REFRESH_EVERY`,
 /// default 1: every frame, as before). A world that renders at a frame a second
 /// spends most of that frame reading title memory for textures: measured on one
@@ -640,7 +719,10 @@ fn refresh_every() -> u64 {
 /// would put every texture of a heap on the same frame; the address's
 /// 64 KiB are the unit, as their layout is.)
 fn due_at(every: u64, frame: u64, address: usize) -> bool {
-    every <= 1 || frame.wrapping_add((address >> 16) as u64).is_multiple_of(every)
+    every <= 1
+        || frame
+            .wrapping_add((address >> 16) as u64)
+            .is_multiple_of(every)
 }
 
 /// No refresh yet ([`Staging::looked`]): older than any frame can be.
@@ -663,7 +745,10 @@ fn due(every: u64, frame: u64, address: usize, looked: u64) -> bool {
 fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     let started = std::time::Instant::now();
     let out = f();
-    REFRESH_WAITS[slot].fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    REFRESH_WAITS[slot].fetch_add(
+        started.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     out
 }
 
@@ -729,7 +814,10 @@ fn in_place_max() -> usize {
     let mb = crate::switches::u64v(
         "VICTORY_TEXTURE_INPLACE_MAX_MB",
         *MB.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_INPLACE_MAX_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1)
+            std::env::var("VICTORY_TEXTURE_INPLACE_MAX_MB")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(1)
         }) as u64,
     );
     (mb as usize) << 20
@@ -768,7 +856,8 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
 
 /// Staging buffers alive (also those only a list still holds) and their
 /// bytes.
-static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static STAGED: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 impl Drop for Staging {
     fn drop(&mut self) {
@@ -792,7 +881,8 @@ pub(crate) fn memory() -> [u64; 3] {
 }
 
 /// Staging buffers let go as idle since the start, and their bytes.
-static LET_GO: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static LET_GO: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// For the memory line: staging buffers let go as idle, and their bytes.
 #[cfg(feature = "diagnostics")]
@@ -835,7 +925,12 @@ pub(crate) fn let_go_idle() {
         keep
     });
     if went > 0 {
-        crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
+        crate::host::trail(|| {
+            format!(
+                "sweep: {went} staging buffers of textures let go ({} KiB), held by no list",
+                bytes >> 10
+            )
+        });
     }
 }
 
@@ -847,7 +942,8 @@ static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::ne
 pub(crate) fn host_written(resource: This) {
     let new = {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-        set.get_or_insert_with(Default::default).insert(resource as usize)
+        set.get_or_insert_with(Default::default)
+            .insert(resource as usize)
     };
     // The host chain is complete; the window title memory was last found
     // with is stale and must not clamp the views of it any more (#616).
@@ -856,13 +952,27 @@ pub(crate) fn host_written(resource: This) {
     // the title reads that memory through ([`placed_in_host_written`]).
     if new && let Some((at, desc)) = crate::resource::texture_memory(resource) {
         // SAFETY: 56 bytes in the description's layout.
-        let words = unsafe { std::ptr::from_ref(&desc).cast::<[u32; 14]>().read_unaligned() };
+        let words = unsafe {
+            std::ptr::from_ref(&desc)
+                .cast::<[u32; 14]>()
+                .read_unaligned()
+        };
         let bytes = crate::resource::placed_bytes(&words).unwrap_or(0);
         if !at.is_null() && bytes > 0 {
             HOST_WRITTEN_AT
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(at as u64, (bytes, words[4], words[6], words[7], words[8], resource as usize));
+                .insert(
+                    at as u64,
+                    (
+                        bytes,
+                        words[4],
+                        words[6],
+                        words[7],
+                        words[8],
+                        resource as usize,
+                    ),
+                );
         }
     }
 }
@@ -928,7 +1038,9 @@ pub(crate) fn forget(resource: usize) {
     {
         // A list not yet reset may still hold it and refresh it: that must
         // not note a window for the released address.
-        staging.released.store(true, std::sync::atomic::Ordering::Relaxed);
+        staging
+            .released
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
@@ -942,7 +1054,10 @@ pub(crate) fn forget(resource: usize) {
     }
     // Its memory may be given to other textures now (run 177: most of the
     // "HERO LEAD" lines were views in memory a released texture had held).
-    HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, d| d.5 != resource);
+    HOST_WRITTEN_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|_, d| d.5 != resource);
     let mut through = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(through) = through.as_mut() {
         through.remove(&resource);
@@ -977,6 +1092,61 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     };
     use std::sync::atomic::Ordering::Relaxed;
     staging.used.store(crate::host::moment(), Relaxed);
+    // `VICTORY_UPLOAD_AHEAD`: a texture's first upload is read and copied on
+    // the copy queue, ahead of the lists (`ahead`), so a frame's preparation
+    // does not stop for the read of a whole texture; the submission waits for
+    // it before its lists run (`VICTORY_SHOW_AFTER`).
+    if ahead::on()
+        && !staging.uploaded.load(Relaxed)
+        && !list.writes_title(staging.memory as usize, staging.layout.size as usize)
+    {
+        let key = ahead::key(&staging);
+        let upload = ahead::Upload {
+            buffer: staging.buffer.clone(),
+            footprints: staging.footprints.clone(),
+            texture: texture.clone(),
+            bytes: staging.bytes,
+        };
+        let detiling = staging.clone();
+        // The claim is taken with the job (and the registry's lock), so
+        // exactly one list starts a texture's first upload: two batches
+        // copying one texture is not something D3D12 allows, and the second
+        // would be waited on by nothing.
+        if let Some(job) = ahead::take(
+            key,
+            &staging.ahead,
+            upload,
+            Box::new(move || {
+                detiling.refresh_now();
+            }),
+        ) {
+            // The host texture holds what the staging buffer was detiled to
+            // once the copies have run, as a list's own uploads leave it; a
+            // batch that did not run gives the claim back, and the next list
+            // uploads it itself.
+            let ran = staging.clone();
+            job.then(move |copied: bool| {
+                use std::sync::atomic::Ordering::Relaxed;
+                ran.ahead
+                    .store(if copied { ahead::DONE } else { ahead::NONE }, Relaxed);
+                if copied {
+                    ran.uploaded.store(true, Relaxed);
+                    ran.dirty.store(false, Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    ran.present.queued();
+                }
+            });
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexUploads, 1);
+            return false;
+        }
+        // On its way with another list: this list records no copy, and the
+        // submission waits for it before the lists run
+        // (`ahead::synchronise`).
+        if staging.ahead.load(Relaxed) == ahead::PENDING {
+            return false;
+        }
+    }
     // The host texture has the staging buffer's contents: only the check
     // at submission is left, and what it finds changed the next list that
     // samples the texture uploads (a frame late where every list of the
@@ -989,6 +1159,12 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
+    if ahead::on() {
+        // This list records the upload: no upload ahead may claim it until
+        // this one has run (`ahead::LIST`), or the copy queue would write the
+        // texture beside a drawing list's copy, with no fence between them.
+        staging.ahead.store(ahead::LIST, Relaxed);
+    }
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging buffer lives as long as `staging`, which the deferred
@@ -1048,6 +1224,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         list.defer_host(move || {
             staging.uploaded.store(true, Relaxed);
             staging.dirty.store(false, Relaxed);
+            if ahead::on() {
+                staging.ahead.store(ahead::DONE, Relaxed);
+            }
         });
     }
     // Once per submission however many of its lists sample the texture.
@@ -1071,6 +1250,11 @@ impl Staging {
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
         use std::sync::atomic::Ordering::Relaxed;
+        // Its first upload is on the copy queue, reading these bytes: it must
+        // have run before they are detiled over (`ahead`).
+        if self.ahead.load(Relaxed) == ahead::PENDING {
+            ahead::settle(ahead::key_of(self));
+        }
         // `VICTORY_TEXTURE_REFRESH_EVERY`: read at most once every n frames
         // (see [`due`]). Its contents then lag by up to that many frames, and
         // what was detiled before stays what is uploaded. Only once it has
@@ -1079,7 +1263,10 @@ impl Staging {
         let frame = crate::frame::current();
         let every = refresh_every();
         let looked = self.looked.load(Relaxed);
-        if every > 1 && self.uploaded.load(Relaxed) && !due(every, frame, self.memory as usize, looked) {
+        if every > 1
+            && self.uploaded.load(Relaxed)
+            && !due(every, frame, self.memory as usize, looked)
+        {
             return;
         }
         self.looked.store(frame, Relaxed);
@@ -1094,7 +1281,10 @@ impl Staging {
     fn refresh_now(&self) -> usize {
         let whole = std::time::Instant::now();
         let read = self.refresh_timed();
-        REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        REFRESH_WAITS[3].fetch_add(
+            whole.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         read
     }
 
@@ -1103,11 +1293,22 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false))
+        {
+            let previous = last.asked;
+            if previous != 0 && written.iter().all(|&(_, w)| w <= previous) {
                 return 0;
             }
             last.asked = now;
+            // Only the 64 KiB pages the title wrote since the last asking
+            // are read and detiled, where the texture is big enough for that
+            // to pay (`VICTORY_DETILE_DIRTY=0`: the whole texture, as
+            // before).
+            if previous != 0
+                && let Some(read) = self.refresh_pages(&written, previous)
+            {
+                return read;
+            }
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
@@ -1130,7 +1331,8 @@ impl Staging {
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
+            && let Some((now, written)) =
+                waited(1, || crate::watch::writes(start, start + size, true))
         {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
@@ -1139,11 +1341,15 @@ impl Staging {
             // the two turns would multiply (7 and 8: a change found 56 frames
             // late, not 48).
             let turn = refresh_every() > 1
-                || crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+                || crate::frame::current()
+                    .wrapping_add((start >> 16) as u64)
+                    .is_multiple_of(HASH_EVERY);
             last.checked = unwritten && turn;
             // `VICTORY_TEXTURE_GUARD_TRUST=1`: a missed write is not learnt from.
             static TRUST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let trust = *TRUST.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD_TRUST").is_some_and(|v| v == "1"));
+            let trust = *TRUST.get_or_init(|| {
+                std::env::var_os("VICTORY_TEXTURE_GUARD_TRUST").is_some_and(|v| v == "1")
+            });
             if unwritten && !turn && (trust || !last.missed) {
                 return 0;
             }
@@ -1164,7 +1370,8 @@ impl Staging {
                 return crate::watch::title_memory_reading_now();
             }
             let started = std::time::Instant::now();
-            let got = crate::watch::title_memory_reading_within(std::time::Duration::from_micros(room));
+            let got =
+                crate::watch::title_memory_reading_within(std::time::Duration::from_micros(room));
             waited_out(started.elapsed().as_micros() as u64);
             got
         }) else {
@@ -1181,7 +1388,7 @@ impl Staging {
             // What of it is there, as a mip window: the views of it are
             // narrowed to it while it lasts (a streamed texture's mips
             // arrive from the smallest, at the start of each slice).
-            let window = resident_mips(self.memory, &self.layout);
+            let window = resident_mips(self.memory, &self.layout.planes[0].layout);
             if !self.released.load(std::sync::atomic::Ordering::Relaxed) {
                 note_resident(self.resource, window, false);
             }
@@ -1196,7 +1403,11 @@ impl Staging {
             // Read again in `partial_frames`, or in `unmapped_frames` when
             // no mip at all is there (the texture is black until one
             // arrives, where a partly mapped one shows its small mips).
-            let wait = if window.1 == 0 { unmapped_frames() } else { partial_frames() };
+            let wait = if window.1 == 0 {
+                unmapped_frames()
+            } else {
+                partial_frames()
+            };
             let frame = crate::frame::current();
             if last.partial.is_some_and(|at| frame < at + wait) {
                 return 0;
@@ -1337,6 +1548,82 @@ impl Staging {
         }
     }
 
+    /// Detiles only the pages of title memory written since `previous` (the
+    /// asking the staging buffer was last brought up to date after), instead
+    /// of the whole texture. Returns the bytes read, or `None` when the
+    /// caller must take the whole texture (a first refresh, a 3D texture or
+    /// one whose subresource count disagrees with the layout, or
+    /// `VICTORY_DETILE_DIRTY=0`).
+    ///
+    /// A world atlas written in a few places a frame is read and detiled
+    /// whole at each of its refreshes; the write watch already knows which
+    /// 64 KiB pages changed, so only those runs are read, and only the
+    /// elements of them each subresource covers are detiled.
+    fn refresh_pages(&self, written: &[(usize, u64)], previous: u64) -> Option<usize> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !detile_dirty() || previous == 0 {
+            return None;
+        }
+        let ranges = self.ranges.as_ref()?;
+        let start = self.memory as usize;
+        let end = start.saturating_add(self.layout.size as usize);
+        // The runs are offsets from the texture's first byte, as `ranges`
+        // are: the title's memory lies at whatever address the view got.
+        let runs = dirty_runs(written, previous, start, end);
+        if runs.is_empty() {
+            return Some(0);
+        }
+        let mut read = 0usize;
+        for &(run_at, run_len) in &runs {
+            let run_start = start + run_at as usize;
+            // SAFETY: a buffer of our own, filled by the copy.
+            let mut buf = vec![0u8; run_len];
+            // Read through the copy, which stands unmapped pages.
+            crate::host::copy_mapped(buf.as_mut_ptr(), run_start as *const u8, run_len, false);
+            for (sub, &(rs, re)) in ranges.iter().enumerate() {
+                let a = rs.max(run_at);
+                let b = re.min(run_at + run_len as u64);
+                if a >= b {
+                    continue;
+                }
+                let footprint = &self.footprints[sub];
+                let f = footprint.Footprint;
+                let pitch = f.RowPitch as usize;
+                let rows = self.rows[sub] as usize;
+                let len = pitch * rows * f.Depth as usize;
+                // SAFETY: the subresource's part of the mapped staging buffer.
+                let linear = unsafe {
+                    std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+                };
+                let (plane_index, mip, slice) =
+                    plane_of(sub as u32, self.mips, self.subresources_per_plane);
+                let Some(plane) = self.layout.planes.get(plane_index) else {
+                    continue;
+                };
+                let window = &buf[(a - run_at) as usize..(b - run_at) as usize];
+                // `ranges` and the runs are texture-relative; a plane's
+                // layout numbers its own bytes from its offset.
+                if let Err(e) = plane.layout.detile_window(
+                    window,
+                    a - plane.offset,
+                    mip,
+                    slice,
+                    linear,
+                    pitch,
+                    pitch * rows,
+                ) {
+                    tracing::warn!(?e, mip, slice, "texture not detiled");
+                }
+            }
+            read += run_len;
+        }
+        // The diagnostics' content generation (`Present`) is noted for whole
+        // detiles only: the picture and the upload's `dirty` do not need it.
+        self.dirty.store(true, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TexWatched, read as u64);
+        Some(read)
+    }
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1346,12 +1633,30 @@ impl Staging {
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
                 memory = ?self.memory,
-                desc = ?self.layout.desc,
+                desc = ?self.layout.planes[0].layout.desc,
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            // D3D12 orders mips first, then array slices, then planes.
+            let (plane_index, mip, slice) =
+                plane_of(i as u32, self.mips, self.subresources_per_plane);
+            let Some(plane) = self.layout.planes.get(plane_index) else {
+                continue;
+            };
+            let start = plane.offset as usize;
+            let Some(tiled) = tiled.get(start..start + plane.layout.size as usize) else {
+                tracing::warn!(
+                    i,
+                    start,
+                    size = plane.layout.size,
+                    "a plane lies past the texture's memory"
+                );
+                return;
+            };
+            // The title's top mips the host copy lacks (dropped_mips) are not
+            // subresources of a plane: they shift every mip it names.
+            let mip = mip + self.skipped;
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
@@ -1360,7 +1665,8 @@ impl Staging {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
             if let Err(e) =
-                self.layout
+                plane
+                    .layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
@@ -1403,7 +1709,12 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
         read.resize(3 * WINDOW, 0);
         let mut take = |from: usize, bytes: usize| {
             read[..bytes].fill(0);
-            crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
+            crate::host::copy_mapped(
+                read.as_mut_ptr(),
+                (at as usize + from) as *const u8,
+                bytes,
+                false,
+            );
             hasher.update(&read[..bytes]);
         };
         if len <= 3 * WINDOW {
@@ -1424,7 +1735,8 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
 /// upload, and the lists that sample it check it at submission.
 pub(crate) fn is_staged(resource: This) -> bool {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
+    map.as_ref()
+        .is_some_and(|map| map.contains_key(&(resource as usize)))
 }
 
 /// The bytes of a title texture's memory, and whether all of it is mapped,
@@ -1447,7 +1759,7 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     if len == 0 {
         return true;
     }
-    let (there, of) = readable(at as usize, len, true);
+    let (there, of) = readable(at as usize, len, true, 1);
     there == of
 }
 
@@ -1473,10 +1785,19 @@ fn by_query() -> bool {
 /// trimmed), and a one-byte read through the kernel says.
 /// A page that is committed and may not be read counts as not there, which
 /// is what the callers ask for: they read or write the memory next.
-fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
-    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+///
+/// Only one page in `stride` of those the query finds outside the working
+/// set costs a read: an answer that needs no count of pages (is anything
+/// there) asks about the first page of every 64 KiB block, the size the
+/// title's memory is mapped in, and a texture that is not there at all then
+/// costs 1,024 reads for its 64 MiB instead of 16,384, on every look.
+fn readable(at: usize, len: usize, all: bool, stride: usize) -> (usize, usize) {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
+    };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     const KERNEL_PAGE: usize = 4096;
+    let stride = stride.max(1);
     let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len - 1) / KERNEL_PAGE);
     let of = last - first + 1;
     let mut there = 0;
@@ -1501,7 +1822,9 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
             // SAFETY: plain data the query filled in.
             let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
             let mut byte = [0u8];
-            if valid || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
+            let read = (valid || (page + i) % stride == 0)
+                && (valid || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte));
+            if read {
                 there += 1;
             } else if all {
                 return (there, of);
@@ -1529,12 +1852,38 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
     true
 }
 
+/// Whether any byte of `[at, at + len)` can be read: a texture streaming
+/// in can have only its interior mips mapped, and it then has bytes to
+/// stage though neither its first nor its last page is there.
+fn any_mapped(at: *const u8, len: usize) -> bool {
+    any_mapped_by(at as usize, len, |p, n| readable(p, n, false, 16).0)
+}
+
+/// [`any_mapped`] with the question about a range of pages passed in (how
+/// many of them can be read), asked of 256-page batches as [`readable`] does
+/// and stopping at the first that holds one: the batching is what a test
+/// checks, without the kernel.
+fn any_mapped_by(start: usize, len: usize, readable_pages: impl Fn(usize, usize) -> usize) -> bool {
+    const BATCH: usize = 256 * 4096;
+    let end = start.saturating_add(len);
+    let mut p = start;
+    while p < end {
+        let n = (end - p).min(BATCH);
+        if readable_pages(p, n) > 0 {
+            return true;
+        }
+        p += n;
+    }
+    false
+}
+
 /// How many bytes of `[at, at + len)` are committed memory: all of a
 /// texture that is there, some of one streaming in (its smaller mips lie
 /// at the start of its memory, and their pages are mapped first), none of
-/// one not there. With neither the first nor the last page committed the
-/// answer is none without a look at the pages between (two queries for the
-/// slots whose texture is away, which are asked again and again).
+/// one not there. Neither end page committed is usually none (two queries
+/// for the slots whose texture is away, which are asked again and again),
+/// but a texture whose interior mips alone have arrived is not away: it is
+/// looked for a readable page only then ([`any_mapped`]).
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     if len == 0 {
@@ -1542,14 +1891,16 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     }
     let start = at as usize;
     let end = start.saturating_add(len);
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
+    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) && !any_mapped(at, len) {
         return 0;
     }
     if !by_query() {
         static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
+        if *BY_PAGE
+            .get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1"))
+        {
             // By page, without the walk: whole pages, cut to the range.
-            let (there, _) = readable(start, len, false);
+            let (there, _) = readable(start, len, false, 1);
             return (there as u64 * 4096).min(len as u64);
         }
         // By 64 KiB block, one page asked of each: the title's memory is
@@ -1565,7 +1916,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         let mut block = start & !(BLOCK - 1);
         while block < end {
             let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
+            if readable(lo, 1, true, 1).0 == 1 {
                 there += (hi - lo) as u64;
             }
             block = block.saturating_add(BLOCK);
@@ -1578,7 +1929,9 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
+        let next = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            .min(end);
         if n == 0 || next <= p {
             break;
         }
@@ -1678,7 +2031,10 @@ pub(crate) fn resident_suffix(extents: &[(u64, u64)], mapped: u64) -> (u32, u32)
 
 /// [`resident_suffix`] of the texture at `memory`: the mips all of whose
 /// bytes are mapped now.
-pub(crate) fn resident_mips(memory: *const u8, layout: &victory_formats::texture::Layout) -> (u32, u32) {
+pub(crate) fn resident_mips(
+    memory: *const u8,
+    layout: &victory_formats::texture::Layout,
+) -> (u32, u32) {
     if layout.size == 0 || layout.mips.is_empty() {
         return (0, 0);
     }
@@ -1687,7 +2043,10 @@ pub(crate) fn resident_mips(memory: *const u8, layout: &victory_formats::texture
         return (0, layout.mips.len() as u32);
     }
     if mapped == 0 {
-        return (0, 0);
+        // Interior mips alone are there: no prefix to narrow the chain to,
+        // so the view names the mips asked for and the ones that have not
+        // arrived read zeros (the slot still shows the texture that was).
+        return (0, layout.mips.len() as u32);
     }
     resident_suffix(&layout.mip_extents(), mapped)
 }
@@ -1704,7 +2063,7 @@ fn mapped_prefix(at: *const u8, len: usize) -> u64 {
     let end = block.saturating_add(len);
     while block < end {
         let n = (end - block).min(BLOCK);
-        if readable(block, 1, true).0 != 1 {
+        if readable(block, 1, true, 1).0 != 1 {
             break;
         }
         there += n as u64;
@@ -1761,7 +2120,14 @@ pub(crate) fn wanted(
     mips: u32,
     host_written: bool,
 ) -> (u32, u32) {
-    let all = (asked.0, if asked.1 == 0 { mips.saturating_sub(asked.0) } else { asked.1 });
+    let all = (
+        asked.0,
+        if asked.1 == 0 {
+            mips.saturating_sub(asked.0)
+        } else {
+            asked.1
+        },
+    );
     if host_written {
         return all;
     }
@@ -1789,7 +2155,11 @@ pub(crate) fn note_resident(resource: This, window: (u32, u32), whole: bool) {
 /// every mip it can sample is there.
 pub(crate) fn narrowed(asked: (u32, u32), resident: (u32, u32), mips: u32) -> (u32, u32) {
     let (first, levels) = asked;
-    let end = if levels == 0 { mips } else { first.saturating_add(levels).min(mips) };
+    let end = if levels == 0 {
+        mips
+    } else {
+        first.saturating_add(levels).min(mips)
+    };
     let (rfirst, rcount) = resident;
     let rend = rfirst.saturating_add(rcount).min(mips);
     let start = first.max(rfirst).min(rend.saturating_sub(1));
@@ -1800,51 +2170,182 @@ pub(crate) fn narrowed(asked: (u32, u32), resident: (u32, u32), mips: u32) -> (u
     (start, count)
 }
 
+/// The plane, mip and array slice of native subresource `i`: D3D12 orders
+/// mips first, then array slices, then planes (`subresources_per_plane` =
+/// mips × slices).
+fn plane_of(i: u32, mips: u32, subresources_per_plane: u32) -> (usize, u32, u32) {
+    let subresource = i % subresources_per_plane;
+    (
+        (i / subresources_per_plane) as usize,
+        subresource % mips,
+        subresource / mips,
+    )
+}
+
+/// Whether a depth-stencil texture's second plane is uploaded
+/// (`VICTORY_TEXTURE_PLANES=0`: the first plane alone, as before).
+fn planes_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_PLANES").is_none_or(|v| v != "0"))
+}
+
+/// The planes of `layout` the host takes, where the host takes more than
+/// one: the host format's plane count (`host_planes`, `None` if the host
+/// cannot say), for a format whose console planes the host lays out the
+/// same way (the stencil plane its second, one byte a texel).
+///
+/// One plane otherwise: the console's 16-bit depth with 8-bit stencil is
+/// three bytes a texel with the stencil alongside, where the host's depth
+/// plane (R32 float, four bytes) is not the console's, and converting it
+/// is not done here (the depth plane's twin carries its contents instead).
+fn planes_uploaded(
+    layout: &victory_formats::texture::Texture,
+    host_planes: Option<u32>,
+    format: u32,
+) -> usize {
+    if layout.planes.len() < 2 || !planes_on() {
+        return 1;
+    }
+    // The host format must be a typed depth-stencil one: a copy writes one
+    // plane of a texture at a time, and D3D12 refuses that for a TYPELESS
+    // format (the runtime faults where it would size the copy).
+    const TYPED: [u32; 2] = [20, 45]; // D32_FLOAT_S8X24_UINT, D24_UNORM_S8_UINT
+    let Some(host_planes) = host_planes.filter(|_| TYPED.contains(&format)) else {
+        return 1;
+    };
+    let matching = victory_formats::texture::format(format)
+        .is_some_and(|f| f.stencil && f.bytes == layout.planes[0].layout.desc.element_bytes);
+    if matching {
+        (host_planes.max(1) as usize).min(layout.planes.len())
+    } else {
+        1
+    }
+}
+
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
+    // Read (and make) the host copy first: `hosted` takes the texture's own
+    // lock, which `let_go_idle` holds while it calls `unstage` and so takes
+    // this one.
+    let skipped = crate::resource::dropped_mips(resource);
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize)) {
         return Some(s.clone());
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
-    let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
-    else {
+    let Some(mut layout) = crate::resource::texture_layout(&desc) else {
         once!(
             ?desc,
             "texture contents without a console layout not uploaded"
         );
         return None;
     };
-    if layout.desc.swizzle.xor() {
+    if layout
+        .planes
+        .iter()
+        .any(|plane| plane.layout.desc.swizzle.xor())
+    {
         once!(?desc, "texture contents in an XOR mode not uploaded");
         return None;
     }
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
-    let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+    let subresources_per_plane = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
         u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize)
     };
+    // The host's planes of a depth-stencil format, if it has any: asked
+    // only where the console has a second plane to upload.
+    let host_planes = if layout.planes.len() > 1 {
+        let mut info = D3D12_FEATURE_DATA_FORMAT_INFO {
+            Format: d.Format,
+            ..Default::default()
+        };
+        // SAFETY: a live device and a correctly sized format query.
+        unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_INFO,
+                (&raw mut info).cast(),
+                size_of_val(&info) as u32,
+            )
+        }
+        .ok()
+        .map(|()| u32::from(info.PlaneCount))
+    } else {
+        None
+    };
+    let planes = planes_uploaded(&layout, host_planes, d.Format.0 as u32);
+    if planes < layout.planes.len() {
+        // shortcut: the planes above the uploaded ones are not read: a
+        // console texture whose depth plane the host holds in another form
+        // (the console's 16-bit depth with 8-bit stencil, 3 bytes a texel)
+        // keeps its first plane, as it was.
+        layout.planes.truncate(planes);
+        let last = layout.planes.last()?;
+        layout.size = last.offset + last.layout.size;
+    }
+    let count = subresources_per_plane * layout.planes.len() as u32;
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
     let mut total = 0;
-    // SAFETY: outputs for `count` subresources.
-    unsafe {
-        host.device.GetCopyableFootprints(
-            &d,
-            0,
-            count,
-            0,
-            Some(footprints.as_mut_ptr()),
-            Some(rows.as_mut_ptr()),
-            None,
-            Some(&mut total),
-        );
+    // A plane at a time: D3D12 gives a depth-stencil plane's own copy format
+    // only when the subresources asked for are one plane's.
+    for (plane, _) in layout.planes.iter().enumerate() {
+        let first = (plane as u32 * subresources_per_plane) as usize;
+        let mut plane_total = 0;
+        // SAFETY: outputs for this plane's subresources.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &d,
+                first as u32,
+                subresources_per_plane,
+                total,
+                Some(footprints[first..].as_mut_ptr()),
+                Some(rows[first..].as_mut_ptr()),
+                None,
+                Some(&mut plane_total),
+            );
+        }
+        total = total.max(total + plane_total);
     }
+    // The buffer covers every footprint's whole rows: `GetCopyableFootprints`
+    // leaves the last row of the last footprint unpadded, and a placed copy
+    // names RowPitch × Height bytes.
+    let total = footprints
+        .iter()
+        .zip(&rows)
+        .map(|(f, &r)| {
+            f.Offset + u64::from(f.Footprint.RowPitch) * u64::from(r) * u64::from(f.Footprint.Depth)
+        })
+        .fold(total, u64::max);
     let (buffer, data) = host.upload_buffer(total)?;
+    // Memory each subresource (plane, then mip plus slice times mips)
+    // occupies, for detiling only the pages that changed. 3D textures
+    // interleave their depth slices, so they are detiled whole.
+    let ranges = {
+        let (mips, slices) = (u32::from(d.MipLevels), u32::from(d.DepthOrArraySize));
+        let per_plane = mips.saturating_mul(slices);
+        (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            && per_plane != 0
+            && per_plane == subresources_per_plane
+            && layout.planes.len() as u32 * per_plane == count)
+            .then(|| {
+                let mut r = Vec::with_capacity(count as usize);
+                for plane in &layout.planes {
+                    let extents = plane.layout.mip_extents();
+                    for slice in 0..slices {
+                        let base = plane.offset + u64::from(slice) * plane.layout.slice_size;
+                        for &(start, end) in &extents {
+                            r.push((base + start, base + end));
+                        }
+                    }
+                }
+                r
+            })
+    };
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1862,7 +2363,10 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         footprints,
         rows,
         layout,
+        ranges,
         mips: u32::from(d.MipLevels),
+        skipped,
+        subresources_per_plane,
         bytes: total,
         memory,
         resource,
@@ -1870,6 +2374,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
+        ahead: std::sync::atomic::AtomicU8::new(0),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         looked: std::sync::atomic::AtomicU64::new(NEVER),
         present: Present::default(),
@@ -1881,7 +2386,9 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod in_place_tests {
     use super::{in_place, in_place_max, stable_hash};
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
 
     /// The hash of a stable range read in place is the hash of a copy of it,
     /// and a range the title moves under the reader is not decided on.
@@ -1889,7 +2396,12 @@ mod in_place_tests {
     fn the_live_hash_is_the_copy_of_it_and_a_moving_one_is_none() {
         // SAFETY: two pages of private memory, freed at the end.
         let at = unsafe {
-            VirtualAlloc(std::ptr::null(), 2 * 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * 4096,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
         } as usize;
         assert_ne!(at, 0);
         // SAFETY: our memory.
@@ -1898,8 +2410,13 @@ mod in_place_tests {
             *b = (i * 31 + 7) as u8;
         }
         // SAFETY: the range is ours and stays mapped for the call.
-        let live = unsafe { stable_hash(at as *const u8, 2 * 4096) }.expect("a range nobody writes");
-        assert_eq!(live, blake3::hash(bytes), "in place and through a copy are the same bytes");
+        let live =
+            unsafe { stable_hash(at as *const u8, 2 * 4096) }.expect("a range nobody writes");
+        assert_eq!(
+            live,
+            blake3::hash(bytes),
+            "in place and through a copy are the same bytes"
+        );
         // A title writing the bytes while they are read: the two hashings
         // disagree, and no decision is made on the mix (the next refresh
         // looks again).
@@ -1926,6 +2443,40 @@ mod in_place_tests {
 mod title_memory_tests {
     use super::with_title;
 
+    /// The written pages become texture-relative runs: the address the view
+    /// got plays no part in the intersection with the subresource ranges,
+    /// pages outside the texture are cut away, and pages that meet are one
+    /// read. (An absolute address here skipped every subresource: the
+    /// refresh then advanced its asking and kept the old pixels.)
+    #[test]
+    fn dirty_pages_become_texture_relative_runs() {
+        const PAGE: usize = crate::watch::PAGE;
+        let start = 0x7f00_0000_0000usize;
+        let end = start + 4 * PAGE;
+        let written = [
+            (start / PAGE, 1),
+            (start / PAGE, 2),
+            (start / PAGE + 1, 2),
+            (start / PAGE + 3, 3),
+            (start / PAGE + 4, 3),
+        ];
+        assert_eq!(
+            super::dirty_runs(&written, 1, start, end),
+            vec![(0, 2 * PAGE), (3 * PAGE as u64, PAGE)]
+        );
+        assert_eq!(
+            super::dirty_runs(&written, 2, start, end),
+            vec![(3 * PAGE as u64, PAGE)]
+        );
+        // A page past the texture's end is not part of this one's runs.
+        assert!(
+            super::dirty_runs(&written, 2, start, end)
+                .iter()
+                .all(|&(at, len)| { at + len as u64 <= 4 * PAGE as u64 })
+        );
+        assert!(super::dirty_runs(&written, 3, start, end).is_empty());
+    }
+
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
     /// memory a page of which is taken away between two reads, and the
@@ -1940,10 +2491,16 @@ mod title_memory_tests {
         unsafe {
             // The read buffer holds something else first.
             let other = vec![0x77u8; SIZE];
-            with_title(other.as_ptr(), SIZE, |bytes| assert!(bytes.iter().all(|&b| b == 0x77)));
-            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            with_title(other.as_ptr(), SIZE, |bytes| {
+                assert!(bytes.iter().all(|&b| b == 0x77))
+            });
+            let base =
+                VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
             assert!(!base.is_null());
-            assert_eq!(VirtualAlloc(base.cast(), HEAD, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            assert_eq!(
+                VirtualAlloc(base.cast(), HEAD, MEM_COMMIT, PAGE_READWRITE),
+                base.cast()
+            );
             base.write_bytes(0x5a, HEAD);
             with_title(base, SIZE, |bytes| {
                 assert!(bytes[..HEAD].iter().all(|&b| b == 0x5a), "what is mapped");
@@ -1951,7 +2508,10 @@ mod title_memory_tests {
             });
             // The title takes a page in the middle away: zeros from then
             // on, the rest as before.
-            assert_ne!(VirtualFree(base.add(0x4_0000).cast(), 0x1_0000, MEM_DECOMMIT), 0);
+            assert_ne!(
+                VirtualFree(base.add(0x4_0000).cast(), 0x1_0000, MEM_DECOMMIT),
+                0
+            );
             with_title(base, SIZE, |bytes| {
                 assert!(bytes[..0x4_0000].iter().all(|&b| b == 0x5a));
                 assert!(bytes[0x4_0000..0x5_0000].iter().all(|&b| b == 0));
@@ -1975,7 +2535,9 @@ mod title_memory_tests {
         use windows_sys::Win32::System::Memory::*;
         for (height, within) in [(4u32, 0x300usize), (8, 0x700), (4, 0xf00), (8, 0xf00)] {
             // The description as the log printed it, word for word.
-            let words: [u32; 14] = [3, 0, 0, 0, 16, 0, height, 65537, 10, 1, 0, 256, 3_145_728, 0];
+            let words: [u32; 14] = [
+                3, 0, 0, 0, 16, 0, height, 65537, 10, 1, 0, 256, 3_145_728, 0,
+            ];
             // SAFETY: fourteen words are a resource description (56 bytes,
             // plain numbers).
             let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(words) };
@@ -1986,16 +2548,28 @@ mod title_memory_tests {
                 .clone();
             let size = layout.size as usize;
             let (row, pitch) = (16 * 8, 256usize);
-            assert!(size >= row * height as usize, "the layout holds every texel");
+            assert!(
+                size >= row * height as usize,
+                "the layout holds every texel"
+            );
             // Committed pages and a reserved one after them; the texture
             // begins `within` bytes into the first, as the title placed it.
             // SAFETY: our own reservation; the committed part is written
             // and read in place, by this thread alone.
             unsafe {
                 let pages = size.div_ceil(4096) + 1;
-                let base = VirtualAlloc(std::ptr::null(), (pages + 1) * 4096, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+                let base = VirtualAlloc(
+                    std::ptr::null(),
+                    (pages + 1) * 4096,
+                    MEM_RESERVE,
+                    PAGE_NOACCESS,
+                )
+                .cast::<u8>();
                 assert!(!base.is_null());
-                assert_eq!(VirtualAlloc(base.cast(), pages * 4096, MEM_COMMIT, PAGE_READWRITE), base.cast());
+                assert_eq!(
+                    VirtualAlloc(base.cast(), pages * 4096, MEM_COMMIT, PAGE_READWRITE),
+                    base.cast()
+                );
                 for i in 0..pages * 4096 {
                     base.add(i).write((i * 7 + i / 251) as u8);
                 }
@@ -2019,8 +2593,16 @@ mod title_memory_tests {
                 let through = with_title(memory, size, |copied| detile(copied));
                 assert_eq!(direct, through);
                 for y in 0..height as usize {
-                    assert!(direct[y * pitch..][..row].iter().any(|&b| b != 0xee), "row {y} written");
-                    assert!(direct[y * pitch + row..(y + 1) * pitch].iter().all(|&b| b == 0xee), "nothing past row {y}");
+                    assert!(
+                        direct[y * pitch..][..row].iter().any(|&b| b != 0xee),
+                        "row {y} written"
+                    );
+                    assert!(
+                        direct[y * pitch + row..(y + 1) * pitch]
+                            .iter()
+                            .all(|&b| b == 0xee),
+                        "nothing past row {y}"
+                    );
                 }
                 // A buffer of exactly the staged bytes is enough.
                 let mut exact = vec![0u8; staged];
@@ -2072,7 +2654,10 @@ mod refresh_every_tests {
         for every in [0, 1] {
             for frame in 0..8 {
                 for address in [0x10_0000, 0x10_0040, 0x7f_0000_0000] {
-                    assert!(due_at(every, frame, address), "every {every}, frame {frame}, at {address:#x}");
+                    assert!(
+                        due_at(every, frame, address),
+                        "every {every}, frame {frame}, at {address:#x}"
+                    );
                 }
             }
         }
@@ -2098,14 +2683,24 @@ mod refresh_every_tests {
                 looked = frame;
             }
         }
-        assert_eq!(reads.len(), 64 / EVERY as usize, "one read every {EVERY} frames: {reads:?}");
+        assert_eq!(
+            reads.len(),
+            64 / EVERY as usize,
+            "one read every {EVERY} frames: {reads:?}"
+        );
         for pair in reads.windows(2) {
-            assert!(pair[1] - pair[0] <= EVERY, "never stale for longer than {EVERY}: {reads:?}");
+            assert!(
+                pair[1] - pair[0] <= EVERY,
+                "never stale for longer than {EVERY}: {reads:?}"
+            );
         }
         // Twice in one frame is not a second read, and the frame after it is
         // off its turn: it waits for the interval.
         assert!(!due(EVERY, 0, address, 0), "read already in this frame");
-        assert!(!due(EVERY, 1, address, 0), "one frame later, off its turn: no read");
+        assert!(
+            !due(EVERY, 1, address, 0),
+            "one frame later, off its turn: no read"
+        );
         // A texture used every frame is read once every n, on its own turn.
         let mut looked = NEVER;
         let mut reads = Vec::new();
@@ -2115,7 +2710,11 @@ mod refresh_every_tests {
                 looked = frame;
             }
         }
-        assert_eq!(reads.len(), 64 / EVERY as usize, "eight reads in 64 frames: {reads:?}");
+        assert_eq!(
+            reads.len(),
+            64 / EVERY as usize,
+            "eight reads in 64 frames: {reads:?}"
+        );
         assert!(reads.windows(2).all(|p| p[1] - p[0] == EVERY), "{reads:?}");
     }
 
@@ -2129,10 +2728,18 @@ mod refresh_every_tests {
         let addresses = [0x10_0000usize, 0x11_0000, 0x12_0000, 0x13_0000];
         for &address in &addresses {
             let turns: Vec<u64> = (0..64).filter(|&f| due_at(EVERY, f, address)).collect();
-            assert_eq!(turns.len(), 64 / EVERY as usize, "{address:#x} is read once every {EVERY} frames");
+            assert_eq!(
+                turns.len(),
+                64 / EVERY as usize,
+                "{address:#x} is read once every {EVERY} frames"
+            );
             // Not two turns closer than n frames, nor further apart either.
             for pair in turns.windows(2) {
-                assert_eq!(pair[1] - pair[0], EVERY, "{address:#x}: every {EVERY} frames");
+                assert_eq!(
+                    pair[1] - pair[0],
+                    EVERY,
+                    "{address:#x}: every {EVERY} frames"
+                );
             }
             // And the frames differ between textures, 64 KiB apart.
             let in_window: Vec<u64> = (0..EVERY).filter(|&f| due_at(EVERY, f, address)).collect();
@@ -2142,7 +2749,10 @@ mod refresh_every_tests {
                 .filter(|&&a| a != address)
                 .map(|&a| (0..EVERY).find(|&f| due_at(EVERY, f, a)).unwrap())
                 .collect();
-            assert!(others.iter().all(|&f| f != in_window[0]), "{address:#x} shares its frame with another");
+            assert!(
+                others.iter().all(|&f| f != in_window[0]),
+                "{address:#x} shares its frame with another"
+            );
         }
     }
 }
@@ -2199,6 +2809,96 @@ mod present_tests {
         assert_eq!(o.content, 4);
         assert_eq!(o.staged, 4);
         assert!(!o.back);
+    }
+
+    /// A depth-stencil texture's stencil plane is uploaded where the host
+    /// lays it out as the console does, and the subresources of a plane are
+    /// its mips and array slices, plane after plane: a stencil-only write of
+    /// the title's then reaches the host's stencil plane.
+    #[test]
+    fn a_stencil_plane_is_uploaded_where_the_host_lays_it_out_the_same() {
+        use super::{plane_of, planes_uploaded};
+        use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+        let texture = |format| {
+            Texture::new(&TextureDesc {
+                dimension: Dimension::Tex2d,
+                width: 2,
+                height: 2,
+                depth_or_array: 2,
+                mips: 2,
+                format,
+                samples: 1,
+                swizzle: Swizzle::LINEAR,
+            })
+            .expect("a console layout")
+        };
+        // R32G8X24_TYPELESS: 32-bit depth, 8-bit stencil, one byte a texel,
+        // the host's own two planes.
+        let depth_stencil = texture(19);
+        let typed_20 = texture(20);
+        assert_eq!(depth_stencil.planes.len(), 2);
+        // Both planes only with the switch on and a typed host format the
+        // runtime can copy one plane of; one plane otherwise.
+        let both = if super::planes_on() { 2 } else { 1 };
+        assert_eq!(
+            planes_uploaded(&typed_20, Some(2), 20),
+            both,
+            "depth and stencil"
+        );
+        assert_eq!(
+            planes_uploaded(&typed_20, Some(0), 20),
+            1,
+            "a host that names no plane"
+        );
+        assert_eq!(
+            planes_uploaded(&typed_20, Some(1), 20),
+            1,
+            "a host with one plane"
+        );
+        assert_eq!(
+            planes_uploaded(&typed_20, None, 20),
+            1,
+            "a host that cannot say"
+        );
+        assert_eq!(
+            planes_uploaded(&depth_stencil, Some(2), 19),
+            1,
+            "a TYPELESS host format"
+        );
+        let (depth, stencil) = (&depth_stencil.planes[0], &depth_stencil.planes[1]);
+        assert_eq!(
+            (
+                depth.layout.desc.element_bytes,
+                stencil.layout.desc.element_bytes
+            ),
+            (4, 1)
+        );
+        assert_eq!(
+            stencil.offset,
+            depth.layout.size.next_multiple_of(stencil.layout.alignment)
+        );
+        // The console's 16-bit depth with stencil stands on a 32-bit depth
+        // plane on the host, not the same bytes: the depth plane alone, as
+        // before (its twin carries the contents).
+        let console_d16s8 = texture(118);
+        assert_eq!(console_d16s8.planes.len(), 2);
+        assert_eq!(console_d16s8.planes[0].layout.desc.element_bytes, 2);
+        assert_eq!(planes_uploaded(&console_d16s8, Some(2), 45), 1);
+        // Two mips and two slices a plane, plane after plane.
+        let names = (0..8u32).map(|i| plane_of(i, 2, 4)).collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                (0, 0, 0),
+                (0, 1, 0),
+                (0, 0, 1),
+                (0, 1, 1),
+                (1, 0, 0),
+                (1, 1, 0),
+                (1, 0, 1),
+                (1, 1, 1)
+            ]
+        );
     }
 }
 
@@ -2265,5 +2965,39 @@ mod resident_tests {
         // rest of the chain.
         assert_eq!(wanted((1, 0), None, 8, false), (1, 7));
         assert_eq!(wanted((0, 3), Some((0, 8)), 8, false), (0, 3));
+    }
+}
+
+#[cfg(test)]
+mod sparse_tests {
+    use super::any_mapped_by;
+
+    const PAGE: usize = 4096;
+
+    /// How many pages of a batch at `first` can be read, with page `wanted`
+    /// (the only one) the answer.
+    fn only(wanted: usize) -> impl Fn(usize, usize) -> usize {
+        move |first, n| usize::from((first..first + n).contains(&wanted))
+    }
+
+    /// A texture whose interior mips alone have arrived is not away: a page
+    /// past an unreadable run answers for it, and none answers for one that
+    /// is not there at all.
+    #[test]
+    fn the_sweep_finds_an_interior_readable_page() {
+        assert!(
+            any_mapped_by(0, 8 * PAGE, only(3 * PAGE)),
+            "page 3 can be read"
+        );
+        assert!(!any_mapped_by(0, 8 * PAGE, |_, _| 0), "nothing there");
+    }
+
+    /// The sweep crosses its 256-page batches.
+    #[test]
+    fn the_sweep_crosses_a_batch() {
+        assert!(
+            any_mapped_by(0, 600 * PAGE, only(512 * PAGE)),
+            "page 512 is in the second batch"
+        );
     }
 }
