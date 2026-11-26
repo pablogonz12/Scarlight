@@ -3565,7 +3565,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// in the card's memory a mirror in it).
 pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
-    let map = buffers();
+    let map = buffers_read();
     let key = map
         .range(..=(address, usize::MAX))
         .rev()
