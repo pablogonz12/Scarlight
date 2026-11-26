@@ -24,6 +24,10 @@ mod bound;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
+// Byte compares (`VICTORY_AVX2_COMPARE`): used by the Windows paths'
+// copy-back (`shadow`); the walks and their tests run anywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod compare;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(any(windows, test))]

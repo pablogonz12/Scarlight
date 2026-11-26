@@ -188,6 +188,12 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   `crates/victory-shader/src/dxbc.rs`; `Source::bytes()` for both the raw and the `SGD5` paths,
   `apps/victory/src/shader.rs`). Reimplemented on this tree's `victory translate`, which has no `warm` command.
 
+- **avatarmanz/VIctory-7900XTX** (GPL-3.0), commit [b6202840a](https://github.com/avatarmanz/VIctory-7900XTX/commit/b6202840a):
+  the idea of comparing title bytes under shader writes with AVX2 rather than eight bytes at a time: the copy-back's
+  piece walk, its first and last difference and the differing runs take thirty-two bytes a compare where the CPU has
+  AVX2, checked at run time, with the eight-byte walk kept as the fallback (`crates/victory-gpu/src/compare.rs`,
+  `VICTORY_AVX2_COMPARE=1`; on his machine 14 -> 4-7 ms of compares a frame). His compares run on threads of their
+  own; ours already do (`wide` in `shadow.rs`).
 - **HUMAN** ([HumanlyDev/HUMAN](https://github.com/HumanlyDev/HUMAN)) by HumanlyDev and bdycounter-sudo,
   GPL-3.0-or-later: one immediate sampler constant used both for normal and for comparison sampling takes two
   static sampler slots (`crates/victory-shader/src/emit/lower.rs`, `samplers`/`cmp_samplers`), where our bit
