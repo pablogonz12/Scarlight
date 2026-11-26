@@ -156,11 +156,14 @@ impl Target {
     pub(crate) fn new(resource: This, format: u32, view: Option<&[u32; 10]>) -> Option<Self> {
         // Keep the host copy independently of the title's resource lifetime.
         let copy = crate::resource::host_copy(resource)?;
-        let (layout, at, size) = crate::resource::title_texture(resource)?;
-        let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
-        // Serialize ticket registration against concurrent remaps on `[at, end)`.
+        // Serialize the reading of the title allocation and ticket
+        // registration against concurrent remaps on `[at, end)`: a remap
+        // after the observation but before `track` must mark the ticket
+        // invalid, which it cannot do for one made later.
         // Lock order: READING -> TRACKED (matches REMAPPING -> TRACKED).
         let _mapping = crate::watch::title_memory_reading();
+        let (layout, at, size) = crate::resource::title_texture(resource)?;
+        let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
         let ticket = track(resource as usize, at, end);
         let mut target = Self {
             copy,
