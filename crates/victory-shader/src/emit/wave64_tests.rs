@@ -260,6 +260,23 @@ fn a_sum_of_halves_inside_a_lane_branch_is_summed_widened() {
         }
     };
     let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    // The whole wave first: both halves run and write their sum into the exchange pair, so
+    // the dword of a half that runs no lane is left holding the whole wave's sum for a
+    // lowering that reads the pair without zeroing it first (WARP hands out a zeroed LDS,
+    // a card hands out the last dispatch's dwords: 0x5249 on RADV, differently per run).
+    ud[0] = 64;
+    let _whole = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud.clone()))],
+                views: &[View::RawUav(1)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
     ud[0] = 32;
     let out = host
         .dispatch(
