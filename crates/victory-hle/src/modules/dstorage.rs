@@ -715,9 +715,13 @@ fn work(scheduler: &'static Scheduler, mut worker: Worker) {
         let mark = Mark::begin();
         lanes = scheduler.lock();
         mark.end(Stage::Lock);
+        // Only a finish that freed staging gives a refused start room to
+        // try again (finish clears `starved` when it does); waking for the
+        // flag alone sent every worker through a start that refuses the same
+        // staged read again.
         let freed = lanes.finish(&job, result);
         lanes.count(&job, started);
-        if std::mem::take(&mut lanes.starved) || freed {
+        if freed {
             scheduler.work.notify_all();
         }
         scheduler.finished.notify_all();
@@ -1653,7 +1657,12 @@ pub(crate) mod bench {
                 Some(worker) => worker,
                 None => worker.insert(Worker::new().ok_or("no worker event")?),
             };
-            execute(&request, worker).map_err(|hr| format!("{:#010x}", hr as u32))
+            let result = execute(&request, worker);
+            // The production path releases the large buffer after every
+            // request (work); the bench keeps the same allocation work in
+            // what it measures.
+            worker.release_large();
+            result.map_err(|hr| format!("{:#010x}", hr as u32))
         })
     }
 
@@ -2210,6 +2219,18 @@ mod tests {
         assert!(read.is_err());
         writer.write_all(&[0xAA]).unwrap();
         assert_eq!(out, [0], "no read is left to take the byte");
+        // The read was pending, not refused: the byte written after it was
+        // cancelled is still in the pipe, and a read with an event it can
+        // wait on takes it (an immediately failed ReadFile would also have
+        // been an error, and this is what tells the two apart).
+        let mut event = Event::new().unwrap();
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            read_at(&pipe, &mut event, 0, &mut byte),
+            Ok(1),
+            "the cancelled read left the byte for the next read"
+        );
+        assert_eq!(byte, [0xAA]);
     }
 
     #[test]
