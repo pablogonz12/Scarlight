@@ -233,6 +233,11 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   `SetEventOnCompletion` with no event blocks the guest thread on the fence's value with `WaitOnAddress`, and
   `Signal`/`Set` wakes it with `WakeByAddressAll` (`crates/victory-gpu/src/fence.rs`; the wait here is bounded
   by `VICTORY_FENCE_BLOCK_MS` and lets the queue run what it holds between slices).
+- **codec-d/cool_fox [`8cc31ab37`](https://github.com/codec-d/cool_fox/commit/8cc31ab37)**, GPL-3.0: an XMA
+  voice whose input the title publishes again while the context stays enabled decodes on instead of staying
+  ended, and the decode pass publishes only whole blocks (a short one only as the flushed tail), trying a few
+  frames for a block and no more so a voice that produces nothing cannot hold the lock
+  (`crates/victory-hle/src/modules/audio.rs`, `VICTORY_XMA_REFILL`).
 
 ## Tools
 
