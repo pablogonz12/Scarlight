@@ -854,6 +854,15 @@ mod tests {
         assert_eq!(amd_mesh_family(0x10de, 0x2684), None, "RTX 4090");
     }
 
+    /// Only a named family refuses a mesh pipeline: an adapter DXGI cannot
+    /// describe is not a refusal, and a listed one is.
+    #[test]
+    fn an_unidentified_adapter_is_not_a_refusal() {
+        assert!(!MeshIdentity::Refused("gfx9 (Vega)").safe(), "a named family refuses");
+        assert!(MeshIdentity::Other.safe(), "an unlisted family keeps its pipelines");
+        assert!(MeshIdentity::Unknown.safe(), "a failed lookup must not refuse every card");
+    }
+
     #[test]
     fn warp_adapter_accepts_only_software() {
         let _once = crate::warptest::lock();
@@ -4640,17 +4649,70 @@ impl Host {
     /// and an abort takes the whole run down where a refused pipeline only
     /// skips the draws that name it.
     pub(crate) fn mesh_pipelines_safe(&self) -> bool {
-        self.mesh_family().is_none()
+        self.mesh_identity().safe()
     }
 
     /// The family this adapter is of, where RADV does not expose mesh
     /// shaders on it (`None`: it does, or the adapter is not AMD and the
     /// D3D12 tier decides). Named in the refusal, so a log says why.
     pub(crate) fn mesh_family(&self) -> Option<&'static str> {
+        match self.mesh_identity() {
+            MeshIdentity::Refused(family) => Some(family),
+            MeshIdentity::Other | MeshIdentity::Unknown => None,
+        }
+    }
+
+    /// What the adapter's id says, asking again once when the query fails:
+    /// a failed lookup is [`MeshIdentity::Unknown`], not "identified and not
+    /// in a listed family", which is [`MeshIdentity::Other`]. The vendor and
+    /// device ids, or none when DXGI will not give them.
+    fn mesh_identity(&self) -> MeshIdentity {
+        for _ in 0..2 {
+            if let Some((vendor, device)) = self.adapter_ids() {
+                return match amd_mesh_family(vendor, device) {
+                    Some(family) => MeshIdentity::Refused(family),
+                    None => MeshIdentity::Other,
+                };
+            }
+        }
+        // Said once: the gate cannot tell a GFX9 adapter from an NVIDIA one
+        // without an id, and refusing every unidentified adapter would take
+        // mesh pipelines from cards that run them.
+        static SAID_UNKNOWN: std::sync::Once = std::sync::Once::new();
+        SAID_UNKNOWN.call_once(|| {
+            tracing::warn!(
+                "the adapter could not be identified: mesh pipelines are left to the \
+                 D3D12 tier, so a gfx9 card could take the abort this gate exists for"
+            );
+        });
+        MeshIdentity::Unknown
+    }
+
+    /// The adapter's vendor and device ids, if DXGI answers.
+    fn adapter_ids(&self) -> Option<(u32, u32)> {
         let adapter = self.adapter.clone()?;
         // SAFETY: a plain DXGI query on the adapter the device was made on.
         let desc = unsafe { adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()? };
-        amd_mesh_family(desc.VendorId, desc.DeviceId)
+        Some((desc.VendorId, desc.DeviceId))
+    }
+}
+
+/// What an adapter's identity says about mesh shaders on its driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeshIdentity {
+    /// A family whose driver refuses or aborts a mesh pipeline; named for the log.
+    Refused(&'static str),
+    /// Identified, and not in a listed family: the D3D12 tier decides.
+    Other,
+    /// The query failed twice: we do not know what card this is.
+    Unknown,
+}
+
+impl MeshIdentity {
+    /// Whether a mesh pipeline may go to the driver. Only a named family
+    /// says no: an unknown adapter keeps the pipelines it has always kept.
+    fn safe(self) -> bool {
+        !matches!(self, MeshIdentity::Refused(_))
     }
 }
 
