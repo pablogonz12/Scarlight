@@ -229,6 +229,11 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   AVX2, checked at run time, with the eight-byte walk kept as the fallback (`crates/victory-gpu/src/compare.rs`,
   `VICTORY_AVX2_COMPARE=1`; on his machine 14 -> 4-7 ms of compares a frame). His compares run on threads of their
   own; ours already do (`wide` in `shadow.rs`).
+- **Marvisak/VIctory [#2773](https://github.com/Marvisak/VIctory/pull/2773)** (kais7654), GPL-3.0: the idea
+  that a format's uses are the host's `CheckFeatureSupport` answer, and a use it does not take left out of the
+  resource it makes -- a typeless format, which the device reports no use for, keeping the uses of its
+  description (`crates/victory-gpu/src/resource.rs` `uses_taken`/`taken_flags`, `VICTORY_FORMAT_USES=0`). The
+  views side is in from the round before (`descriptor::host::fits`, `VICTORY_TYPED_UAV`).
 - **HUMAN** ([HumanlyDev/HUMAN](https://github.com/HumanlyDev/HUMAN)) by HumanlyDev and bdycounter-sudo,
   GPL-3.0-or-later: one immediate sampler constant used both for normal and for comparison sampling takes two
   static sampler slots (`crates/victory-shader/src/emit/lower.rs`, `samplers`/`cmp_samplers`), where our bit

@@ -741,20 +741,29 @@ impl State {
                 // takes its slot: left out, the next live target would move
                 // into it and the pixel shader's outputs reach the wrong
                 // targets.
-                // shortcut: a view without a description or a format has no
-                // null view to stand for it and is left out, as before.
-                let null = record
-                    .desc()
-                    .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
-                if let Some(desc) = null {
-                    views.push((None, Some(desc)));
-                    keys.push((0, record.key()));
-                }
+                // The description is the title's where it gave one, else a
+                // null view every device renders to (`RtvRecord::slot_desc`).
+                views.push((None, Some(record.slot_desc())));
+                keys.push((0, record.key()));
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
+            if !crate::resource::host_use_allowed(texture, false) {
+                // The host does not take the render target use of this
+                // texture's format: its host copy was made without that use
+                // (`resource::taken_flags`), and a view of it would be
+                // refused. A null view takes its slot: the pixel shader's
+                // writes to it are dropped.
+                once!(
+                    format = unsafe { texture.GetDesc() }.Format.0,
+                    "render target of a format the host cannot render to"
+                );
+                views.push((None, Some(record.slot_desc())));
+                keys.push((0, record.key()));
+                continue;
+            }
             views.push((Some(texture), record.desc()));
             keys.push((texture.as_raw() as usize, record.key()));
         }
