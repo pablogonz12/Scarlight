@@ -878,8 +878,14 @@ pub(crate) fn record_gpu_copy(
     // The source first: the copy reads the host copy's bytes, and the refresh
     // is what makes them the title's (the pages a CPU copy would read).
     src.refresh(list, src_address as u64, len as u64);
-    // Then the destination: its bytes before are kept for the copy-back, and
-    // a refresh in the meantime leaves title memory alone there.
+    // Then the destination, brought up to date first: the bytes kept for the
+    // copy-back are its baseline, and title memory may have moved on since
+    // this host copy was last read (a stale baseline would leave the title's
+    // newer bytes there for a copy the GPU does not change). In place there
+    // is nothing to bring up: it is title memory.
+    if !dst.in_place() {
+        dst.refresh(list, dst_address as u64, len as u64);
+    }
     dst.gpu_writes(list, dst_address as u64, len as u64);
     // SAFETY: an open list and live buffers, both inside their resources.
     unsafe {
@@ -2421,10 +2427,13 @@ mod tests {
         // ([`crate::shadow::Shadow::gpu_writes`] returns early): the GPU's
         // copy lands there, so there is no snapshot to take and nothing to
         // copy back for it.
+        // The source's copy, then the destination's own refresh (its
+        // baseline), then its GPU write; in place the destination is title
+        // memory: no refresh of it and no GPU write step.
         let expected: &[StepKind] = if to.in_place() {
             &[StepKind::Refresh]
         } else {
-            &[StepKind::Refresh, StepKind::GpuWrite]
+            &[StepKind::Refresh, StepKind::Refresh, StepKind::GpuWrite]
         };
         assert_eq!(list.step_kinds(), expected);
         list.close();
