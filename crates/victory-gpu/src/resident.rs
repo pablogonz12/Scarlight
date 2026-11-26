@@ -136,8 +136,9 @@ impl Registry {
         gone.len() as u64
     }
 
-    /// Regions in it and their bytes.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Regions in it and their bytes. Only the tests ask (CodeRabbit, PR
+    /// #273): compiled for them alone.
+    #[cfg(test)]
     fn census(&self) -> (u64, u64) {
         (self.regions.len() as u64, self.regions.values().copied().sum())
     }
@@ -222,8 +223,18 @@ fn admit(device: &ID3D12Device, resource: &ID3D12Resource, offset: u64, at: u64)
         std::ptr::copy_nonoverlapping(at as *const u8, their.as_mut_ptr(), SAMPLE);
         std::ptr::copy_nonoverlapping(sent.as_ptr(), at as *mut u8, SAMPLE);
     }
+    // A fetch that fails after its copy was submitted leaves the copy the
+    // card's: the rig holds the allocator the list was recorded in, which must
+    // live until the card finishes with it (`arena.rs` keeps its own the same
+    // way, CodeRabbit PR #273), and `fetch` keeps the readback buffer.
     let read = match Rig::new(device) {
-        Ok(mut rig) => rig.fetch(resource, offset, SAMPLE).map_err(|_| Why::Canary),
+        Ok(mut rig) => match rig.fetch(resource, offset, SAMPLE) {
+            Ok(read) => Ok(read),
+            Err(_) => {
+                std::mem::forget(rig);
+                Err(Why::Canary)
+            }
+        },
         Err(_) => Err(Why::Rig),
     };
     // SAFETY: as above: the title's bytes go back the way they came.
