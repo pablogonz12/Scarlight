@@ -2194,10 +2194,11 @@ pub(crate) fn late() -> bool {
 
 /// `VICTORY_LATE_WAIT`: 0 (off), 1, or 2 ([`late_exact`]).
 fn late_stage() -> u8 {
-    static STAGE: OnceLock<u8> = OnceLock::new();
-    if std::env::var_os("VICTORY_GPU_TIMING").is_some() {
+    static TIMING: OnceLock<bool> = OnceLock::new();
+    if *TIMING.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some()) {
         return 0;
     }
+    static STAGE: OnceLock<u8> = OnceLock::new();
     let start = *STAGE.get_or_init(|| match std::env::var("VICTORY_LATE_WAIT").as_deref() {
         Ok("1") => 1,
         Ok("2") => 2,
