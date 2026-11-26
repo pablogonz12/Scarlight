@@ -197,3 +197,11 @@ Missing or wrong name? Open an issue.
   (after fxceless/victory-fork [c36971b2](https://github.com/fxceless/victory-fork/commit/c36971b2)), GPL-3.0:
   `VICTORY_CARD_BUFFERS_MIN_KB`, so that title buffers' copies under the MiB floor can go into the card's memory
   (unset: the floor of before) (`crates/victory-gpu/src/shadow.rs`).
+- **Belobug/VIctory-Belobug-AMD [4d291d4](https://github.com/Belobug/VIctory-Belobug-AMD/commit/4d291d4)**
+  (davutsimsekk) via **Yoshi-233**, GPL-3.0: operandless VOP1 (`v_nop`, `v_pipeflush`, `v_clrexcp`) ignores its
+  source field, so a marker byte there is not an extra dword and no longer swallows the next instruction, and the
+  VOP3 encoding of `v_cmpx*` writes EXEC rather than its VDST, for both wave sizes
+  (`crates/victory-shader/src/gfx10/{mod.rs,fields.rs}`).
+- **Yoshi-233 [coolfox/main PR #7](https://github.com/Yoshi-233), from fxceless/victory-fork [9bf4a0f](https://github.com/fxceless/victory-fork/commit/9bf4a0f)**,
+  GPL-3.0: the RGB dump decodes the packed 16-bit BGR targets (B5G6R5, B5G5R5A1, B4G4R4A4, host formats 85, 86,
+  115) and keeps padded rows aligned (diagnostics only) (`crates/victory-gpu/src/capture.rs`).
