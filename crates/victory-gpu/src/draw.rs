@@ -1605,25 +1605,51 @@ impl State {
         // Per host heap: the host copy and range each slot's buffer view
         // reads, kept from pass to pass. Only the slots written since the
         // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
-        type Ranges =
-            std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
+        // at best); all of them every `full_every` passes, because a view of
+        // a released resource goes stale without a write.
+        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+        /// Slots whose view could not be made ready yet (no host copy), with
+        /// the passes left to ask again.
+        type Pending = std::collections::HashMap<u32, u8>;
+        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges, Pending)>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
+        let (passes, ranges, pending) = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+            .or_insert_with(|| (0, Ranges::new(), Pending::new()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        static FULL_EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let full_every = (*FULL_EVERY.get_or_init(|| {
+            std::env::var("VICTORY_HEAP_FULL_EVERY")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(128)
+        }))
+        .clamp(1, 4096);
+        // A slot first seen before its memory had a host copy is asked again
+        // for a few passes: a full scan alone would leave a dynamic index
+        // reading a stale or missing view until `full_every` came round (112
+        // extra passes at the default of 128). `VICTORY_HEAP_RETRY=0` goes
+        // back to waiting for the full scan.
+        static RETRY: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let retry = *RETRY.get_or_init(|| {
+            std::env::var("VICTORY_HEAP_RETRY")
+                .ok()
+                .and_then(|v| v.trim().parse::<u8>().ok())
+                .unwrap_or(8)
+        });
+        let slots = if *passes % full_every == 0 {
             ranges.clear();
+            pending.clear();
             host.buffer_slots()
         } else {
-            changed
+            let mut slots = changed;
+            slots.extend(pending.keys().copied());
+            slots
         };
+        // What this pass could not make ready, for the next one.
+        let mut again = Pending::new();
         *passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
@@ -1635,7 +1661,13 @@ impl State {
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
+            // The budget a slot has left: a new one where this pass is the
+            // one that found it, else what the pass before it stored.
+            let left = pending.get(&index).copied().unwrap_or(retry);
             let Some(view) = host.mirror(index, handle, true) else {
+                if left > 0 {
+                    again.insert(index, left - 1);
+                }
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1662,6 +1694,12 @@ impl State {
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                // No host copy yet: the memory may be written and read in
+                // this very list, so ask again next pass, until the budget
+                // runs out and the full scan takes it.
+                if left > 0 {
+                    again.insert(index, left - 1);
+                }
                 continue;
             };
             #[cfg(feature = "diagnostics")]
@@ -1670,6 +1708,7 @@ impl State {
             }
             ranges.insert(index, (shadow, address, address + len));
         }
+        *pending = again;
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<
