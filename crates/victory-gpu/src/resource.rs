@@ -2157,8 +2157,6 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
     footprint(&d).map(|f| f.size)
 }
 
-/// The resource for a texture placed at `address` with the resource
-/// description `desc` (as words), made on first use.
 #[cfg(windows)]
 /// The texture [`texture_at`] made for `address` and `desc`, if it was
 /// made: with the filler words of the description left out and with them
@@ -2173,6 +2171,8 @@ pub(crate) fn placed_known(address: u64, desc: &[u32; 14]) -> Option<This> {
         .map(|&r| r as This)
 }
 
+/// The resource for a texture placed at `address` with the resource
+/// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // Words 1 and 13 of the description are the filler of its layout

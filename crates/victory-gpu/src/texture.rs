@@ -286,6 +286,10 @@ static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 /// texture's layout first.
 struct Through {
     buffer: ID3D12Resource,
+    /// The source's levels and layers the pairs were made for: the pairs
+    /// name its subresources by index, so a source without them is not the
+    /// copy this one holds.
+    source: (u32, u32),
     parts: Vec<(
         u32,
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
@@ -326,23 +330,25 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         return false;
     };
     let Some(host) = host() else { return false };
+    // SAFETY: live textures.
+    let (of_from, of_to) = unsafe { (from.GetDesc(), to.GetDesc()) };
+    let layers = |d: &D3D12_RESOURCE_DESC| {
+        if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+            1
+        } else {
+            u32::from(d.DepthOrArraySize).max(1)
+        }
+    };
+    let (from_mips, to_mips) = (u32::from(of_from.MipLevels), u32::from(of_to.MipLevels));
+    let layers_from = layers(&of_from);
     let through = {
         let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
         let map = map.get_or_insert_with(HashMap::new);
         match map.get(&(placed as usize)) {
-            Some(through) => through.clone(),
-            None => {
-                // SAFETY: live textures.
-                let (of_from, of_to) = unsafe { (from.GetDesc(), to.GetDesc()) };
-                let layers = |d: &D3D12_RESOURCE_DESC| {
-                    if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
-                        1
-                    } else {
-                        u32::from(d.DepthOrArraySize).max(1)
-                    }
-                };
-                let (from_mips, to_mips) = (u32::from(of_from.MipLevels), u32::from(of_to.MipLevels));
-                let layers_from = layers(&of_from);
+            Some(through) if through.source == (from_mips, layers_from) => through.clone(),
+            // A source with another layout: the pairs name its subresources
+            // by index, and an index it no longer has is an invalid copy.
+            _ => {
                 if of_from.Dimension != of_to.Dimension
                     || layers_from != layers(&of_to)
                     || to_mips == 0
@@ -427,6 +433,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 );
                 let through = Arc::new(Through {
                     buffer,
+                    source: (from_mips, layers_from),
                     parts: pairs,
                 });
                 map.insert(placed as usize, through.clone());
@@ -2798,6 +2805,10 @@ mod resident_tests {
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: src_fp },
         };
+        // The upload's destination is a copy destination: the list's state
+        // tracker has to know before the copy, or the alias below records
+        // its first transition from a state the copy was never in.
+        crate::list::ensure_state(&list, src, 0x400); // COPY_DEST
         // SAFETY: an open list and live resources.
         unsafe { list.list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None) };
         super::host_written(src);
