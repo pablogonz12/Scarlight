@@ -16,6 +16,7 @@
 //! (swap chain).
 
 #[cfg(windows)]
+mod ambient_floor;
 mod ambient;
 #[cfg(any(windows, test))]
 mod bindcache;

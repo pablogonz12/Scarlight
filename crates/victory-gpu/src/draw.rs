@@ -741,20 +741,29 @@ impl State {
                 // takes its slot: left out, the next live target would move
                 // into it and the pixel shader's outputs reach the wrong
                 // targets.
-                // shortcut: a view without a description or a format has no
-                // null view to stand for it and is left out, as before.
-                let null = record
-                    .desc()
-                    .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
-                if let Some(desc) = null {
-                    views.push((None, Some(desc)));
-                    keys.push((0, record.key()));
-                }
+                // The description is the title's where it gave one, else a
+                // null view every device renders to (`RtvRecord::slot_desc`).
+                views.push((None, Some(record.slot_desc())));
+                keys.push((0, record.key()));
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
+            if !crate::resource::host_use_allowed(texture, false) {
+                // The host does not take the render target use of this
+                // texture's format: its host copy was made without that use
+                // (`resource::taken_flags`), and a view of it would be
+                // refused. A null view takes its slot: the pixel shader's
+                // writes to it are dropped.
+                once!(
+                    format = unsafe { texture.GetDesc() }.Format.0,
+                    "render target of a format the host cannot render to"
+                );
+                views.push((None, Some(record.slot_desc())));
+                keys.push((0, record.key()));
+                continue;
+            }
             views.push((Some(texture), record.desc()));
             keys.push((texture.as_raw() as usize, record.key()));
         }
@@ -2324,6 +2333,12 @@ impl State {
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         self.stand_ins(list, None);
         self.reflection(list, p);
+        if self.light_floor(list, p) {
+            // Our pass set its own pipeline, root signature and heap: the next bind sets the title's again.
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+            self.host_heaps = [0; 2];
+        }
     }
 
     /// The stand-ins `VICTORY_AMBIENT` sets for the bound program
@@ -2532,6 +2547,54 @@ impl State {
             })
             .collect();
         crate::reflection::after(list, mode, &stage.shader.hash, &uavs);
+    }
+
+    /// After a dispatch of `p`: the least indirect light, where
+    /// `VICTORY_AMBIENT_FLOOR` names that program's ([`crate::ambient_floor`]).
+    /// The view is the one the console shader addresses (root parameter and
+    /// table offset), so it holds across translator versions.
+    fn light_floor(&self, list: &HostList, p: &HostPipeline) -> bool {
+        if !crate::ambient_floor::enabled() {
+            return false;
+        }
+        let Some(stage) = p.stages.first() else {
+            return false;
+        };
+        let rules = crate::ambient_floor::rules(&stage.shader.hash);
+        if rules.is_empty() {
+            return false;
+        }
+        let Some(translated) = stage.shader.translated() else {
+            return false;
+        };
+        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            translated.used.iter().find(|u| {
+                u.kind == kind
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return None;
+            };
+            crate::descriptor::view(table + u64::from(offset) * 4)
+        };
+        let mut ran = false;
+        for rule in rules {
+            let light = match view(ResourceType::Uav, rule.light) {
+                Some(View::Unordered(r, ..)) => r,
+                _ => 0,
+            };
+            if light == 0 {
+                once!("a light the console shader does not address");
+                continue;
+            }
+            let depth = match rule.depth.map(|d| view(ResourceType::Srv, d)) {
+                Some(Some(View::Shader(r, _))) => Some(r as This),
+                _ => None,
+            };
+            ran |= crate::ambient_floor::raise(list, rule, light as This, depth);
+        }
+        ran
     }
 
     /// Clears the whole of the texture `resource`, seen as the view the
