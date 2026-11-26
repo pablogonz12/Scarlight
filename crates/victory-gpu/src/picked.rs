@@ -138,12 +138,14 @@ fn spans_on(picked: bool, id: u64, start: usize, from: usize, to: usize, keep: b
         sweep.turn = turn.wrapping_add(1);
         turn
     };
-    spans_turn(turn, id, first, last, base, start, from, to)
+    spans_turn(turn, id, base, start, from, to)
 }
 
 /// [`spans_on`] of a turn given rather than taken: the looks of a copy in
 /// the order a sweep runs them (the tests and the benchmark take them so).
-fn spans_turn(turn: u64, id: u64, first: usize, last: usize, base: usize, start: usize, from: usize, to: usize) -> Vec<(usize, usize)> {
+fn spans_turn(turn: u64, id: u64, base: usize, start: usize, from: usize, to: usize) -> Vec<(usize, usize)> {
+    let first = (start + from) / PAGE - base;
+    let last = (start + to - 1) / PAGE - base;
     let exams: Vec<bool> = {
         let sets = SETS.lock().unwrap_or_else(|e| e.into_inner());
         // (A copy no compare has had yet, or whose set went with the
@@ -344,7 +346,7 @@ fn compare_of_4k_pages_whole_and_picked() {
     // The copy and its snapshot, page 0 of the run's title memory.
     let start = 0x1_0000_0000usize;
     let mut data = vec![0xa5u8; len];
-    let mut before = vec![0xa5u8; len];
+    let before = vec![0xa5u8; len];
     // 1 page in 64 changed, as the shaders of a frame leave it.
     let changed: Vec<usize> = (0..pages).filter(|page| page % 64 == 37).collect();
     for &page in &changed {
@@ -367,7 +369,7 @@ fn compare_of_4k_pages_whole_and_picked() {
     let picked = |turn: u64, data: &[u8], before: &[u8]| -> Vec<(usize, usize)> {
         let mut pieces = Vec::new();
         // (The pages of the copy, counted from its first: 0..pages.)
-        for (a, e) in spans_turn(turn, 1, 0, pages - 1, start / PAGE, start, 0, len) {
+        for (a, e) in spans_turn(turn, 1, start / PAGE, start, 0, len) {
             let mut at = a;
             while at < e {
                 let n = (PAGE - (start + at) % PAGE).min(e - at);
