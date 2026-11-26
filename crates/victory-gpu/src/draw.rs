@@ -299,6 +299,10 @@ pub(crate) struct State {
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
+    /// The render target views and the depth view the host list has, once
+    /// it has any ([`State::set_targets`]): per view the host texture (0:
+    /// a null view) and what its descriptor says.
+    host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -540,6 +544,10 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+/// What a render target or depth view of the host is made from: the host
+/// texture, and [`crate::descriptor::RtvRecord::key`].
+type TargetKey = (usize, (usize, [u32; 7]));
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory.
@@ -564,9 +572,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
+    list.fill_scratch(address as *const u8, len)
 }
 
 macro_rules! once {
@@ -574,6 +580,34 @@ macro_rules! once {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
+}
+
+/// Whether the code of a program, whose used descriptors are `used`, names
+/// the unordered view of `rule` as an entry of a table (`crate::ambient`).
+fn names_view(used: &[UsedResource], rule: &crate::ambient::Rule) -> bool {
+    used.iter().any(|u| {
+        u.kind == ResourceType::Uav
+            && u.root == RootType::Table
+            && u.slot == rule.slot
+            && u.table_offset_dwords == rule.offset
+    })
+}
+
+/// A barrier over every unordered access: what a dispatch wrote before a
+/// stand-in's clear reads, and the clear before what comes after it.
+fn uav_barrier(texture: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                // SAFETY: a borrowed pointer, as `host::transition` takes it:
+                // the barrier never releases it, and the list keeps the host
+                // copy alive until it has run.
+                pResource: unsafe { std::mem::transmute_copy(texture) },
+            }),
+        },
+    }
 }
 
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
@@ -678,7 +712,11 @@ impl State {
         self.index = view.copied().unwrap_or_default();
     }
 
-    /// Render targets and depth, set on the host list at once.
+    /// Render targets and depth, set on the host list at once, unless it has
+    /// the same ones already: the title sets the same targets again and
+    /// again, each time a host view per target and a call of the driver
+    /// (25,662 times in a frame of another fork). `VICTORY_BIND_CACHE=0`
+    /// sets them every time.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
         let Some(host) = crate::host::host() else {
             return;
@@ -688,7 +726,8 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        let mut views = Vec::with_capacity(handles.len());
+        let mut keys = Vec::with_capacity(handles.len());
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -708,14 +747,16 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
-                    rtvs.push(host.rtv(None, Some(&desc)));
+                    views.push((None, Some(desc)));
+                    keys.push((0, record.key()));
                 }
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+            views.push((Some(texture), record.desc()));
+            keys.push((texture.as_raw() as usize, record.key()));
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
@@ -728,8 +769,15 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            Some((texture, record))
         });
+        let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
+        if crate::bindcache::same(self.host_targets.as_ref(), &now) {
+            return;
+        }
+        self.host_targets = Some(now);
+        let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
+        let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -802,6 +850,7 @@ impl State {
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
+        self.host_targets = None;
         if self.targets_set {
             let handles = std::mem::take(&mut self.target_handles);
             self.set_targets(list, &handles, self.depth_handle);
@@ -864,9 +913,14 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_GROUP_BASE {
+            // The first group of the dispatch being bound: 0 until a split
+            // dispatch sets it before each run but the first ([`State::dispatch`]).
+            return 0;
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -965,6 +1019,12 @@ impl State {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
         }
+        if self.depth != 0 {
+            // A depth texture shaders also write: sync what they wrote
+            // before binding, marking depth as written only when depth writes
+            // are enabled.
+            list.twin_use(self.depth as This, false, self.depth_state != DEPTH_READ);
+        }
         if !self.bind(list, p, false) {
             return false;
         }
@@ -1015,8 +1075,6 @@ impl State {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
         if self.depth != 0 {
-            // A depth texture shaders also write: what they wrote, first.
-            list.twin_use(self.depth as This, false, true);
             // A view that writes neither plane keeps the texture readable:
             // the depth read state, together with the shader read states
             // if this draw's shaders read the same texture (the write state
@@ -1048,6 +1106,9 @@ impl State {
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
+        if list.take_plane_clobbered() {
+            self.replay(list);
+        }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
@@ -1090,10 +1151,8 @@ impl State {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
         let pixel_hash = (!compute)
             .then(|| {
@@ -1286,6 +1345,12 @@ impl State {
                     return false;
                 }
             }
+        }
+        // If a table/resource SRV triggered an inline depth-plane pass,
+        // restore title graphics/compute bindings and re-bind cleanly once.
+        if list.take_plane_clobbered() {
+            self.replay(list);
+            return self.bind(list, p, compute);
         }
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
@@ -1540,25 +1605,51 @@ impl State {
         // Per host heap: the host copy and range each slot's buffer view
         // reads, kept from pass to pass. Only the slots written since the
         // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
-        type Ranges =
-            std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
+        // at best); all of them every `full_every` passes, because a view of
+        // a released resource goes stale without a write.
+        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+        /// Slots whose view could not be made ready yet (no host copy), with
+        /// the passes left to ask again.
+        type Pending = std::collections::HashMap<u32, u8>;
+        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges, Pending)>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
+        let (passes, ranges, pending) = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+            .or_insert_with(|| (0, Ranges::new(), Pending::new()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        static FULL_EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let full_every = (*FULL_EVERY.get_or_init(|| {
+            std::env::var("VICTORY_HEAP_FULL_EVERY")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(128)
+        }))
+        .clamp(1, 4096);
+        // A slot first seen before its memory had a host copy is asked again
+        // for a few passes: a full scan alone would leave a dynamic index
+        // reading a stale or missing view until `full_every` came round (112
+        // extra passes at the default of 128). `VICTORY_HEAP_RETRY=0` goes
+        // back to waiting for the full scan.
+        static RETRY: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let retry = *RETRY.get_or_init(|| {
+            std::env::var("VICTORY_HEAP_RETRY")
+                .ok()
+                .and_then(|v| v.trim().parse::<u8>().ok())
+                .unwrap_or(8)
+        });
+        let slots = if *passes % full_every == 0 {
             ranges.clear();
+            pending.clear();
             host.buffer_slots()
         } else {
-            changed
+            let mut slots = changed;
+            slots.extend(pending.keys().copied());
+            slots
         };
+        // What this pass could not make ready, for the next one.
+        let mut again = Pending::new();
         *passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
@@ -1570,7 +1661,13 @@ impl State {
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
+            // The budget a slot has left: a new one where this pass is the
+            // one that found it, else what the pass before it stored.
+            let left = pending.get(&index).copied().unwrap_or(retry);
             let Some(view) = host.mirror(index, handle, true) else {
+                if left > 0 {
+                    again.insert(index, left - 1);
+                }
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1597,6 +1694,12 @@ impl State {
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                // No host copy yet: the memory may be written and read in
+                // this very list, so ask again next pass, until the budget
+                // runs out and the full scan takes it.
+                if left > 0 {
+                    again.insert(index, left - 1);
+                }
                 continue;
             };
             #[cfg(feature = "diagnostics")]
@@ -1605,6 +1708,7 @@ impl State {
             }
             ranges.insert(index, (shadow, address, address + len));
         }
+        *pending = again;
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<
@@ -2112,6 +2216,48 @@ impl State {
         });
     }
 
+    /// The most groups the host runs in one dimension of a dispatch. The
+    /// console's own limit is higher (a builder pass asks for 77,500 in
+    /// `x`): a dispatch beyond it is run as several ([`State::dispatch`]).
+    const MOST_GROUPS: u32 = 65_535;
+
+    /// The most groups a mesh dispatch runs in all (2^22, the host's grid
+    /// limit): a piece of a split mesh dispatch is cut to it as well.
+    const MOST_MESH_GROUPS: u32 = 1 << 22;
+
+    /// Where a compute or mesh stage's group-ID base is bound, if the stage
+    /// reads its group id: its user-data root parameter and the dword in it
+    /// (`victory_shader::emit::USER_GROUP_BASE`).
+    fn group_base_slot(p: &HostPipeline) -> Option<(u32, u32)> {
+        for stage in &p.stages {
+            let Some((param, _)) = stage.user_data else {
+                continue;
+            };
+            let t = stage.translated();
+            if let Some(u) = t
+                .host
+                .user_data
+                .iter()
+                .find(|u| u.root == RootType::Other(victory_shader::emit::USER_GROUP_BASE))
+            {
+                return Some((param, u.index));
+            }
+        }
+        None
+    }
+
+    /// Sets the group-ID base of the next run of a split dispatch.
+    fn set_group_base(list: &HostList, compute: bool, (param, dword): (u32, u32), base: u32) {
+        // SAFETY: an open list whose root signature has that parameter.
+        unsafe {
+            if compute {
+                list.list.SetComputeRoot32BitConstant(param, base, dword);
+            } else {
+                list.list.SetGraphicsRoot32BitConstant(param, base, dword);
+            }
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
@@ -2160,10 +2306,222 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        // The host runs at most 65,535 groups in a dimension. A console
+        // dispatch over that runs as several, each with the group id where it
+        // starts (`VICTORY_GROUP_SPLIT=0`: the first 65,535 groups only).
+        match Self::group_base_slot(p) {
+            Some(slot) if x > Self::MOST_GROUPS => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::info!(
+                        x,
+                        runs = x.div_ceil(Self::MOST_GROUPS),
+                        "a dispatch asks for more groups in x than the host runs: it runs in pieces, each told where its \
+                         groups start (VICTORY_GROUP_SPLIT=0: the first 65,535 groups only)"
+                    );
+                });
+                let mut at = 0;
+                while at < x {
+                    let n = (x - at).min(Self::MOST_GROUPS);
+                    if at != 0 {
+                        Self::set_group_base(list, true, slot, at);
+                    }
+                    // SAFETY: an open list with everything set.
+                    unsafe { list.list.Dispatch(n, y, z) };
+                    at += n;
+                }
+            }
+            _ => {
+                if x > Self::MOST_GROUPS {
+                    once!(
+                        x,
+                        "a dispatch asks for more groups in x than the host runs and its program reads no group id: \
+                         the groups after 65,535 do not run"
+                    );
+                }
+                // No group id to move: the groups after the host's limit
+                // cannot be run at all (a count over it the host does not
+                // give its driver either).
+                // SAFETY: an open list with everything set.
+                unsafe { list.list.Dispatch(x.min(Self::MOST_GROUPS), y, z) };
+            }
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.stand_ins(list, None);
         self.reflection(list, p);
+    }
+
+    /// The stand-ins `VICTORY_AMBIENT` sets for the bound program
+    /// (`crate::ambient`), after a dispatch ran: how many views were
+    /// cleared, `None` if no rule names the program. `indirect`: the
+    /// records a dispatch may run at most, and its count's buffer and
+    /// offset if it has one ([`Self::stand_ins_of`]).
+    fn stand_ins(
+        &mut self,
+        list: &HostList,
+        indirect: Option<(u32, Option<(ID3D12Resource, u64)>)>,
+    ) -> Option<usize> {
+        let rules = crate::ambient::rules();
+        if rules.is_empty() {
+            return None;
+        }
+        let p = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        let stage = p.stages.first()?;
+        let program = stage.shader.hash.as_str();
+        if !rules.iter().any(|r| r.program == program) {
+            return None;
+        }
+        let used = &stage.translated().used;
+        // The stand-ins follow shader work: no records at most (or none
+        // known to run), nothing to stand in for.
+        let (count, offset) = match indirect {
+            None => return Some(self.stand_in(list, program, used)),
+            Some((0, _)) => return None,
+            Some((_, Some((count, offset)))) => (count, offset),
+            Some((_, None)) => return Some(self.stand_in(list, program, used)),
+        };
+        let Some(word) = crate::host::host().and_then(|h| h.predicate_word()) else {
+            once!("ambient stand-in: no word to gate them on, so an indirect dispatch gets no clears");
+            for _ in rules.iter().filter(|r| r.program == program) {
+                crate::ambient::note(false);
+            }
+            return None;
+        };
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COPY_DEST as COPY_DEST;
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_PREDICATION as PREDICATION;
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
+        const COMMON: u32 = 0;
+        // SAFETY: an open list; a count read where the execution reads it,
+        // into the low half of our own word (zero elsewhere). The copy
+        // promotes the word to `COPY_DEST`, where the barrier finds it.
+        unsafe {
+            list.list.CopyBufferRegion(word, 0, &count, offset, 4);
+            list.list.ResourceBarrier(&[crate::host::transition(
+                word,
+                COPY_DEST,
+                PREDICATION,
+            )]);
+            list.list.SetPredication(word, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        }
+        let filled = self.stand_in(list, program, used);
+        // SAFETY: as above.
+        unsafe {
+            list.list.SetPredication(
+                None::<&ID3D12Resource>,
+                0,
+                D3D12_PREDICATION_OP_EQUAL_ZERO,
+            );
+            list.list.ResourceBarrier(&[crate::host::transition(
+                word,
+                PREDICATION,
+                State(COMMON as i32),
+            )]);
+        }
+        Some(filled)
+    }
+
+    /// The views of the rules that name `program`, whose code uses `used`,
+    /// cleared to their values ([`Self::clear_uav`]): how many were.
+    fn stand_in(&mut self, list: &HostList, program: &str, used: &[UsedResource]) -> usize {
+        let mut filled = 0;
+        for rule in crate::ambient::rules()
+            .iter()
+            .filter(|r| r.program == program)
+        {
+            let first = !rule.seen.swap(true, Ordering::Relaxed);
+            let uavs = || -> Vec<String> {
+                used.iter()
+                    .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table)
+                    .map(|u| format!("s{}+{}", u.slot, u.table_offset_dwords))
+                    .collect()
+            };
+            if !names_view(used, rule) {
+                if first {
+                    tracing::warn!(program, view = %rule.view(), views = ?uavs(), "ambient stand-in: the program has no such unordered view in a table");
+                }
+                crate::ambient::note(false);
+                continue;
+            }
+            let view = self.roots_ref(true).get(usize::from(rule.slot)).and_then(
+                |root| match root {
+                    Root::Table(table) => {
+                        crate::descriptor::view(*table + u64::from(rule.offset) * 4)
+                    }
+                    _ => None,
+                },
+            );
+            let Some(View::Unordered(resource, _, words)) = view else {
+                if first {
+                    tracing::warn!(program, view = %rule.view(), "ambient stand-in: not an unordered view of a resource there");
+                }
+                crate::ambient::note(false);
+                continue;
+            };
+            let resource = resource as This;
+            // The formats of the view and of the texture it views, the
+            // title's; the size, for the log.
+            let own = crate::resource::host_resource(resource).map(|texture| {
+                // SAFETY: a live resource, read for its description only.
+                unsafe { texture.GetDesc() }
+            });
+            let Some(own) = own else {
+                if first {
+                    tracing::warn!(program, view = %rule.view(), "ambient stand-in: no host texture there");
+                }
+                crate::ambient::note(false);
+                continue;
+            };
+            if crate::resource::buffer_bytes(resource).is_some() {
+                if first {
+                    tracing::warn!(program, view = %rule.view(), "ambient stand-in: a view of a buffer, which a clear of a view does not take");
+                }
+                crate::ambient::note(false);
+                continue;
+            }
+            if own.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 {
+                if first {
+                    tracing::warn!(program, view = %rule.view(), "ambient stand-in: a depth texture, whose views go to a colour twin and take no clear of this kind");
+                }
+                crate::ambient::note(false);
+                continue;
+            }
+            let (width, height, own) = (own.Width, own.Height, own.Format.0 as u32);
+            // The title's own description of the view, unless it leaves the
+            // format to the resource: then the resource's, whole.
+            let words = words.filter(|words| words[0] != 0);
+            let format = words.map_or(own, |words| words[0]);
+            let fill = crate::ambient::fill(rule.value, format, own);
+            if first {
+                tracing::info!(
+                    program,
+                    view = %rule.view(),
+                    views = ?uavs(),
+                    format,
+                    texture_format = own,
+                    size = ?(width, height),
+                    value = ?rule.value,
+                    ?fill,
+                    "ambient stand-in: first dispatch of the program"
+                );
+            }
+            let recorded = match fill {
+                Ok(crate::ambient::Fill::Float(rgba)) => {
+                    self.clear_uav(list, resource, words, rgba.map(f32::to_bits), true)
+                }
+                Ok(crate::ambient::Fill::Uint(fill)) => {
+                    self.clear_uav(list, resource, words, fill, false)
+                }
+                Err(why) => {
+                    if first {
+                        tracing::warn!(program, view = %rule.view(), format, texture_format = own, "ambient stand-in: {why}");
+                    }
+                    false
+                }
+            };
+            crate::ambient::note(recorded);
+            filled += usize::from(recorded);
+        }
+        filled
     }
 
     /// After a dispatch of `p`: the stand-in for ray-traced reflections
@@ -2201,7 +2559,84 @@ impl State {
         crate::reflection::after(list, mode, &stage.shader.hash, &uavs);
     }
 
-    /// What a draw or dispatch runs, for the device-removed report
+    /// Clears the whole of the texture `resource`, seen as the view the
+    /// title described (`words`, as [`Host::uav`] takes them; `None`: its
+    /// own format, whole), to `values` (a float clear's bits when `floats`):
+    /// our heap set for the clear and the title's again after it, the
+    /// texture in the state it was found in. False if the clear could not be
+    /// recorded.
+    fn clear_uav(
+        &mut self,
+        list: &HostList,
+        resource: This,
+        words: Option<[u32; 10]>,
+        values: [u32; 4],
+        floats: bool,
+    ) -> bool {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS as UNORDERED;
+        let Some(host) = crate::host::host() else {
+            return false;
+        };
+        let (Some(heap), Some((cpu, gpu))) = (host.uav_heap(), host.uav(resource, words)) else {
+            return false;
+        };
+        let Some(texture) = crate::resource::host_resource(resource) else {
+            return false;
+        };
+        // The state the list saw it in, also when that is the unordered one
+        // already (a dispatch reads and writes it): the clear is still owed
+        // a barrier of its own then.
+        let Some(before) = list.state_of(resource) else {
+            return false;
+        };
+        let unordered = before == UNORDERED.0 as u32;
+        // SAFETY: an open list, a live texture, our own descriptors and the
+        // heap they are in (the title's heaps are set again by the next
+        // bind, which this drops from the cache).
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap)]);
+            if !unordered {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    texture,
+                    D3D12_RESOURCE_STATES(before as i32),
+                    UNORDERED,
+                )]);
+            }
+            // What the dispatch wrote is ordered before the clear, and the
+            // clear before what reads the view next.
+            list.list.ResourceBarrier(&[uav_barrier(texture)]);
+            if floats {
+                list.list.ClearUnorderedAccessViewFloat(
+                    gpu,
+                    cpu,
+                    texture,
+                    &values.map(f32::from_bits),
+                    &[],
+                );
+            } else {
+                list.list
+                    .ClearUnorderedAccessViewUint(gpu, cpu, texture, &values, &[]);
+            }
+            list.list.ResourceBarrier(&[uav_barrier(texture)]);
+            if !unordered {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    texture,
+                    UNORDERED,
+                    D3D12_RESOURCE_STATES(before as i32),
+                )]);
+            }
+        }
+        if !unordered {
+            // The tracked state follows the barriers above: back to `before`.
+            let _ = list.transition(resource, before);
+        }
+        // The title's own heaps are not those of the clear: the next bind
+        // sets them again.
+        self.host_heaps = [0; 2];
+        true
+    }
+
+    /// What a draw or dispatch runs, for the device-removed report    /// What a draw or dispatch runs, for the device-removed report
     /// (diagnostics): the pipeline, then per stage the user data it gets
     /// (with the view at that heap index, if one is), the host addresses
     /// of its root views and the views its tables name.
@@ -2315,8 +2750,47 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}x{y}x{z}"), false));
                     self.mesh_scissor(list, true);
-                    // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, y, z) };
+                    match crate::pipeline::host_pipeline(self.pipeline as This).and_then(Self::group_base_slot) {
+                        Some(slot) if x > Self::MOST_GROUPS => {
+                            static ONCE: std::sync::Once = std::sync::Once::new();
+                            ONCE.call_once(|| {
+                                tracing::info!(
+                                    x,
+                                    runs = x.div_ceil(Self::MOST_GROUPS),
+                                    "a mesh dispatch asks for more groups in x than the host runs: it runs in pieces, \
+                                     each told where its groups start (VICTORY_GROUP_SPLIT=0: the first 65,535 groups only)"
+                                );
+                            });
+                            // A mesh dispatch's pieces are bounded by the
+                            // grid's own limit too, in all three dimensions.
+                            let grid = y.saturating_mul(z).max(1);
+                            let piece = (Self::MOST_MESH_GROUPS / grid).clamp(1, Self::MOST_GROUPS);
+                            let mut at = 0;
+                            while at < x {
+                                let n = (x - at).min(piece);
+                                if at != 0 {
+                                    Self::set_group_base(list, false, slot, at);
+                                }
+                                // SAFETY: an open list with everything set.
+                                unsafe { l6.DispatchMesh(n, y, z) };
+                                at += n;
+                            }
+                        }
+                        _ => {
+                            if x > Self::MOST_GROUPS {
+                                once!(
+                                    x,
+                                    "a mesh dispatch asks for more groups in x than the host runs and its program \
+                                     reads no group id: the groups after 65,535 do not run"
+                                );
+                            }
+                            // As above: no group id to move, and a count
+                            // over the limit the host does not hand its
+                            // driver either.
+                            // SAFETY: an open list with everything set.
+                            unsafe { l6.DispatchMesh(x.min(Self::MOST_GROUPS), y, z) };
+                        }
+                    }
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -2698,6 +3172,27 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
+        let n = (count / 3) as usize;
+        // Where the `POSITION` element is read from, if the layout has one:
+        // every slot of a rectangle takes its right angle from there, so that
+        // the vertices it completes line up between buffers. Found once per
+        // draw, read at submission like the vertices themselves.
+        let position = p.inputs.iter().find(|e| e.position && !e.per_instance);
+        let position_src = position.and_then(|e| {
+            let v = self.vertex[e.slot as usize];
+            rectangle_vertex_range(v, count, first)
+                .filter(|&(from, src_bytes, _)| crate::shadow::find(from, src_bytes).is_some())
+                .map(|(from, _, _)| (from, v.stride, e.offset, e.format))
+        });
+        // A `POSITION` range the checks refuse rejects the whole draw here,
+        // before any slot registers a callback that would read it: the slots'
+        // callbacks run at submission even when the draw is dropped after
+        // them.
+        if position.is_some() && position_src.is_none() {
+            once!("rectangle vertices outside their buffer");
+            return false;
+        }
+        let corners = std::sync::Arc::new(std::sync::OnceLock::new());
         for slot in 0..32 {
             let elements: Vec<(u32, u32)> = p
                 .inputs
@@ -2719,6 +3214,7 @@ impl State {
                 return false;
             };
             let (from, to, stride) = (from as usize, to as usize, v.stride as usize);
+            let corners = corners.clone();
             list.defer_host(move || {
                 // The vertices are read in place, at submission: no change
                 // of mapping under the read (see
@@ -2732,7 +3228,24 @@ impl State {
                         std::slice::from_raw_parts_mut(to as *mut u8, dst_bytes as usize),
                     )
                 };
-                crate::primitive::expand_rects(src, dst, stride, &elements);
+                // Once for the whole draw, whichever slot runs first: the
+                // `POSITION` buffer's bytes are the rectangle's corners.
+                let corners = corners.get_or_init(|| match position_src {
+                    // SAFETY: the `POSITION` element's buffer was checked
+                    // the same way as this slot's, and it is read under the
+                    // same guard.
+                    Some((at, pstride, offset, format)) => unsafe {
+                        let src = std::slice::from_raw_parts(at as *const u8, n * 3 * pstride as usize);
+                        crate::primitive::right_corners(
+                            src,
+                            pstride as usize,
+                            n,
+                            (offset, format),
+                        )
+                    },
+                    None => Vec::new(),
+                });
+                crate::primitive::expand_rects(src, dst, stride, &elements, corners);
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
@@ -3014,6 +3527,12 @@ impl State {
         crate::indirect::done(list, &bounded);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            // The stand-in follows the records that ran: none at most, none
+            // with a count of zero.
+            let count = counter
+                .as_ref()
+                .map(|(s, at)| (s.buffer.clone(), s.offset(*at)));
+            self.stand_ins(list, Some((max, count)));
             self.reflection(list, p);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -3277,6 +3796,57 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::names_view;
+    use victory_shader::{ResourceType, RootType, UsedResource};
+
+    /// A view a program names, as a table entry (the stand-in compares
+    /// root parameter and offset in dwords, `crate::ambient`).
+    fn used(kind: ResourceType, root: RootType, slot: u8, offset: u32) -> UsedResource {
+        UsedResource {
+            kind,
+            root,
+            table_offset_dwords: offset,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 4,
+            slot,
+        }
+    }
+
+    #[test]
+    fn the_stand_in_names_a_view_of_a_table() {
+        let rule = crate::ambient::parse("0123456789abcdef:s1+176:0.5,0.5,0.5")
+            .unwrap()
+            .remove(0);
+        assert!(names_view(
+            &[used(ResourceType::Uav, RootType::Table, 1, 176)],
+            &rule
+        ));
+        // Another root parameter, offset or kind, or not a table: no.
+        assert!(!names_view(
+            &[used(ResourceType::Uav, RootType::Table, 2, 176)],
+            &rule
+        ));
+        assert!(!names_view(
+            &[used(ResourceType::Uav, RootType::Table, 1, 168)],
+            &rule
+        ));
+        assert!(!names_view(
+            &[used(ResourceType::Uav, RootType::Table, 1, 180)],
+            &rule
+        ));
+        assert!(!names_view(
+            &[used(ResourceType::Srv, RootType::Table, 1, 176)],
+            &rule
+        ));
+        assert!(!names_view(
+            &[used(ResourceType::Uav, RootType::Descriptor, 1, 176)],
+            &rule
+        ));
+        assert!(!names_view(&[], &rule));
+    }
+
     use super::{
         VertexView, expanded_rectangle_vertices_guarded, rectangle_vertex_range_guarded,
         staging_budget_per_frame,
