@@ -179,6 +179,15 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   title memory in the console's layout, by kind (`VICTORY_TEXTURE_BACK`, off by default), with each read-back's
   allocation and fence tracked so a remapped or released allocation is not landed
   (`crates/victory-gpu/src/texback.rs`).
+- **fxceless/victory-fork [PR #1024](https://github.com/fxceless/victory-fork/pull/1024),
+  [#1030](https://github.com/fxceless/victory-fork/pull/1030),
+  [#1036](https://github.com/fxceless/victory-fork/pull/1036),
+  [#1040](https://github.com/fxceless/victory-fork/pull/1040),
+  [#1042](https://github.com/fxceless/victory-fork/pull/1042)** (Bartosz), GPL-3.0: four lowerings and a
+  hardware rule from the console line, ported: a cube texture's level query in a pixel program
+  (`image_get_lod`), an inactive compute lane's swizzle read as zero (`VICTORY_SHADER_SWIZZLE_ZERO=0` turns it
+  off), 16-bit compares that ignore `op_sel` as RDNA2 does, `v_div_fixup_f16`, and saturating `v.clamp` on the
+  packed 16-bit integer add/sub/mad (`crates/victory-shader/src/emit/`).
 
 - **fxceless/victory-fork [PR #976](https://github.com/fxceless/victory-fork/pull/976)** (MoscaLosca), GPL-3.0: a
   compute or mesh dispatch asking for more than the host's 65,535 groups in `x` runs as pieces, each told where
@@ -211,6 +220,20 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   GPL-3.0: a rectangle list's fourth corner is completed opposite the right angle, wherever the three
   corners put it. This tree's geometry stage (`emit::rect_list_gs`) already finds the corner in any order; the
   rule is now in the CPU expansion too (`right_angle`, `right_corners` in `crates/victory-gpu/src/primitive.rs`).
+D
+- **JMAN730/project-flamingo [#734](https://github.com/JMAN730/project-flamingo/pull/734)** (Yaekai, with swarm,
+  Blitz Studios and axknxla), GPL-3.0: the two-plane present compositor for the Series S menu -- the fullscreen
+  triangle, its premultiplied blend, the explicit root signature for Wine, the retry after an initialization that
+  failed, and the pair check that leaves every other present on the base-only path -- reimplemented for this
+  tree's presenter (`crates/victory-gpu/src/present_compositor.rs`, `Host::present_overlay`), whose present keeps
+  its own late-free lists and present fill. It supersedes the same idea in fxceless/victory-fork
+  [#188](https://github.com/fxceless/victory-fork/pull/188) (sagouindupm), GPL-3.0, which bundled it with an
+  `ffxDispatch` stand-in that our #162 now makes unnecessary.
+- **codec-d/CGBJ (cool_fox) `1ad6e67aa`**, GPL-3.0: the retail two-plane present's plane stride is 72 bytes
+  (`RetailPlane`, asserted at compile time) and not the common parameter prefix's size; and no barrier is
+  recorded into the state a presented texture is already in (`COPY_SOURCE -> COPY_SOURCE` is illegal, and
+  that is where a title leaves one). The second rule is in `host::moved` (`crates/victory-gpu/src/host.rs`);
+  the stride was already ours (`queue::second_plane_resource`, 0x48).
 - **avatarmanz/VIctory-7900XTX [350c68648](https://github.com/avatarmanz/VIctory-7900XTX/commit/350c68648)** (avatarmanz), GPL-3.0: a texture's first upload started ahead on a copy queue of its own (`texture/ahead.rs`) and a slot shown only once that upload ran (`descriptor/host.rs::show_after`, 3bab23c06), which there ended a device loss every ~16 minutes. Reimplemented on this tree's texture path: `crates/victory-gpu/src/texture/ahead.rs`, the copy queue made at device creation and a submission's wait on its fence in `crates/victory-gpu/src/host.rs`, `VICTORY_UPLOAD_AHEAD=1` and `VICTORY_SHOW_AFTER`.
 
 - **fxceless/victory-fork [PR #980](https://github.com/fxceless/victory-fork/pull/980)** (fxceless), GPL-3.0:
@@ -218,12 +241,22 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   the GPU reads and writes the title's own memory (`crates/victory-gpu/src/arena.rs`, `VICTORY_ARENA=1`, off by
   default). The part grid, the region registry, the budget and the canary are reimplemented on this tree's
   `inplace`; the canary here proves each part **both ways** with our own `Rig` (#188), which the fork's tests do not.
+- **fever308/victory-corgi [f4c1175a1](https://github.com/fever308/victory-corgi/commit/f4c1175a1)**, GPL-3.0: the
+  blocks view memory is guarded by, sharded across cache-line-aligned locks with contiguous block runs a shard and
+  the shards of a range taken in ascending order, so a copy does not stop the title's write faults elsewhere
+  (`crates/victory-gpu/src/guards.rs`, `VICTORY_GUARD_SHARDS=1` for the one lock of before).
 
 - **Marvisak/VIctory [#1264](https://github.com/Marvisak/VIctory/pull/1264)** (Marvisak), GPL-3.0: a batched
   run of page mappings asks the host where the placeholder it starts in ends (`placeholder_room`, one
   `VirtualQueryEx`) instead of trusting the pages to end at the same boundary, so a run across two placeholders
   is clipped rather than refused after its range was unmapped (`crates/victory-hle/src/modules/xmem.rs`,
   `VICTORY_MAP_CLIP=0` turns it off).
+
+- **codec-d/cool_fox [`8cc31ab37`](https://github.com/codec-d/cool_fox/commit/8cc31ab37)**, GPL-3.0: an XMA
+  voice whose input the title publishes again while the context stays enabled decodes on instead of staying
+  ended, and the decode pass publishes only whole blocks (a short one only as the flushed tail), trying a few
+  frames for a block and no more so a voice that produces nothing cannot hold the lock
+  (`crates/victory-hle/src/modules/audio.rs`, `VICTORY_XMA_REFILL`).
 
 ## Tools
 
@@ -280,3 +313,10 @@ D
 - **Yoshi-233 [coolfox/main PR #7](https://github.com/Yoshi-233), from fxceless/victory-fork [9bf4a0f](https://github.com/fxceless/victory-fork/commit/9bf4a0f)**,
   GPL-3.0: the RGB dump decodes the packed 16-bit BGR targets (B5G6R5, B5G5R5A1, B4G4R4A4, host formats 85, 86,
   115) and keeps padded rows aligned (diagnostics only) (`crates/victory-gpu/src/capture.rs`).
+- **fever308/victory-corgi [0aa32360e](https://github.com/fever308/victory-corgi/commit/0aa32360e)**, after
+  **fxceless/victory-fork [#1152](https://github.com/fxceless/victory-fork/pull/1152)** and
+  **[#1170](https://github.com/fxceless/victory-fork/pull/1170)**, GPL-3.0: a texture copied back for the title's
+  CPU takes only the mip and array slices the list's texture UAVs expose (the union of the views, instead of every
+  mip and slice), leaves the texels it did not take as they were, and the texture's recorded state is put back
+  after the copy, behind `VICTORY_TEXTURE_BACK_UNION=1` (off by default) (`crates/victory-gpu/src/texback.rs`,
+  `crates/victory-gpu/src/host.rs`, `crates/victory-gpu/src/draw.rs`, `crates/victory-gpu/src/descriptor/host.rs`).

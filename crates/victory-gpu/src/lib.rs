@@ -41,6 +41,10 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
+// Guarded blocks of view memory, sharded so copies and write faults do not
+// queue on one lock (`VICTORY_GUARD_SHARDS=1` for one lock, as before).
+#[cfg(windows)]
+mod guards;
 pub mod dxgi;
 #[cfg(windows)]
 mod dxc;
@@ -58,8 +62,9 @@ pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
-#[cfg(windows)]
 mod placed;
+#[cfg(windows)]
+mod present_compositor;
 mod primitive;
 pub mod query;
 pub mod queue;
