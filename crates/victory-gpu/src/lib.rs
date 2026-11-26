@@ -18,6 +18,8 @@
 #[cfg(windows)]
 mod ambient;
 #[cfg(any(windows, test))]
+mod bindcache;
+#[cfg(any(windows, test))]
 mod bound;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
