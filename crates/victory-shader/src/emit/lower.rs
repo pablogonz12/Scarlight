@@ -27,6 +27,16 @@ pub(super) mod intersect;
 #[path = "group_wide.rs"]
 mod group_wide;
 use group_wide::{all_group_blocks, lane_regions};
+/// The wide reads of a console buffer load (`bitcode::opt::WIDE`).
+#[path = "lower/wide.rs"]
+mod wide;
+
+/// The form a test asks for the wide reads to take, whatever the process's
+/// `VICTORY_SHADER_OPT` says (`None`: the switch again).
+#[cfg(test)]
+pub(super) fn wide_for_test(wide: Option<bool>) {
+    wide::FORCE.with(|f| *f.borrow_mut() = wide);
+}
 
 type Why = &'static str;
 
@@ -68,6 +78,14 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// The constant table's first byte and dwords, if the program has one.
+    #[cfg(test)]
+    pub code_table: Option<(u32, Vec<u32>)>,
+    /// Buffer loads in the module as the lowering left it, before the
+    /// clean-up: a test counts them (one a dword or, with
+    /// `bitcode::opt::WIDE`, one for every four).
+    #[cfg(test)]
+    pub buffer_loads: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -87,6 +105,15 @@ enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
     Fail(ShaderError),
+}
+
+/// Whether a fixed load through a descriptor built around the program's code
+/// counts the byte it reads (its base plus the load's offset) when the
+/// constant table's start is chosen. `VICTORY_CODE_READS=0` turns it off: the
+/// table then starts at the descriptor's base again.
+fn code_reads_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CODE_READS").is_none_or(|v| v != "0"))
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
@@ -309,6 +336,9 @@ struct Lower<'a> {
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
+    /// The table's dwords, for a test to check where it starts.
+    #[cfg(test)]
+    code_words: Vec<u32>,
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
@@ -1583,6 +1613,8 @@ impl<'a> Lower<'a> {
             sections: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
+            #[cfg(test)]
+            code_words: Vec::new(),
             counters: HashMap::new(),
             abort: None,
         }
@@ -1608,6 +1640,18 @@ impl<'a> Lower<'a> {
                             _ => None,
                         })
                     }))
+                    // A built descriptor's base is not the byte a load
+                    // through it reads: that is the base plus the load's own
+                    // offset, which can lie below the base.
+                    .chain(
+                        if code_reads_on() {
+                            self.x.res.code_reads.as_slice()
+                        } else {
+                            &[]
+                        }
+                        .iter()
+                        .copied(),
+                    )
                     .filter(|a| a.param == CODE)
                     .map(|a| a.offset & !3)
                     .min()
@@ -1632,6 +1676,10 @@ impl<'a> Lower<'a> {
                 let g = self.s.m.constant_global("code", init);
                 let t = (g, first, words.len() as u32);
                 self.code_table = Some(t);
+                #[cfg(test)]
+                {
+                    self.code_words = words;
+                }
                 t
             }
         };
@@ -2284,6 +2332,11 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        #[cfg(test)]
+        let buffer_loads = {
+            let k = |s: &str| super::bitcode::census::KINDS.iter().position(|k| *k == s).expect("kind");
+            self.s.m.census().counts[k("buffer_load")]
+        };
         Ok(Lowered {
             wave_size,
             cmp_samplers,
@@ -2294,6 +2347,10 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            code_table: self.code_table.map(|t| (t.1, self.code_words)),
+            #[cfg(test)]
+            buffer_loads,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -5769,8 +5826,13 @@ impl<'a> Lower<'a> {
             let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
+            let wide = wide::loads();
             let mut raw = Vec::new();
-            for k in 0..count {
+            if wide {
+                let dwords = self.raw_dwords(h, addr, count);
+                raw.extend(dwords.into_iter().map(|x| (x, zero)));
+            }
+            for k in 0..if wide { 0 } else { count } {
                 let b = self.cur;
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(b, Bin::Add, addr, off);
@@ -5808,6 +5870,12 @@ impl<'a> Lower<'a> {
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
+            if wide::loads() {
+                for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+                return Ok(());
+            }
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -11632,6 +11700,7 @@ mod tests {
     }
 
     // Descriptor words read as numbers: kept in their own file (lower.rs is at the size limit).
+    mod code_table;
     mod desc_data;
     mod mad_u16_lerp;
     mod vop3p_dot;
