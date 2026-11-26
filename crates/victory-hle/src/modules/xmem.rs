@@ -798,8 +798,13 @@ pub extern "system" fn XMemMapPhysicalPages(
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
             return std::ptr::null_mut();
         };
-        // One view per run of consecutive slices of one section.
-        let run = 1 + pages[i + 1..]
+        // One view per run of consecutive slices of one section, but never
+        // past the placeholder the run starts in: the title splits its pool
+        // into placeholders of its own, and consecutive pages say nothing
+        // about where one ends. A call across two is refused, and its range
+        // has already been unmapped. Ask the host where that placeholder
+        // ends (Marvisak/VIctory #1264's triage).
+        let mut run = 1 + pages[i + 1..]
             .iter()
             .zip(1..)
             .take_while(|&(page, k)| {
@@ -808,6 +813,29 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
+        if run > 1 && clipping() {
+            let at = base + i * PAGE;
+            let room = placeholder_room(at) / PAGE;
+            if room > 0 && room < run {
+                run = room.max(1);
+                let clipped = CLIPPED_RUNS.fetch_add(1, Ordering::Relaxed) + 1;
+                if clipped == 1 || clipped.is_multiple_of(1024) {
+                    tracing::info!(
+                        address = format_args!("{at:#x}"),
+                        pages = run,
+                        clipped,
+                        "a mapping run stops at the end of its placeholder"
+                    );
+                } else {
+                    tracing::debug!(
+                        address = format_args!("{at:#x}"),
+                        pages = run,
+                        clipped,
+                        "a mapping run stops at the end of its placeholder"
+                    );
+                }
+            }
+        }
         if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
             return std::ptr::null_mut();
         }
@@ -843,6 +871,52 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
         }
     }
     1
+}
+
+/// How many bytes from `base` to the end of the placeholder it lies in: the
+/// most one call can map as one view there. 0 when the host does not report
+/// a reserved placeholder at `base` (an address already shown, or the title's
+/// own memory), so the caller maps page by page as before.
+fn placeholder_room(base: usize) -> usize {
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: `VirtualQueryEx` fills `info` for the region holding `base`.
+    let got = unsafe {
+        VirtualQueryEx(
+            GetCurrentProcess(),
+            base as *const c_void,
+            &mut info,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if got == 0 || info.State != MEM_RESERVE {
+        return 0;
+    }
+    (info.BaseAddress as usize)
+        .saturating_add(info.RegionSize)
+        .saturating_sub(base)
+}
+
+/// Batched mapping runs that stopped at the end of their placeholder
+/// (`VICTORY_MAP_CLIP`; reported in the counters line of `victory-gpu`).
+static CLIPPED_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a batched run is clipped to the placeholder it starts in;
+/// `VICTORY_MAP_CLIP=0` maps it as it comes (a title that splits its
+/// placeholders would get the refused batch of before).
+fn clip_from(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
+}
+
+fn clipping() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        clip_from(std::env::var("VICTORY_MAP_CLIP").ok().as_deref())
+    });
+    *ON
+}
+
+#[cfg(test)]
+pub(crate) fn clipped_runs() -> usize {
+    CLIPPED_RUNS.load(Ordering::Relaxed)
 }
 
 /// Maps the physical pages shown at `[from, from + len)` at `to` as well,
@@ -1492,7 +1566,9 @@ mod tests {
         }
         // Two consecutive slices of one section, the run crossing from the
         // first placeholder into the second.
+        let before = clipped_runs();
         assert_eq!(XMemMapPhysicalPages(pool, 2, pages.as_ptr()), pool);
+        assert_eq!(clipped_runs(), before + 1, "one run clipped, none refused");
         // Each page shows its own bytes: the clip maps the first, then the
         // rest in the placeholder that follows.
         for (k, at) in [pool, second].into_iter().enumerate() {
@@ -1505,6 +1581,18 @@ mod tests {
         }
         assert_eq!(XMemMapPhysicalPages(pool, 2, std::ptr::null()), pool);
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// The clip's off switch: `VICTORY_MAP_CLIP=0` maps a run as it comes,
+    /// everything else (unset, empty, `1`) clips.
+    #[test]
+    fn the_map_clip_can_be_turned_off() {
+        assert!(clip_from(None));
+        assert!(clip_from(Some("1")));
+        assert!(!clip_from(Some("0")));
+        assert!(!clip_from(Some(" 0 ")));
+        // An unser switch is not one.
+        assert!(clip_from(Some("off")));
     }
 
     #[test]
