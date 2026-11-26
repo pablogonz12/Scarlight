@@ -300,6 +300,7 @@ pub const SWITCHES: &[&str] = &[
     "VICTORY_F16_SUM_WIDE",
     "VICTORY_FIRSTLANE_OWN",
     "VICTORY_FIRST_HALF",
+    "VICTORY_FSPX",
     "VICTORY_GROUP_SPLIT",
     "VICTORY_GROUP_SYNC",
     "VICTORY_INT_CLAMP",
@@ -446,10 +447,8 @@ pub struct UserData {
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let part = crate::program_part(&c).ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let native = crate::native_programs(part)?
         .into_iter()
         .find(|p| {
             matches!(
