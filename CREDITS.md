@@ -192,6 +192,11 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   default). The part grid, the region registry, the budget and the canary are reimplemented on this tree's
   `inplace`; the canary here proves each part **both ways** with our own `Rig` (#188), which the fork's tests do not.
 
+- **codec-d/cool_fox [`e05d4633a`](https://github.com/codec-d/cool_fox/commit/e05d4633a)**, GPL-3.0: a
+  `SetEventOnCompletion` with no event blocks the guest thread on the fence's value with `WaitOnAddress`, and
+  `Signal`/`Set` wakes it with `WakeByAddressAll` (`crates/victory-gpu/src/fence.rs`; the wait here is bounded
+  by `VICTORY_FENCE_BLOCK_MS` and lets the queue run what it holds between slices).
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
