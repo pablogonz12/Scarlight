@@ -313,11 +313,19 @@ pub(crate) fn ready(
         .ok()
         .and_then(|n| n.checked_add(1))?;
     if run.slots < needed {
-        let slots = run_slots(needed);
         // A fragmented heap can still expose its first slots: take what fits
-        // and grow on a later bind, when slots have been given back.
-        let grown = heap.dynamic(slots).or_else(|| heap.dynamic(needed));
-        if let Some(base) = grown {
+        // (the rounded run, the exact size, then half of it at a time) and
+        // grow on a later bind, when slots have been given back.
+        let mut asks = vec![run_slots(needed), needed];
+        let mut small = needed;
+        while small > 64 {
+            small /= 2;
+            asks.push(small);
+        }
+        let grown = asks
+            .into_iter()
+            .find_map(|slots| heap.dynamic(slots).map(|base| (base, slots)));
+        if let Some((base, slots)) = grown {
             if run.slots != 0 {
                 tracing::info!(previous = run.slots, slots, "grew the raw page view run");
             }
