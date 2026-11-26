@@ -561,7 +561,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
                 return;
             }
             let recordings = crate::list::thin::submitted(lists);
-            let backs = recordings.ready().to_vec();
+            let backs = recordings.ready();
             submit_list(host, this, &backs);
             return;
         }

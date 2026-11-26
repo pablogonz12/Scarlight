@@ -101,7 +101,7 @@ fn run(job: Job) {
     match job {
         Job::Submit { queue, lists } => {
             if let Some(host) = crate::host::host() {
-                let backs = lists.ready().to_vec();
+                let backs = lists.ready();
                 STATS[0].fetch_add(1, Relaxed);
                 submit_list(host, queue, &backs);
             }

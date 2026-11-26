@@ -349,7 +349,6 @@ fn start() {
 /// out), with the lists of ours they go to. Kept while they run: dropping it
 /// gives the lists back.
 pub(crate) struct Submitted {
-    backs: Vec<This>,
     /// Kept alive while the lists run: let go, they give the lists back.
     #[allow(dead_code)]
     recordings: Vec<Arc<Recording>>,
@@ -361,11 +360,17 @@ unsafe impl Send for Submitted {}
 
 impl Submitted {
     /// The lists of ours to execute: every recording is translated first.
-    pub(crate) fn ready(&self) -> &[This] {
+    ///
+    /// The list of ours a recording goes to is made when its translation
+    /// begins, which is after this was handed over: it is asked for here, not
+    /// where the submission was closed (a recording whose list was not made
+    /// yet has none, and asking there took that for good: the submission ran
+    /// nothing and a texture the title filled kept zeros).
+    pub(crate) fn ready(&self) -> Vec<This> {
         for recording in &self.recordings {
             recording.wait();
         }
-        &self.backs
+        self.recordings.iter().map(|r| r.back()).collect()
     }
 }
 
@@ -383,8 +388,7 @@ pub(crate) fn submitted(lists: &[This]) -> Submitted {
             front.recording.clone()
         })
         .collect();
-    let backs = recordings.iter().map(|r| r.back()).collect();
-    Submitted { backs, recordings }
+    Submitted { recordings }
 }
 
 /// For the log: what was written down and translated since the last line.
@@ -1072,5 +1076,24 @@ mod tests {
         assert_eq!(slot[1], 99, "the slot was written again");
         assert_eq!(kept[1], 2, "the copy is the one at the call");
         assert_eq!(record(0), [0; RECORD]);
+    }
+
+    /// A submission names the list of ours it went to when its translation
+    /// begins, not where the title closed it: a recording closed before the
+    /// translation started has no list yet, and taking that as the answer left
+    /// the submission with nothing to run (a texture the title filled kept
+    /// zeros).
+    #[test]
+    fn a_submission_names_the_list_of_ours_its_translation_made() {
+        let mut list = test_list();
+        let this: This = (&mut *list as *mut List).cast();
+        draw(this, 0, 1, 0, 0);
+        let submitted = super::submitted(&[this]);
+        assert_eq!(submitted.recordings.len(), 1);
+        // Translate it here, as a thread of ours would.
+        submitted.recordings[0].run();
+        let backs = submitted.ready();
+        assert_eq!(backs.len(), 1);
+        assert!(!backs[0].is_null(), "the list of ours its translation made");
     }
 }
