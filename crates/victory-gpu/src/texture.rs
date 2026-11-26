@@ -849,7 +849,7 @@ fn settled(first: blake3::Hash, second: blake3::Hash) -> Option<blake3::Hash> {
 /// there read as zeros. The bytes are those a read in place would see.
 fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> R {
     with_read(size, |read| {
-        crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
+        crate::host::copy_mapped_at(read.as_mut_ptr(), memory, size, false, crate::host::SITE_TEXTURE);
         f(read)
     })
 }
@@ -1312,7 +1312,7 @@ impl Staging {
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                crate::host::copy_mapped_at(read.as_mut_ptr(), self.memory, size, false, crate::host::SITE_TEXTURE);
                 self.detile(read);
             });
             #[cfg(feature = "diagnostics")]
@@ -1416,7 +1416,7 @@ impl Staging {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                crate::host::copy_mapped_at(read.as_mut_ptr(), self.memory, size, false, crate::host::SITE_TEXTURE);
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -1579,7 +1579,7 @@ impl Staging {
             // SAFETY: a buffer of our own, filled by the copy.
             let mut buf = vec![0u8; run_len];
             // Read through the copy, which stands unmapped pages.
-            crate::host::copy_mapped(buf.as_mut_ptr(), run_start as *const u8, run_len, false);
+            crate::host::copy_mapped_at(buf.as_mut_ptr(), run_start as *const u8, run_len, false, crate::host::SITE_TEXTURE);
             for (sub, &(rs, re)) in ranges.iter().enumerate() {
                 let a = rs.max(run_at);
                 let b = re.min(run_at + run_len as u64);
@@ -1709,11 +1709,12 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
         read.resize(3 * WINDOW, 0);
         let mut take = |from: usize, bytes: usize| {
             read[..bytes].fill(0);
-            crate::host::copy_mapped(
+            crate::host::copy_mapped_at(
                 read.as_mut_ptr(),
                 (at as usize + from) as *const u8,
                 bytes,
                 false,
+                crate::host::SITE_TEXTURE,
             );
             hasher.update(&read[..bytes]);
         };
