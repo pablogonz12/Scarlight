@@ -32,16 +32,28 @@ answer comes from the compiler, on a device nobody has run.
 | RDNA4 (gfx1201), stub control | RADV | 751 / 751 | 30 ms | Offline (stub) |
 | RDNA3 (gfx1100) | RADV | 751 / 751 | 33 ms | Offline (stub) |
 | RDNA2 (gfx1030) | RADV | 751 / 751 | 33 ms | Offline (stub) |
-| RDNA1 (gfx1010) | RADV | 751 / 751 | 41 ms | Offline (stub) |
-| Vega (gfx900) | RADV | 669 / 751 | 80 ms | Offline (stub); 82 mesh programs abort the driver |
+| RDNA1 (gfx1010) | RADV | 669 / 751 | 22 ms | Offline (stub); the 82 mesh programs are skipped, no `VK_EXT_mesh_shader` |
+| Vega (gfx900) | RADV | 669 / 751 | 23 ms | Offline (stub); the 82 mesh programs are skipped, that family aborted the driver |
 | Arc B (bmg, Xe2) | ANV | 751 / 751 | 35 ms | Offline (stub) |
 | Arc A (dg2) | ANV | 750 / 751 | 78 ms | Offline (stub); one miss, the stub's query gap |
 | Xe-LPG (mtl) | ANV | 750 / 751 | 69 ms | Offline (stub); one miss, the same gap |
 
 A pass means the driver's compiler accepted every pipeline we asked for. It does not mean the program
 draws correctly, and it does not prove a card has the features at run time: on RDNA1 all 82 mesh
-programs create, yet RADV does not advertise `VK_EXT_mesh_shader` there. The one Intel miss on Arc A
-and Xe-LPG stops on the shim's own `drm_i915_query_item` gap, not on a shader the compiler refused.
+programs create, yet RADV does not advertise `VK_EXT_mesh_shader` there, and on Vega asking for one
+ended the process inside RADV instead of being refused.
+
+Both families below RDNA2 are now handled before the driver sees a mesh pipeline. In a run the check
+reads the D3D12 mesh-shader tier and, when that says yes, the adapter's device id: RADV exposes
+`VK_EXT_mesh_shader` from RDNA2 up, so a Vega or Navi 1x adapter is named by id and its mesh pipeline
+is refused once, with the family in the warning, instead of being created. That pipeline is gone for
+the run: its draws are lost while everything else goes on, where before it went to a driver that
+either refused it or, on Vega, aborted the process and took every other draw with it. Nothing changes
+on RDNA2 and newer — APUs included: Van Gogh and Mendocino are RDNA2, not Vega, and the RX 9070 XT
+still creates all 751. The same two families are the ones the offline matrix above skips.
+
+The one Intel miss on Arc A and Xe-LPG stops on the shim's own `drm_i915_query_item` gap, not on a
+shader the compiler refused.
 Only RDNA4 has actually been run, and every row above changes to Tested the day a report shows a run
 on it.
 

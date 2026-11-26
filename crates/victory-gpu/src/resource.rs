@@ -296,6 +296,125 @@ pub(crate) fn target_format(format: u32) -> u32 {
     format
 }
 
+/// The render target use of a resource (`uses_taken`).
+pub(crate) const TAKES_RENDER_TARGET: u32 = 1;
+/// The typed unordered access use of a resource (`uses_taken`).
+pub(crate) const TAKES_UNORDERED: u32 = 2;
+
+/// Whether `format` names no format itself: a typeless one, whose views
+/// name theirs, and which `CheckFeatureSupport` reports no use for. DXGI
+/// puts it first in its family.
+pub(crate) fn typeless(format: u32) -> bool {
+    family(format) == format && family(format.saturating_add(1)) == format
+}
+
+/// The uses the host takes of a resource in `format`, given `report`: what
+/// `CheckFeatureSupport` answered for the format (its render target and its
+/// typed unordered access use; `None` where it answered nothing for it).
+/// A use it does not take is left out of the resource: the host refuses a
+/// creation with a use its format cannot take, and such a creation removed
+/// the device (B5G5R5A1 takes no typed unordered access on NVIDIA,
+/// B4G4R4A4 neither use, #2725). Shaders still read the texture; a view of
+/// the use it lacks is held back (`descriptor::host::fits`, which asks the
+/// same question of the format a typed unordered access view names).
+/// A typeless format names no format itself --
+/// its views do -- so it keeps the uses its description has, whatever the
+/// report says of it; the same where the query left it unknown, as the
+/// console makes such textures.
+pub(crate) fn uses_taken(format: u32, report: Option<(bool, bool)>) -> u32 {
+    let Some((render_target, unordered)) = report.filter(|_| !typeless(format)) else {
+        return TAKES_RENDER_TARGET | TAKES_UNORDERED;
+    };
+    (if render_target { TAKES_RENDER_TARGET } else { 0 })
+        | (if unordered { TAKES_UNORDERED } else { 0 })
+}
+
+/// The flags the host makes a resource of `format` with, from the title's
+/// `flags`: a use the host does not take of the format is left away
+/// (`uses_taken`), so the creation is not refused -- nor, on NVIDIA, the
+/// device removed (#2725).
+pub(crate) fn taken_flags(format: u32, flags: u32, report: Option<(bool, bool)>) -> u32 {
+    const TARGET: u32 = 1;
+    const UNORDERED: u32 = 4;
+    let taken = uses_taken(format, report);
+    let mut flags = flags;
+    if taken & TAKES_RENDER_TARGET == 0 {
+        flags &= !TARGET;
+    }
+    if taken & TAKES_UNORDERED == 0 {
+        flags &= !UNORDERED;
+    }
+    flags
+}
+
+/// Whether the host copy `texture` was made with `unordered` (the unordered
+/// access use) or the render target one: a use the host does not take of
+/// its format is left out of the creation ([`taken_flags`]), and a view of
+/// it would be refused -- and, on NVIDIA, remove the device (#2725). Such a
+/// view is not made, and what it would write is dropped.
+#[cfg(windows)]
+pub(crate) fn host_use_allowed(
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    unordered: bool,
+) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    // SAFETY: a live resource.
+    let flags = unsafe { texture.GetDesc() }.Flags.0;
+    let use_flag = if unordered {
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0
+    } else {
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0
+    };
+    flags & use_flag != 0
+}
+
+/// What the host answers for the uses of `format`, asked once per format:
+/// its render target and its typed unordered access use, `None` where it
+/// answered nothing (or no host is there).
+#[cfg(windows)]
+pub(crate) fn host_uses(format: u32) -> Option<(bool, bool)> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    static KNOWN: std::sync::Mutex<Vec<(u32, Option<(bool, bool)>)>> =
+        std::sync::Mutex::new(Vec::new());
+    let host = crate::host::host()?;
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, uses)) = known.iter().find(|&&(f, _)| f == format) {
+        return uses;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    // SAFETY: a plain query into our own structure.
+    let asked = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    };
+    let uses = asked.is_ok().then_some((
+        support.Support1.0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0,
+        support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0,
+    ));
+    known.push((format, uses));
+    uses
+}
+
+/// No host without Windows: every use is taken, as the console makes them.
+#[cfg(not(windows))]
+pub(crate) fn host_uses(_format: u32) -> Option<(bool, bool)> {
+    None
+}
+
+/// Whether the texture keeps the uses its format takes:
+/// `VICTORY_FORMAT_USES=0` keeps every use the title asks for, as before.
+pub(crate) fn format_uses_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FORMAT_USES").is_none_or(|v| v != "0"))
+}
+
 /// Whether the host copy of the title texture `this` is in a stand-in
 /// format ([`target_format`]): its texels are not laid out as the title's.
 #[cfg(windows)]
@@ -635,6 +754,21 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
     // A stand-in target is typed.
     (format != own && format != target_format(own)).then_some(own)
+}
+
+/// The description words a view of a typeless host copy takes: the title's
+/// own format and `dimension`. `None` where the host cannot say what the
+/// host copy is typed as (and for a view of no resource).
+pub(crate) fn slot_view_words(this: This, dimension: u32) -> Option<[u32; 6]> {
+    #[cfg(windows)]
+    {
+        Some([view_format(this)?, dimension, 0, 0, 0, 0])
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (this, dimension);
+        None
+    }
 }
 
 /// Depth formats with their typeless family: depth textures that shaders
@@ -1270,6 +1404,23 @@ pub(crate) struct HostTexture {
     filled: bool,
 }
 
+/// A host copy of `texture` the host believes is in `state`, for a test that
+/// presents a plane no title made (the present's own bookkeeping is what it
+/// wants; nothing writes through it).
+#[cfg(all(windows, test, feature = "diagnostics"))]
+pub(crate) fn test_copy(
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    state: u32,
+) -> std::sync::Arc<HostTexture> {
+    std::sync::Arc::new(HostTexture {
+        texture: texture.clone(),
+        state: std::sync::atomic::AtomicU32::new(state),
+        dropped: 0,
+        bytes: 0,
+        filled: false,
+    })
+}
+
 /// What a title texture has on the host: its host copy and, for a depth
 /// texture shaders also write, the colour twin.
 #[cfg(windows)]
@@ -1856,6 +2007,18 @@ fn host_texture(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    // The host makes the resource with the uses the format it is made in
+    // takes: one it does not take is refused at creation, and that removed
+    // the device (B5G5R5A1 takes no typed unordered access on NVIDIA,
+    // B4G4R4A4 neither use, #2725). Asked of the format that is made, after
+    // the stand-in and the typeless ones above: a sRGB format (29) takes no
+    // typed unordered access itself, where the typeless one it is made in
+    // (27) names no format at all and keeps every use. Left away, shaders
+    // still read the texture and a view of the missing use is held back
+    // (`descriptor::host::fits`).
+    if d.flags & DEPTH == 0 && format_uses_on() {
+        d.flags = taken_flags(d.format, d.flags, host_uses(d.format));
+    }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
     let clear_value = (!clear.is_null()).then(|| {
@@ -2370,6 +2533,29 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     Some(out)
 }
 
+/// The host copy of the target at `address`, if the title texture table
+/// holds it and something already made one. A present plane that is not
+/// used must not make a host texture just by being looked at, so an absent
+/// copy answers `None` and the next frame finds the one the title's own
+/// work made.
+#[cfg(windows)]
+pub(crate) fn existing_host_copy(address: usize) -> Option<std::sync::Arc<HostTexture>> {
+    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    // Checked against the table before the object is touched: a plane
+    // parameter the title left behind must not name freed memory.
+    if !targets.values().any(|&target| target == address) {
+        return None;
+    }
+    // SAFETY: a resource in the table takes this same lock before its
+    // allocation goes, so the object outlives the read.
+    let made = resource(address as This)
+        .host
+        .made
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    Some(made.as_ref()?.0.clone())
+}
+
 pub(crate) extern "system" fn create_placed(
     _: This,
     heap: This,
@@ -2542,10 +2728,21 @@ static RESOURCE_FUNCTIONS: Table<32> = {
     Table(f)
 };
 
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// A present plane that is not used, and an address the table never
+    /// held, must not touch an object: the base alone is presented.
+    #[cfg(windows)]
+    #[test]
+    fn host_copy_is_not_made_for_an_unknown_target() {
+        assert!(super::existing_host_copy(0).is_none());
+        assert!(super::existing_host_copy(0xdead_0000).is_none());
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {
@@ -2561,6 +2758,129 @@ mod tests {
         // Boundaries: 59 belongs to the preceding family, 66 is unmapped.
         assert_eq!(family(59), 53);
         assert_eq!(family(66), 66);
+    }
+
+    /// The uses of a resource a host takes, as its `CheckFeatureSupport`
+    /// answers them: a use it does not take is left out of the creation,
+    /// which it would refuse -- and which removed the device on NVIDIA
+    /// (#2725). A typeless format names no format itself and keeps every
+    /// use of its description; so does one the query left unknown. RADV
+    /// takes both uses of every format, so nothing is left out there.
+    #[test]
+    fn a_use_the_host_does_not_take_is_left_out_of_the_resource() {
+        const TARGET: u32 = 1;
+        const UNORDERED: u32 = 4;
+        let both = TARGET | UNORDERED;
+        // NVIDIA's answers: B4G4R4A4 (115) takes neither use of the two,
+        // B5G5R5A1 (86) the render target one only.
+        let nvidia = |format: u32| match format {
+            115 => Some((false, false)),
+            86 => Some((true, false)),
+            _ => Some((true, true)),
+        };
+        assert_eq!(
+            taken_flags(86, both, nvidia(86)),
+            TARGET,
+            "B5G5R5A1 keeps its render target use"
+        );
+        assert_eq!(
+            taken_flags(115, both, nvidia(115)),
+            0,
+            "B4G4R4A4 keeps neither use"
+        );
+        assert_eq!(
+            taken_flags(28, both, nvidia(28)),
+            both,
+            "R8G8B8A8_UNORM keeps both"
+        );
+        // RADV takes both uses of every format: no use is ever left out.
+        let radv = |_: u32| Some((true, true));
+        for format in [10, 28, 86, 87, 115] {
+            assert_eq!(
+                taken_flags(format, both, radv(format)),
+                both,
+                "format {format}: a host taking both uses keeps both"
+            );
+        }
+        // A typeless format names no format itself: its views do, and the
+        // device reports no use for it. It keeps the uses of its
+        // description (the game's own sRGB targets, 29 into 27).
+        for format in [27, 90, 92] {
+            assert!(typeless(format), "format {format} is typeless");
+            assert!(!typeless(format + 1), "format {} is typed", format + 1);
+            assert_eq!(
+                taken_flags(format, both, Some((false, false))),
+                both,
+                "format {format}: a typeless resource keeps its uses"
+            );
+        }
+        // A format the query left unknown is made as the console makes it.
+        assert_eq!(taken_flags(86, both, None), both);
+    }
+
+    /// The uses left out are exactly the ones the device does not take: its
+    /// own answer per format, nothing beyond it dropped. A host that takes
+    /// both uses of every format -- RADV does -- keeps every use, so the new
+    /// path never triggers there.
+    #[cfg(windows)]
+    #[test]
+    fn the_uses_left_out_are_the_ones_the_device_does_not_take() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        for format in [10, 28, 86, 87, 115] {
+            let Some(report) = host_uses(format) else {
+                continue;
+            };
+            let flags = taken_flags(format, 1 | 4, Some(report));
+            assert_eq!(
+                flags & 1 != 0,
+                report.0,
+                "format {format}: the render target use stays exactly where the device takes it"
+            );
+            assert_eq!(
+                flags & 4 != 0,
+                report.1,
+                "format {format}: the unordered access use stays exactly where the device takes it"
+            );
+        }
+    }
+
+    /// A texture the title makes both a target and unordered access in its
+    /// sRGB format (29) is made typeless (27) and keeps both uses: asked
+    /// before the typeless conversion, the device's answer for the sRGB
+    /// format -- which takes no typed unordered access itself -- would leave
+    /// the use out, and the texture would be made in 29 without it.
+    #[cfg(windows)]
+    #[test]
+    fn an_srgb_unordered_texture_keeps_its_uses() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let desc = ResourceDesc {
+            flags: 1 | 4,
+            ..texture(4, 4, 29, 1)
+        };
+        // SAFETY: a texture description of ours, and no clear value.
+        let (texture, _) = host_texture(&desc, 4, std::ptr::null(), false)
+            .expect("a texture the host makes");
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        assert_eq!(
+            d.Format.0 as u32, 27,
+            "a sRGB target's host copy is typeless"
+        );
+        assert_ne!(
+            d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0,
+            0,
+            "the render target use stays"
+        );
+        assert_ne!(
+            d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0,
+            0,
+            "the unordered access use stays"
+        );
     }
 
     type Release = extern "system" fn(This) -> u32;
