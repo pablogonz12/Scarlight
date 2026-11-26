@@ -202,6 +202,15 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
+    /// All the view it records is made from: records with equal keys have
+    /// equal views (of the same host texture).
+    #[cfg(windows)]
+    pub(crate) fn key(&self) -> (usize, [u32; 7]) {
+        let mut words = [self.described; 7];
+        words[1..].copy_from_slice(&self.desc);
+        (self.resource as usize, words)
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
@@ -223,16 +232,26 @@ impl RtvRecord {
     pub(crate) fn slot_desc(
         &self,
     ) -> windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC {
-        use windows::Win32::Graphics::Direct3D12::{
-            D3D12_RENDER_TARGET_VIEW_DESC, D3D12_RTV_DIMENSION_TEXTURE2D,
-        };
-        self.desc()
-            .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0)
-            .unwrap_or(D3D12_RENDER_TARGET_VIEW_DESC {
-                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
-                ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
-                ..Default::default()
-            })
+        use windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC;
+        let words = self.slot_words();
+        // SAFETY: the host view description is 24 bytes in this layout.
+        unsafe {
+            (&raw const words)
+                .cast::<D3D12_RENDER_TARGET_VIEW_DESC>()
+                .read_unaligned()
+        }
+    }
+
+    /// [`Self::slot_desc`]'s words, for the targets, heaps and tests that
+    /// run where the host types are not there.
+    pub(crate) fn slot_words(&self) -> [u32; 6] {
+        /// A 2D render target view (`D3D12_RTV_DIMENSION_TEXTURE2D`).
+        const TEXTURE_2D: u32 = 4;
+        /// `DXGI_FORMAT_R8G8B8A8_UNORM`: a format every device renders to.
+        const RGBA8_UNORM: u32 = 28;
+        self.desc_words(TEXTURE_2D)
+            .filter(|w| w[0] != 0 && w[1] != 0)
+            .unwrap_or([RGBA8_UNORM, TEXTURE_2D, 0, 0, 0, 0])
     }
 
     /// The depth view description in the host's type (the same layout).
@@ -250,22 +269,22 @@ impl RtvRecord {
     #[cfg(windows)]
     fn host_desc<T>(&self, dimension: u32) -> Option<T> {
         assert!(size_of::<T>() <= size_of::<[u32; 6]>());
+        let words = self.desc_words(dimension)?;
+        // SAFETY: both host view descriptions are 24 bytes in this layout.
+        Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
+    }
+
+    /// [`Self::host_desc`]'s words: the title's own description words where
+    /// it spelled one out, else those of a view of a typeless host copy.
+    fn desc_words(&self, dimension: u32) -> Option<[u32; 6]> {
         let mut words = if self.described != 0 {
             self.desc
         } else {
-            [
-                crate::resource::view_format(self.resource)?,
-                dimension,
-                0,
-                0,
-                0,
-                0,
-            ]
+            crate::resource::slot_view_words(self.resource, dimension)?
         };
         // A target or depth view: of a target, in its stand-in format.
         words[0] = crate::resource::target_format(crate::resource::pc_format(words[0]));
-        // SAFETY: both host view descriptions are 24 bytes in this layout.
-        Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
+        Some(words)
     }
 }
 
@@ -1218,10 +1237,12 @@ mod tests {
     /// target stays where the shader's output index expects it.
     #[test]
     fn a_discarded_target_keeps_its_slot_with_a_description() {
-        use windows::Win32::Graphics::Direct3D12::{
-            D3D12_RTV_DIMENSION_TEXTURE2D, D3D12_RTV_DIMENSION_TEXTURE2DARRAY,
-        };
-        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+        /// `D3D12_RTV_DIMENSION_TEXTURE2D`.
+        const TEXTURE_2D: u32 = 4;
+        /// `D3D12_RTV_DIMENSION_TEXTURE2DARRAY`.
+        const TEXTURE_2D_ARRAY: u32 = 5;
+        /// `DXGI_FORMAT_R8G8B8A8_UNORM`.
+        const RGBA8_UNORM: u32 = 28;
         // No host copy and no description (a typeless target we never made).
         let bare = RtvRecord {
             tag: RTV_TAG,
@@ -1229,23 +1250,25 @@ mod tests {
             resource: std::ptr::null(),
             desc: [0; 6],
         };
-        assert!(bare.desc().is_none(), "no host copy and no description: nothing to spell out");
-        let slot = bare.slot_desc();
-        assert_eq!(slot.Format, DXGI_FORMAT_R8G8B8A8_UNORM, "a format every device renders to");
-        assert_eq!(slot.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE2D);
+        assert!(
+            bare.desc_words(TEXTURE_2D).is_none(),
+            "no host copy and no description: nothing to spell out"
+        );
+        let slot = bare.slot_words();
+        assert_eq!(slot[0], RGBA8_UNORM, "a format every device renders to");
+        assert_eq!(slot[1], TEXTURE_2D);
         // One the title described keeps the description it gave.
         let mut described = bare;
         described.described = 1;
         described.desc = [10, 5, 0, 0, 0, 0];
         assert_eq!(
-            described.slot_desc().ViewDimension,
-            D3D12_RTV_DIMENSION_TEXTURE2DARRAY,
+            described.slot_words()[1],
+            TEXTURE_2D_ARRAY,
             "the title's own description, not the fallback"
         );
         assert_eq!(
-            described.slot_desc().Format.0,
+            described.slot_words()[0],
             10,
             "the title's own format, not the fallback's"
         );
-    }
-}
+    }}

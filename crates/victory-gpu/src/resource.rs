@@ -157,16 +157,20 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
         l if l & !0xff == 0x100 => Swizzle(l & 0xff),
         _ => return None,
     };
-    texture::Texture::new(&TextureDesc {
-        dimension,
-        width: u32::try_from(desc.width).ok()?,
-        height: desc.height,
-        depth_or_array: u32::from(desc.depth_or_array_size),
-        mips: u32::from(desc.mip_levels),
-        format: desc.format,
-        samples: desc.sample_count.max(1),
-        swizzle,
-    })
+    texture::Texture::for_gpu(
+        &TextureDesc {
+            dimension,
+            width: u32::try_from(desc.width).ok()?,
+            height: desc.height,
+            depth_or_array: u32::from(desc.depth_or_array_size),
+            mips: u32::from(desc.mip_levels),
+            format: desc.format,
+            samples: desc.sample_count.max(1),
+            swizzle,
+        },
+        crate::console::current().pipes(),
+        0,
+    )
     .ok()
 }
 
@@ -750,6 +754,21 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
     // A stand-in target is typed.
     (format != own && format != target_format(own)).then_some(own)
+}
+
+/// The description words a view of a typeless host copy takes: the title's
+/// own format and `dimension`. `None` where the host cannot say what the
+/// host copy is typed as (and for a view of no resource).
+pub(crate) fn slot_view_words(this: This, dimension: u32) -> Option<[u32; 6]> {
+    #[cfg(windows)]
+    {
+        Some([view_format(this)?, dimension, 0, 0, 0, 0])
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (this, dimension);
+        None
+    }
 }
 
 /// Depth formats with their typeless family: depth textures that shaders
