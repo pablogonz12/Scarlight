@@ -480,6 +480,8 @@
     }
 
     // Descriptor words read as numbers: kept in their own file (lower.rs is at the size limit).
+    #[path = "lower/tests/code_table.rs"]
+    mod code_table;
     #[path = "lower/tests/desc_data.rs"]
     mod desc_data;
     // The 16-bit multiply-add and lerp tests, in their own file as well.

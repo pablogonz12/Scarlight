@@ -154,6 +154,11 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   `crates/victory-shader/src/dxbc.rs`; `Source::bytes()` for both the raw and the `SGD5` paths,
   `apps/victory/src/shader.rs`). Reimplemented on this tree's `victory translate`, which has no `warm` command.
 
+- **Marvisak/VIctory [`8ff791351`](https://github.com/Marvisak/VIctory/commit/8ff791351)** (Marvis),
+  GPL-3.0: a rectangle list's fourth corner is completed opposite the right angle, wherever the three
+  corners put it. This tree's geometry stage (`emit::rect_list_gs`) already finds the corner in any order; the
+  rule is now in the CPU expansion too (`right_angle`, `right_corners` in `crates/victory-gpu/src/primitive.rs`).
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
@@ -166,3 +171,12 @@ Missing or wrong name? Open an issue.
   enables blending on one, so those targets are made to write unblended, per target and with independent
   blending turned on only where it was needed (`crates/victory-gpu/src/pipeline/host.rs`,
   `VICTORY_HOST_BLEND=0`). Its host-pipeline device test used `D3DCompile`; ours checks the state itself.
+- **avatarmanz/VIctory-7900XTX [200a9cc5](https://github.com/avatarmanz/VIctory-7900XTX/commit/200a9cc5e)**
+  (after fxceless/victory-fork [c36971b2](https://github.com/fxceless/victory-fork/commit/c36971b2)), GPL-3.0: the
+  dwords of one console buffer load read by one `rawBufferLoad` for every four of them instead of a call a dword,
+  behind `VICTORY_SHADER_OPT=64` (off by default, worth nothing on the card that measured it)
+  (`crates/victory-shader/src/emit/lower/wide.rs`).
+- **avatarmanz/VIctory-7900XTX [17c4717b](https://github.com/avatarmanz/VIctory-7900XTX/commit/17c4717b4)**
+  (after fxceless/victory-fork [c36971b2](https://github.com/fxceless/victory-fork/commit/c36971b2)), GPL-3.0:
+  `VICTORY_CARD_BUFFERS_MIN_KB`, so that title buffers' copies under the MiB floor can go into the card's memory
+  (unset: the floor of before) (`crates/victory-gpu/src/shadow.rs`).
