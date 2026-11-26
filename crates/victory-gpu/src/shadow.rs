@@ -3284,12 +3284,17 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         return loose(address, end, len <= 1, any);
     };
     // The copy is usually made already: asks find it under the read lock.
-    if let Some(shadow) = buffers_read().get(&key).and_then(|e| e.shadow.clone()) {
+    // Between the guards the key may be registered again with a shorter
+    // width (`register`/`unregister`, the title releasing a buffer and
+    // taking its address for a smaller one): the entry used is the one that
+    // still covers the range asked for, as the search found.
+    if let Some(shadow) = buffers_read().get(&key).filter(|e| e.end >= end).and_then(|e| e.shadow.clone()) {
         return Some(shadow);
     }
     let mut map = buffers_write();
-    // The title may have released it between the two guards: as a miss.
-    let Some(entry) = map.get_mut(&key) else {
+    // The title may have released it between the two guards, or taken the
+    // key for a shorter buffer: as a miss, as no buffer found.
+    let Some(entry) = map.get_mut(&key).filter(|e| e.end >= end) else {
         drop(map);
         return loose(address, end, len <= 1, any);
     };
