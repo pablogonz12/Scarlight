@@ -153,6 +153,12 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   corners put it. This tree's geometry stage (`emit::rect_list_gs`) already finds the corner in any order; the
   rule is now in the CPU expansion too (`right_angle`, `right_corners` in `crates/victory-gpu/src/primitive.rs`).
 
+- **DexNom/VIctory [921d8d3b4](https://github.com/DexNom/VIctory/commit/921d8d3b43b44f3a6ca4b44095edd3c4baf10a87)**,
+  GPL-3.0: a pixel shader's quad permutations (`ds_swizzle_b32` quad_perm and DPP) read through quad operations,
+  whose values include a helper lane's, as the console's do at a triangle's edge; common broadcasts and exchanges
+  take one read, and a DPP8 that selects across quads falls back to a wave-lane read (`VICTORY_DX_PIXEL_QUAD=0`
+  turns it off).
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
