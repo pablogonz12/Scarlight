@@ -78,6 +78,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// The blocks of the module (a test of which edge blocks lowering made).
+    #[cfg(test)]
+    pub blocks: usize,
     /// The constant table's first byte and dwords, if the program has one.
     #[cfg(test)]
     pub code_table: Option<(u32, Vec<u32>)>,
@@ -1471,12 +1474,7 @@ impl<'a> Lower<'a> {
                 let at = |b: usize| place.get(b).copied().unwrap_or(usize::MAX);
                 at(from) != usize::MAX && at(to) <= at(from)
             };
-            let cut_short = x
-                .st
-                .exits
-                .iter()
-                .enumerate()
-                .any(|(b, e)| matches!(*e, LaneExit::Jump(t) if back(b, t)));
+            let cut_short = cuts_short(&x.st.exits, &back);
             let all = all_lane_blocks(x.st);
             (0..p.blocks.len())
                 .filter(|&b| p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier"))
@@ -2379,6 +2377,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            blocks: self.s.m.blocks(),
             #[cfg(test)]
             code_table: self.code_table.map(|t| (t.1, self.code_words)),
             #[cfg(test)]
@@ -4249,7 +4249,13 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        if v.clamp || v.omod != 0 {
+        // Integer `clamp` is unsigned saturation on add and subtract, which
+        // apply it before calling here (`VICTORY_INT_CLAMP=0` refuses it
+        // again). Other integer ops still refuse the modifier.
+        if v.omod != 0
+            || (v.clamp
+                && !(crate::emit::switches::int_clamp() && Self::integer_clamp_op(inst.name())))
+        {
             return Err("integer output modifiers");
         }
         match v.dst {
@@ -7814,7 +7820,11 @@ impl<'a> Lower<'a> {
                 } else {
                     None
                 };
-                let (r, carry) = self.add_sub_carry(c, name.starts_with("v_add"), a, bb, cin);
+                let add = name.starts_with("v_add");
+                let (mut r, carry) = self.add_sub_carry(c, add, a, bb, cin);
+                if v.clamp && crate::emit::switches::int_clamp() {
+                    r = self.clamp_u32(c, add, r, carry);
+                }
                 int(self, r)?;
                 if let Some(Operand::Scalar { code, .. }) = v.carry
                     && let Some(w) = inst.write(Reg::S(code))
@@ -11004,6 +11014,23 @@ impl<'a> Lower<'a> {
                 self.enter_loop(b, t, self.cur);
                 Term::Br(self.block[t].expect("reachable"))
             }
+            // Both arms go to one block: a CondBr would make the same
+            // critical edge twice, and the edge map (keyed by `(from, to)`)
+            // would drop the first block, leaving the PHIs of that successor
+            // one predecessor short (VIC-BT-007). A jump instead
+            // (`VICTORY_BRANCH_SAME_ARMS=0` keeps the CondBr).
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } if taken == not_taken && crate::emit::switches::branch_same_arms() => {
+                if self.counters.contains_key(&taken) && self.rpo[taken] <= self.rpo[b] {
+                    let ok = self.count_iteration(taken, pred::IULT);
+                    let abort = self.abort_block();
+                    Term::CondBr(ok, self.block[taken].expect("reachable"), abort)
+                } else {
+                    self.enter_loop(b, taken, self.cur);
+                    Term::Br(self.block[taken].expect("reachable"))
+                }
+            }
             LaneExit::Branch {
                 when,
                 taken,
@@ -11363,6 +11390,28 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 
 // The VALU integer operations, in their own file (this one is at the 512 KiB cap).
 mod valu_int;
+
+/// VOP3 integer `clamp` on add and subtract (unsigned saturation), a child
+/// module so it shares the emitter's state.
+#[path = "valu_clamp.rs"]
+pub(super) mod valu_clamp;
+
+/// Whether the abort path can leave a lane out of the program before a
+/// later `s_barrier`: a loop closed by a plain jump, or by a branch whose
+/// both arms are one block, which lowers as a jump and takes the same
+/// iteration counter (`VICTORY_BRANCH_SAME_ARMS`). `back(from, to)` says
+/// whether that edge closes a loop.
+fn cuts_short(exits: &[LaneExit], back: &dyn Fn(usize, usize) -> bool) -> bool {
+    exits.iter().enumerate().any(|(b, e)| match *e {
+        LaneExit::Jump(t) => back(b, t),
+        LaneExit::Branch {
+            taken, not_taken, ..
+        } => {
+            taken == not_taken && crate::emit::switches::branch_same_arms() && back(b, taken)
+        }
+        _ => false,
+    })
+}
 
 #[cfg(test)]
 mod tests;

@@ -81,6 +81,8 @@
 //!   It binds nothing.
 
 mod bitcode;
+#[cfg(test)]
+mod branch_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
@@ -95,9 +97,9 @@ mod own_bits;
 mod rect;
 mod sampler;
 mod shader;
+pub mod switches;
 #[cfg(test)]
-mod key_tests;
-mod threading;
+mod key_tests;mod threading;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -266,6 +268,7 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
 /// from then on, and the test in `key_tests` fails if the sources read one
 /// that is in none of the three lists.
 pub const SWITCHES: &[&str] = &[
+    "VICTORY_BRANCH_SAME_ARMS",
     "VICTORY_CODE_READS",
     "VICTORY_ANISO_POINT_MIP",
     "VICTORY_INTERP_F16_OMOD_CLAMP",
@@ -275,6 +278,7 @@ pub const SWITCHES: &[&str] = &[
     "VICTORY_FIRST_HALF",
     "VICTORY_GROUP_SPLIT",
     "VICTORY_GROUP_SYNC",
+    "VICTORY_INT_CLAMP",
     "VICTORY_MESH_OUTPUT_STRICT",
     "VICTORY_SHADER_DIV_FIXUP_F16",
     "VICTORY_SHADER_LOOP_LIMIT",

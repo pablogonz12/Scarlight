@@ -80,6 +80,18 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   pruned. Reimplemented against this tree's library, which has no `victory_shader::SOURCE_HASH`: the key is
   the executable's BLAKE3, the same bytes the shader cache keys its translations on
   (`crates/victory-gpu/src/shader_cache.rs`), and `VICTORY_LIBRARY_PRUNE=0` keeps every library.
+- **JMAN730/victory** ([project-flamingo#685](https://github.com/JMAN730/project-flamingo/pull/685)),
+  GPL-3.0: a `LaneExit::Branch` whose two arms name one block is lowered as the jump it is, so the
+  edge map's `(from, to)` key is not written twice and that successor's PHIs keep their predecessor
+  (`crates/victory-shader/src/emit/lower.rs`, `crates/victory-shader/src/emit/branch_tests.rs`).
+- **JMAN730/victory** ([project-flamingo#675](https://github.com/JMAN730/project-flamingo/pull/675)),
+  GPL-3.0: VOP3 integer `clamp` on add/sub is unsigned saturation (carry → all ones, borrow → zero),
+  applied in the lowering instead of refused as an integer output modifier, and a clamped add is no
+  wrapping sum for address analysis (`crates/victory-shader/src/emit/valu_clamp.rs`,
+  `crates/victory-shader/src/resource.rs`).
+- **vitutu1** by **ZigZagBoi1** ([ZigZagBoi1/ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort),
+  GPL-3.0-or-later): the resolution and upscaler levers, which here are profile hooks and the
+  switches `VICTORY_RENDER_SCALE` / `VICTORY_OWN_UPSCALER` rather than code that names a title.
 
 - **fxceless/victory-fork [PR #1117](https://github.com/fxceless/victory-fork/pull/1117)** (Azemed),
   GPL-3.0: the title's views behind an `RwLock` (`views_read`/`views_write`, `crates/victory-gpu/src/inplace.rs`)
