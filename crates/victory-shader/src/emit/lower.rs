@@ -4550,9 +4550,8 @@ impl<'a> Lower<'a> {
                 && self.s.mesh.is_none()
                 && crate::emit::shader_swizzle_zero()
             {
-                // A console lane sends a swizzle value only when its EXEC
-                // bit is set. Ballot the guard over the host lanes present
-                // here so absent lanes and lanes masked by EXEC both read as zero.
+                // A console lane sends a swizzle value only when its EXEC bit
+                // is set: ballot the guard so absent and masked lanes read zero.
                 let on = guard.unwrap_or_else(|| self.s.m.bool(true));
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
@@ -4560,13 +4559,11 @@ impl<'a> Lower<'a> {
                     .s
                     .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
                 let lo = self.s.m.extract(c, ballot, 0);
-                // A swizzle source stays inside a 32-lane half, and with
-                // `exchange` the host wave is one half, so the low word
-                // holds the lane asked about.
+                // A source stays inside a 32-lane half; with `exchange` the wave is one.
                 let hi = (self.x.native.wave64 && self.exchange.is_none())
                     .then(|| self.s.m.extract(c, ballot, 1));
                 let active = self.lane_bit_at(c, src, lo, hi);
-                // Keep the DXIL read defined even for an inactive source.
+                // Keep the read defined for an inactive source.
                 let src = self.s.m.select(c, active, src, lane);
                 let read = self.read_lane(x, src);
                 let zero = self.s.m.i32(0);
@@ -8168,7 +8165,7 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
-        // RDNA2 ignores VOP3 op_sel on 16-bit compares (v_cmp_class not measured).
+        // RDNA2 ignores op_sel on 16-bit compares (v_cmp_class unmeasured).
         let name = inst.name();
         let compare = name.starts_with("v_cmp") && !name.contains("class");
         let mut high = !compare && v.opsel >> k & 1 != 0;
@@ -8617,14 +8614,10 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::And, r, m16))
     }
 
-    /// `v_div_fixup`'s special cases, on f32 values (an f16's are exact):
-    /// `q` is the quotient a division computed, `den` and `num` its
-    /// denominator and numerator. A NaN operand (numerator first) comes
-    /// back; 0/0 and inf/inf give NaN; x/0 and inf/x give a signed
-    /// infinity; 0/x and x/inf a signed zero; a quotient with an all-ones
-    /// exponent (NaN included, as gfx1036 hardware gives) a signed infinity;
-    /// anything else is `|q|` with the quotient's sign (the ISA's order of
-    /// checks).
+    /// `v_div_fixup`'s special cases on f32 values: a NaN operand, 0/0 and
+    /// inf/inf give NaN, x/0 and inf/x a signed infinity, 0/x and x/inf a signed
+    /// zero, an all-ones quotient exponent a signed infinity; else `|q|` with
+    /// the quotient's sign (the ISA's order, f16 bits being exact in f32).
     fn div_fixup(&mut self, q: V, den: V, num: V) -> V {
         let c = self.cur;
         let (qi, di, ni) = (self.as_int(q), self.as_int(den), self.as_int(num));
@@ -8797,8 +8790,7 @@ impl<'a> Lower<'a> {
                 };
                 if v.clamp && saturates {
                     match op {
-                        // Unsigned: add/mad fit in u32 (max 65535*65535+65535 <= u32::MAX);
-                        // sub is in [-65535, 65535] so signed < 0 catches underflow.
+                        // Unsigned add/mad fit in u32; sub is in [-65535, 65535].
                         "add_u16" | "mad_u16" => {
                             let hi = self.s.m.i32(0xFFFF);
                             let over = self.s.m.cmp(c, pred::IUGT, r, hi);
@@ -8809,8 +8801,7 @@ impl<'a> Lower<'a> {
                             let under = self.s.m.cmp(c, pred::SLT, r, z);
                             self.s.m.select(c, under, z, r)
                         }
-                        // Signed: operands are sign-extended i16 in i32, so add/sub/mad
-                        // never wrap i32 (|r| <= 32768*32768 + 32768 < 2^31).
+                        // Signed: sign-extended i16 operands, so i32 never wraps.
                         _ => {
                             let lo = self.s.m.i32(i32::from(i16::MIN) as u32);
                             let hi = self.s.m.i32(i32::from(i16::MAX) as u32);
@@ -11748,7 +11739,9 @@ mod tests {
     }
 
     // Descriptor words read as numbers: kept in their own file (lower.rs is at the size limit).
+    mod cube_lod;
     mod desc_data;
+    mod group_base;
     mod mad_u16_lerp;
     mod vop3p_dot;
     mod mul24_hi;
@@ -12029,118 +12022,5 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
-    }
-
-    #[test]
-    fn cube_image_get_lod_lowers_and_validates() {
-        use crate::native::{RootParam, RootType};
-
-        // Pixel shader:
-        // s_mov_b32 s1, 0
-        // s_mov_b32 s3, 0
-        // s_load_dwordx8 s[4:11], s[0:1], null
-        // s_load_dwordx4 s[12:15], s[2:3], null
-        // v_mov_b32 v0..v2, 0
-        // image_get_lod (op 0x60, dim=3, dmask=3) v[0..1], v[0..2], s[4:11], s[12:15]
-        // v_cmpx_ne_u32_e32 v0, 0
-        // s_endpgm
-        let mimg_w0 = 0xF000_0000 | (0x60 << 18) | (3 << 8) | (3 << 3);
-        // srsrc = 1 (s[4:11]), ssamp = 3 (s[12:15]): (3 << 21) | (1 << 16) = 0x0061_0000
-        let words = [
-            0xBE81_0380u32,
-            0xBE83_0380,
-            0xF40C_0100,
-            0xFA00_0000,
-            0xF408_0301,
-            0xFA00_0000,
-            0x7E00_0280,
-            0x7E02_0280,
-            0x7E04_0280,
-            mimg_w0,
-            0x0061_0000,
-            0x7D9A_0080,
-            S_ENDPGM,
-        ];
-        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let native = NativeProgram {
-            stage: HwStage::Ps,
-            wave64: false,
-            vgprs: 4,
-            layout: vec![
-                RootParam {
-                    root: RootType::Table,
-                    table_offset_dwords: 0,
-                    sgprs: 1,
-                    base_register: 0,
-                    user_data: 0,
-                    slot: 0,
-                },
-                RootParam {
-                    root: RootType::Table,
-                    table_offset_dwords: 0,
-                    sgprs: 1,
-                    base_register: 0,
-                    user_data: 2,
-                    slot: 1,
-                },
-            ],
-            used: vec![],
-            io: StageIo::Ps {
-                inputs: vec![],
-                input_addr: 0,
-                db_shader_control: 0,
-                patches: vec![],
-            },
-            code,
-        };
-        let p = ir::build(&native.code, false, 4).unwrap();
-        let st = structure::structure(&p).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-        let io = io::raise(&p, &native).unwrap();
-        let lowered = lower(&Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: vec![],
-            outputs: vec![],
-            prims: vec![],
-            mesh_stride: 0,
-        })
-        .unwrap();
-        #[cfg(windows)]
-        if let Ok(mut v) = crate::emit::validator::Validator::load(
-            crate::emit::validator::Validator::default_path().as_deref(),
-        ) {
-            v.validate(&mut lowered.dxil.clone())
-                .expect("DXIL validation failed for cube image_get_lod");
-        }
-        #[cfg(not(windows))]
-        let _ = lowered;
-    }
-
-    /// A program that reads its group id reads the host's base too, so that a
-    /// dispatch the host runs in pieces moves its ids; `VICTORY_GROUP_SPLIT=0`
-    /// leaves the id as the console's.
-    #[test]
-    fn a_program_that_reads_its_group_id_gets_the_group_base() {
-        let words = [
-            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
-            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
-            0xBE83_0380, // s_mov_b32 s3, 0
-            S_ENDPGM,
-        ];
-        let group_id_x = 1 << 7;
-        let base = |l: &Lowered| {
-            l.user_data
-                .iter()
-                .any(|u| u.root == RootType::Other(USER_GROUP_BASE))
-        };
-        TEST_GROUP_SPLIT.set(Some(true));
-        assert!(base(&lowers_cs(&words, group_id_x, false, [1, 1, 1]).expect("group id")));
-        TEST_GROUP_SPLIT.set(Some(false));
-        assert!(!base(&lowers_cs(&words, group_id_x, false, [1, 1, 1]).expect("group id")));
-        TEST_GROUP_SPLIT.set(None);
     }
 }
