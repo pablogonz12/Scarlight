@@ -81,12 +81,24 @@ pub(crate) fn log(frames: f64) {
     tracing::info!("compared per frame with picked writes: {:.1} MB of {:.1} MB declared", c[0], c[0] + c[1]);
 }
 
-/// The pass's turn: one per compare of a submission's ranges, the same for
-/// every span of it (see [`spans`]).
-pub(crate) fn next_turn() -> u64 {
-    static TURN: AtomicU64 = AtomicU64::new(0);
-    TURN.fetch_add(1, Relaxed)
+/// The copy's turn: its own count, one per compare of a submission's ranges
+/// and the same for every span of it (see [`spans`]). Per copy, so that a
+/// copy compares on every other submission of two still walks every one of
+/// its pages (`turn % slice` would otherwise only ever be the parity of its
+/// own turns, and half its pages never look).
+pub(crate) fn next_turn(id: u64) -> u64 {
+    let mut turns = TURNS.lock().unwrap_or_else(|e| e.into_inner());
+    if turns.len() >= KEPT && !turns.contains_key(&id) {
+        turns.clear();
+    }
+    let t = turns.entry(id).or_insert(0);
+    let now = *t;
+    *t += 1;
+    now
 }
+
+/// Each copy's count of compares so far, its turn ([`next_turn`]).
+static TURNS: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
 
 /// The pages a copy's compares have found written: looked at every time
 /// from then on, counted from the copy's first page.
@@ -190,6 +202,7 @@ pub(crate) fn found(id: u64, start: usize, found: &[(usize, usize)]) {
 /// number does not inherit its pages.
 pub(crate) fn forget(id: u64) {
     SETS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    TURNS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
 }
 
 #[cfg(test)]

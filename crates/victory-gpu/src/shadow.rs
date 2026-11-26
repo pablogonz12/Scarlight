@@ -1523,11 +1523,12 @@ fn find_pieces(scans: Vec<Scan>) -> Vec<Vec<(usize, usize)>> {
         }));
     };
     let count = scans.len();
-    // This compare's turn: the same for every span of it, so that a copy
-    // with several spans in one submission is covered by the sweep
-    // (`crate::picked`).
-    let turn = crate::picked::next_turn();
     for (which, scan) in scans.iter().enumerate() {
+        // This copy's turn: the same for every span of this compare, so that
+        // a copy with several spans in one submission is covered by the
+        // sweep, and its own count, so that a copy compared every other
+        // submission still walks every page (`crate::picked`).
+        let turn = crate::picked::next_turn(scan.id);
         let (data, before, start) = (scan.data, scan.before, scan.start);
         // The spans of the range this look examines (`crate::picked`), or
         // the range whole.
