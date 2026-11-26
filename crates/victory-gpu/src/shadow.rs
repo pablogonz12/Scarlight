@@ -2068,6 +2068,25 @@ mod piece_tests {
     }
 }
 
+#[cfg(test)]
+mod range_tests {
+    use super::covered;
+
+    /// Ranges a submission declared it writes cover a range only where they
+    /// merge: a copy reading title memory in one of them must not.
+    #[test]
+    fn pending_ranges_cover_only_what_they_merge_over() {
+        assert!(!covered(vec![], 0, 4));
+        assert!(covered(vec![(0, 10)], 2, 5));
+        assert!(covered(vec![(0, 4), (4, 10)], 2, 8));
+        assert!(covered(vec![(6, 10), (0, 4), (2, 8)], 0, 10));
+        assert!(!covered(vec![(0, 4), (6, 10)], 2, 8));
+        assert!(!covered(vec![(0, 4)], 2, 8));
+        assert!(!covered(vec![(0, 10)], 10, 12));
+        assert!(!covered(vec![(4, 10)], 0, 4));
+    }
+}
+
 /// Copies of windows outside buffers let go since the start, and their
 /// bytes.
 static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -2308,6 +2327,42 @@ impl Shadow {
         (from - start, (address + len).clamp(from, end) - start)
     }
 
+    /// The GPU buffer and the offset in it of `[address, address + len)`,
+    /// when all of it is inside the copy: what a copy on the host GPU names.
+    /// The buffer is the one shaders read and write: the placed resource of
+    /// memory in place, the card's side of a copy in the card's memory, the
+    /// copy itself otherwise.
+    #[cfg(windows)]
+    pub(crate) fn gpu_range(
+        &self,
+        address: usize,
+        len: usize,
+    ) -> Option<(ID3D12Resource, u64)> {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        if len == 0 || address < start || address + len > end {
+            return None;
+        }
+        Some((self.buffer.clone(), self.offset(address as u64)))
+    }
+
+    /// Whether `[address, address + len)` of the copy is ahead of title
+    /// memory: GPU work of this submission wrote it and it is not copied back
+    /// yet, so title memory there must not be read.
+    pub(crate) fn ahead(&self, address: usize, len: usize) -> bool {
+        if self.place.is_some() {
+            // In place the shaders write title memory itself: never behind.
+            return false;
+        }
+        let ranges: Vec<(usize, usize)> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|p| (p.from, p.to))
+            .collect();
+        covered(ranges, address, address + len)
+    }
+
     /// Shaders of `list` may write `[address, address + len)` of the copy
     /// (unordered access): after the list's submission has run, the range
     /// is copied back into title memory, where the title reads it; until
@@ -2317,6 +2372,13 @@ impl Shadow {
     /// shortcut: what shaders wrote is found by keeping the range's bytes
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
+    /// Whether this host copy's bytes are the title memory itself (in place):
+    /// the shaders write there, so there is no snapshot and no copy-back.
+    #[cfg(windows)]
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
@@ -3464,6 +3526,63 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
+}
+
+/// As [`find`], for a copy that exists already: `None` without making one, so
+/// a title copy does not give every buffer it names a host copy (and a buffer
+/// in the card's memory a mirror in it).
+pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    let map = buffers();
+    let key = map
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end >= end)
+        .map(|(k, _)| *k);
+    let Some(key) = key else {
+        // Memory outside buffers: a window that is there and holds it
+        // (windows are cut to suit the ask, [`window`]).
+        drop(map);
+        return LOOSE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|&(&(start, len), _)| start <= address && end <= start + len)
+            .map(|(_, shadow)| shadow.clone());
+    };
+    map.get(&key).and_then(|e| e.shadow.clone())
+}
+
+/// The memory of a copy at `[address, address + len)`, for a copy out of it
+/// (`None` unless all of the range is inside the copy).
+pub(crate) fn bytes_of(shadow: &Arc<Shadow>, address: usize, len: usize) -> Option<*const u8> {
+    let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+    (start <= address && address + len <= end).then(|| {
+        // SAFETY: inside the copy's mapping, checked above.
+        unsafe { shadow.data.add(address - start).cast_const() }
+    })
+}
+
+/// Whether `[from, to)` lies inside `ranges`, merged where they share or
+/// touch a boundary (a submission declares overlapping ranges: a destination
+/// several steps write is covered by all of them).
+fn covered(mut ranges: Vec<(usize, usize)>, from: usize, to: usize) -> bool {
+    if ranges.is_empty() {
+        return false;
+    }
+    ranges.sort_unstable();
+    let mut at = from;
+    for (a, e) in ranges {
+        if a > at {
+            return false;
+        }
+        at = at.max(e);
+        if at >= to {
+            return true;
+        }
+    }
+    at >= to
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has

@@ -1394,6 +1394,19 @@ pub(crate) fn dred_on() -> bool {
     })
 }
 
+/// Whether the title's own buffer copies run on the host GPU when both sides
+/// have a host copy (`VICTORY_GPU_COPIES`, on unless `0`; live): one
+/// `CopyBufferRegion` in the list instead of a read and a write of title
+/// memory at submission time, with the destination copied back like a shader
+/// write. Off, every copy is a CPU copy, as before.
+pub(crate) fn gpu_copies() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    crate::switches::b(
+        "VICTORY_GPU_COPIES",
+        *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_COPIES").is_none_or(|v| v != "0")),
+    )
+}
+
 /// Indirect dispatch records since the last frame line: the largest group
 /// count a record asked for, and the groups asked in all (from the lists'
 /// budget buffers, a run late). MESH_GROUPS are the mesh records,
@@ -1855,6 +1868,19 @@ impl Drop for Deferred {
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
+}
+
+/// What a [`Step`] is, for tests that check the order a list records them in.
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StepKind {
+    Copy,
+    Fill,
+    Refresh,
+    Run,
+    Host,
+    GpuWrite,
+    Texture,
 }
 
 /// Whether a queue's submissions go to the card without a wait for each
@@ -5493,6 +5519,24 @@ impl HostList {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// (Tests.) The submission-time steps recorded so far, in order.
+    #[cfg(test)]
+    pub(crate) fn step_kinds(&self) -> Vec<StepKind> {
+        self.deferred()
+            .copies
+            .iter()
+            .map(|step| match step {
+                Step::Copy(..) => StepKind::Copy,
+                Step::Fill(..) => StepKind::Fill,
+                Step::Refresh(..) => StepKind::Refresh,
+                Step::Run(_) => StepKind::Run,
+                Step::Host(_) => StepKind::Host,
+                Step::GpuWrite(..) => StepKind::GpuWrite,
+                Step::Texture(_) => StepKind::Texture,
+            })
+            .collect()
+    }
+
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
@@ -5736,7 +5780,19 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    // A GPU copy of this submission may have written the
+                    // source's host copy (not title memory, which is behind):
+                    // the copy comes out of the host copy then.
+                    match ahead_bytes(src, len) {
+                        Some(bytes) => {
+                            // The destination's guards open first, as
+                            // `copy_mapped` does: a write through a guarded
+                            // page fails piecemeal and is not reported.
+                            crate::watch::writing(dst, len);
+                            write_mapped(dst as *mut u8, bytes, len);
+                        }
+                        None => copy_mapped(dst as *mut u8, src as *const u8, len, true),
+                    }
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
                     len
@@ -6106,6 +6162,32 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize, title_dst: bool) {
             });
         }
     });
+}
+
+/// The host copy's bytes at `src` (`len` of them) when they are ahead of
+/// title memory: a GPU copy of this submission wrote them there, and title
+/// memory will not have them until its copy-back. `None` when title memory is
+/// what to read: no host copy, no GPU write pending, or a copy in the card's
+/// memory (whose bytes are on the card, not in the CPU's side).
+fn ahead_bytes(src: usize, len: usize) -> Option<*const u8> {
+    let shadow = crate::shadow::peek(src as u64, len as u64)?;
+    if !shadow.ahead(src, len) {
+        return None;
+    }
+    if shadow.carded() {
+        // Nothing to read: the bytes are on the card. Reported once, so a run
+        // shows the case instead of a silent stale read.
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                src = format_args!("{src:#x}"),
+                len,
+                "a copy reads memory a GPU copy of this submission wrote, in the card's memory"
+            )
+        });
+        return None;
+    }
+    crate::shadow::bytes_of(&shadow, src, len)
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not

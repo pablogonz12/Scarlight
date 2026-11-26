@@ -100,6 +100,9 @@ pub(crate) enum C {
     /// nanoseconds the looks took, on every thread.
     WaitChecks,
     WaitCheckNs,
+    /// Title buffer copies that ran on the host GPU, and their bytes.
+    GpuCopies,
+    GpuBytes,
     /// Host lists made (`Host::new_list`: for the lists a queue holds and
     /// for the parts of lists cut at waits) and the nanoseconds that took.
     HostLists,
@@ -165,9 +168,15 @@ pub(crate) enum C {
     ViewNarrowed,
 }
 /// 88 (the live-switches base, async write-back's counters among them) plus
-/// intro-fix's seven and tex-resident's three.
-const COUNTERS: usize = 98;
+/// intro-fix's seven and tex-resident's three, and the GPU copies' two.
+const COUNTERS: usize = 100;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+
+/// A title buffer copy of `len` bytes ran on the host GPU instead of the CPU.
+pub(crate) fn gpu_copy(len: usize) {
+    add(C::GpuCopies, 1);
+    add(C::GpuBytes, len as u64);
+}
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
@@ -1105,7 +1114,7 @@ pub(crate) fn log(frames: f64) {
          changed, {:.1} MB hashed, {:.1} MB of them changed, {:.0} written behind the guard; \
          presented textures from title memory {:.0}, of them a submission old {:.0}; \
          put up at the present {:.0}; shown out of order {:.0}, their copy's source \
-         rewritten since {:.0}",
+         rewritten since {:.0}; {:.0} title copies on the host GPU {:.1} MB",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -1137,6 +1146,8 @@ pub(crate) fn log(frames: f64) {
         c[C::PresentRefilled as usize],
         c[C::PresentReorder as usize],
         c[C::PresentOverwritten as usize],
+        c[C::GpuCopies as usize],
+        mb(c[C::GpuBytes as usize]),
     );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
