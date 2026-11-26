@@ -197,3 +197,8 @@ Missing or wrong name? Open an issue.
   (after fxceless/victory-fork [c36971b2](https://github.com/fxceless/victory-fork/commit/c36971b2)), GPL-3.0:
   `VICTORY_CARD_BUFFERS_MIN_KB`, so that title buffers' copies under the MiB floor can go into the card's memory
   (unset: the floor of before) (`crates/victory-gpu/src/shadow.rs`).
+- **fever308/victory-corgi [95641affc](https://github.com/fever308/victory-corgi/commit/95641affc)**, GPL-3.0:
+  the title's "idle" and "lowest" threads (the streaming pager's among them) run "below normal", and the process
+  can run "above normal", so a build or a scan beside the title no longer starves its loading, behind
+  `VICTORY_TITLE_PRIORITIES=1` and `VICTORY_PROCESS_PRIORITY=above` (both off by default)
+  (`crates/victory-hle/src/modules/kernel.rs`, `crates/victory-hle/src/runtime.rs`).
