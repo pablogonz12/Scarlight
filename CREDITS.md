@@ -172,6 +172,10 @@ Missing or wrong name? Open an issue.
   `crates/victory-gpu/src/list/thin.rs`), reimplemented on this tree's lists: the render target and depth view
   records, arrays and structures are copied at the call, and a recording the title resets or releases without
   submitting is not run further.
+- **avatarmanz/VIctory-7900XTX [2be0515c](https://github.com/avatarmanz/VIctory-7900XTX/commit/2be0515cb)**, GPL-3.0:
+  a page the title maps at more than one address, where a guard at one address can be written through another: the
+  guarded blocks of the views beside it are given back to write together, under the one look
+  (`crates/victory-gpu/src/watch.rs`, `VICTORY_GUARD_ALIASES=0`).
 - **avatarmanz/VIctory-7900XTX [200a9cc5](https://github.com/avatarmanz/VIctory-7900XTX/commit/200a9cc5e)**
   (after fxceless/victory-fork [c36971b2](https://github.com/fxceless/victory-fork/commit/c36971b2)), GPL-3.0: the
   dwords of one console buffer load read by one `rawBufferLoad` for every four of them instead of a call a dword,
