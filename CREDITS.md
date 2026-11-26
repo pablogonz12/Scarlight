@@ -238,6 +238,12 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   is clipped rather than refused after its range was unmapped (`crates/victory-hle/src/modules/xmem.rs`,
   `VICTORY_MAP_CLIP=0` turns it off).
 
+- **codec-d/cool_fox [`8cc31ab37`](https://github.com/codec-d/cool_fox/commit/8cc31ab37)**, GPL-3.0: an XMA
+  voice whose input the title publishes again while the context stays enabled decodes on instead of staying
+  ended, and the decode pass publishes only whole blocks (a short one only as the flushed tail), trying a few
+  frames for a block and no more so a voice that produces nothing cannot hold the lock
+  (`crates/victory-hle/src/modules/audio.rs`, `VICTORY_XMA_REFILL`).
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
