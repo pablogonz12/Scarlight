@@ -452,15 +452,24 @@ pub(crate) fn take_empty() -> u64 {
 /// pipeline wait budget (upstream Marvisak/VIctory #2654).
 /// On by default; `VICTORY_EMPTY_DRAW_SKIP=0` prepares empty draws as before.
 fn empty_draw(items: u32, instances: u32) -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    let on = *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_EMPTY_DRAW_SKIP").is_none_or(|v| v != "0")
-    });
-    if !(on && (items == 0 || instances == 0)) {
+    if !empty_draw_with(empty_draw_on(), items, instances) {
         return false;
     }
     EMPTY.fetch_add(1, Ordering::Relaxed);
     true
+}
+
+/// Whether the skip is on in this process ([`empty_draw`]'s switch), read
+/// once: `VICTORY_EMPTY_DRAW_SKIP=0` prepares empty draws as before.
+fn empty_draw_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EMPTY_DRAW_SKIP").is_none_or(|v| v != "0"))
+}
+
+/// The decision [`empty_draw`] makes, for a given setting: `on` and the draw
+/// has no work. Pure, so a test can check both settings in one process.
+fn empty_draw_with(on: bool, items: u32, instances: u32) -> bool {
+    on && (items == 0 || instances == 0)
 }
 
 /// The draws traced since the last present (diagnostics builds, with
@@ -3490,16 +3499,35 @@ mod tests {
 
     /// An empty draw is skipped and counted, a draw with work is not: the
     /// check sits above the state preparation, so nothing asks for its host
-    /// pipeline (upstream Marvisak/VIctory #2654).
+    /// pipeline (upstream Marvisak/VIctory #2654). The decision is checked
+    /// under both settings of the switch, which this process cannot change.
     #[test]
     fn empty_draws_are_skipped_and_counted() {
+        use super::{empty_draw_on, empty_draw_with};
         let _ = take_empty();
         for (items, instances) in [(0, 1), (3, 0), (0, 0)] {
-            assert!(empty_draw(items, instances), "{items} items {instances} instances");
+            assert!(
+                empty_draw_with(true, items, instances),
+                "{items} items {instances} instances"
+            );
+            assert!(
+                !empty_draw_with(false, items, instances),
+                "the off switch prepares {items} items {instances} instances"
+            );
         }
-        assert_eq!(take_empty(), 3);
-        assert!(!empty_draw(3, 1));
-        assert!(!empty_draw(1, 1));
+        assert!(!empty_draw_with(true, 3, 1));
+        assert!(!empty_draw_with(true, 1, 1));
+        // What this process does with the setting it started with.
+        if empty_draw_on() {
+            for (items, instances) in [(0, 1), (3, 0), (0, 0)] {
+                assert!(empty_draw(items, instances), "{items} items {instances} instances");
+            }
+            assert_eq!(take_empty(), 3);
+            assert!(!empty_draw(3, 1));
+            assert!(!empty_draw(1, 1));
+        } else {
+            assert!(!empty_draw(0, 1));
+        }
         assert_eq!(take_empty(), 0);
     }
 
