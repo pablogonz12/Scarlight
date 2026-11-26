@@ -702,14 +702,9 @@ impl State {
                 // takes its slot: left out, the next live target would move
                 // into it and the pixel shader's outputs reach the wrong
                 // targets.
-                // shortcut: a view without a description or a format has no
-                // null view to stand for it and is left out, as before.
-                let null = record
-                    .desc()
-                    .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
-                if let Some(desc) = null {
-                    rtvs.push(host.rtv(None, Some(&desc)));
-                }
+                // The description is the title's where it gave one, else a
+                // null view every device renders to (`RtvRecord::slot_desc`).
+                rtvs.push(host.rtv(None, Some(&record.slot_desc())));
                 continue;
             };
             self.targets.push(record.resource as usize);
@@ -725,12 +720,7 @@ impl State {
                     format = unsafe { texture.GetDesc() }.Format.0,
                     "render target of a format the host cannot render to"
                 );
-                let null = record
-                    .desc()
-                    .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
-                if let Some(desc) = null {
-                    rtvs.push(host.rtv(None, Some(&desc)));
-                }
+                rtvs.push(host.rtv(None, Some(&record.slot_desc())));
                 continue;
             }
             rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));

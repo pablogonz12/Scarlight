@@ -211,6 +211,30 @@ impl RtvRecord {
         self.host_desc(TEXTURE_2D)
     }
 
+    /// The description a target keeps its output slot with when the host
+    /// cannot render to it: its own where the title spelled one out, else a
+    /// null view in a format every device renders to. The slot has to stay —
+    /// left out, the next target moves into it and the pixel shader's
+    /// outputs reach the wrong targets — and writes through the null view
+    /// are discarded. A readable format is used rather than the target's,
+    /// because a format without render-target support would be refused and
+    /// can reach the device-removal path.
+    #[cfg(windows)]
+    pub(crate) fn slot_desc(
+        &self,
+    ) -> windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RENDER_TARGET_VIEW_DESC, D3D12_RTV_DIMENSION_TEXTURE2D,
+        };
+        self.desc()
+            .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0)
+            .unwrap_or(D3D12_RENDER_TARGET_VIEW_DESC {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            })
+    }
+
     /// The depth view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn depth_desc(
@@ -1186,5 +1210,42 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    /// A target the host cannot render to keeps its output slot: its own
+    /// description where the title gave one, else a null view in a format
+    /// every device renders to. Either way the slot is one entry, so a later
+    /// target stays where the shader's output index expects it.
+    #[test]
+    fn a_discarded_target_keeps_its_slot_with_a_description() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RTV_DIMENSION_TEXTURE2D, D3D12_RTV_DIMENSION_TEXTURE2DARRAY,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+        // No host copy and no description (a typeless target we never made).
+        let bare = RtvRecord {
+            tag: RTV_TAG,
+            described: 0,
+            resource: std::ptr::null(),
+            desc: [0; 6],
+        };
+        assert!(bare.desc().is_none(), "no host copy and no description: nothing to spell out");
+        let slot = bare.slot_desc();
+        assert_eq!(slot.Format, DXGI_FORMAT_R8G8B8A8_UNORM, "a format every device renders to");
+        assert_eq!(slot.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE2D);
+        // One the title described keeps the description it gave.
+        let mut described = bare;
+        described.described = 1;
+        described.desc = [10, 5, 0, 0, 0, 0];
+        assert_eq!(
+            described.slot_desc().ViewDimension,
+            D3D12_RTV_DIMENSION_TEXTURE2DARRAY,
+            "the title's own description, not the fallback"
+        );
+        assert_eq!(
+            described.slot_desc().Format.0,
+            10,
+            "the title's own format, not the fallback's"
+        );
     }
 }
