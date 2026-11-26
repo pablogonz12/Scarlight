@@ -1449,6 +1449,59 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
+    /// Titles split one pool of 64 KiB placeholders into per-page ones, and
+    /// the pages of a batch say nothing about where their placeholder ends:
+    /// a run of consecutive slices that starts in one placeholder and ends
+    /// outside it must be clipped to the room the host reports, not handed
+    /// to the host whole (which is refused, after the range was unmapped).
+    #[test]
+    fn a_run_of_mappings_stops_at_the_end_of_its_placeholder() {
+        let pages = allocate(2);
+        for (k, page) in pages.iter().enumerate() {
+            assert!(write_physical(std::slice::from_ref(page), 0, &[b'0' + k as u8]));
+        }
+        // Two 64 KiB pages reserved as one pool, then split in two
+        // placeholders of their own, as the title hands its pool out.
+        let pool = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!pool.is_null());
+        let second = pool.wrapping_byte_add(PAGE);
+        // SAFETY: our own placeholder; the range freed stays a placeholder.
+        assert_ne!(
+            unsafe {
+                VirtualFree(
+                    second,
+                    PAGE,
+                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+                )
+            },
+            0
+        );
+        for at in [pool, second] {
+            assert_eq!(query(at).host.State, MEM_RESERVE, "a placeholder of its own");
+        }
+        // Two consecutive slices of one section, the run crossing from the
+        // first placeholder into the second.
+        assert_eq!(XMemMapPhysicalPages(pool, 2, pages.as_ptr()), pool);
+        // Each page shows its own bytes: the clip maps the first, then the
+        // rest in the placeholder that follows.
+        for (k, at) in [pool, second].into_iter().enumerate() {
+            assert_eq!(
+                // SAFETY: mapped read-write.
+                unsafe { at.cast::<u8>().read() },
+                b'0' + k as u8,
+                "page {k} at its own address"
+            );
+        }
+        assert_eq!(XMemMapPhysicalPages(pool, 2, std::ptr::null()), pool);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
     #[test]
     fn mapping_no_pages_changes_nothing() {
         let pages = allocate(2);
