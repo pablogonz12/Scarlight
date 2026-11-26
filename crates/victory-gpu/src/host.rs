@@ -38,6 +38,23 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
 
+/// The same for the unordered access views a stand-in's clear takes
+/// ([`Host::uav`]): one slot per clear, as the render target ring has one
+/// per clear, and a slot is read only while its submission runs (every
+/// submission is waited for), so a ring of the same depth is as safe.
+const UAV_RING: u32 = RTV_RING;
+
+/// The descriptors a stand-in's clear takes: a ring of unordered access
+/// views and their shader-visible copies, made together and only when a
+/// rule first needs one.
+struct Uavs {
+    views: ID3D12DescriptorHeap,
+    visible: ID3D12DescriptorHeap,
+    /// One slot's size, the same in both heaps.
+    size: u32,
+    next: AtomicU32,
+}
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
@@ -50,6 +67,12 @@ pub(crate) struct Host {
     /// A ring of depth views, used as `rtvs`.
     dsvs: ID3D12DescriptorHeap,
     dsv_size: u32,
+    /// The views a stand-in's clear takes ([`Host::uav`]), made the first
+    /// time a rule asks for one.
+    uavs: OnceLock<Option<Uavs>>,
+    /// The word an indirect dispatch's stand-ins are gated on
+    /// ([`Host::predicate_word`]).
+    predicate: OnceLock<Option<ID3D12Resource>>,
     next_dsv: AtomicU32,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
@@ -676,6 +699,8 @@ fn create() -> windows::core::Result<Host> {
             rtv_size,
             dsvs,
             dsv_size,
+            uavs: OnceLock::new(),
+            predicate: OnceLock::new(),
             next_dsv: AtomicU32::new(0),
             messages,
             next_rtv: AtomicU32::new(0),
@@ -4734,6 +4759,165 @@ impl Host {
             handle
         }
     }
+
+    /// The views a clear takes, made now if a rule asks for one.
+    fn uavs(&self) -> Option<&Uavs> {
+        self.uavs
+            .get_or_init(|| {
+                // SAFETY: heap creation, with nothing bound.
+                let made = unsafe {
+                    let views = self
+                        .device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                            NumDescriptors: UAV_RING,
+                            ..Default::default()
+                        })
+                        .ok();
+                    let visible = self
+                        .device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                            NumDescriptors: UAV_RING,
+                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                            ..Default::default()
+                        })
+                        .ok();
+                    let size = self
+                        .device
+                        .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                    Some(Uavs {
+                        views: views?,
+                        visible: visible?,
+                        size,
+                        next: AtomicU32::new(0),
+                    })
+                };
+                if made.is_none() {
+                    tracing::warn!(
+                        "ambient stand-in: no heap for the views a clear takes, so no stand-in"
+                    );
+                }
+                made
+            })
+            .as_ref()
+    }
+
+    /// The heap a clear's GPU handle is in, for `SetDescriptorHeaps`:
+    /// `None` if there is none (nothing is cleared then).
+    pub(crate) fn uav_heap(&self) -> Option<ID3D12DescriptorHeap> {
+        self.uavs().map(|uavs| uavs.visible.clone())
+    }
+
+    /// A host unordered access view of the texture `resource`, as the title
+    /// described it (`words`: its description's first ten words — format,
+    /// dimension, then that dimension's own fields; `None`: the resource's
+    /// own, whole), in the two forms a clear takes: the CPU handle of a heap
+    /// the shader cannot see, and the GPU handle of one it can. Both are
+    /// valid until the command is recorded. `None` if there is no such
+    /// texture, or the view is not of a texture the clear takes.
+    pub(crate) fn uav(
+        &self,
+        resource: crate::object::This,
+        words: Option<[u32; 10]>,
+    ) -> Option<(D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_GPU_DESCRIPTOR_HANDLE)> {
+        let texture = crate::resource::host_resource(resource)?;
+        let desc = match words {
+            // The texture dimensions a clear takes here; a buffer's (1), the
+            // multisampled ones (6, 7) and 1D/3D ones are refused, as the
+            // view of one is not what a stand-in stands in for.
+            Some(w) => Some(D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT(w[0] as i32),
+                ViewDimension: D3D12_UAV_DIMENSION(w[1] as i32),
+                Anonymous: match w[1] {
+                    4 => D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Texture2D: D3D12_TEX2D_UAV {
+                            MipSlice: w[2],
+                            PlaneSlice: w[3],
+                        },
+                    },
+                    5 => D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
+                            MipSlice: w[2],
+                            FirstArraySlice: w[4],
+                            ArraySize: w[5],
+                            PlaneSlice: w[3],
+                        },
+                    },
+                    _ => return None,
+                },
+            }),
+            None => None,
+        };
+        let uavs = self.uavs()?;
+        let slot = uavs.next.fetch_add(1, Ordering::Relaxed) % UAV_RING;
+        // SAFETY: a slot of our heaps and a live texture; the description is
+        // ours, and read only by the call.
+        unsafe {
+            let mut cpu = uavs.views.GetCPUDescriptorHandleForHeapStart();
+            cpu.ptr += (slot * uavs.size) as usize;
+            self.device
+                .CreateUnorderedAccessView(texture, None, desc.as_ref().map(|d| d as *const _), cpu);
+            // The same view where a clear reads it.
+            let mut visible = uavs.visible.GetCPUDescriptorHandleForHeapStart();
+            visible.ptr += (slot * uavs.size) as usize;
+            let mut gpu = uavs.visible.GetGPUDescriptorHandleForHeapStart();
+            gpu.ptr += u64::from(slot * uavs.size);
+            self.device.CopyDescriptorsSimple(
+                1,
+                visible,
+                cpu,
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+            Some((cpu, gpu))
+        }
+    }
+
+    /// The word an indirect dispatch's clears are gated on
+    /// ([`crate::ambient`]): eight bytes of video memory, zero at creation
+    /// and common between uses. `None` if it could not be made.
+    pub(crate) fn predicate_word(&self) -> Option<&ID3D12Resource> {
+        self.predicate
+            .get_or_init(|| {
+                let heap = D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 8,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                let mut buffer: Option<ID3D12Resource> = None;
+                // SAFETY: plain object creation, with nothing bound.
+                let made = unsafe {
+                    self.device.CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut buffer,
+                    )
+                };
+                match made {
+                    Ok(()) => buffer,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ambient stand-in: no predicate word, so an indirect dispatch gets no clears");
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
 }
 
 impl HostList {
@@ -4872,6 +5056,16 @@ impl HostList {
     /// list: the host texture and the state it leaves, if that is a change.
     /// The list's first use of a texture records nothing: its prelude brings
     /// the texture there at submission.
+    /// The state the list last saw `resource`'s host copy in: `None` if it
+    /// has not seen it (a caller that puts the texture back needs it).
+    pub(crate) fn state_of(&self, resource: crate::object::This) -> Option<u32> {
+        let copy = crate::resource::host_copy(resource)?;
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        states
+            .get(&(std::sync::Arc::as_ptr(&copy) as usize))
+            .map(|(_, state, _)| *state)
+    }
+
     pub(crate) fn transition(
         &self,
         resource: crate::object::This,
