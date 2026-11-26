@@ -62,6 +62,9 @@ pub(super) struct Front {
     words: Vec<u64>,
     closed: bool,
     submitted: bool,
+    /// Calls written down on this list (the test's own count: the one for the
+    /// log is the process's, and another list's calls are not this list's).
+    written: u64,
 }
 
 impl Drop for Front {
@@ -113,6 +116,7 @@ impl Front {
         self.recording = Some(Arc::new(Recording::new(kind)));
         self.closed = false;
         self.submitted = false;
+        self.written = 0;
         self.put(RESET, &[pipeline as usize as u64]);
     }
 
@@ -123,6 +127,7 @@ impl Front {
         }
         self.words.push(op | (args.len() as u64) << 16);
         self.words.extend_from_slice(args);
+        self.written += 1;
         OPS.fetch_add(1, Relaxed);
         if self.words.len() >= CHUNK {
             self.hand_over();
@@ -151,6 +156,7 @@ impl Front {
         }
         let len = (self.words.len() - at - 1) as u64;
         self.words[at] = op | len << 16;
+        self.written += 1;
         OPS.fetch_add(1, Relaxed);
         if self.words.len() >= CHUNK {
             self.hand_over();
@@ -1118,20 +1124,6 @@ mod tests {
         list
     }
 
-    /// How many records a stream holds (a call each).
-    fn records(stream: &[u64]) -> u64 {
-        let (mut i, mut calls) = (0, 0);
-        while i < stream.len() {
-            let len = (stream[i] >> 16) as usize;
-            if i + 1 + len > stream.len() {
-                break;
-            }
-            calls += 1;
-            i += 1 + len;
-        }
-        calls
-    }
-
     /// Nothing of a submission waits for a thread of ours that is not there:
     /// the translation happens where the submission is made.
     #[test]
@@ -1141,7 +1133,10 @@ mod tests {
         for n in 0..8u32 {
             draw(this, n, 1, 0, 0);
         }
-        assert_eq!(THREADS.load(Relaxed), 0, "no thread of ours in a test");
+        // (The gate runs this with `VICTORY_THIN=1` as well, where the
+        // process has its threads: none is claimed while this runs, which is
+        // the state a failed spawn leaves.)
+        let saved = THREADS.swap(0, SeqCst);
         let (tx, rx) = std::sync::mpsc::channel();
         let bits = this as usize;
         std::thread::spawn(move || {
@@ -1153,6 +1148,7 @@ mod tests {
             .expect("a submission waited for a translation no thread of ours would do");
         assert_eq!(backs, 1);
         let chunks = held(&list.thin.recording.as_ref().expect("a recording").inner).chunks.len();
+        THREADS.store(saved, SeqCst);
         assert_eq!(chunks, 0, "what it wrote down was translated");
     }
 
@@ -1270,7 +1266,7 @@ mod tests {
             draw(this, n, 1, 0, 0);
         }
         // begin's RESET, then a record a call.
-        assert_eq!(records(&list.thin.words), 1 + 64, "one record a draw");
+        assert_eq!(list.thin.written, 1 + 64, "one record a draw");
         let viewport = D3D12_VIEWPORT {
             TopLeftX: 1.0,
             TopLeftY: 2.0,
@@ -1281,7 +1277,7 @@ mod tests {
         };
         viewports(this, 1, &viewport);
         constants(this, COMPUTE_CONSTANTS, 3, 2, [9u32, 10].as_ptr(), 7);
-        assert_eq!(records(&list.thin.words), 1 + 66);
+        assert_eq!(list.thin.written, 1 + 66);
         let words = std::mem::take(&mut list.thin.words);
         // begin's RESET, 64 draws, one viewport, one constants block.
         assert_eq!((words[0] & 0xffff, words[0] >> 16), (RESET, 1));
@@ -1319,15 +1315,9 @@ mod tests {
             draw(this, n, 1, 0, 0);
         }
         let recorded = began.elapsed();
-        // Every call is one record, in the words held and the streams handed
-        // over (this list's own, not a count of the process's).
-        let recording = list.thin.recording.clone().expect("a recording");
-        let handed: u64 = held(&recording.inner).chunks.iter().map(|c| records(c)).sum();
-        assert_eq!(
-            handed + records(&list.thin.words) - 1,
-            u64::from(N),
-            "one record a draw"
-        );
+        // Every call is one record on this list (its own count: not the
+        // process's, and not where the words happen to be).
+        assert_eq!(list.thin.written, u64::from(N) + 1, "one record a draw");
         // What translating the same calls through the list methods costs,
         // here with no host list behind them (the floor of that cost).
         let began = std::time::Instant::now();

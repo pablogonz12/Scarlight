@@ -79,6 +79,12 @@ static FINISHED_JOBS: Mutex<u64> = Mutex::new(0);
 /// Submissions taken or waiting: those the card will be given (a signal in
 /// the line is not one).
 static SUBMISSIONS: Mutex<u64> = Mutex::new(0);
+/// A test holding the line's thread out of its own jobs (the switches being
+/// on, it would take them as they are pushed).
+#[cfg(test)]
+static PARKED: Mutex<bool> = Mutex::new(false);
+#[cfg(test)]
+static PARKED_ACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static IDLE: Condvar = Condvar::new();
 static WORK: Condvar = Condvar::new();
 /// Since the last line of the log: submissions, waits the title took in, and
@@ -172,6 +178,14 @@ fn start() {
                     line = WORK.wait(line).unwrap_or_else(|e| e.into_inner());
                 }
             };
+            #[cfg(test)]
+            if *held(&PARKED) {
+                PARKED_ACK.store(true, Release);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                continue;
+            }
+            #[cfg(test)]
+            PARKED_ACK.store(false, Release);
             if std::panic::catch_unwind(run_one).is_err() {
                 crate::host::fail(format_args!("the thread that submits lists panicked"));
             }
@@ -269,6 +283,42 @@ pub(crate) fn log(frames: f64) {
 mod tests {
     use super::*;
 
+    /// Keeps the line's own thread out of a test's jobs: with the switches on
+    /// it takes them as they are pushed, and the test then reads another
+    /// thread's work. (With no line of ours there is nothing to keep out.)
+    struct Parked {
+        parked: bool,
+    }
+
+    fn park_the_line() -> Parked {
+        if !on() {
+            return Parked { parked: false };
+        }
+        *held(&PARKED) = true;
+        // A job for it to wake on: it takes none, and says so.
+        push(Job::Work(Box::new(|| {})));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !PARKED_ACK.load(Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the line of ours did not stand still for the test"
+            );
+            std::thread::yield_now();
+        }
+        // That one is ours to run: it does nothing.
+        assert!(run_one(), "the job the line was woken with");
+        Parked { parked: true }
+    }
+
+    impl Drop for Parked {
+        fn drop(&mut self) {
+            if self.parked {
+                *held(&PARKED) = false;
+                WORK.notify_all();
+            }
+        }
+    }
+
     /// A fence, for the order test (no device needed).
     fn fence() -> This {
         let mut fence: This = std::ptr::null();
@@ -282,6 +332,8 @@ mod tests {
     /// title's wait for it takes the line in first.
     #[test]
     fn a_submission_is_not_seen_before_its_writes_are() {
+        let _parked = park_the_line();
+        let base = queued();
         let fence = fence();
         let written = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = written.clone();
@@ -292,13 +344,14 @@ mod tests {
             value: 1,
         });
         assert!(!written.load(Acquire), "nothing runs before the line does");
-        assert_eq!(queued(), 2);
+        assert_eq!(queued() - base, 2);
         assert!(run_one(), "the work runs first");
         assert!(written.load(Acquire), "its writes are in");
-        assert_eq!(queued(), 1, "the signal is still behind them");
+        assert_eq!(queued() - base, 1, "the signal is still behind them");
         assert!(run_one(), "then the signal");
-        assert_eq!(crate::fence::completed(fence), 1, "the value is set last");
-        assert_eq!(queued(), 0);
+        // (Ours, not the title's: the title's read takes the line in.)
+        assert_eq!(crate::fence::value(fence), 1, "the value is set last");
+        assert_eq!(queued(), base);
     }
 
     /// A drain waits for what the line took before it was called, not for what
@@ -306,6 +359,7 @@ mod tests {
     /// keep submitting).
     #[test]
     fn a_drain_waits_only_for_what_it_came_after() {
+        let _parked = park_the_line();
         push(Job::Work(Box::new(|| {})));
         let up_to = ACCEPTED.load(Acquire);
         push(Job::Work(Box::new(|| {})));
@@ -329,6 +383,7 @@ mod tests {
     /// does (the value is not seen before the work before it ran).
     #[test]
     fn a_signal_of_the_line_waits_for_what_the_queue_holds() {
+        let _parked = park_the_line();
         let mut queue: This = std::ptr::null();
         let desc = crate::queue::QueueDesc {
             kind: 0,
@@ -360,6 +415,7 @@ mod tests {
     /// object is not kept for a number `FINISHED` will never reach.
     #[test]
     fn a_pending_signal_is_not_a_submission_to_keep_an_object_for() {
+        let _parked = park_the_line();
         struct Flag(std::sync::Arc<std::sync::atomic::AtomicBool>);
         impl Drop for Flag {
             fn drop(&mut self) {
