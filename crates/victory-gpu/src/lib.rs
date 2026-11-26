@@ -14,12 +14,15 @@
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
 //! share, [`console`] which console model the title sees. Planned: `present`
 //! (swap chain).
-
+#[cfg(any(windows, test))]
+mod bound;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(any(windows, test))]
+mod declareonce;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -29,6 +32,8 @@ pub mod dxgi;
 mod dxc;
 pub mod fence;
 pub mod frame;
+#[cfg(any(windows, test))]
+mod frame_budget;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
@@ -42,6 +47,7 @@ pub mod pipeline;
 mod primitive;
 pub mod query;
 pub mod queue;
+mod reflection;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -52,10 +58,18 @@ mod switches;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod shader_meta;
+#[cfg(windows)]
 mod shadow;
 pub mod signature;
+#[cfg(all(windows, test))]
+mod test_device;
+#[cfg(windows)]
+mod texback;
 #[cfg(windows)]
 mod texture;
+#[cfg(all(test, windows))]
+mod warptest;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]
