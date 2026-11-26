@@ -106,7 +106,7 @@ fn under_wine() -> bool {
 
 /// Whether the container holds the root signature the shader asked for: both
 /// compilers store it as the chunk `RTS0`.
-fn carries_root_signature(bytes: &[u8]) -> bool {
+pub(crate) fn carries_root_signature(bytes: &[u8]) -> bool {
     bytes.windows(4).any(|chunk| chunk == b"RTS0")
 }
 

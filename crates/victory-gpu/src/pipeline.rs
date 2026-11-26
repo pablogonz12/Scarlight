@@ -193,11 +193,11 @@ fn with_resources(
     container: &[u8],
     host: victory_shader::emit::HostShader,
 ) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
+    use victory_shader::{Container, HwStage};
     let meta = crate::shader_meta::get_or_compute(full_hash, || {
         let c = Container::parse(container).map_err(|e| e.to_string())?;
-        let programs = match c.part(FourCC::DXIL) {
-            Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
+        let programs = match victory_shader::program_part(&c) {
+            Some(part) => victory_shader::native_programs(part).map_err(|e| e.to_string())?,
             None => Vec::new(),
         };
         let stores = programs.is_empty() || programs.iter().any(stores);
