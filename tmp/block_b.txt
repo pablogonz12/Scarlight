@@ -1,0 +1,35 @@
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = (frame, capture_source);
+            // The base back in `state` and the back buffer in PRESENT; the
+            // compositor restored both of its sources itself.
+            if composition.is_none() {
+                if by_hand {
+                    list.ResourceBarrier(&[
+                        transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                        transition(
+                            &back,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_PRESENT,
+                        ),
+                    ]);
+                } else {
+                    // The texture stays in `COPY_SOURCE`, as the list's
+                    // prelude recorded it: the title's own lists then move it
+                    // from there (`HostList::prelude`).
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    )]);
+                }
+            } else {
+                #[cfg(feature = "diagnostics")]
+                let back_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                #[cfg(not(feature = "diagnostics"))]
+                let back_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    back_state,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                )]);
+            }

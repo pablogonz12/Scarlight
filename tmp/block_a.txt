@@ -1,0 +1,91 @@
+            // What the readback below names: the composed frame on the back
+            // buffer, or the base the copy leaves there.
+            let by_hand = !present_prelude();
+            let capture_source = if let Some(((overlay, overlay_state, extent), compositor)) =
+                composition
+            {
+                compositor.record(
+                    &self.device,
+                    list,
+                    &back,
+                    [(texture, state), (overlay, overlay_state)],
+                    extent,
+                );
+                // The back buffer leaves RENDER_TARGET: as a copy source for
+                // the readback, else for PRESENT below.
+                #[cfg(feature = "diagnostics")]
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                &back
+            } else {
+                // The frame shown is the title's newest content of this
+                // texture: its staging buffer is refreshed and copied up in
+                // this present's own list, in order with the copy to the back
+                // buffer. Without it the present shows what the last list
+                // that sampled the texture uploaded -- one recorded before
+                // its refresh found the newest bytes holds a frame behind,
+                // and two textures taking turns then show their frames out of
+                // order (the intro's movie).
+                let filling = fill.is_some_and(|resource| {
+                    slot.is_none()
+                        && crate::texture::title_written(texture)
+                        && crate::texture::present_fill_pending(resource)
+                });
+                // The texture's move to the copy state is the list's, as it
+                // is any list's: the list's prelude moves it from its real
+                // state at submission, under the submission lock, recording
+                // no barrier at all when it is already in a copy state (the
+                // title may have left it in `COPY_SOURCE`, and `COPY_SOURCE
+                // -> COPY_SOURCE` is illegal). It ends in `COPY_SOURCE`,
+                // which is what the prelude then records as its real state.
+                if filling {
+                    if by_hand {
+                        list.ResourceBarrier(&[transition(
+                            texture,
+                            state,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )]);
+                    } else {
+                        copy.settle(source, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+                    }
+                    if let Some(resource) = fill {
+                        crate::texture::present_fill(copy, resource, texture);
+                    }
+                }
+                if by_hand {
+                    list.ResourceBarrier(&[
+                        transition(
+                            texture,
+                            if filling {
+                                D3D12_RESOURCE_STATE_COPY_DEST
+                            } else {
+                                state
+                            },
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        ),
+                        transition(
+                            &back,
+                            D3D12_RESOURCE_STATE_PRESENT,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        ),
+                    ]);
+                } else {
+                    // The copy up runs with the texture in `COPY_SOURCE`:
+                    // after the fill it is in `COPY_DEST`, and `settle`
+                    // records that move too.
+                    copy.settle(source, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                }
+                list.CopyResource(&back, texture);
+                texture
+            };
+            // The frame rate, into the corner of what is shown (not of the
+            // title's own frame, which the lines below read back).
+            crate::fpsbox::draw(self, list, &back, (width, height, format));

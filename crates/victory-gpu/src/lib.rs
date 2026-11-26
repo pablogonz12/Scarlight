@@ -46,6 +46,8 @@ pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod present_compositor;
+#[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;

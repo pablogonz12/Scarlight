@@ -160,6 +160,14 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   GPL-3.0: a rectangle list's fourth corner is completed opposite the right angle, wherever the three
   corners put it. This tree's geometry stage (`emit::rect_list_gs`) already finds the corner in any order; the
   rule is now in the CPU expansion too (`right_angle`, `right_corners` in `crates/victory-gpu/src/primitive.rs`).
+- **JMAN730/project-flamingo [#734](https://github.com/JMAN730/project-flamingo/pull/734)** (Yaekai, with swarm,
+  Blitz Studios and axknxla), GPL-3.0: the two-plane present compositor for the Series S menu -- the fullscreen
+  triangle, its premultiplied blend, the explicit root signature for Wine, the retry after an initialization that
+  failed, and the pair check that leaves every other present on the base-only path -- reimplemented for this
+  tree's presenter (`crates/victory-gpu/src/present_compositor.rs`, `Host::present_overlay`), whose present keeps
+  its own late-free lists and present fill. It supersedes the same idea in fxceless/victory-fork
+  [#188](https://github.com/fxceless/victory-fork/pull/188) (sagouindupm), GPL-3.0, which bundled it with an
+  `ffxDispatch` stand-in that our #162 now makes unnecessary.
 
 ## Tools
 
