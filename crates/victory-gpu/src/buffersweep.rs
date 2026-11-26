@@ -19,10 +19,30 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Passes between the ones that look at every slot: a view of a released
-/// resource goes stale without a write, and a slot written before its memory
-/// had a host copy is only made then.
-const HEAP_ROUND: u64 = 16;
+/// Passes between the ones that look at every slot when
+/// `VICTORY_HEAP_FULL_EVERY` names none: a view of a released resource goes
+/// stale without a write, and a slot written before its memory had a host
+/// copy is only made then.
+const HEAP_ROUND: u64 = 128;
+
+/// The passes between the ones that look at every slot
+/// (`VICTORY_HEAP_FULL_EVERY`, 1..=4096).
+pub(crate) fn full_every() -> u64 {
+    std::env::var("VICTORY_HEAP_FULL_EVERY")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(HEAP_ROUND)
+        .clamp(1, 4096)
+}
+
+/// The passes a slot first seen before its memory had a host copy is asked
+/// again for (`VICTORY_HEAP_RETRY=0` waits for the full scan instead).
+pub(crate) fn retry() -> u8 {
+    std::env::var("VICTORY_HEAP_RETRY")
+        .ok()
+        .and_then(|v| v.trim().parse::<u8>().ok())
+        .unwrap_or(8)
+}
 
 /// Unwatched copies refreshed, skipped as covered by the last refresh, or
 /// refreshed because they now cover more than it did.
@@ -47,6 +67,10 @@ pub(crate) struct Sweep {
     /// Only a host heap has copies, so only a Windows build keeps them.
     #[cfg(windows)]
     pub(crate) ranges: HashMap<u32, (Arc<crate::shadow::Shadow>, u64, u64)>,
+    /// Slots whose view could not be made ready yet (no host copy), with the
+    /// passes left to ask again.
+    #[cfg(windows)]
+    pub(crate) pending: HashMap<u32, u8>,
     /// Host copy: the frame it was last refreshed, and the span it covered
     /// then. Copies no write watch covers are copied whole, so the span is
     /// what decides whether the last refresh is still the newest state.
@@ -62,6 +86,8 @@ impl Default for Sweep {
             frame: AtomicU64::new(u64::MAX),
             #[cfg(windows)]
             ranges: HashMap::new(),
+            #[cfg(windows)]
+            pending: HashMap::new(),
             unwatched: HashMap::new(),
             next: HashMap::new(),
         }
@@ -74,11 +100,12 @@ impl Sweep {
         self.frame.swap(frame, Ordering::Relaxed) != frame
     }
 
-    /// The next pass number, and whether it looks at every slot.
-    pub(crate) fn pass(&mut self) -> (u64, bool) {
+    /// The next pass number, and whether it looks at every slot (every
+    /// `full_every` passes).
+    pub(crate) fn pass(&mut self, full_every: u64) -> (u64, bool) {
         let passes = self.passes;
         self.passes += 1;
-        (passes, passes.is_multiple_of(HEAP_ROUND))
+        (passes, passes.is_multiple_of(full_every.max(1)))
     }
 
     /// Whether the unwatched copy `id`, whose views now read `from..to`, is
@@ -128,10 +155,10 @@ mod tests {
         // `ranges` is per heap now: nothing is left to inherit.
         let mut old = Sweep::default();
         old.ranges.reserve(1);
-        old.pass();
+        old.pass(full_every());
         let mut new = Sweep::default();
         assert!(new.ranges.is_empty());
-        assert_eq!(new.pass().0, 0, "the first pass looks at every slot");
+        assert_eq!(new.pass(full_every()).0, 0, "the first pass looks at every slot");
     }
 
     #[test]

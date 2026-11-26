@@ -299,6 +299,10 @@ pub(crate) struct State {
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
+    /// The render target views and the depth view the host list has, once
+    /// it has any ([`State::set_targets`]): per view the host texture (0:
+    /// a null view) and what its descriptor says.
+    host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -540,6 +544,10 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+/// What a render target or depth view of the host is made from: the host
+/// texture, and [`crate::descriptor::RtvRecord::key`].
+type TargetKey = (usize, (usize, [u32; 7]));
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory.
@@ -564,9 +572,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
+    list.fill_scratch(address as *const u8, len)
 }
 
 macro_rules! once {
@@ -706,7 +712,11 @@ impl State {
         self.index = view.copied().unwrap_or_default();
     }
 
-    /// Render targets and depth, set on the host list at once.
+    /// Render targets and depth, set on the host list at once, unless it has
+    /// the same ones already: the title sets the same targets again and
+    /// again, each time a host view per target and a call of the driver
+    /// (25,662 times in a frame of another fork). `VICTORY_BIND_CACHE=0`
+    /// sets them every time.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
         let Some(host) = crate::host::host() else {
             return;
@@ -716,7 +726,8 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        let mut views = Vec::with_capacity(handles.len());
+        let mut keys = Vec::with_capacity(handles.len());
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -736,14 +747,16 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
-                    rtvs.push(host.rtv(None, Some(&desc)));
+                    views.push((None, Some(desc)));
+                    keys.push((0, record.key()));
                 }
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+            views.push((Some(texture), record.desc()));
+            keys.push((texture.as_raw() as usize, record.key()));
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
@@ -756,8 +769,15 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            Some((texture, record))
         });
+        let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
+        if crate::bindcache::same(self.host_targets.as_ref(), &now) {
+            return;
+        }
+        self.host_targets = Some(now);
+        let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
+        let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -830,6 +850,7 @@ impl State {
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
+        self.host_targets = None;
         if self.targets_set {
             let handles = std::mem::take(&mut self.target_handles);
             self.set_targets(list, &handles, self.depth_handle);
@@ -1580,22 +1601,32 @@ impl State {
         // buffer view reads, kept from pass to pass, and the frame its pass
         // last ran in (`crate::buffersweep`). Only the slots written since
         // the last pass are looked at again (83,000 slots a pass otherwise,
-        // 0.1 s at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
+        // 0.1 s at best); all of them every `full_every` passes, because a
+        // view of a released resource goes stale without a write, and a slot
+        // written before its memory had a host copy is only made then.
         let frame = crate::frame::current();
         let mut sweep = host.buffer_sweep();
         if !sweep.frame_due(frame) {
             return Some(gpu);
         }
         let changed = host.buffer_changes();
-        let (_, all) = sweep.pass();
+        // A slot first seen before its memory had a host copy is asked again
+        // for a few passes: a full scan alone would leave a dynamic index
+        // reading a stale or missing view until `full_every` came round.
+        // `VICTORY_HEAP_RETRY=0` goes back to waiting for the full scan.
+        let retry = crate::buffersweep::retry();
+        let (_, all) = sweep.pass(crate::buffersweep::full_every());
         let slots = if all {
             sweep.ranges.clear();
+            sweep.pending.clear();
             host.buffer_slots()
         } else {
-            changed
+            let mut slots = changed;
+            slots.extend(sweep.pending.keys().copied());
+            slots
         };
+        // What this pass could not make ready, for the next one.
+        let mut again: std::collections::HashMap<u32, u8> = std::collections::HashMap::new();
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1606,7 +1637,13 @@ impl State {
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
+            // The budget a slot has left: a new one where this pass is the
+            // one that found it, else what the pass before it stored.
+            let left = sweep.pending.get(&index).copied().unwrap_or(retry);
             let Some(view) = host.mirror(index, handle, true) else {
+                if left > 0 {
+                    again.insert(index, left - 1);
+                }
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1633,6 +1670,12 @@ impl State {
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                // No host copy yet: the memory may be written and read in
+                // this very list, so ask again next pass, until the budget
+                // runs out and the full scan takes it.
+                if left > 0 {
+                    again.insert(index, left - 1);
+                }
                 continue;
             };
             #[cfg(feature = "diagnostics")]
@@ -1641,6 +1684,7 @@ impl State {
             }
             sweep.ranges.insert(index, (shadow, address, address + len));
         }
+        sweep.pending = again;
         let views = sweep.ranges.len() as u32;
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<
