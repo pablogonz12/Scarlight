@@ -1,9 +1,9 @@
 //! Console primitive types the host lacks. A rectangle list gives three
-//! corners per rectangle, the second the one between the other two, and
-//! the hardware adds the fourth at `v0 + v2 - v1` (the title's
-//! full-screen rectangles come as top left, bottom left, bottom right); on
-//! the host each rectangle becomes two triangles, with the fourth vertex
-//! made from the other three on the CPU.
+//! corners per rectangle, in any order, and the hardware adds the fourth
+//! opposite the right angle (the title's full-screen rectangles come as
+//! top left, bottom left, bottom right, other lists give the right angle
+//! elsewhere); on the host each rectangle becomes two triangles, with the
+//! fourth vertex made from the other three on the CPU.
 //!
 //! shortcut: the fourth vertex is computed from vertex inputs, not from
 //! vertex shader outputs as the hardware does; that is the same for vertex
@@ -19,19 +19,42 @@
 //! left for a pipeline that could not get that stage.
 
 /// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
-/// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
-/// triangles turn the same way. `elements` are (byte offset, format).
-pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
-    for (rect, out) in src
+/// vertices each in `dst`: `(v0, v1, v2)` and `(va, vb, v3)`, so both
+/// triangles turn the same way, with the right angle `vc` picked from the
+/// `POSITION` element's first two components (taken as x and y; no such
+/// element, or not a float pair: at `v1`), `va` before it, `vb` after it and
+/// `v3 = va + vb - vc`, one entry per rectangle ([`right_corners`]; none:
+/// at `v1`). `elements` are (byte offset, format).
+pub(crate) fn expand_rects(
+    src: &[u8],
+    dst: &mut [u8],
+    stride: usize,
+    elements: &[(u32, u32)],
+    corners: &[u8],
+) {
+    if stride == 0 {
+        return;
+    }
+    for (index, (rect, out)) in src
         .chunks_exact(3 * stride)
         .zip(dst.chunks_exact_mut(6 * stride))
+        .enumerate()
     {
         let v = |i: usize| &rect[i * stride..(i + 1) * stride];
-        for (slot, i) in [0, 1, 2, 0, 2].into_iter().enumerate() {
+        // `corners` holds the corner each rectangle holds its right angle at
+        // (from the `POSITION` buffer, once for every slot): no entry keeps
+        // the second corner.
+        let right = if any_corner() {
+            corners.get(index).map_or(1, |&corner| usize::from(corner))
+        } else {
+            1
+        };
+        let (a, b) = ((right + 2) % 3, (right + 1) % 3);
+        for (slot, i) in [0, 1, 2, a, b].into_iter().enumerate() {
             out[slot * stride..(slot + 1) * stride].copy_from_slice(v(i));
         }
         let fourth = &mut out[5 * stride..];
-        fourth.copy_from_slice(v(0));
+        fourth.copy_from_slice(v(a));
         for &(offset, format) in elements {
             let at = offset as usize;
             let Some((n, kind)) = components(format) else {
@@ -42,10 +65,70 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
             let inside = stride.saturating_sub(at) / kind.bytes();
             for c in 0..n.min(inside) {
                 let get = |i: usize| kind.read(&v(i)[at..], c);
-                let value = get(0) + get(2) - get(1);
+                let value = get(a) + get(b) - get(right);
                 kind.write(&mut fourth[at..], c, value);
             }
         }
+    }
+}
+
+/// Whether the right angle is picked in any order of the corners: on by
+/// default, `VICTORY_RECT_ANY_CORNER=0` keeps the old rule (the second
+/// corner), as every list the blits make gives it.
+fn any_corner() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECT_ANY_CORNER").is_none_or(|v| v != "0"))
+}
+
+/// The corner each of `rects` rectangles of `stride`-byte vertices in `src`
+/// holds its right angle at, read from the `POSITION` element at `offset` and
+/// `format`: empty when that element is no float pair, which keeps every
+/// rectangle's second corner. Read once per draw, so that every vertex buffer
+/// slot orders the same rectangle's vertices alike.
+pub(crate) fn right_corners(src: &[u8], stride: usize, rects: usize, (offset, format): (u32, u32)) -> Vec<u8> {
+    let at = offset as usize;
+    let Some((n, kind)) = components(format) else {
+        return Vec::new();
+    };
+    let float = matches!(kind, Kind::F32 | Kind::F16);
+    if stride == 0 || !float || n < 2 || stride.saturating_sub(at) / kind.bytes() < 2 {
+        return Vec::new();
+    }
+    src.chunks_exact(3 * stride)
+        .take(rects)
+        .map(|rect| {
+            let v = |i: usize| &rect[i * stride..(i + 1) * stride];
+            right_angle([0, 1, 2].map(|i| [0, 1].map(|k| kind.read(&v(i)[at..], k)))) as u8
+        })
+        .collect()
+}
+
+/// Which of three corners holds a rectangle's right angle: the one opposite
+/// the longest side, in squared distance. A tie for the longest (and NaN,
+/// and three points on a line) keeps `1`, the corner the blits put it at.
+fn right_angle(p: [[f32; 2]; 3]) -> usize {
+    let side = |a: usize, b: usize| {
+        let (x, y) = (p[a][0] - p[b][0], p[a][1] - p[b][1]);
+        x * x + y * y
+    };
+    // The side opposite each corner: the one between the other two. A
+    // position that is not a number (or overflows a squared distance) keeps
+    // the second corner: `max` would pass over it and pick another.
+    let opposite = [side(1, 2), side(0, 2), side(0, 1)];
+    if opposite.iter().any(|s| !s.is_finite()) {
+        return 1;
+    }
+    // Three points on a line are no rectangle's corners (both halves have no
+    // area whichever corner is taken): the second, as for a tie.
+    let cross = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) - (p[1][1] - p[0][1]) * (p[2][0] - p[0][0]);
+    if cross == 0.0 {
+        return 1;
+    }
+    let longest = opposite[0].max(opposite[1]).max(opposite[2]);
+    let mut found = [0, 1, 2].into_iter().filter(|&c| opposite[c] == longest);
+    match (found.next(), found.next()) {
+        (Some(corner), None) => corner,
+        _ => 1,
     }
 }
 
@@ -176,7 +259,7 @@ mod tests {
         ]
         .concat();
         let mut dst = vec![0u8; 6 * 12];
-        expand_rects(&src, &mut dst, 12, &[(0, 16), (8, 28)]);
+        expand_rects(&src, &mut dst, 12, &[(0, 16), (8, 28)], &[]);
         assert_eq!(dst[..36], src[..]);
         assert_eq!(dst[36..48], src[..12]);
         assert_eq!(dst[48..60], src[24..36]);
@@ -200,7 +283,7 @@ mod tests {
             .flat_map(|h| h.to_le_bytes())
             .collect();
         let mut dst = vec![0u8; 6 * 2];
-        expand_rects(&src, &mut dst, 2, &[(0, 54)]);
+        expand_rects(&src, &mut dst, 2, &[(0, 54)], &[]);
         assert_eq!(dst[10..], 0x4000_u16.to_le_bytes());
     }
 
@@ -213,9 +296,111 @@ mod tests {
         let vertex = |x: f32, y: f32| [x.to_le_bytes(), y.to_le_bytes()].concat();
         let src = [vertex(0.0, 2.0), vertex(1.0, 3.0), vertex(5.0, 7.0)].concat();
         let mut dst = vec![0u8; 6 * 8];
-        expand_rects(&src, &mut dst, 8, &[(0, 16), (4, 2), (8, 28)]);
+        expand_rects(&src, &mut dst, 8, &[(0, 16), (4, 2), (8, 28)], &[]);
         assert_eq!(dst[..40], [&src[..], &src[..8], &src[16..]].concat()[..]);
         assert_eq!(dst[40..], vertex(4.0, 6.0)[..]);
+    }
+
+    /// The corners can come in any order: a list whose right angle is the
+    /// first (top left, bottom left, top right, as a tiled lighting shader
+    /// gives them) completes at the bottom right, the second triangle
+    /// (v2, v1, v3), and a triangle that is no rectangle's keeps its
+    /// winding in both halves.
+    #[test]
+    fn rectangles_complete_opposite_their_right_angle() {
+        let vertex = |x: f32, y: f32| [x.to_le_bytes(), y.to_le_bytes()].concat();
+        let src = [vertex(0.0, 0.0), vertex(0.0, 1.0), vertex(1.0, 0.0)].concat();
+        let mut dst = vec![0u8; 6 * 8];
+        let corners = right_corners(&src, 8, 1, (0, 16));
+        assert_eq!(corners, [0], "the right angle is the first corner");
+        expand_rects(&src, &mut dst, 8, &[(0, 16)], &corners);
+        assert_eq!(
+            dst[24..],
+            [&src[16..24], &src[8..16], &vertex(1.0, 1.0)[..]].concat()[..]
+        );
+        let read = |d: &[u8], i: usize| {
+            let f = |k: usize| {
+                f32::from_le_bytes(d[i * 8 + k * 4..i * 8 + k * 4 + 4].try_into().unwrap())
+            };
+            [f(0), f(1)]
+        };
+        let turn = |d: &[u8], i: usize| {
+            let [a, b, c] = [i, i + 1, i + 2].map(|k| read(d, k));
+            (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+        };
+        // No rectangle at all: both halves keep the source's winding.
+        let src = [vertex(0.0, 0.0), vertex(3.0, 1.0), vertex(1.0, 0.0)].concat();
+        let corners = right_corners(&src, 8, 1, (0, 16));
+        expand_rects(&src, &mut dst, 8, &[(0, 16)], &corners);
+        assert!(turn(&dst, 0) * turn(&dst, 3) > 0.0, "same winding");
+    }
+
+    /// The right angle is read from the `POSITION` element, wherever it sits
+    /// in the vertex: a float pair before it (texture coordinates, say) is no
+    /// position and does not pick the corner.
+    #[test]
+    fn the_right_angle_comes_from_the_position_element() {
+        let vertex = |u: f32, v: f32, x: f32, y: f32| {
+            [
+                u.to_le_bytes(),
+                v.to_le_bytes(),
+                x.to_le_bytes(),
+                y.to_le_bytes(),
+            ]
+            .concat()
+        };
+        // The texture coordinates (0,0), (0,1), (1,0) put the right angle
+        // first; the positions (0,0), (0,1), (1,1) put it second, so the
+        // fourth corner is (1, 0) and not (1, 2).
+        let src = [
+            vertex(0.0, 0.0, 0.0, 0.0),
+            vertex(0.0, 1.0, 0.0, 1.0),
+            vertex(1.0, 0.0, 1.0, 1.0),
+        ]
+        .concat();
+        let mut dst = vec![0u8; 6 * 16];
+        let corners = right_corners(&src, 16, 1, (8, 16));
+        assert_eq!(corners, [1], "the positions put the right angle second");
+        expand_rects(&src, &mut dst, 16, &[(0, 16), (8, 16)], &corners);
+        let fourth = &dst[5 * 16 + 8..];
+        assert_eq!(fourth[..4], 1.0f32.to_le_bytes(), "x");
+        assert_eq!(fourth[4..], 0.0f32.to_le_bytes(), "y");
+    }
+
+    /// The right angle is the corner opposite the longest side, in every
+    /// order; ties and NaN keep vertex 1.
+    #[test]
+    fn right_angles_are_found_in_any_order() {
+        let square = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]];
+        for (order, right) in [
+            ([0, 1, 2], 0), // top left, bottom left, top right
+            ([1, 2, 0], 2), // bottom left, top right, top left
+            ([2, 0, 1], 1), // top right, bottom left, top left
+        ] {
+            let p = order.map(|i| square[i]);
+            assert_eq!(right_angle(p), right, "{order:?}");
+        }
+        // Two sides as long as each other and the longest: the second corner.
+        assert_eq!(right_angle([[-1.0, 0.0], [0.0, 2.0], [1.0, 0.0]]), 1, "a tie");
+        assert_eq!(right_angle([[0.0, 0.0], [f32::NAN, 0.0], [1.0, 1.0]]), 1, "NaN");
+        assert_eq!(right_angle([[f32::NAN, 0.0], [0.0, 0.0], [1.0, 0.0]]), 1, "NaN first");
+        // Collinear, whichever corner is between the other two: no corner.
+        assert_eq!(right_angle([[0.0, 0.0], [2.0, 0.0], [1.0, 0.0]]), 1, "collinear, sorted");
+        assert_eq!(right_angle([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]), 1, "collinear");
+    }
+
+    /// A tie for the longest side completes at the second corner's opposite,
+    /// as the old rule did: the fourth corner of [[-1,0],[0,2],[1,0]] is
+    /// (0, -2).
+    #[test]
+    fn a_tied_longest_side_keeps_the_second_corner() {
+        let vertex = |x: f32, y: f32| [x.to_le_bytes(), y.to_le_bytes()].concat();
+        let src = [vertex(-1.0, 0.0), vertex(0.0, 2.0), vertex(1.0, 0.0)].concat();
+        let mut dst = vec![0u8; 6 * 8];
+        let corners = right_corners(&src, 8, 1, (0, 16));
+        assert_eq!(corners, [1]);
+        expand_rects(&src, &mut dst, 8, &[(0, 16)], &corners);
+        assert_eq!(dst[40..], vertex(0.0, -2.0)[..]);
     }
 
     /// `half_to_f32` reads subnormals, so an f16 rectangle output must be
