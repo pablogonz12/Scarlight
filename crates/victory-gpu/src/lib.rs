@@ -14,7 +14,8 @@
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
 //! share, [`console`] which console model the title sees. Planned: `present`
 //! (swap chain).
-
+#[cfg(any(windows, test))]
+mod bound;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
@@ -24,6 +25,8 @@ pub mod console;
 mod compare;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(any(windows, test))]
+mod declareonce;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
