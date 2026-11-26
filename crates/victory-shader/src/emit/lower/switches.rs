@@ -88,6 +88,9 @@ mod tests {
     /// Each accessor reads its own variable, and `force` is what its path sees.
     #[test]
     fn each_switch_turns_its_own_path_off() {
+        // Held across the force, the assertion and the clear: another test
+        // forcing a switch must not see a half-cleared state.
+        let _held = super::exclusive();
         for (name, accessor) in [
             ("VICTORY_BITWISE_MODS", mods as fn() -> bool),
             ("VICTORY_F16_FMA_ONCE", fma_once as fn() -> bool),
@@ -99,7 +102,11 @@ mod tests {
             assert!(accessor(), "{name} on must leave the switch on");
             force(name, None);
         }
-        // Cleared again: the process default, on.
-        assert!(mods() && fma_once() && field());
+        // Cleared again: each accessor reads its variable, on unless it is
+        // set to 0.
+        let configured = |name: &str| super::set_from(std::env::var_os(name).as_deref());
+        assert_eq!(mods(), configured("VICTORY_BITWISE_MODS"));
+        assert_eq!(fma_once(), configured("VICTORY_F16_FMA_ONCE"));
+        assert_eq!(field(), configured("VICTORY_FIELD_DWORD"));
     }
 }

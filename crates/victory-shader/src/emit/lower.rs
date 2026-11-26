@@ -7812,6 +7812,12 @@ impl<'a> Lower<'a> {
                     (self.src(inst, 0)?, self.src(inst, 1)?)
                 };
                 let r = self.s.m.select(c, cond, bb, a);
+                if v.clamp || v.omod != 0 {
+                    // Output modifiers are float ones, on the bits the
+                    // select passed: the select itself stays bitwise.
+                    let f = self.as_float(r);
+                    return float(self, f);
+                }
                 int(self, r)
             }
             "v_add_co_u32" | "v_sub_co_u32" | "v_subrev_co_u32" | "v_add_co_ci_u32"
