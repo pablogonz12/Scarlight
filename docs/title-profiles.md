@@ -46,11 +46,15 @@ tree. Do not open a pull request that adds one.
 name  = "my label for this build"   # what the layer prints at launch
 build = ["<hex>"]                   # BLAKE3 of the image, 16+ digits, matched as a prefix
 
+render_scale  = 0.67                # optional; 0.2..=1.0 of the output size
+own_upscaler  = true                # optional; the title's own upscaler everywhere
+
 [[hooks]]                           # optional; place code patches after mapping
 what   = "our words for the patch"  # logged
 rva    = 0x1000                     # offset from the start of the mapped image
 expect = "488b0500000000"           # bytes that must be there first (hex, spaces allowed)
 new    = "eb189090909090"           # bytes to write, the same length as expect
+when   = ["render_scale"]           # optional; only with these switches on
 
 [skip]                              # optional; work the GPU layer leaves out
 shaders = ["<16 hex digits>"]       # skip a pipeline containing one of these shaders
@@ -67,6 +71,35 @@ match the bytes there. Anything else is logged and skipped, and the code never t
 fails those checks. A hook that passes them is applied as written, so the profile's own bytes are
 still your decision. Hooks need `VICTORY_HOOKS=1` (formerly `VICTORY_NO_WATCHDOG=1`, still
 accepted) — patches are opt-in, never automatic.
+
+### Switches a hook can depend on
+
+A build's resolution work is a set of patches that only make sense together, and which of them
+apply depends on what was asked for. Rather than a switch per title, a hook names the switches it
+needs in `when`, and the profile (or the environment) says which are on:
+
+| Switch | On when | Written as |
+|---|---|---|
+| `render_scale` | `VICTORY_RENDER_SCALE` is a number in `0.2..=1.0`; with the variable unset, the profile's `render_scale` | an f32 |
+| `own_upscaler` | `VICTORY_OWN_UPSCALER` is set and not `0`; with the variable unset, the profile's `own_upscaler = true` | a bool |
+
+The profile's fields are read only when the variable is absent. Set, the variable's own reading wins
+whatever the profile says: `VICTORY_OWN_UPSCALER=0` is off even where the profile says `true`, and a
+`VICTORY_RENDER_SCALE` that is not a number in `0.2..=1.0` turns the scale off rather than falling
+back to the profile's value (the log says the value was refused).
+
+`!own_upscaler` in `when` means the hook is placed only when the switch is off — a patch for the
+fallback path that must not run beside the one for the other, for instance. A hook whose `when`
+lists a name that is not one of the two is never placed, and the log says so.
+
+Two kinds of bytes a profile cannot spell out are written for it:
+
+- `new_scale = true` writes the effective render scale as an f32, little-endian, instead of `new`
+  (`expect` still gives the length, which must be four). The `render_scale` switch must be on.
+- `expect_from = 0x1234` and `new_from = 0x5678` read and write `base + rva` as an 8-byte address,
+  where `base` is where the image was loaded, instead of the bytes in `expect` and `new`: some
+  places hold a pointer to one of the image's own functions, and only the load address knows it.
+  Leave `expect` or `new` out when the matching `*_from` is given.
 
 `[skip]` is read by the GPU layer's diagnostics build (it already excludes draws and dispatches for
 other reasons there). In a plain release build the lists are ignored, and `VICTORY_SKIP_PIPELINES`
