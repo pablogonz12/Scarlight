@@ -1746,6 +1746,8 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
 
 #[test]
 fn write_f_omod_flushes_neg_zero() {
+    // The fix has to be on for this test, whatever the environment says.
+    lower::switches::force(lower::switches::OMOD_ZERO, Some(true));
     // v_add_f32_e64 v0, v1, v2 with omod: RDNA2 flushes -0.0 to +0.0 after
     // the scale (mul:2/mul:4/div:2), while IEEE FMul keeps the sign of zero.
     // VOP3 opcode 0x103 is VOP2 v_add_f32 (0x003) on the VOP2-in-VOP3 base.
@@ -1778,6 +1780,7 @@ fn write_f_omod_flushes_neg_zero() {
             "{backend}: v_add_f32(-0, -0) without omod must keep -0 ({got:#010x})"
         );
     });
+    lower::switches::force(lower::switches::OMOD_ZERO, None);
 }
 
 /// `v_mad_u32_u16` / `v_mad_i32_i16` (op_sel[0:1] pick the halves of src0/src1,

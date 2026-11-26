@@ -94,6 +94,9 @@ mod tests {
     /// Each accessor reads its own variable, and `force` is what its path sees.
     #[test]
     fn each_switch_turns_its_own_path_off() {
+        // The process default of each switch, whatever the environment holds
+        // (`VICTORY_SHADER_OMOD_ZERO=0` in it must not fail this test).
+        let defaults = [cfg_prune(), omod_zero(), sbuffer_term()];
         for (name, accessor) in [
             (CFG_PRUNE, cfg_prune as fn() -> bool),
             (OMOD_ZERO, omod_zero as fn() -> bool),
@@ -105,7 +108,7 @@ mod tests {
             assert!(accessor(), "{name} on must leave the switch on");
             force(name, None);
         }
-        // Cleared again: the process default, on.
-        assert!(cfg_prune() && omod_zero() && sbuffer_term());
+        // Cleared again: each switch is back on its process default.
+        assert_eq!([cfg_prune(), omod_zero(), sbuffer_term()], defaults);
     }
 }
