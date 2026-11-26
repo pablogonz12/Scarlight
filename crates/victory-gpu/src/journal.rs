@@ -324,10 +324,13 @@ mod tests {
             let page = READS + t * (1 << 20) + i;
             let _ = any_since(page, page + 1, 0);
         };
+        // Alone at a page base of its own, so the two runs' pages do not
+        // overlap and each can be counted.
+        const ALONE: usize = 64;
         let alone = |f: &dyn Fn(usize, usize)| {
             let started = Instant::now();
             for i in 0..OPS {
-                f(0, i);
+                f(ALONE, i);
             }
             started.elapsed().as_nanos() as f64 / OPS as f64
         };
@@ -345,12 +348,14 @@ mod tests {
             started.elapsed().as_nanos() as f64 / OPS as f64
         };
         let (w1, w8, r1, r8) = (alone(&bump), eight(&bump), alone(&question), eight(&question));
-        // Whether the bench fired at all: the pages it recorded are there.
+        // Whether the bench fired at all: the pages it recorded are there,
+        // one per op of each run.
         let seen = recorded();
+        assert_eq!(pages(WRITES, WRITES + 8 * (1 << 20)).len(), OPS, "nothing was recorded");
         assert_eq!(
-            pages(WRITES, WRITES + 8 * (1 << 20)).len(),
+            pages(WRITES + ALONE * (1 << 20), WRITES + (ALONE + 1) * (1 << 20)).len(),
             OPS,
-            "the bench recorded nothing"
+            "nothing was recorded alone"
         );
         eprintln!(
             "journal: {n} shards, {OPS} ops — record (one page): {w1:.1} ns alone, {w8:.1} ns on 8 \
@@ -360,6 +365,24 @@ mod tests {
         assert!(
             r8 < 20_000.0 && w8 < 20_000.0,
             "acquisitions cost microseconds: {r8:.0}/{w8:.0} ns"
+        );
+        // A frame's records: a submission of 10,000 buffer copies, the same
+        // pages every frame, ten frames deep.
+        const FRAME: usize = 10_000;
+        const FRAMES: usize = 10;
+        clear();
+        let started = Instant::now();
+        for _ in 0..FRAMES {
+            for i in 0..FRAME {
+                record(FRAME + i, FRAME + i + 1, 1);
+            }
+        }
+        let per = started.elapsed().as_micros() as f64 / FRAMES as f64;
+        let fired = pages(FRAME, 2 * FRAME).len();
+        assert_eq!(fired, FRAME, "the frame's records were not journalled");
+        eprintln!(
+            "journal: a frame of {FRAME} records — {per:.1} us a frame, {fired} pages in the \
+             journal of it"
         );
         clear();
     }
