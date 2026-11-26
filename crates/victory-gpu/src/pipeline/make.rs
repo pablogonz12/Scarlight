@@ -164,6 +164,15 @@ pub(crate) fn waiting() -> u64 {
 
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
+/// Pipeline requests that had to wait for their pipeline, since the last
+/// call: what the frame's wait budget was spent on (counted per request,
+/// not once per pipeline: a pipeline made long ago costs nothing here).
+static DEMANDED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn take_demanded() -> u64 {
+    DEMANDED.swap(0, Ordering::Relaxed)
+}
+
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
@@ -171,6 +180,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
+        DEMANDED.fetch_add(1, Ordering::Relaxed);
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }

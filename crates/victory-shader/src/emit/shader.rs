@@ -13,6 +13,18 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
 
+/// A view handle's properties word, bit 13: the view is a rasterizer
+/// ordered view (DXC's `AnnotateROVMask`; dxil-spirv reads it as `rov`).
+/// A pixel shader that touches one runs under a pixel interlock
+/// (`SPV_EXT_fragment_shader_interlock`).
+pub const ROV: u32 = 0x2000;
+
+/// A view handle's properties word, bit 12: the view is a UAV.
+pub const UAV: u32 = 0x1000;
+
+/// `DB_SHADER_CONTROL` bit 16: primitive ordered pixel shading (POPS).
+const POPS: u32 = 1 << 16;
+
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
 /// index it computes (SM 6.6 dynamic resources): a raw buffer of
@@ -84,6 +96,9 @@ pub(crate) mod flags {
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
+    /// A POPS pixel shader's rasterizer ordered views (the console's
+    /// primitive ordered pixel shading): DXC's `RasterizerOrderedViews`.
+    pub const ROVS: u64 = 1 << 18;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
@@ -162,6 +177,11 @@ pub(crate) struct Shader {
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
+    /// A pixel shader under the console's primitive ordered pixel shading
+    /// (`DB_SHADER_CONTROL` bit 16): every UAV it reads or writes is a
+    /// rasterizer ordered view, so writes to one address from different
+    /// primitives reach it in primitive order.
+    pub rovs: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// Ballots made to learn whether a DPP source lane is in EXEC.
@@ -228,6 +248,7 @@ impl Shader {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             flags: 0,
+            rovs: false,
             nonuniform_handles: 0,
             #[cfg(test)]
             exec_ballots: 0,
@@ -368,10 +389,24 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        let rov = if self.rovs { ROV } else { 0 };
+        if rov != 0 {
+            self.flags |= flags::ROVS;
+        }
+        let h = self.annotate(block, h, 11 | UAV | rov, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_uavs.push((slot, h));
         h
+    }
+
+    /// Whether the program is a pixel shader under the console's primitive ordered pixel
+    /// shading (`DB_SHADER_CONTROL` bit 16): its writes through UAVs are ordered against
+    /// other primitives' writes to the same address, which the host has as rasterizer
+    /// ordered views (an interlock). `VICTORY_POPS_ROV=0` keeps plain UAVs, as before.
+    pub fn pops(&mut self, db_shader_control: u32) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var_os("VICTORY_POPS_ROV").is_none_or(|v| v != "0"));
+        self.rovs = db_shader_control & POPS != 0 && on;
     }
 
     /// The handle of immediate sampler `n` (a comparison sampler when its
@@ -453,6 +488,13 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
+        // A UAV in a POPS pixel shader is rasterizer ordered (see `rovs`).
+        let props = if self.rovs && props.0 & UAV != 0 {
+            self.flags |= flags::ROVS;
+            (props.0 | ROV, props.1)
+        } else {
+            props
+        };
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -592,6 +634,13 @@ impl Shader {
                 let u = self.m.undef(p);
                 let no = self.m.bool(false);
                 let no = self.m.md_value(no);
+                // A POPS pixel shader's UAVs are rasterizer ordered views.
+                let ordered = if self.rovs {
+                    let yes = self.m.bool(true);
+                    self.m.md_value(yes)
+                } else {
+                    no
+                };
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
                     // Id, variable, name, space, lower bound, range size,
@@ -607,7 +656,7 @@ impl Shader {
                         Some(i32c(&mut self, 11)),
                         Some(no),
                         Some(no),
-                        Some(no),
+                        Some(ordered),
                         None,
                     ];
                     list.push(Some(self.m.md_node(ops)));
@@ -820,6 +869,11 @@ impl Shader {
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
+        }
+        // D3D_SHADER_FEATURE_ROVS: the validator compares it with the
+        // handles' ROV property and the resources metadata's flag.
+        if self.flags & flags::ROVS != 0 {
+            features |= 0x1000;
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;

@@ -87,6 +87,12 @@ pub(crate) struct Lowered {
     /// `dx.op.discard`s a pixel program makes (survival and masking).
     #[cfg(test)]
     pub pixel_discards: u32,
+    /// Whether its UAVs are rasterizer ordered views (a POPS pixel shader).
+    #[cfg(test)]
+    pub rovs: bool,
+    /// Whether the shader flags and `SFI0` declare rasterizer ordered views.
+    #[cfg(test)]
+    pub rov_flag: bool,
     /// The constant table's first byte and dwords, if the program has one.
     #[cfg(test)]
     pub code_table: Option<(u32, Vec<u32>)>,
@@ -1276,6 +1282,12 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if let StageIo::Ps {
+            db_shader_control, ..
+        } = &x.native.io
+        {
+            s.pops(*db_shader_control);
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -2389,6 +2401,10 @@ impl<'a> Lower<'a> {
             helper_readfirst: self.s.helper_readfirst,
             #[cfg(test)]
             pixel_discards: self.s.pixel_discards,
+            #[cfg(test)]
+            rovs: self.s.rovs,
+            #[cfg(test)]
+            rov_flag: self.s.flags & flags::ROVS != 0,
             #[cfg(test)]
             code_table: self.code_table.map(|t| (t.1, self.code_words)),
             #[cfg(test)]
