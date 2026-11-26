@@ -454,20 +454,22 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     let first = list.first_use(placed as usize);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
-    // shows as a change of state.
+    // shows as a change of state. A texture no list has recorded is one the
+    // host wrote behind this view — a copy destination — so its first read
+    // is ordered from there, not assumed to be a copy source already.
     let before = list
-        .transition(source, COPY_SOURCE)
+        .transition_from(source, COPY_SOURCE, COPY_DEST)
         .map(|(texture, before)| {
-            let state = crate::host::legal_state(texture, COPY_SOURCE);
-            let barrier = crate::host::transition(
-                texture,
-                D3D12_RESOURCE_STATES(before as i32),
-                D3D12_RESOURCE_STATES(state as i32),
-            );
-            // SAFETY: an open list and a live texture.
-            unsafe { list.list.ResourceBarrier(&[barrier]) };
-            before
-        });
+        let state = crate::host::legal_state(texture, COPY_SOURCE);
+        let barrier = crate::host::transition(
+            texture,
+            D3D12_RESOURCE_STATES(before as i32),
+            D3D12_RESOURCE_STATES(state as i32),
+        );
+        // SAFETY: an open list and a live texture.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        before
+    });
     if !first && before.is_none() {
         return true;
     }
