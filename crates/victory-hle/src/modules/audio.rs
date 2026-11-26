@@ -1163,6 +1163,12 @@ mod tests {
                 .map(|v| v.trace.produced)
                 .unwrap_or(0)
         };
+        let frames = || {
+            lock(&xma().voices[1])
+                .as_ref()
+                .map(|v| v.trace.frames)
+                .unwrap_or(0)
+        };
         submit(ENABLE_XMA, &[1]);
         // Drain the first input: the voice ends on the flushed tail.
         for _ in 0..40 {
@@ -1174,7 +1180,7 @@ mod tests {
         }
         assert_eq!(context.field(0, 20, 2), 0, "input used up");
         assert_eq!(context.field(2, 26, 5), INPUT_INVALID, "the voice ended");
-        let first = produced();
+        let (first, first_frames) = (produced(), frames());
         assert!(first > 0, "the first input played");
 
         // The title publishes a second input on input 1 and enables the ring
@@ -1186,6 +1192,9 @@ mod tests {
         unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), second.cast(), stream.len()) };
         context.set(2, 32);
         context.set(6, second_apu);
+        // Its packet count lives in word 1 (input 1), as input 0's does in
+        // word 0: without it the decoder is handed no packets.
+        context.set_field(1, 0, 12, 2);
         context.set_field(0, 20, 2, 2);
         context.set_field(2, 26, 5, INPUT_INVALID);
         context.set_field(1, 31, 1, 1);
@@ -1195,6 +1204,11 @@ mod tests {
             produced() > first,
             "the refilled input decodes ({first} -> {})",
             produced()
+        );
+        assert!(
+            frames() > first_frames,
+            "a frame of the second input reached the decoder ({first_frames} -> {})",
+            frames()
         );
 
         submit(DISABLE_XMA, &[1]);
