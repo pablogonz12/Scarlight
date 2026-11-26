@@ -184,6 +184,11 @@ responsible for the code they submit, whoever or whatever helped write it.
 
 Missing or wrong name? Open an issue.
 
+- **fxceless/victory-fork [PR #1040](https://github.com/fxceless/victory-fork/pull/1040)** (Moon0755), GPL-3.0:
+  `v_div_fixup_f16` lowered through the f32 `v_div_fixup`'s special cases (an f16 is exact in f32), its table of
+  the ISA's checks and its generated case grid (`crates/victory-shader/src/emit/lower.rs`,
+  `VICTORY_SHADER_DIV_FIXUP_F16=0`). Its `v_div_fixup_f32` rewrite (a `|q|`-all-ones check and a different
+  default NaN) is not taken: the f32 arm stays as it was, only moved into the shared helper.
 - **miatson/VIctory [28b7278f](https://github.com/miatson/VIctory/commit/28b7278f)** (miatson), GPL-3.0: the
   finding that the console blends (MIN, MAX) into integer render targets while D3D12 refuses a pipeline that
   enables blending on one, so those targets are made to write unblended, per target and with independent
