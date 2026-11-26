@@ -298,6 +298,7 @@ pub const SWITCHES: &[&str] = &[
     "VICTORY_GROUP_SPLIT",
     "VICTORY_GROUP_SYNC",
     "VICTORY_MESH_OUTPUT_STRICT",
+    "VICTORY_SHADER_DIV_FIXUP_F16",
     "VICTORY_SHADER_LOOP_LIMIT",
     "VICTORY_SHADER_LOOP_LIMIT_CS",
     "VICTORY_SHADER_OPT",
@@ -846,7 +847,7 @@ fn emit_program(
             .enumerate()
             .map(|(n, &w)| {
                 let mut s = StaticSampler::from_words(w);
-                if l.cmp_samplers >> n & 1 != 0 {
+                if l.cmp_samplers.get(n).copied().unwrap_or(false) {
                     s.filter |= 0x80;
                 }
                 s
