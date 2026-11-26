@@ -196,6 +196,12 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   off), 16-bit compares that ignore `op_sel` as RDNA2 does, `v_div_fixup_f16`, and saturating `v.clamp` on the
   packed 16-bit integer add/sub/mad (`crates/victory-shader/src/emit/`).
 
+- **Belobug/VIctory-Belobug-AMD `ambient.rs`**, via **fxceless/victory-fork [PR #1093](https://github.com/fxceless/victory-fork/pull/1093)**
+  (m335671), GPL-3.0: the least indirect light, a compute pass after the program that resolves it, shaded from the
+  scene's depth alone and packed as R9G9B9E5 words (`crates/victory-gpu/src/ambient_floor.rs`,
+  `VICTORY_AMBIENT_FLOOR`). Its program name and both table offsets are not taken: the runner names the program and
+  the views, so no title's own hold in this tree.
+
 - **fxceless/victory-fork [PR #976](https://github.com/fxceless/victory-fork/pull/976)** (MoscaLosca), GPL-3.0: a
   compute or mesh dispatch asking for more than the host's 65,535 groups in `x` runs as pieces, each told where
   its groups start in a host-computed user-data dword the translated program adds to its group id
