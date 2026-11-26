@@ -75,6 +75,34 @@ body:
       placeholder: vkd3d-proton master, d3d12.dll next to victory.exe
     validations:
       required: true
+  - type: input
+    id: mesa-cache
+    attributes:
+      label: Mesa shader cache (optional)
+      description: The `MESA_SHADER_CACHE_*` values the run used — directory, disable flag, max
+        size — or "defaults". A warm cache and a cold one are not comparable runs.
+      placeholder: MESA_SHADER_CACHE_DIR=~/.local/share/scarlight-prefix/mesa-cache, MAX_SIZE=8G,
+        DISABLE=false
+  - type: input
+    id: victory-switches
+    attributes:
+      label: VICTORY_* switches set (optional)
+      description: Any experimental or diagnostics switches the run used; the tables are in
+        [docs/linux.md](https://github.com/pablogonz12/Scarlight/blob/main/docs/linux.md#switches).
+        Write "none" for a plain run.
+      placeholder: VICTORY_HOOKS=1, VICTORY_GPU_TIMING=1
+  - type: textarea
+    id: device-features
+    attributes:
+      label: host device features line (optional)
+      description: The `host device features` line from the startup log (`VICTORY_LOG=info`). It
+        names the shader model, mesh-shader and ray-tracing tiers and 64-bit integer shader ops the
+        driver
+        gave the run, so a quiet fallback path is visible without guessing.
+      render: shell
+      placeholder: 'INFO victory_gpu::host: host device features adapter=... shader_model=6.8
+
+        mesh_tier=1 raytracing_tier=1.1 int64_shader_ops=true'
   - type: dropdown
     id: progress
     attributes:
