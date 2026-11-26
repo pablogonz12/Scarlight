@@ -638,6 +638,12 @@ void main() {
         for source in [crate::host::CARD_COMPARE, crate::host::CARD_COMPARE_WIDE] {
             let bytes = compile(source, "main", "cs_5_1").expect("the card compare must compile");
             assert!(bytes.len() > 4);
+            // The host creates the root signature the container holds: bytes
+            // without it would pass a length check and still be refused.
+            assert!(
+                crate::dxc::carries_root_signature(&bytes),
+                "the card compare's container must carry its root signature"
+            );
         }
     }
 
