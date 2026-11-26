@@ -2365,7 +2365,7 @@ impl State {
             // Our pass set its own pipeline, root signature and heap: the next bind sets the title's again.
             self.host_pipeline = 0;
             self.host_roots = [0; 2];
-            self.host_heaps = [0; 2];
+            self.host_heaps = None;
         }
     }
 
