@@ -2085,6 +2085,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn root_signature_flags_end_in_a_usable_signature() {
+        let _once = crate::warptest::lock();
         let Some(device) = device() else { return };
         let mut taken = true;
         for (compute, what) in [(false, "graphics"), (true, "compute")] {
