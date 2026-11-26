@@ -191,6 +191,11 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   the container gets the same BLAKE3 as its standalone copy (`Container::as_bytes()`,
   `crates/victory-shader/src/dxbc.rs`; `Source::bytes()` for both the raw and the `SGD5` paths,
   `apps/victory/src/shader.rs`). Reimplemented on this tree's `victory translate`, which has no `warm` command.
+- **DexNom/VIctory [ddb73326](https://github.com/DexNom/VIctory/commit/ddb73326b09e600bd2405ee5c987fa611098aaa1)** (DexNom), GPL-3.0: a
+  sample whose sampler comes from a uniform branch between two immediate samplers binds both as static
+  samplers, samples twice with the original derivatives and selects the texel on the edge that supplied the
+  console's sampler (`crates/victory-shader/src/emit/lower.rs`); this is what recovered the archive's refused
+  windshield and wiper pixel and mesh variants.
 
 - **avatarmanz/VIctory-7900XTX** (GPL-3.0), commit [b6202840a](https://github.com/avatarmanz/VIctory-7900XTX/commit/b6202840a):
   the idea of comparing title bytes under shader writes with AVX2 rather than eight bytes at a time: the copy-back's

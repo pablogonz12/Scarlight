@@ -270,6 +270,8 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
 pub const SWITCHES: &[&str] = &[
     "VICTORY_BRANCH_SAME_ARMS",
     "VICTORY_CODE_READS",
+    "VICTORY_DX_LANE_MASK_MOVES",
+    "VICTORY_DX_STATIC_SAMPLER_PHI",
     "VICTORY_ANISO_POINT_MIP",
     "VICTORY_INTERP_F16_OMOD_CLAMP",
     "VICTORY_F16_NEAREST",

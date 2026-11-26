@@ -1259,6 +1259,14 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// Whether a sample whose sampler is a phi of two immediate samplers binds
+/// both as static samplers and selects the texel.
+/// `VICTORY_DX_STATIC_SAMPLER_PHI=0` refuses such a sample again.
+fn static_sampler_phi() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var_os("VICTORY_DX_STATIC_SAMPLER_PHI").is_some_and(|v| v == "0"))
+}
+
 /// Where a program's constant table starts in its code: where its
 /// instructions end, unless a load at a fixed offset reads below that (then
 /// at `lowest`, the lowest offset any load or descriptor names). The
@@ -9395,7 +9403,8 @@ impl<'a> Lower<'a> {
 
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let sampler = self.descriptors.get(&((b, i), true)).copied();
-        if let Some(Source::Phi { block, args }) = sampler
+        if static_sampler_phi()
+            && let Some(Source::Phi { block, args }) = sampler
             && let [first @ Source::Constant(_), second @ Source::Constant(_)] = args.as_slice()
             && let [left, right] = self.x.p.blocks[*block].preds.as_slice()
         {
