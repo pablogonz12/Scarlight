@@ -12,6 +12,29 @@ use crate::{io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
+/// A same-target branch that closes a loop can be cut short exactly as a
+/// plain jump can (`VICTORY_BRANCH_SAME_ARMS`), so a barrier after it
+/// must not wait for the group.
+#[test]
+fn a_same_target_branch_loop_counts_as_a_cut_short_loop() {
+    use super::cuts_short;
+    use crate::structure::LaneExit;
+    let back = |from: usize, to: usize| from > to;
+    let loop_ = |taken, not_taken| LaneExit::Branch {
+        when: crate::structure::Bool::TRUE,
+        taken,
+        not_taken,
+    };
+    // Index is the block the exit belongs to: 2 > 0 closes a loop.
+    assert!(!cuts_short(&[LaneExit::Jump(0)], &back));
+    assert!(cuts_short(&[LaneExit::End, LaneExit::End, LaneExit::Jump(0)], &back));
+    assert!(!cuts_short(&[loop_(0, 0)], &back));
+    assert!(cuts_short(&[LaneExit::End, LaneExit::End, loop_(0, 0)], &back));
+    assert!(!cuts_short(&[LaneExit::End, LaneExit::End, loop_(0, 1)], &back));
+    assert!(!cuts_short(&[LaneExit::End, LaneExit::End, loop_(2, 2)], &back));
+    assert!(!cuts_short(&[LaneExit::End], &back));
+}
+
 #[test]
 fn packed_pixel_inputs_find_their_second_row() {
     use super::super::container::SigElement;
