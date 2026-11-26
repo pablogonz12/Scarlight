@@ -154,6 +154,9 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
 
 - **Mesa** ([aco_opcodes.py](https://gitlab.freedesktop.org/mesa/mesa)), MIT: the reference list of
   RDNA2 instruction forms in `tools/progress/rdna2_isa_forms.txt` is generated from it.
+- **JMAN730/project-flamingo** ([#666](https://github.com/JMAN730/project-flamingo/pull/666)), GPL-3.0: page
+  numbers of freed physical pages are handed out again instead of only ever growing, and allocation stops at the
+  title's 21-bit `number >> 4` field (`crates/victory-hle/src/modules/xmem.rs`, `VICTORY_PAGE_RECYCLE=0`).
 - **Marvisak/VIctory [#2507](https://github.com/Marvisak/VIctory/pull/2507)** (TheGrayOrange), GPL-3.0: the
   DirectStorage staging buffer takes the capacities the console documents (0, 16, 20, 24, 28, 32 MiB) and refuses
   any other size, keeping the one the scheduler has (`crates/victory-hle/src/modules/dstorage.rs`).
