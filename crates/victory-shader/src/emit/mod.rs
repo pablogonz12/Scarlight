@@ -97,6 +97,9 @@ mod sampler;
 mod shader;
 #[cfg(test)]
 mod key_tests;
+#[cfg(test)]
+mod spirv_tests;
+pub mod spirv;
 mod threading;
 #[cfg(windows)]
 pub mod validator;
@@ -432,6 +435,26 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let io = io::raise(&p, &native)?;
     let st = st?;
     emit(&c, &native, &p, &st, &io, &res)
+}
+
+/// Translates a compute container straight to a SPIR-V module (native-path
+/// spike: no DXIL, no dxil-spirv). See [`spirv`] for what it covers.
+pub fn translate_spirv(container: &[u8]) -> Result<Vec<u32>, ShaderError> {
+    let c = Container::parse(container)?;
+    let dxil = c
+        .part(FourCC::DXIL)
+        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let native = crate::native_programs(dxil.data)?
+        .into_iter()
+        .find(|p| p.stage == HwStage::Cs)
+        .ok_or(ShaderError::Unsupported {
+            offset: 0,
+            what: "a container without a compute program",
+        })?;
+    let p = crate::spill::build(&native)?;
+    let io = io::raise(&p, &native)?;
+    let words = spirv::emit(&native, &p, &io)?;
+    Ok(words)
 }
 
 /// Emits a program whose earlier stages already ran.
