@@ -1195,7 +1195,13 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     forget(at, len);
     let mut g = guards();
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    g.absent.retain(|b| *b < first || *b >= last);
+    // Only this range's entries: `absent` holds every hole of every
+    // reservation, and a scan of all of them under `GUARDS` is what the
+    // guard and fault paths cannot afford.
+    let stale: Vec<usize> = g.absent.range(first..last).copied().collect();
+    for block in stale {
+        g.absent.remove(&block);
+    }
     // What is there now is new: a copy must ask the kernel again.
     let was: Vec<usize> = g.mapped.range(first..last).copied().collect();
     for block in was {
