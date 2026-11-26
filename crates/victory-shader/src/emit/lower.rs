@@ -78,6 +78,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// The blocks of the module (a test of which edge blocks lowering made).
+    #[cfg(test)]
+    pub blocks: usize,
     /// The constant table's first byte and dwords, if the program has one.
     #[cfg(test)]
     pub code_table: Option<(u32, Vec<u32>)>,
@@ -305,6 +308,8 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
+    /// Whether the exchange pair was zeroed in the entry block ([`Self::zero_exchange_pair`]).
+    wide_zeroed: bool,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
@@ -1254,6 +1259,14 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// Whether a sample whose sampler is a phi of two immediate samplers binds
+/// both as static samplers and selects the texel.
+/// `VICTORY_DX_STATIC_SAMPLER_PHI=0` refuses such a sample again.
+fn static_sampler_phi() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var_os("VICTORY_DX_STATIC_SAMPLER_PHI").is_some_and(|v| v == "0"))
+}
+
 /// Where a program's constant table starts in its code: where its
 /// instructions end, unless a load at a fixed offset reads below that (then
 /// at `lowest`, the lowest offset any load or descriptor names). The
@@ -1471,12 +1484,7 @@ impl<'a> Lower<'a> {
                 let at = |b: usize| place.get(b).copied().unwrap_or(usize::MAX);
                 at(from) != usize::MAX && at(to) <= at(from)
             };
-            let cut_short = x
-                .st
-                .exits
-                .iter()
-                .enumerate()
-                .any(|(b, e)| matches!(*e, LaneExit::Jump(t) if back(b, t)));
+            let cut_short = cuts_short(&x.st.exits, &back);
             let all = all_lane_blocks(x.st);
             (0..p.blocks.len())
                 .filter(|&b| p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier"))
@@ -1610,6 +1618,7 @@ impl<'a> Lower<'a> {
             all_group,
             clane: None,
             pair: None,
+            wide_zeroed: false,
             halves,
             wave_base: None,
             flat: None,
@@ -2256,6 +2265,7 @@ impl<'a> Lower<'a> {
         if halves {
             // two host waves of 32 hold the console's 64 lanes: the second half's sum is
             // read where the first holds it and added (the exchange of [`Self::half_sum`]).
+            self.zero_exchange_pair();
             let c = self.cur;
             let bits = self.as_int(total);
             let (lo, hi) = self.exchange_halves(c, bits);
@@ -2379,6 +2389,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            blocks: self.s.m.blocks(),
             #[cfg(test)]
             code_table: self.code_table.map(|t| (t.1, self.code_words)),
             #[cfg(test)]
@@ -3842,6 +3854,36 @@ impl<'a> Lower<'a> {
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
+    /// The exchange pair starts at zero: every lane of the group writes its console wave's two
+    /// dwords in the entry block, before any lane is masked off, and a barrier there orders
+    /// them for all host waves of the group. The widened sum ([`Self::half_sum_wide`]) folds
+    /// in both halves' sums, but a half whose lanes all run elsewhere (a host wave that
+    /// branches over the region) writes nothing, and its dword would otherwise be read as
+    /// whatever the workgroup's LDS held there: WARP leaves such a slot zero, a card leaves
+    /// the last dispatch's dwords, so the same sum came out 0x5246 on WARP and 0x5249 on RADV
+    /// (RX 9070 XT, Mesa 26.3.1), differently per run.
+    fn zero_exchange_pair(&mut self) {
+        let Some(&(slot, false, _)) = self.exchange.as_ref() else {
+            return;
+        };
+        if self.local || self.wide_zeroed {
+            return;
+        }
+        self.wide_zeroed = true;
+        let e = self.s.entry;
+        let pair = self.exchange_pair(slot);
+        let zero = self.s.m.i32(0);
+        let lds = self.s.lds();
+        let ptr = self.s.m.element(e, lds, pair);
+        self.s.m.store(e, ptr, zero);
+        let one = self.s.m.i32(1);
+        let next = self.s.m.bin(e, Bin::Add, pair, one);
+        let ptr = self.s.m.element(e, lds, next);
+        self.s.m.store(e, ptr, zero);
+        // every lane of the group runs the entry block
+        self.group_sync(e);
+    }
+
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
     /// (lower half's, upper half's). A group with no upper half gets 0 for it.
     fn exchange_halves(&mut self, at: usize, mine: V) -> (V, V) {
@@ -4249,7 +4291,13 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        if v.clamp || v.omod != 0 {
+        // Integer `clamp` is unsigned saturation on add and subtract, which
+        // apply it before calling here (`VICTORY_INT_CLAMP=0` refuses it
+        // again). Other integer ops still refuse the modifier.
+        if v.omod != 0
+            || (v.clamp
+                && !(crate::emit::switches::int_clamp() && Self::integer_clamp_op(inst.name())))
+        {
             return Err("integer output modifiers");
         }
         match v.dst {
@@ -7814,7 +7862,11 @@ impl<'a> Lower<'a> {
                 } else {
                     None
                 };
-                let (r, carry) = self.add_sub_carry(c, name.starts_with("v_add"), a, bb, cin);
+                let add = name.starts_with("v_add");
+                let (mut r, carry) = self.add_sub_carry(c, add, a, bb, cin);
+                if v.clamp && crate::emit::switches::int_clamp() {
+                    r = self.clamp_u32(c, add, r, carry);
+                }
                 int(self, r)?;
                 if let Some(Operand::Scalar { code, .. }) = v.carry
                     && let Some(w) = inst.write(Reg::S(code))
@@ -9351,7 +9403,8 @@ impl<'a> Lower<'a> {
 
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let sampler = self.descriptors.get(&((b, i), true)).copied();
-        if let Some(Source::Phi { block, args }) = sampler
+        if static_sampler_phi()
+            && let Some(Source::Phi { block, args }) = sampler
             && let [first @ Source::Constant(_), second @ Source::Constant(_)] = args.as_slice()
             && let [left, right] = self.x.p.blocks[*block].preds.as_slice()
         {
@@ -11004,6 +11057,23 @@ impl<'a> Lower<'a> {
                 self.enter_loop(b, t, self.cur);
                 Term::Br(self.block[t].expect("reachable"))
             }
+            // Both arms go to one block: a CondBr would make the same
+            // critical edge twice, and the edge map (keyed by `(from, to)`)
+            // would drop the first block, leaving the PHIs of that successor
+            // one predecessor short (VIC-BT-007). A jump instead
+            // (`VICTORY_BRANCH_SAME_ARMS=0` keeps the CondBr).
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } if taken == not_taken && crate::emit::switches::branch_same_arms() => {
+                if self.counters.contains_key(&taken) && self.rpo[taken] <= self.rpo[b] {
+                    let ok = self.count_iteration(taken, pred::IULT);
+                    let abort = self.abort_block();
+                    Term::CondBr(ok, self.block[taken].expect("reachable"), abort)
+                } else {
+                    self.enter_loop(b, taken, self.cur);
+                    Term::Br(self.block[taken].expect("reachable"))
+                }
+            }
             LaneExit::Branch {
                 when,
                 taken,
@@ -11363,6 +11433,28 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 
 // The VALU integer operations, in their own file (this one is at the 512 KiB cap).
 mod valu_int;
+
+/// VOP3 integer `clamp` on add and subtract (unsigned saturation), a child
+/// module so it shares the emitter's state.
+#[path = "valu_clamp.rs"]
+pub(super) mod valu_clamp;
+
+/// Whether the abort path can leave a lane out of the program before a
+/// later `s_barrier`: a loop closed by a plain jump, or by a branch whose
+/// both arms are one block, which lowers as a jump and takes the same
+/// iteration counter (`VICTORY_BRANCH_SAME_ARMS`). `back(from, to)` says
+/// whether that edge closes a loop.
+fn cuts_short(exits: &[LaneExit], back: &dyn Fn(usize, usize) -> bool) -> bool {
+    exits.iter().enumerate().any(|(b, e)| match *e {
+        LaneExit::Jump(t) => back(b, t),
+        LaneExit::Branch {
+            taken, not_taken, ..
+        } => {
+            taken == not_taken && crate::emit::switches::branch_same_arms() && back(b, taken)
+        }
+        _ => false,
+    })
+}
 
 #[cfg(test)]
 mod tests;

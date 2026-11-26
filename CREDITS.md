@@ -36,6 +36,10 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
 - **Marvisak/VIctory #2401** (Mumogg) — the Wine `ExitProcess` hook that makes a host driver
   compiler crash cost one pipeline instead of the run ([`pipeline/wine.rs`](crates/victory-gpu/src/pipeline/wine.rs)),
   adapted to our pipeline workers and library.
+- **fever308/victory-corgi `38e367763`** (fever308) — the bounded, size-bucketed pool of mapped `UPLOAD`
+  buffers that a list copies title memory through: a buffer a list let go of is kept by its size class and reused by
+  the next copy, and only after every submission in the air has finished
+  ([`upload_pool.rs`](crates/victory-gpu/src/upload_pool.rs), `VICTORY_UPLOAD_POOL=0` off).
 
 ## Design notes
 
@@ -80,6 +84,18 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   pruned. Reimplemented against this tree's library, which has no `victory_shader::SOURCE_HASH`: the key is
   the executable's BLAKE3, the same bytes the shader cache keys its translations on
   (`crates/victory-gpu/src/shader_cache.rs`), and `VICTORY_LIBRARY_PRUNE=0` keeps every library.
+- **JMAN730/victory** ([project-flamingo#685](https://github.com/JMAN730/project-flamingo/pull/685)),
+  GPL-3.0: a `LaneExit::Branch` whose two arms name one block is lowered as the jump it is, so the
+  edge map's `(from, to)` key is not written twice and that successor's PHIs keep their predecessor
+  (`crates/victory-shader/src/emit/lower.rs`, `crates/victory-shader/src/emit/branch_tests.rs`).
+- **JMAN730/victory** ([project-flamingo#675](https://github.com/JMAN730/project-flamingo/pull/675)),
+  GPL-3.0: VOP3 integer `clamp` on add/sub is unsigned saturation (carry → all ones, borrow → zero),
+  applied in the lowering instead of refused as an integer output modifier, and a clamped add is no
+  wrapping sum for address analysis (`crates/victory-shader/src/emit/valu_clamp.rs`,
+  `crates/victory-shader/src/resource.rs`).
+- **vitutu1** by **ZigZagBoi1** ([ZigZagBoi1/ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort),
+  GPL-3.0-or-later): the resolution and upscaler levers, which here are profile hooks and the
+  switches `VICTORY_RENDER_SCALE` / `VICTORY_OWN_UPSCALER` rather than code that names a title.
 
 - **fxceless/victory-fork [PR #1117](https://github.com/fxceless/victory-fork/pull/1117)** (Azemed),
   GPL-3.0: the title's views behind an `RwLock` (`views_read`/`views_write`, `crates/victory-gpu/src/inplace.rs`)
@@ -179,7 +195,18 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   the container gets the same BLAKE3 as its standalone copy (`Container::as_bytes()`,
   `crates/victory-shader/src/dxbc.rs`; `Source::bytes()` for both the raw and the `SGD5` paths,
   `apps/victory/src/shader.rs`). Reimplemented on this tree's `victory translate`, which has no `warm` command.
+- **DexNom/VIctory [ddb73326](https://github.com/DexNom/VIctory/commit/ddb73326b09e600bd2405ee5c987fa611098aaa1)** (DexNom), GPL-3.0: a
+  sample whose sampler comes from a uniform branch between two immediate samplers binds both as static
+  samplers, samples twice with the original derivatives and selects the texel on the edge that supplied the
+  console's sampler (`crates/victory-shader/src/emit/lower.rs`); this is what recovered the archive's refused
+  windshield and wiper pixel and mesh variants.
 
+- **avatarmanz/VIctory-7900XTX** (GPL-3.0), commit [b6202840a](https://github.com/avatarmanz/VIctory-7900XTX/commit/b6202840a):
+  the idea of comparing title bytes under shader writes with AVX2 rather than eight bytes at a time: the copy-back's
+  piece walk, its first and last difference and the differing runs take thirty-two bytes a compare where the CPU has
+  AVX2, checked at run time, with the eight-byte walk kept as the fallback (`crates/victory-gpu/src/compare.rs`,
+  `VICTORY_AVX2_COMPARE=1`; on his machine 14 -> 4-7 ms of compares a frame). His compares run on threads of their
+  own; ours already do (`wide` in `shadow.rs`).
 - **HUMAN** ([HumanlyDev/HUMAN](https://github.com/HumanlyDev/HUMAN)) by HumanlyDev and bdycounter-sudo,
   GPL-3.0-or-later: one immediate sampler constant used both for normal and for comparison sampling takes two
   static sampler slots (`crates/victory-shader/src/emit/lower.rs`, `samplers`/`cmp_samplers`), where our bit
@@ -195,6 +222,12 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   the GPU reads and writes the title's own memory (`crates/victory-gpu/src/arena.rs`, `VICTORY_ARENA=1`, off by
   default). The part grid, the region registry, the budget and the canary are reimplemented on this tree's
   `inplace`; the canary here proves each part **both ways** with our own `Rig` (#188), which the fork's tests do not.
+
+- **Marvisak/VIctory [#1264](https://github.com/Marvisak/VIctory/pull/1264)** (Marvisak), GPL-3.0: a batched
+  run of page mappings asks the host where the placeholder it starts in ends (`placeholder_room`, one
+  `VirtualQueryEx`) instead of trusting the pages to end at the same boundary, so a run across two placeholders
+  is clipped rather than refused after its range was unmapped (`crates/victory-hle/src/modules/xmem.rs`,
+  `VICTORY_MAP_CLIP=0` turns it off).
 
 ## Tools
 
@@ -213,6 +246,17 @@ Missing or wrong name? Open an issue.
   enables blending on one, so those targets are made to write unblended, per target and with independent
   blending turned on only where it was needed (`crates/victory-gpu/src/pipeline/host.rs`,
   `VICTORY_HOST_BLEND=0`). Its host-pipeline device test used `D3DCompile`; ours checks the state itself.
+
+- **avatarmanz/VIctory-7900XTX** ([ca1d519f1](https://github.com/avatarmanz/VIctory-7900XTX/commit/ca1d519f1),
+  [44629de2e](https://github.com/avatarmanz/VIctory-7900XTX/commit/44629de2e), and the four commits beside them),
+  GPL-3.0, after ZJOU acf478b8 and Belobug 92d353f8, 84ea9c12, dd799aad and 76387c2d (romainhedouin): per-frame CPU
+  work taken off the submitting thread — render targets compared by their views and not set again
+  (`crates/victory-gpu/src/bindcache.rs`, `VICTORY_BIND_CACHE=0`), a pipeline a list binds again neither kept nor
+  named again (`HostList::bind_pipeline`), a root constant buffer not 256-byte aligned filled into scratch memory
+  once per list (`HostList::fill_scratch`), a range shaders write declared once until the list next writes title
+  memory (`VICTORY_DECLARE_ONCE=0`), an indirect record that does not fit its list's budget taking nothing from the
+  ones after it and the frame line counting those refused (`VICTORY_INDIRECT_REST=0`), and the heaps' records copied
+  as bytes read, compared and sorted out on several threads.
 - **avatarmanz/VIctory-7900XTX [2be0515c](https://github.com/avatarmanz/VIctory-7900XTX/commit/2be0515cb)**, GPL-3.0:
   a page the title maps at more than one address, where a guard at one address can be written through another: the
   guarded blocks of the views beside it are given back to write together, under the one look
@@ -226,6 +270,12 @@ Missing or wrong name? Open an issue.
   (after fxceless/victory-fork [c36971b2](https://github.com/fxceless/victory-fork/commit/c36971b2)), GPL-3.0:
   `VICTORY_CARD_BUFFERS_MIN_KB`, so that title buffers' copies under the MiB floor can go into the card's memory
   (unset: the floor of before) (`crates/victory-gpu/src/shadow.rs`).
+D
+- **fever308/victory-corgi [95641affc](https://github.com/fever308/victory-corgi/commit/95641affc)**, GPL-3.0:
+  the title's "idle" and "lowest" threads (the streaming pager's among them) run "below normal", and the process
+  can run "above normal", so a build or a scan beside the title no longer starves its loading, behind
+  `VICTORY_TITLE_PRIORITIES=1` and `VICTORY_PROCESS_PRIORITY=above` (both off by default)
+  (`crates/victory-hle/src/modules/kernel.rs`, `crates/victory-hle/src/runtime.rs`).
 - **Belobug/VIctory-Belobug-AMD [4d291d4](https://github.com/Belobug/VIctory-Belobug-AMD/commit/4d291d4)**
   (davutsimsekk) via **Yoshi-233**, GPL-3.0: operandless VOP1 (`v_nop`, `v_pipeflush`, `v_clrexcp`) ignores its
   source field, so a marker byte there is not an extra dword and no longer swallows the next instruction, and the
