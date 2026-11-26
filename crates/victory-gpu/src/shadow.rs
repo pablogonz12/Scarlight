@@ -2381,8 +2381,10 @@ impl Shadow {
             // byte written, once for this copy-back and not once a piece: a
             // remap already under way is waited for 2 ms only, since it may
             // itself be waiting for the blocks this copy-back's job holds.
-            // The writes go on as before without the reading.
-            let _reading = crate::watch::title_memory_reading_within(std::time::Duration::from_millis(2));
+            // The writes go on as before without the reading. Nothing
+            // differing means nothing to read or write: no guard asked for.
+            let _reading = (!differing.is_empty())
+                .then(|| crate::watch::title_memory_reading_within(std::time::Duration::from_millis(2)));
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
