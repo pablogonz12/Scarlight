@@ -169,6 +169,7 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   GPL-3.0: a rectangle list's fourth corner is completed opposite the right angle, wherever the three
   corners put it. This tree's geometry stage (`emit::rect_list_gs`) already finds the corner in any order; the
   rule is now in the CPU expansion too (`right_angle`, `right_corners` in `crates/victory-gpu/src/primitive.rs`).
+- **avatarmanz/VIctory-7900XTX [350c68648](https://github.com/avatarmanz/VIctory-7900XTX/commit/350c68648)** (avatarmanz), GPL-3.0: a texture's first upload started ahead on a copy queue of its own (`texture/ahead.rs`) and a slot shown only once that upload ran (`descriptor/host.rs::show_after`, 3bab23c06), which there ended a device loss every ~16 minutes. Reimplemented on this tree's texture path: `crates/victory-gpu/src/texture/ahead.rs`, the copy queue made at device creation and a submission's wait on its fence in `crates/victory-gpu/src/host.rs`, `VICTORY_UPLOAD_AHEAD=1` and `VICTORY_SHOW_AFTER`.
 
 - **fxceless/victory-fork [PR #980](https://github.com/fxceless/victory-fork/pull/980)** (fxceless), GPL-3.0:
   the arena, the layer a resident stands on: a title region opened as a D3D12 heap and a buffer placed over it, so
