@@ -90,6 +90,13 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// [`HostHeap::made`] again in atomics, for the hit path of
+    /// [`HostHeap::mirror`]: the same key stored under the lock with Release,
+    /// so a slot already made from the record a draw names is recognised
+    /// without taking it. A slot is made once and then read by every draw and
+    /// every pass in between, so the lock was being taken for a lookup that
+    /// almost always found the slot up to date.
+    made_fast: Vec<std::sync::atomic::AtomicU64>,
     /// The slots made from a view narrowed to a part-resident texture's mips
     /// ([`narrow_to_resident`]): the texture, the mips the title asked for
     /// and those the host view names. More levels arriving (or a host copy
@@ -778,6 +785,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            made_fast: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             narrowed: Mutex::default(),
             narrowed_count: std::sync::atomic::AtomicUsize::new(0),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
@@ -1055,6 +1063,8 @@ impl HostHeap {
         if key == 0 {
             return;
         }
+        // Null from here on: the hit path must not read the slot as made.
+        self.made_fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
         match view_at(key as u32, (key >> 32) as u32) {
             Some(view) => null_for(&view, self.cpu(index)),
             None => null_view(self.cpu(index)),
@@ -1502,6 +1512,19 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        // The hit path: the slot was made from this very record and nothing
+        // has narrowed it since. `widen_due` is asked all the same: a host
+        // copy that brought more mips of a narrowed texture in wants a wider
+        // slot without the title's descriptor changing (#672).
+        if mirror_fast_on()
+            && tag == VIEW_TAG
+            && key != 0
+            && self.made_fast[index as usize].load(std::sync::atomic::Ordering::Acquire) == key
+            && !self.widen_due(index)
+            && let Some(view) = view_at(i, generation)
+        {
+            return Some(view);
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
@@ -1509,6 +1532,7 @@ impl HostHeap {
             // title released): nothing to read.
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
+                self.made_fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
@@ -1554,6 +1578,7 @@ impl HostHeap {
                 return Some(view);
             }
             made[index as usize] = if later { 0 } else { key };
+            self.made_fast[index as usize].store(if later { 0 } else { key }, std::sync::atomic::Ordering::Release);
             let kept = if later {
                 self.forget_narrowed(index);
                 None
@@ -1597,6 +1622,19 @@ impl HostHeap {
         }
         Some(text)
     }
+}
+
+/// Whether [`HostHeap::mirror`] may take its hit path without the lock
+/// (`VICTORY_MIRROR_FAST=0` off, the slow way: every slot through the mutex).
+fn mirror_fast_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| mirror_fast_from(std::env::var("VICTORY_MIRROR_FAST").ok().as_deref()))
+}
+
+/// [`mirror_fast_on`] from the variable's text: unset or anything but `0` is
+/// on, `0` is the slow way.
+fn mirror_fast_from(text: Option<&str>) -> bool {
+    text.map(str::trim) != Some("0")
 }
 
 /// Logs `what` the first time it happens.
@@ -1718,6 +1756,18 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
+/// Checked `(start, bytes)` of `count` elements of `element` bytes starting
+/// at `base + first * element`: `None` on any `u64` overflow. A title's
+/// `FirstElement` is whatever its descriptor words held, so a view of other
+/// memory read as a buffer (or a bogus `FirstElement`) would otherwise wrap
+/// to a plausible address in release and panic in a debug build.
+fn checked_buffer_range(base: u64, first: u64, count: u32, element: u64) -> Option<(u64, u64)> {
+    let start = base.checked_add(first.checked_mul(element)?)?;
+    let bytes = u64::from(count).checked_mul(element)?;
+    start.checked_add(bytes)?;
+    Some((start, bytes))
+}
+
 /// The title memory a buffer shader or unordered access view reads: its
 /// address and length.
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
@@ -1741,13 +1791,14 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
         _ => return None,
     };
     let desc = srv_desc(words);
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        // A texture view of a buffer: its words are no buffer's.
+        return None;
+    }
     let element = element_size(&desc);
-    // SAFETY: a buffer view's union member.
+    // SAFETY: `ViewDimension` is `D3D12_SRV_DIMENSION_BUFFER`.
     let buffer = unsafe { desc.Anonymous.Buffer };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_buffer_range(base, buffer.FirstElement, buffer.NumElements, element)
 }
 
 /// The title memory the host slot of buffer view `view` is made on
@@ -1807,7 +1858,11 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
 /// [`buffer_range`] of an unordered access view of memory at `base`.
 fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     let desc = uav_desc(words);
-    // SAFETY: a buffer view's union member.
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        // A texture view of a buffer: its words are no buffer's.
+        return None;
+    }
+    // SAFETY: `ViewDimension` is `D3D12_UAV_DIMENSION_BUFFER`.
     let buffer = unsafe { desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
         u64::from(buffer.StructureByteStride)
@@ -1816,10 +1871,7 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     } else {
         crate::resource::element(desc.Format.0 as u32)?.0
     };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    checked_buffer_range(base, buffer.FirstElement, buffer.NumElements, element)
 }
 
 /// The host resource a slot made by [`make`] views, if any.
@@ -1918,7 +1970,8 @@ fn buffer_srv(
             );
             return None;
         }
-        buffer.FirstElement += offset / element;
+        // A `FirstElement` the title wrote past `u64` is no view of the copy.
+        buffer.FirstElement = buffer.FirstElement.checked_add(offset / element)?;
     }
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
@@ -2032,7 +2085,8 @@ fn buffer_srv_alias(
         );
         return None;
     }
-    buffer.FirstElement += offset / element;
+    // A `FirstElement` the title wrote past `u64` is no view of the copy.
+    buffer.FirstElement = buffer.FirstElement.checked_add(offset / element)?;
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
@@ -2102,7 +2156,8 @@ fn buffer_uav(
             once!(offset, element, "unordered buffer view not on an element of its host copy");
             return None;
         }
-        buffer.FirstElement += offset / element;
+        // A `FirstElement` the title wrote past `u64` is no view of the copy.
+        buffer.FirstElement = buffer.FirstElement.checked_add(offset / element)?;
     }
     buffer.CounterOffsetInBytes = 0;
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
@@ -2163,6 +2218,51 @@ fn casts_typed() -> bool {
     })
 }
 
+/// Whether [`fits`] refuses unordered access views in formats the host
+/// cannot store to. On by default; `VICTORY_TYPED_UAV=0` lets such a view
+/// reach the host (as before), which then removes the device.
+fn typed_uav_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TYPED_UAV").is_none_or(|v| v != "0"))
+}
+
+/// Whether the host creates a typed unordered access view in `format`,
+/// asked once per format. Hosts refuse some (B8G8R8X8_UNORM and the block
+/// formats on NVIDIA: no typed store there) by removing the device rather
+/// than failing the call, so [`fits`] leaves such a view's slot null. A
+/// host that stores to `format` (RADV through vkd3d-proton does, B8G8R8X8
+/// as B8G8R8A8 with the alpha ignored) keeps every view it had.
+fn typed_store(format: DXGI_FORMAT) -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    // 0: not asked, 1: refused, 2: stored to.
+    static SUPPORT: [AtomicU8; 256] = [const { AtomicU8::new(0) }; 256];
+    let Some(state) = usize::try_from(format.0).ok().and_then(|f| SUPPORT.get(f)) else {
+        return false;
+    };
+    match state.load(Relaxed) {
+        0 => {}
+        known => return known == 2,
+    }
+    let asked = host().is_some_and(|host| {
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: format,
+            ..Default::default()
+        };
+        // SAFETY: a plain query into our own structure.
+        let asked = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        };
+        asked.is_ok()
+            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+    });
+    state.store(if asked { 2 } else { 1 }, Relaxed);
+    asked
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -2207,7 +2307,16 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        return !typeless;
+        if typeless {
+            return false;
+        }
+        // A default view of a texture in a format the host cannot store to
+        // removes the device: leave the slot null instead.
+        if unordered && typed_uav_check() && !typed_store(d.Format) {
+            once!(own, "an unordered view in a format the host cannot store");
+            return false;
+        }
+        return true;
     }
     // A view of a target whose format the host refuses, in the title's
     // format: in the stand-in the host copy has.
@@ -2224,9 +2333,19 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     let twin = crate::resource::SRGB
         .iter()
         .any(|&(s, l)| (s, l) == (view, own) || (l, s) == (view, own));
+    let casts = twin && casts_typed();
+    // The format the host makes the view in: the texture's (the title's the
+    // host takes as it is), or the view's for a typeless texture and for the
+    // twins the host casts. A host that cannot store to it removes the
+    // device for a write there, so the slot stays null instead.
+    let created = if !typeless && !casts { own } else { view };
+    if unordered && typed_uav_check() && !typed_store(DXGI_FORMAT(created as i32)) {
+        once!(view = created, own, "an unordered view in a format the host cannot store");
+        return false;
+    }
     if let Some(format) = format
+        && !casts
         && !typeless
-        && !(twin && casts_typed())
     {
         *format = d.Format;
     }
@@ -2725,6 +2844,15 @@ mod tests {
     /// which was the whole of the first frame's 21 s stall. A quarter of a
     /// million slots past the heap now cost one line.
     #[test]
+    fn the_mirror_hit_path_is_on_by_default_and_has_an_off_switch() {
+        assert!(mirror_fast_from(None));
+        assert!(mirror_fast_from(Some("")));
+        assert!(mirror_fast_from(Some("1")));
+        assert!(!mirror_fast_from(Some("0")));
+        assert!(!mirror_fast_from(Some(" 0 ")));
+    }
+
+    #[test]
     fn a_slot_past_the_host_heap_is_said_once_not_per_slot() {
         let lines = Lines::default();
         tracing::subscriber::with_default(lines.clone(), || {
@@ -2811,6 +2939,111 @@ mod tests {
         let View::Placed(_, resource, desc) = low.clone() else { unreachable!() };
         assert!(!same_placed_texture(&low, &View::Placed(true, resource, desc)));
         assert!(!same_placed_texture(&low, &View::Shader(0, None)));
+    }
+
+    /// Unordered views in formats the host cannot store to stay null
+    /// instead of removing the device, for shared sRGB render targets and
+    /// their linear twins as for default views: `fits` gives the host's own
+    /// answer for the format the view is made in.
+    #[test]
+    fn unordered_views_follow_the_hosts_typed_store_support() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let stores = |format: u32| {
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: DXGI_FORMAT(format as i32),
+                ..Default::default()
+            };
+            // SAFETY: a plain query into our own structure.
+            let asked = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of_val(&support) as u32,
+                )
+            };
+            asked.is_ok()
+                && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+        };
+        let texture = |format: DXGI_FORMAT| -> Option<ID3D12Resource> {
+            let mut tex: Option<ID3D12Resource> = None;
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 64,
+                Height: 64,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+                    | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            // SAFETY: plain committed texture creation.
+            unsafe {
+                host.device.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut tex,
+                )
+            }
+            .ok()?;
+            tex
+        };
+        // The title's shared pair: an sRGB render target the host makes
+        // typeless and a linear unordered access texture over it.
+        let Some(bgra) = texture(DXGI_FORMAT_B8G8R8A8_TYPELESS) else {
+            return; // no such texture on this host
+        };
+        let pair = |own: DXGI_FORMAT, view: Option<u32>| {
+            let tex = texture(own)?;
+            let mut format = view.map(|v| DXGI_FORMAT(v as i32));
+            let fits = fits(&tex, format.as_mut(), true);
+            let made = match format {
+                Some(f) => f,
+                // A default view names the texture's own format.
+                None => own,
+            };
+            Some((fits, stores(made.0 as u32)))
+        };
+        // RGBA8 and BGRA8 sRGB views are rewritten to their linear twins,
+        // whose typed store every host has.
+        for (own, view) in [
+            (DXGI_FORMAT_B8G8R8A8_TYPELESS, Some(91)),
+            (DXGI_FORMAT_B8G8R8A8_TYPELESS, Some(87)),
+            (DXGI_FORMAT_B8G8R8X8_TYPELESS, Some(93)),
+            (DXGI_FORMAT_B8G8R8X8_TYPELESS, Some(88)),
+            (DXGI_FORMAT_R8G8B8A8_TYPELESS, Some(29)),
+            (DXGI_FORMAT_R8G8B8A8_TYPELESS, Some(28)),
+        ] {
+            let Some((fits, stores)) = pair(own, view) else {
+                continue; // a texture this host cannot create
+            };
+            assert_eq!(fits, stores, "texture {own:?}, view {view:?}");
+        }
+        // A typed texture's default unordered view follows its own format.
+        for own in [
+            DXGI_FORMAT_B8G8R8X8_UNORM,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+        ] {
+            let Some((fits, stores)) = pair(own, None) else {
+                continue;
+            };
+            assert_eq!(fits, stores, "texture {own:?}, default view");
+        }
+        // A view of a texture without the unordered access flag is refused
+        // whatever the format, and a typeless one with no view format too.
+        assert!(!fits(&bgra, None, true));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// A null 3D UAV made on the real device leaves it alive.
@@ -2902,6 +3135,87 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// A buffer view's `FirstElement` and `NumElements` are the title's: one
+    /// that would overflow `u64` (a bogus address, or a texture's words read
+    /// as a buffer's) is refused instead of wrapping to a plausible address.
+    #[test]
+    fn overflowing_buffer_ranges_are_refused() {
+        assert_eq!(checked_buffer_range(0x1000, 2, 4, 16), Some((0x1020, 64)));
+        assert_eq!(checked_buffer_range(0x1000, 0, 0, 16), Some((0x1000, 0)));
+        // `FirstElement * element` beyond `u64`: wraps to 0 when unchecked.
+        assert_eq!(checked_buffer_range(0x1000, 1u64 << 60, 1, 16), None);
+        assert_eq!(checked_buffer_range(0x1000, u64::MAX, 1, 1), None);
+        // The start fits, the whole view does not (release: wraps to a small one).
+        assert_eq!(checked_buffer_range(u64::MAX - 8, 0, u32::MAX, u64::from(u32::MAX)), None);
+        assert_eq!(checked_buffer_range(u64::MAX - 8, 0, 1, 16), None);
+
+        let mut resource = [0u32; 14];
+        resource[0] = 1; // D3D12_RESOURCE_DIMENSION_BUFFER
+        let view = |desc: [u32; 16]| View::Placed(false, resource, desc);
+
+        // The host's 40-byte descriptor words: format, dimension, component
+        // mapping, then the union at word 4 (a `u64` `FirstElement` there,
+        // `NumElements`, stride and flags after it).
+        let words = |format: u32, dimension: u32, first: u64, count: u32, stride: u32, flags: u32| {
+            let mut words = [0u32; 10];
+            words[0] = format;
+            words[1] = dimension;
+            words[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            (words[4], words[5]) = (first as u32, (first >> 32) as u32);
+            (words[6], words[7], words[8]) = (count, stride, flags);
+            words
+        };
+        let placed = |words: [u32; 10]| {
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&words);
+            desc[10] = 0x1000; // the view's address
+            view(desc)
+        };
+        let buffer = |first: u64| {
+            words(
+                DXGI_FORMAT_UNKNOWN.0 as u32,
+                D3D12_SRV_DIMENSION_BUFFER.0 as u32,
+                first,
+                4,
+                16,
+                D3D12_BUFFER_SRV_FLAG_NONE.0 as u32,
+            )
+        };
+
+        // A structured buffer view at a bogus first element: refused.
+        assert_eq!(buffer_range(&placed(buffer(1u64 << 60))), None);
+        assert_eq!(buffer_range(&placed(buffer(u64::MAX))), None);
+        // The same view with a first element that fits is a view of it.
+        assert_eq!(buffer_range(&placed(buffer(2))), Some((0x1020, 64)));
+
+        // A texture view of buffer memory is no buffer view at all: its words
+        // are a texture's, and reading them as a buffer's is a bogus address.
+        let texture = words(
+            DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(buffer_range(&placed(texture)), None);
+        // Through a table's unordered slot too (its dimension word is its own).
+        let unordered_texture = words(
+            DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(buffer_range(&View::Placed(true, resource, {
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&unordered_texture);
+            desc[10] = 0x1000;
+            desc
+        })), None);
     }
 
     /// A view written over memory that older views describe otherwise

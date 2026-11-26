@@ -272,11 +272,15 @@ fn dxc(source: &str, entry: &str, target: &str) -> windows::core::Result<Vec<u8>
 fn library() -> windows::core::Result<HMODULE> {
     let mut paths: Vec<PathBuf> = Vec::new();
     if let Some(p) = std::env::var_os("VICTORY_DXC").map(PathBuf::from) {
-        paths.push(if p.is_dir() {
+        let p = if p.is_dir() {
             p.join("dxcompiler.dll")
         } else {
             p
-        });
+        };
+        // `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` wants a fully qualified path, so
+        // a relative one (`VICTORY_DXC=.\sdk`) is resolved against this
+        // process's working directory first.
+        paths.push(std::path::absolute(&p).unwrap_or(p));
     }
     if let Some(dir) = victory_shader::emit::validator::Validator::default_path()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -357,7 +361,7 @@ mod tests {
 
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
     use windows::Win32::Graphics::Direct3D12::{
-        D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_SHADER_BYTECODE, D3D12CreateDevice, ID3D12Device,
+        D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_SHADER_BYTECODE, ID3D12Device,
         ID3D12PipelineState, ID3D12RootSignature,
     };
 
@@ -453,11 +457,9 @@ float4 corner(uint i : SV_VertexID) : SV_Position {
         assert!(!carries_root_signature(&bytes));
     }
 
-    /// A D3D12 device (the default adapter; WARP counts), if there is one.
+    /// A D3D12 device on the adapter `VICTORY_TEST_ADAPTER` picks (the card,
+    /// or WARP), if there is one.
     fn device() -> Option<ID3D12Device> {
-        let mut device: Option<ID3D12Device> = None;
-        // SAFETY: the out pointer is ours.
-        unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut device).ok()? };
-        device
+        crate::test_device::device(D3D_FEATURE_LEVEL_11_0)
     }
 }

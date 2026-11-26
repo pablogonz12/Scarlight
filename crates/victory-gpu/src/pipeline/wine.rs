@@ -104,10 +104,10 @@ unsafe extern "system" fn exit(code: u32) -> ! {
     // so it exits; likewise while it holds the library's store guard, which
     // every later save waits on. A crash outside both (a creation) parks as
     // before; the name it held is let go by `library::abandon`.
-    if !super::make::worker_lost()
-        || super::library::calling()
-        || super::library::storing_now()
-    {
+    // The guards first: `worker_lost` drains the queue and saves, and a save
+    // asks for the library's write lock, which a thread holding the store
+    // read guard would wait on for good (a lost worker does not unwind it).
+    if super::library::calling() || super::library::storing_now() || !super::make::worker_lost() {
         // SAFETY: what the caller asked for.
         unsafe { ExitProcess(code) }
     }
