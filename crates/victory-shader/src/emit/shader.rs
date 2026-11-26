@@ -96,6 +96,9 @@ pub(crate) mod flags {
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
+    /// A POPS pixel shader's rasterizer ordered views (the console's
+    /// primitive ordered pixel shading): DXC's `RasterizerOrderedViews`.
+    pub const ROVS: u64 = 1 << 18;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
@@ -372,6 +375,9 @@ impl Shader {
             &[bind, r, f],
         );
         let rov = if self.rovs { ROV } else { 0 };
+        if rov != 0 {
+            self.flags |= flags::ROVS;
+        }
         let h = self.annotate(block, h, 11 | UAV | rov, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_uavs.push((slot, h));
@@ -469,6 +475,7 @@ impl Shader {
         self.nonuniform_handles += u32::from(nonuniform);
         // A UAV in a POPS pixel shader is rasterizer ordered (see `rovs`).
         let props = if self.rovs && props.0 & UAV != 0 {
+            self.flags |= flags::ROVS;
             (props.0 | ROV, props.1)
         } else {
             props
@@ -847,6 +854,11 @@ impl Shader {
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
+        }
+        // D3D_SHADER_FEATURE_ROVS: the validator compares it with the
+        // handles' ROV property and the resources metadata's flag.
+        if self.flags & flags::ROVS != 0 {
+            features |= 0x1000;
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;

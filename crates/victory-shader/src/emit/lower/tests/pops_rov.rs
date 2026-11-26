@@ -93,4 +93,17 @@ use super::*;
         // (`AnnotateROVMask`, which dxil-spirv reads as `rov`).
         assert_eq!(crate::emit::shader::UAV, 1 << 12);
         assert_eq!(crate::emit::shader::ROV, 1 << 13);
+        // The feature declarations: the shader flags gain DXC's
+        // `RasterizerOrderedViews` (bit 18) and `SFI0` gains
+        // D3D_SHADER_FEATURE_ROVS (0x1000) for a POPS pixel shader. Both
+        // stay clear for its plain UAVs.
+        assert!(!ps.rov_flag, "a plain UAV is not a rasterizer ordered view");
+        assert!(pops.rov_flag, "a POPS pixel shader declares rasterizer ordered views");
+        let features = |l: &Lowered| -> u64 {
+            let c = crate::Container::parse(&l.dxil).unwrap();
+            u64::from_le_bytes(c.part(crate::FourCC::SFI0).unwrap().data.try_into().unwrap())
+        };
+        assert_eq!(features(&ps) & 0x1000, 0, "plain UAVs need no ROVS in SFI0");
+        assert_ne!(features(&pops) & 0x1000, 0, "SFI0 declares ROVS");
+        assert_eq!(features(&pops) & 0x1000, 0x1000);
     }

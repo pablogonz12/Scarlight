@@ -81,6 +81,9 @@ pub(crate) struct Lowered {
     /// Whether its UAVs are rasterizer ordered views (a POPS pixel shader).
     #[cfg(test)]
     pub rovs: bool,
+    /// Whether the shader flags and `SFI0` declare rasterizer ordered views.
+    #[cfg(test)]
+    pub rov_flag: bool,
     /// The constant table's first byte and dwords, if the program has one.
     #[cfg(test)]
     pub code_table: Option<(u32, Vec<u32>)>,
@@ -2358,6 +2361,10 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             rovs: self.s.rovs,
+            #[cfg(test)]
+            #[cfg(test)]
+            rov_flag: self.s.flags & flags::ROVS != 0,
+            #[cfg(test)]
             code_table: self.code_table.map(|t| (t.1, self.code_words)),
             #[cfg(test)]
             buffer_loads,
