@@ -28,6 +28,15 @@ wrothgaril, Yaekai.
 
 andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VIctory #2614), BlueKaiman, kais7654, pushkarreddyy, shh.
 
+## Ports of fork pull requests
+
+Code reimplemented here from a fork's pull request, because the fork's tree had diverged from ours;
+the design and the author are credited in the commit's `Co-authored-by:` and here.
+
+- **Marvisak/VIctory #2401** (Mumogg) — the Wine `ExitProcess` hook that makes a host driver
+  compiler crash cost one pipeline instead of the run ([`pipeline/wine.rs`](crates/victory-gpu/src/pipeline/wine.rs)),
+  adapted to our pipeline workers and library.
+
 ## Design notes
 
 - **Marvisak/VIctory [#2478](https://github.com/Marvisak/VIctory/pull/2478)** (HoLa-Lee), GPL-3.0: the idea
@@ -119,6 +128,13 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   `crates/victory-gpu/src/shadow.rs`). Reimplemented: theirs changes `copy_back_marked`, which this tree has no
   equivalent of (its `copy_back` merges into the copy and keeps one snapshot per submission).
 
+- **fxceless/victory-fork [PR #1130](https://github.com/fxceless/victory-fork/pull/1130)** (Lkxex), GPL-3.0:
+  detiling only the 64 KiB pages a texture's write watch says the title wrote, instead of the whole texture at
+  every refresh (`crates/victory-formats/src/texture.rs`'s `Layout::detile_window`,
+  `crates/victory-gpu/src/texture.rs`'s `Staging::refresh_pages`, `VICTORY_DETILE_DIRTY=0`). Its own page table
+  and its per-page reads are not taken: our subresource ranges come from the layout (`Layout::mip_extents`) and
+  the written pages are read in runs, with the rows outside the window skipped whole.
+
 - **Marvisak/VIctory [#2163](https://github.com/Marvisak/VIctory/pull/2163)** (0xkn0wh3r3), GPL-3.0: the
   built-in BCPack table's first BC7 dictionary entry has its 32 indices right after its width bytes, where
   every other entry repeats them first and holds 31 (`crates/victory-formats/src/bcpack.rs`).
@@ -129,11 +145,22 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   allocation and fence tracked so a remapped or released allocation is not landed
   (`crates/victory-gpu/src/texback.rs`).
 
+- **fxceless/victory-fork [PR #976](https://github.com/fxceless/victory-fork/pull/976)** (MoscaLosca), GPL-3.0: a
+  compute or mesh dispatch asking for more than the host's 65,535 groups in `x` runs as pieces, each told where
+  its groups start in a host-computed user-data dword the translated program adds to its group id
+  (`USER_GROUP_BASE`, `crates/victory-shader/src/emit/shader.rs`, `Lower::compute_id`;
+  `State::dispatch`/`dispatch_mesh`, `crates/victory-gpu/src/draw.rs`, `VICTORY_GROUP_SPLIT=0`), and the clamp's
+  budget words now count the largest group count a compute record asked for as well as the mesh one.
 - **fxceless/victory-fork [PR #981](https://github.com/fxceless/victory-fork/pull/981)** (avt0m4t), GPL-3.0: an
   embedded shader keys and translates on its declared DXBC bytes, so a packed record whose payload runs on past
   the container gets the same BLAKE3 as its standalone copy (`Container::as_bytes()`,
   `crates/victory-shader/src/dxbc.rs`; `Source::bytes()` for both the raw and the `SGD5` paths,
   `apps/victory/src/shader.rs`). Reimplemented on this tree's `victory translate`, which has no `warm` command.
+
+- **Marvisak/VIctory [`8ff791351`](https://github.com/Marvisak/VIctory/commit/8ff791351)** (Marvis),
+  GPL-3.0: a rectangle list's fourth corner is completed opposite the right angle, wherever the three
+  corners put it. This tree's geometry stage (`emit::rect_list_gs`) already finds the corner in any order; the
+  rule is now in the CPU expansion too (`right_angle`, `right_corners` in `crates/victory-gpu/src/primitive.rs`).
 
 ## Tools
 
@@ -147,10 +174,28 @@ Missing or wrong name? Open an issue.
   enables blending on one, so those targets are made to write unblended, per target and with independent
   blending turned on only where it was needed (`crates/victory-gpu/src/pipeline/host.rs`,
   `VICTORY_HOST_BLEND=0`). Its host-pipeline device test used `D3DCompile`; ours checks the state itself.
-
+- **avatarmanz/VIctory-7900XTX [2be0515c](https://github.com/avatarmanz/VIctory-7900XTX/commit/2be0515cb)**, GPL-3.0:
+  a page the title maps at more than one address, where a guard at one address can be written through another: the
+  guarded blocks of the views beside it are given back to write together, under the one look
+  (`crates/victory-gpu/src/watch.rs`, `VICTORY_GUARD_ALIASES=0`).
+- **avatarmanz/VIctory-7900XTX [200a9cc5](https://github.com/avatarmanz/VIctory-7900XTX/commit/200a9cc5e)**
+  (after fxceless/victory-fork [c36971b2](https://github.com/fxceless/victory-fork/commit/c36971b2)), GPL-3.0: the
+  dwords of one console buffer load read by one `rawBufferLoad` for every four of them instead of a call a dword,
+  behind `VICTORY_SHADER_OPT=64` (off by default, worth nothing on the card that measured it)
+  (`crates/victory-shader/src/emit/lower/wide.rs`).
+- **avatarmanz/VIctory-7900XTX [17c4717b](https://github.com/avatarmanz/VIctory-7900XTX/commit/17c4717b4)**
+  (after fxceless/victory-fork [c36971b2](https://github.com/fxceless/victory-fork/commit/c36971b2)), GPL-3.0:
+  `VICTORY_CARD_BUFFERS_MIN_KB`, so that title buffers' copies under the MiB floor can go into the card's memory
+  (unset: the floor of before) (`crates/victory-gpu/src/shadow.rs`).
 - **avatarmanz/VIctory-7900XTX [3a99ee610](https://github.com/avatarmanz/VIctory-7900XTX/commit/3a99ee610)**
   (avatarmanz), GPL-3.0-or-later: list calls that only write down their arguments, translated by threads of ours
   beside the title's recording, on a list of ours that the title never sees (`VICTORY_THIN=1`, off by default;
   `crates/victory-gpu/src/list/thin.rs`), reimplemented on this tree's lists: the render target and depth view
   records, arrays and structures are copied at the call, and a recording the title resets or releases without
   submitting is not run further.
+
+- **avatarmanz/VIctory-7900XTX [3a99ee610](https://github.com/avatarmanz/VIctory-7900XTX/commit/3a99ee610)**
+  (avatarmanz), GPL-3.0-or-later: the title's `ExecuteCommandLists` and `Signal` put in a line of ours and made by
+  a thread of ours, so the recording does not wait for its own submission (`VICTORY_ASYNC_SUBMIT=1`, off by
+  default, needs `VICTORY_THIN=1`; `crates/victory-gpu/src/queue/behind.rs`), with the order the title asks for
+  kept: a wait, a present, our own submission and a fence read take the line in first.
