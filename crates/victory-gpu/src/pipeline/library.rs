@@ -851,6 +851,10 @@ static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 /// Keys refused since the start because the list was at [`EARLY_MAX`].
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+/// The keys [`DROPPED`] counts: a refused key is not in the list, so a title
+/// asking for it twice (two pipelines with one description) asks again for a
+/// key that was never stored, and one pipeline dropped must count once.
+static REFUSED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
@@ -905,6 +909,11 @@ pub(crate) fn note_used(key: &str) {
         // The next save must write and log the count even when the list
         // itself did not change: a refusal alone is not a reason to save.
         USED_CHANGED.store(true, Ordering::Relaxed);
+        let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+        let first = refused.get_or_insert_with(HashSet::new).insert(key.to_owned());
+        if !first {
+            return;
+        }
         let dropped = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
         if dropped == 1 {
             tracing::warn!(
