@@ -222,6 +222,14 @@ fn sweep() {
     crate::inplace::tick();
     // Host-memory pressure and the refusal backoff ([`crate::residency`]).
     crate::residency::tick();
+    let deferred = crate::residency::take_deferred();
+    if deferred > 0 {
+        tracing::debug!(
+            deferred,
+            pressured = crate::residency::pressured(),
+            "upload growth held back by the host-memory guard"
+        );
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP").is_none_or(|v| v != "0")) {
         return;

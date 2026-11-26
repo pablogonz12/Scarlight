@@ -2106,6 +2106,14 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             f.Offset + u64::from(f.Footprint.RowPitch) * u64::from(r) * u64::from(f.Footprint.Depth)
         })
         .fold(total, u64::max);
+    // A staging buffer is a committed upload resource the size of the texture.
+    // When the host is out of commit, or the driver has just refused one, it is
+    // made on a later frame instead of failing again now: no list marks the
+    // texture uploaded, so the next one that samples it asks again
+    // ([`crate::residency`], and its starvation valve for a PC that stays low).
+    if !crate::residency::admit_upload(total) {
+        return None;
+    }
     let (buffer, data) = host.upload_buffer(total)?;
     // Memory each subresource (plane, then mip plus slice times mips)
     // occupies, for detiling only the pages that changed. 3D textures

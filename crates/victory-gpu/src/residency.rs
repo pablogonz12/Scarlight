@@ -168,6 +168,17 @@ pub(crate) fn refused() -> bool {
     enabled() && crate::host::now_ms() < RETRY_AT.load(Ordering::Relaxed)
 }
 
+/// Uploads deferred in a row: past this, one is admitted whatever the
+/// commit says, so a picture the title needs cannot be starved by a PC that
+/// stays low (a floor that never clears would otherwise mean never uploaded).
+const MAX_UPLOAD_DEFERRALS: u64 = 16;
+static UPLOAD_DEFERRALS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the starvation valve is open after `deferrals` refusals in a row.
+fn starved(deferrals: u64) -> bool {
+    deferrals >= MAX_UPLOAD_DEFERRALS
+}
+
 /// Counts a growth this guard held back, so a frame line can say so.
 pub(crate) fn note_deferred() {
     DEFERRED.fetch_add(1, Ordering::Relaxed);
@@ -184,17 +195,19 @@ pub(crate) fn take_deferred() -> u64 {
 /// the OOM it avoids.
 pub(crate) fn admit_upload(bytes: u64) -> bool {
     if !enabled() {
+        UPLOAD_DEFERRALS.store(0, Ordering::Relaxed);
         return true;
-    }
-    if refused() {
-        note_deferred();
-        return false;
     }
     let total = crate::total_system_ram_bytes().unwrap_or(0);
-    if total == 0 {
-        return true;
+    let deferred = UPLOAD_DEFERRALS.load(Ordering::Relaxed);
+    let admit = total == 0 || starved(deferred) || (!refused() && admitted(total, sampled_commit(), bytes, false));
+    if admit {
+        UPLOAD_DEFERRALS.store(0, Ordering::Relaxed);
+    } else {
+        UPLOAD_DEFERRALS.fetch_add(1, Ordering::Relaxed);
+        note_deferred();
     }
-    admitted(total, sampled_commit(), bytes, false)
+    admit
 }
 
 /// Whether a new OS block of upload storage of `bytes` may be committed. Free
@@ -312,7 +325,7 @@ mod tests {
         assert_eq!(upload_floor(2 * GIB), 256 * MIB);
         assert_eq!(growth_floor(SMALL), GIB);
         assert_eq!(growth_floor(OURS), 2 * GIB);
-        for total in [1 * GIB, SMALL, 12 * GIB, OURS, 30 * GIB, BIG, 64 * GIB] {
+        for total in [GIB, SMALL, 12 * GIB, OURS, 30 * GIB, BIG, 64 * GIB] {
             assert!(upload_floor(total) >= 256 * MIB && upload_floor(total) <= GIB);
             assert!(growth_floor(total) > upload_floor(total));
         }
@@ -421,6 +434,22 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "1e6 admission decisions took {elapsed:?}"
         );
+    }
+
+    /// The valve opens after sixteen refusals in a row, so a PC that stays
+    /// under its floor cannot starve an upload the title needs.
+    #[test]
+    fn a_long_low_commit_still_admits_one_upload() {
+        assert!(!starved(0));
+        assert!(!starved(MAX_UPLOAD_DEFERRALS - 1));
+        assert!(starved(MAX_UPLOAD_DEFERRALS));
+        assert!(starved(MAX_UPLOAD_DEFERRALS * 10));
+        // Off nothing is ever deferred, so nothing can starve.
+        if !enabled() {
+            UPLOAD_DEFERRALS.store(MAX_UPLOAD_DEFERRALS * 3, Ordering::Relaxed);
+            assert!(admit_upload(u64::MAX));
+        }
+        UPLOAD_DEFERRALS.store(0, Ordering::Relaxed);
     }
 
     /// Off, the guard admits everything and reads nothing.
