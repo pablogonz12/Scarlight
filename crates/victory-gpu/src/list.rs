@@ -403,16 +403,16 @@ pub(crate) fn cut_list(this: This) -> bool {
 /// before.
 #[cfg(windows)]
 fn read_back_cuts() -> bool {
+    // Only the variable is read once: the queue's own switches can be turned
+    // during a run, and a cut recorded while the queue runs no parts would be
+    // submitted as `host` alone, so those commands would never run.
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        // A part of its own needs the queue to run parts
-        // ([`crate::queue::cuts`]), and a submission sent ahead of the wait
-        // ([`crate::host::late`]) writes its read-backs when it is settled,
-        // after the next submission's copies were prepared.
-        std::env::var_os("VICTORY_SPLIT_READBACKS").is_none_or(|v| v != "0")
-            && crate::queue::cuts()
-            && !crate::host::late()
-    })
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_SPLIT_READBACKS").is_none_or(|v| v != "0"));
+    // A part of its own needs the queue to run parts ([`crate::queue::cuts`]),
+    // and a submission sent ahead of the wait ([`crate::host::late`]) writes
+    // its read-backs when it is settled, after the next submission's copies
+    // were prepared.
+    on && crate::queue::cuts() && !crate::host::late()
 }
 
 /// Closes the host list `this` records into and records into a fresh one
