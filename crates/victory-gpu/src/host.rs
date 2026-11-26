@@ -1402,10 +1402,13 @@ pub(crate) fn dred_on() -> bool {
     })
 }
 
-/// Indirect mesh dispatches since the last frame line: the largest group
+/// Indirect dispatch records since the last frame line: the largest group
 /// count a record asked for, and the groups asked in all (from the lists'
-/// budget buffers, a run late).
+/// budget buffers, a run late). MESH_GROUPS are the mesh records,
+/// COMPUTE_GROUPS the compute ones.
 static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+static COMPUTE_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
@@ -1856,9 +1859,15 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The pipelines [`HostList::bind_pipeline`] kept, by address.
+    bound: crate::bound::Bound,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Ranges declared written by shaders since the list last wrote title
+    /// memory (host copy, address, bytes): declaring them again would
+    /// change nothing.
+    gpu_written: crate::declareonce::Written,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -1881,6 +1890,14 @@ struct Deferred {
 }
 
 impl Deferred {
+    /// The steps recorded last write title memory: what was brought up to
+    /// date before them, and what the shaders were declared to write before
+    /// them, are not any more.
+    fn title_written(&mut self) {
+        self.refreshed.clear();
+        self.gpu_written.forget();
+    }
+
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
     /// reset.
     fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
@@ -4573,9 +4590,14 @@ impl Host {
                 // readback words has run; word 0 is the work charged, 1 and 2
                 // what the mesh clamp noted of the run.
                 let words = budget.data as *const u32;
+                // SAFETY: as above; words 1 and 2 are what the mesh clamp
+                // noted, 3 and 4 the compute clamp's.
                 let (largest, all) = unsafe { (words.add(1).read_volatile(), words.add(2).read_volatile()) };
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
+                let (largest, all) = unsafe { (words.add(3).read_volatile(), words.add(4).read_volatile()) };
+                COMPUTE_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
+                COMPUTE_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
             }
             // Not executing any more: the next submission takes it.
             BUDGET_LISTS.lock().unwrap_or_else(|e| e.into_inner()).push(budget_list);
@@ -5499,6 +5521,21 @@ impl HostList {
         }
     }
 
+    /// The list binds a pipeline: it and its root signature are kept until
+    /// the list is reset, and its name noted, the first time only (a kept
+    /// pipeline's address names no other).
+    pub(crate) fn bind_pipeline(&self, name: &str, pso: &ID3D12PipelineState, root: &ID3D12RootSignature) {
+        {
+            let mut deferred = self.deferred();
+            if !deferred.bound.first(pso.as_raw() as usize) {
+                return;
+            }
+            deferred.kept.push(pso.clone().into());
+            deferred.kept.push(root.clone().into());
+        }
+        self.used_pipeline(name);
+    }
+
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -5522,7 +5559,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
+        deferred.title_written();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -5553,15 +5590,20 @@ impl HostList {
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
+    /// Declared once until the list next writes title memory (but with
+    /// `VICTORY_DECLARE_ONCE=0`): the dispatches of a frame declared the
+    /// same ranges thousands of times, each a step of its own.
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if !crate::declareonce::on() || deferred.gpu_written.first(key) {
+            deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+        }
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -5697,8 +5739,9 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.title_written();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -6583,8 +6626,13 @@ impl Meter {
         ));
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+        let compute_largest = COMPUTE_GROUPS[0].swap(0, Ordering::Relaxed);
+        let compute_groups = COMPUTE_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
+        );
+        tracing::info!(
+            "indirect compute dispatches: the largest group count asked for {compute_largest} (clamped: at most 65535), {compute_groups:.0} groups asked per frame"
         );
         late_line(frames);
         card_clock_line(frames, ms);
