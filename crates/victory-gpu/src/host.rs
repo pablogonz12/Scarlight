@@ -838,6 +838,7 @@ mod tests {
         assert_eq!(amd_mesh_family(AMD, 0x66af), Some("gfx9 (Vega)"), "Vega 20");
         assert_eq!(amd_mesh_family(AMD, 0x15d8), Some("gfx9 APU"), "Raven");
         assert_eq!(amd_mesh_family(AMD, 0x164c), Some("gfx9 APU"), "Lucienne");
+        assert_eq!(amd_mesh_family(AMD, 0x15e7), Some("gfx9 APU"), "Renoir");
         assert_eq!(amd_mesh_family(AMD, 0x731f), Some("gfx10.1 (RDNA1)"), "16");
         assert_eq!(amd_mesh_family(AMD, 0x7360), Some("gfx10.1 (RDNA1)"), "14");
         // Mesh shaders exist from RDNA2 up, and on the test machine: no
@@ -4733,7 +4734,7 @@ fn amd_mesh_family(vendor: u32, device: u32) -> Option<&'static str> {
         // Vega APUs: Raven Ridge, Raven2, Picasso, Renoir, Cezanne,
         // Lucienne (gfx902/gfx909/gfx90c). Van Gogh (0x163f, gfx1033) and
         // Mendocino (0x1506, gfx1037) are RDNA2 and stay out of this arm.
-        0x15d8 | 0x15dd | 0x1636 | 0x1638 | 0x164c => Some("gfx9 APU"),
+        0x15d8 | 0x15dd | 0x15e7 | 0x1636 | 0x1638 | 0x164c => Some("gfx9 APU"),
         // Navi 10/12/14 (gfx1010-1012): the 82 create, but the driver does
         // not advertise VK_EXT_mesh_shader, so a mesh draw cannot run.
         0x7310..=0x731f | 0x7340..=0x734f | 0x7360..=0x736f => Some("gfx10.1 (RDNA1)"),
