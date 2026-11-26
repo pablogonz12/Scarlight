@@ -35,6 +35,11 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
+    /// The asking at which every page of the copy was last copied whole
+    /// (0: not yet): no page of it is stale at that asking, so a refresh
+    /// copies nothing while the journal has no page of the range written
+    /// after it ([`Shadow::clean`]).
+    all_copied: AtomicU64,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -183,16 +188,26 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
 }
 
 /// Resolve `(min_bytes, max_bytes)` from the adapter's local VRAM budget and
-/// optional explicit MiB overrides from `VICTORY_CARD_BUFFERS_MIN_MB` /
-/// `VICTORY_CARD_BUFFERS_MB`.
+/// optional explicit overrides: `VICTORY_CARD_BUFFERS_MIN_MB` (or the finer
+/// `VICTORY_CARD_BUFFERS_MIN_KB`) and `VICTORY_CARD_BUFFERS_MB`.
 fn resolve_card_limits(
     local_vram_budget: Option<u64>,
     min_mb_override: Option<u64>,
+    min_kb_override: Option<u64>,
     max_mb_override: Option<u64>,
 ) -> (u64, u64) {
     const MIB: u64 = 1 << 20;
+    const KIB: u64 = 1 << 10;
     let (default_min_mb, default_max_mb) = default_card_limits_mb(local_vram_budget);
-    let min_bytes = min_mb_override.unwrap_or(default_min_mb).saturating_mul(MIB).max(MIB);
+    // A floor of a MiB is not a floor of the copies: nearly all of them are
+    // smaller (few bytes each), and in the PC's memory every load, store and
+    // atomic a shader does on one crosses the bus. MIN_KB says the least in
+    // KiB, so that 64 puts every title buffer's copy on the card (after
+    // fxceless c36971b2); unset, the floor is the one of before.
+    let min_bytes = match (min_kb_override, min_mb_override) {
+        (Some(kib), _) => kib.saturating_mul(KIB),
+        (None, mb) => mb.unwrap_or(default_min_mb).saturating_mul(MIB).max(MIB),
+    };
     let max_bytes = max_mb_override.unwrap_or(default_max_mb).saturating_mul(MIB);
     (min_bytes, max_bytes)
 }
@@ -200,7 +215,8 @@ fn resolve_card_limits(
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB`.
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (or `VICTORY_CARD_BUFFERS_MIN_KB`, which
+/// can go under a MiB) and `VICTORY_CARD_BUFFERS_MB`.
 /// Defaults scale with the adapter's local VRAM budget (1 MiB / 1024 MB on
 /// `<= 12 GiB` budgets, 1 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
 /// on `>= 20 GiB` budgets), and explicit env vars always override. Both are
@@ -220,11 +236,12 @@ fn card_limits() -> (u64, u64) {
         let (min_bytes, max_bytes) = resolve_card_limits(
             vram_budget,
             env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
+            env_mb("VICTORY_CARD_BUFFERS_MIN_KB"),
             env_mb("VICTORY_CARD_BUFFERS_MB"),
         );
         tracing::info!(
             vram_budget_mb = vram_budget.map(|b| b >> 20),
-            card_buffers_min_mb = min_bytes >> 20,
+            card_buffers_min_kb = min_bytes >> 10,
             card_buffers_max_mb = max_bytes >> 20,
             "card buffer limits"
         );
@@ -720,6 +737,33 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     differs != 0
 }
 
+/// One piece of a declared range put back into title memory by
+/// [`Shadow::copy_back`]: what the GPU wrote (`now` where it differs from
+/// `before`, the snapshot) goes in, and the copy and its snapshot take the
+/// title's bytes in turn.
+///
+/// The snapshot follows the merged bytes, not just the GPU's: the bytes the
+/// copy takes from title memory are the title's own, and a later copy-back
+/// of a range that overlaps this one must not take them for the GPU's and
+/// put the copy's older value back over a title write made after this
+/// (upstream #2436). Whether `title` changed.
+///
+/// [`merge_piece`]'s rule in one pass that stores into the copy too, written
+/// out rather than copied a second time (this runs over the differing bytes
+/// of every declared range: some hundred MB a frame on the copy-back path).
+fn merge_back(now: &mut [u8], before: &mut [u8], title: &mut [u8]) -> bool {
+    let mut differs = 0u8;
+    for ((n, b), t) in now.iter_mut().zip(before.iter_mut()).zip(title.iter_mut()) {
+        let wrote = if *n != *b { 0xffu8 } else { 0 };
+        let merged = (*t & !wrote) | (*n & wrote);
+        differs |= merged ^ *t;
+        *t = merged;
+        *n = merged;
+        *b = merged;
+    }
+    differs != 0
+}
+
 /// `[from, to)` without the ranges of `skip`, in order.
 fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     skip.sort_unstable();
@@ -1143,6 +1187,97 @@ pub(crate) fn wide_back() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
 }
 
+/// Whether a host copy whose memory nothing wrote since it was last brought
+/// up to date is left out of the submission's refreshes (`VICTORY_SKIP_CLEAN=0`
+/// turns it off; safe to change live, taken per copy at each flush).
+///
+/// Lists whose shaders use title memory ask for every host copy there is at
+/// each submission (about 4,100 in the world), and again after every title
+/// copy: 254,139 change checks a frame over 92.8 GB, 99.7 % of it unchanged.
+/// Each went through the flush's maps, the write-watch journal and the
+/// copy's pages to find nothing to copy, about 330 ns each in a synthetic
+/// frame of the same volumes (half the preparing time). A copy the journal
+/// shows no write in since its last whole copy has nothing to copy, and
+/// skipping it leaves the same bytes in it as the check did.
+pub(crate) fn skip_clean() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let start = *ON.get_or_init(|| {
+        skip_clean_enabled(std::env::var("VICTORY_SKIP_CLEAN").ok().as_deref())
+    });
+    crate::switches::b("VICTORY_SKIP_CLEAN", start)
+}
+
+fn skip_clean_enabled(setting: Option<&str>) -> bool {
+    match setting {
+        Some("0") => false,
+        Some("1") => true,
+        _ => true,
+    }
+}
+
+/// [`Shadow::clean`]'s answer, from what it reads: a copy placed in the
+/// title's memory has nothing to copy, memory last found not write-watched
+/// is copied whole, a copy with no whole copy of its pages yet has them to
+/// fill, and a range the journal cannot answer for is copied.
+/// `[from, to)` cut to a copy of `len` bytes at `start`: what of the ask
+/// lies in the copy, as title addresses.
+fn cut_to_copy(start: usize, len: usize, from: usize, to: usize) -> (usize, usize) {
+    let end = start.saturating_add(len);
+    (from.clamp(start, end), to.clamp(start, end))
+}
+
+fn clean_decided(placed: bool, watched: u8, all_copied: u64, in_range: bool, written: Option<bool>) -> bool {
+    !placed && watched == 1 && all_copied != 0 && in_range && written == Some(false)
+}
+
+#[cfg(test)]
+mod clean_tests {
+    use super::{clean_decided, cut_to_copy, skip_clean_enabled};
+
+    /// A copy nothing wrote since it was last brought up to date is clean;
+    /// one with pages never copied whole, not known to be write-watched,
+    /// placed in the title's memory, or written since is not.
+    #[test]
+    fn a_copy_is_clean_only_where_nothing_wrote_since_its_last_whole_copy() {
+        assert!(clean_decided(false, 1, 7, true, Some(false)));
+        // Never copied whole: its pages are to fill.
+        assert!(!clean_decided(false, 1, 0, true, Some(false)));
+        // Not (yet) known to be write-watched: copied whole.
+        assert!(!clean_decided(false, 0, 7, true, Some(false)));
+        assert!(!clean_decided(false, 2, 7, true, Some(false)));
+        // Placed in the title's memory: nothing to copy either way.
+        assert!(!clean_decided(true, 1, 7, true, Some(false)));
+        // A page written since, or a range the journal cannot answer for.
+        assert!(!clean_decided(false, 1, 7, true, Some(true)));
+        assert!(!clean_decided(false, 1, 7, true, None));
+        // A range outside the copy.
+        assert!(!clean_decided(false, 1, 7, false, Some(false)));
+    }
+
+    /// An ask is cut to the copy: one reaching past its end answers for the
+    /// bytes inside it only (a nested copy's tail is no part of it), and one
+    /// wholly outside asks nothing.
+    #[test]
+    fn a_clean_check_is_cut_to_the_copy() {
+        // A 0x4000-byte copy at 0x1000, and asks around it.
+        assert_eq!(cut_to_copy(0x1000, 0x4000, 0x2000, 0x3000), (0x2000, 0x3000), "inside");
+        assert_eq!(cut_to_copy(0x1000, 0x4000, 0x1000, 0x5000), (0x1000, 0x5000), "whole");
+        assert_eq!(cut_to_copy(0x1000, 0x4000, 0xf00, 0x6000), (0x1000, 0x5000), "past both ends");
+        assert_eq!(cut_to_copy(0x1000, 0x4000, 0x4000, 0x6000), (0x4000, 0x5000), "the tail only");
+        assert_eq!(cut_to_copy(0x1000, 0x4000, 0x6000, 0x7000), (0x5000, 0x5000), "outside: empty");
+        assert_eq!(cut_to_copy(0x1000, 0x4000, 0x9000, 0x9100), (0x5000, 0x5000), "past it: empty");
+    }
+
+    /// Skipping clean copies is on unless the switch is set to 0.
+    #[test]
+    fn skipping_clean_copies_can_be_turned_off() {
+        assert!(skip_clean_enabled(None));
+        assert!(skip_clean_enabled(Some("1")));
+        assert!(!skip_clean_enabled(Some("0")));
+        assert!(skip_clean_enabled(Some("yes")), "anything else keeps the default");
+    }
+}
+
 type Job = Box<dyn FnOnce() + Send>;
 
 /// Threads kept for [`wide`]: what they are to do, and the word that there
@@ -1518,22 +1653,68 @@ pub(crate) fn merged_stats() -> [u64; 3] {
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    #[inline]
+    fn all_differ_8(a: u64, b: u64) -> bool {
+        let d = a ^ b;
+        d.wrapping_sub(0x0101_0101_0101_0101) & !d & 0x8080_8080_8080_8080 == 0
+    }
+    #[inline]
+    unsafe fn load_u64(ptr: *const u8, off: usize) -> u64 {
+        unsafe { ptr.add(off).cast::<u64>().read_unaligned() }
+    }
     let n = now.len().min(was.len());
+    let (np, wp) = (now.as_ptr(), was.as_ptr());
     let mut runs = Vec::new();
     let mut i = 0;
     while i < n {
-        // Equal bytes, eight at a time while they last.
-        while i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
+        // Equal bytes: 64 bytes at a time, then 8 bytes at a time.
+        while i + 64 <= n {
+            let eq = unsafe {
+                load_u64(np, i) == load_u64(wp, i)
+                    && load_u64(np, i + 8) == load_u64(wp, i + 8)
+                    && load_u64(np, i + 16) == load_u64(wp, i + 16)
+                    && load_u64(np, i + 24) == load_u64(wp, i + 24)
+                    && load_u64(np, i + 32) == load_u64(wp, i + 32)
+                    && load_u64(np, i + 40) == load_u64(wp, i + 40)
+                    && load_u64(np, i + 48) == load_u64(wp, i + 48)
+                    && load_u64(np, i + 56) == load_u64(wp, i + 56)
+            };
+            if !eq {
+                break;
+            }
+            i += 64;
+        }
+        while i + 8 <= n && unsafe { load_u64(np, i) == load_u64(wp, i) } {
             i += 8;
         }
-        while i < n && now[i] == was[i] {
+        while i < n && unsafe { *np.add(i) == *wp.add(i) } {
             i += 1;
         }
         if i >= n {
             break;
         }
         let first = i;
-        while i < n && now[i] != was[i] {
+        // Differing bytes: 64 bytes at a time, then 8 bytes at a time.
+        while i + 64 <= n {
+            let diff = unsafe {
+                all_differ_8(load_u64(np, i), load_u64(wp, i))
+                    && all_differ_8(load_u64(np, i + 8), load_u64(wp, i + 8))
+                    && all_differ_8(load_u64(np, i + 16), load_u64(wp, i + 16))
+                    && all_differ_8(load_u64(np, i + 24), load_u64(wp, i + 24))
+                    && all_differ_8(load_u64(np, i + 32), load_u64(wp, i + 32))
+                    && all_differ_8(load_u64(np, i + 40), load_u64(wp, i + 40))
+                    && all_differ_8(load_u64(np, i + 48), load_u64(wp, i + 48))
+                    && all_differ_8(load_u64(np, i + 56), load_u64(wp, i + 56))
+            };
+            if !diff {
+                break;
+            }
+            i += 64;
+        }
+        while i + 8 <= n && unsafe { all_differ_8(load_u64(np, i), load_u64(wp, i)) } {
+            i += 8;
+        }
+        while i < n && unsafe { *np.add(i) != *wp.add(i) } {
             i += 1;
         }
         runs.push((first, i - first));
@@ -1543,7 +1724,38 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod merge_tests {
-    use super::changed_runs;
+    use super::{changed_runs, merge_back, merge_piece};
+
+    /// A copy-back keeps the snapshot in step: the bytes the copy takes from
+    /// title memory are the title's own, so a later copy-back of the same
+    /// bytes finds them unchanged and does not put the copy's older value
+    /// back over a title write made after it (upstream #2436: a shader's
+    /// byte at 10, a title write at 40).
+    #[test]
+    fn a_copy_back_keeps_its_snapshot_in_step() {
+        // One piece of two bytes: the copy before the submission, the title
+        // and the copy after the shaders wrote the first byte.
+        let mut before = [0x00u8, 0x00];
+        let mut title = [0x00u8, 0x40];
+        let mut copy = [0xaau8, 0x00];
+        assert!(merge_back(&mut copy, &mut before, &mut title));
+        // The GPU's byte is in title memory; the copy took the title's.
+        assert_eq!(title, [0xaa, 0x40]);
+        assert_eq!(copy, [0xaa, 0x40]);
+        assert_eq!(before, copy, "the snapshot follows the copy");
+
+        // The title writes both again after the copy-back; a later copy-back
+        // of the same piece takes them, nothing goes back.
+        title = [0x11, 0x41];
+        assert!(!merge_back(&mut copy, &mut before, &mut title));
+        assert_eq!(title, [0x11, 0x41], "the title's later writes stay");
+
+        // What the snapshot left behind did: the copy's older first byte was
+        // taken for the GPU's and written over the title's.
+        let (stale, mut taken, mut older_title) = ([0xaau8, 0x00u8], [0x00u8, 0x00], [0x11u8, 0x41]);
+        assert!(merge_piece(&stale, &mut taken, &mut older_title));
+        assert_eq!(older_title, [0xaa, 0x41]);
+    }
 
     /// The runs hold exactly the bytes that differ: putting them into the
     /// old bytes gives the new ones, and no run holds an equal byte.
@@ -1898,6 +2110,7 @@ impl Shadow {
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
+            all_copied: AtomicU64::new(0),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -2108,17 +2321,21 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
-        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
         self.compared(from, to);
-        if let Some(before) = &*snapshot
+        if snapshot.is_some()
             && from < to
         {
             // SAFETY: `writing` set the snapshot's bytes of every declared
-            // range, at the copy's offsets.
-            let before = unsafe { std::slice::from_raw_parts(before.as_ptr().add(from), to - from) };
+            // range, at the copy's offsets; the merge below, under the same
+            // lock, brings the bytes the copy takes from title memory into
+            // them too. Every read of them ends before its piece is written:
+            // one slice per use, no borrow of the snapshot kept across the
+            // merge.
+            let base = snapshot.as_mut().unwrap().as_mut_ptr();
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission (on several threads: gigabytes a frame, bound by
             // memory speed), title memory read only where the GPU wrote.
@@ -2126,7 +2343,10 @@ impl Shadow {
             let scanning = std::time::Instant::now();
             let differing = match found {
                 Some(found) => found,
-                None => self.differing(from, to, before),
+                None => {
+                    let before = unsafe { std::slice::from_raw_parts(base.add(from), to - from) };
+                    self.differing(from, to, before)
+                }
             };
             #[cfg(feature = "diagnostics")]
             let syncing = {
@@ -2145,17 +2365,23 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
                 // From the first byte that differs to the last: title
                 // memory is read and written there only (a shader that sets
                 // a few words of a piece cost a read, a walk and a write of
-                // all 64 KiB of it).
-                let Some(first) = first_difference(host, old) else {
+                // all 64 KiB of it). The snapshot's bytes are read here and
+                // nowhere else before they are written below.
+                let found = {
+                    // SAFETY: inside the snapshot's allocation (`writing`),
+                    // read only for this comparison.
+                    let old = unsafe { std::slice::from_raw_parts(base.add(at), n) };
+                    first_difference(host, old)
+                        .map(|first| (first, last_difference(host, old).unwrap_or(first)))
+                };
+                let Some((first, last)) = found else {
                     continue;
                 };
-                let last = last_difference(host, old).unwrap_or(first);
                 let (at, n) = (at + first, last + 1 - first);
-                let (host, old) = (&mut host[first..=last], &old[first..=last]);
+                let host = &mut host[first..=last];
                 let title = &mut title[..n];
                 // On the write-back worker the piece may be held
                 // inaccessible (the job's own `back_begin`): the kernel's
@@ -2168,21 +2394,20 @@ impl Shadow {
                 if !crate::host::read_into((start + at) as *const u8, title) {
                     continue;
                 }
-                // Title memory with the GPU's bytes put in; the copy takes
-                // the title's bytes in turn.
+                // Title memory with the GPU's bytes put in; the copy and its
+                // snapshot take the title's bytes in turn, so that a later
+                // copy-back of a range that overlaps this one finds only
+                // what the card writes from now on and not the older bytes
+                // of the copy (upstream #2436).
                 // Without a branch, so the loop runs many bytes at a time:
                 // the GPU's byte where the copy's byte is not what it was
                 // before the submission, else the title's. (With the two
                 // searches above this was 44 ms a frame for 970 pieces.)
-                let mut differs = 0u8;
-                for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                    let gpu = if *h != *o { 0xffu8 } else { 0 };
-                    let merged = (*t & !gpu) | (*h & gpu);
-                    differs |= merged ^ *t;
-                    *t = merged;
-                    *h = merged;
-                }
-                if differs != 0 {
+                // SAFETY: inside the snapshot's allocation (`writing`) and
+                // not read elsewhere while it is written here.
+                let held = unsafe { std::slice::from_raw_parts_mut(base.add(at), n) };
+                let differs = merge_back(host, held, title);
+                if differs {
                     crate::watch::writing(start + at, n);
                     crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                     written += n;
@@ -2619,6 +2844,29 @@ impl Shadow {
         self.update_free(from, to)
     }
 
+    /// Whether a refresh of `[from, to)` (title addresses, cut to the copy)
+    /// would copy nothing:
+    /// every page of the copy was copied whole at some asking, and the
+    /// journal holds no page of the range written after it. The copy keeps
+    /// one number, so the check walks no pages and takes no lock of the
+    /// pages'.
+    ///
+    /// `false` where the answer is not known: memory never found to be
+    /// write-watched, a copy placed in the title's memory (nothing to copy
+    /// either way), and a range no asking of this submission covers
+    /// ([`crate::watch::written_since`]).
+    pub(crate) fn clean(&self, from: usize, to: usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = cut_to_copy(start, end - start, from, to);
+        let since = self.all_copied.load(Ordering::Relaxed);
+        let written = if since != 0 && from < to {
+            crate::watch::written_since(from, to, since)
+        } else {
+            None
+        };
+        clean_decided(self.place.is_some(), self.watched.load(Ordering::Relaxed), since, from < to, written)
+    }
+
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
@@ -2626,6 +2874,13 @@ impl Shadow {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
+                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                // Every page copied, so nothing in the copy is stale as of
+                // this asking: a later refresh of any range is left out
+                // until the journal has a page of it written after.
+                if from <= start && to >= end {
+                    self.all_copied.store(now, Ordering::Relaxed);
+                }
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -3355,10 +3610,17 @@ mod window_tests {
         assert_eq!(default_card_limits_mb(Some(48 * GIB)), (1, 8192));
 
         // Explicit env overrides always win, clamp min to >= 1 MiB, and saturate on overflow.
-        assert_eq!(resolve_card_limits(Some(32 * GIB), Some(8), Some(4096)), (8 * MIB, 4096 * MIB));
-        assert_eq!(resolve_card_limits(Some(12 * GIB), Some(0), Some(1024)), (MIB, 1024 * MIB));
-        assert_eq!(resolve_card_limits(None, Some(u64::MAX), Some(u64::MAX)), (u64::MAX, u64::MAX));
-        assert_eq!(resolve_card_limits(None, None, None), (MIB, 1024 * MIB));
+        assert_eq!(resolve_card_limits(Some(32 * GIB), Some(8), None, Some(4096)), (8 * MIB, 4096 * MIB));
+        assert_eq!(resolve_card_limits(Some(12 * GIB), Some(0), None, Some(1024)), (MIB, 1024 * MIB));
+        assert_eq!(resolve_card_limits(None, Some(u64::MAX), None, Some(u64::MAX)), (u64::MAX, u64::MAX));
+        assert_eq!(resolve_card_limits(None, None, None, None), (MIB, 1024 * MIB));
+        // MIN_KB goes under the MiB the MiB switch cannot: 64 KiB puts every
+        // title buffer's copy on the card, 0 has none at all, and it wins
+        // over MIN_MB when both are set.
+        assert_eq!(resolve_card_limits(None, None, Some(64), None), (64 << 10, 1024 * MIB));
+        assert_eq!(resolve_card_limits(None, None, Some(0), None), (0, 1024 * MIB));
+        assert_eq!(resolve_card_limits(None, Some(8), Some(64), None), (64 << 10, 1024 * MIB));
+        assert_eq!(resolve_card_limits(None, None, Some(u64::MAX), None), (u64::MAX, 1024 * MIB));
     }
 
     /// An ask that may take any window takes the longest that holds all of
