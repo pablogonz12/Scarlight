@@ -1612,9 +1612,12 @@ impl State {
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
+            // The budget a slot has left: a new one where this pass is the
+            // one that found it, else what the pass before it stored.
+            let left = pending.get(&index).copied().unwrap_or(retry);
             let Some(view) = host.mirror(index, handle, true) else {
-                if retry > 0 {
-                    again.insert(index, retry.saturating_sub(1));
+                if left > 0 {
+                    again.insert(index, left - 1);
                 }
                 continue;
             };
@@ -1643,9 +1646,10 @@ impl State {
             // view's range alone would find.
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
                 // No host copy yet: the memory may be written and read in
-                // this very list, so ask again next pass.
-                if retry > 0 {
-                    again.insert(index, retry.saturating_sub(1));
+                // this very list, so ask again next pass, until the budget
+                // runs out and the full scan takes it.
+                if left > 0 {
+                    again.insert(index, left - 1);
                 }
                 continue;
             };
