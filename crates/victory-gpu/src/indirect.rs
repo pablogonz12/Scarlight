@@ -79,11 +79,18 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = count * instances;
         draw_counts = uint2(count, instances);
     } else if (kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+        uint3 want = src_args.Load3(src_at);
+        uint3 g = min(want, uint3(65535u, 65535u, 65535u));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
         }
+        // Diagnostics, in the budget buffer's words 12 and 16 (beside the
+        // mesh notes at 4 and 8): what the record asked, before the clamp
+        // that keeps the first 65,535 groups only.
+        uint was;
+        budget.InterlockedMax(12, want.x, was);
+        budget.InterlockedAdd(16, min(want.x, 1u << 24), was);
         cost = g.x * g.y * g.z * 64u;
         groups = g;
     } else {
