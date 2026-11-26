@@ -1684,7 +1684,7 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     if len == 0 {
         return true;
     }
-    let (there, of) = readable(at as usize, len, true);
+    let (there, of) = readable(at as usize, len, true, 1);
     there == of
 }
 
@@ -1710,12 +1710,19 @@ fn by_query() -> bool {
 /// trimmed), and a one-byte read through the kernel says.
 /// A page that is committed and may not be read counts as not there, which
 /// is what the callers ask for: they read or write the memory next.
-fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
+///
+/// Only one page in `stride` of those the query finds outside the working
+/// set costs a read: an answer that needs no count of pages (is anything
+/// there) asks about the first page of every 64 KiB block, the size the
+/// title's memory is mapped in, and a texture that is not there at all then
+/// costs 1,024 reads for its 64 MiB instead of 16,384, on every look.
+fn readable(at: usize, len: usize, all: bool, stride: usize) -> (usize, usize) {
     use windows_sys::Win32::System::ProcessStatus::{
         K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     const KERNEL_PAGE: usize = 4096;
+    let stride = stride.max(1);
     let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len - 1) / KERNEL_PAGE);
     let of = last - first + 1;
     let mut there = 0;
@@ -1740,7 +1747,9 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
             // SAFETY: plain data the query filled in.
             let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
             let mut byte = [0u8];
-            if valid || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
+            let read = (valid || (page + i) % stride == 0)
+                && (valid || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte));
+            if read {
                 there += 1;
             } else if all {
                 return (there, of);
@@ -1772,7 +1781,7 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
 /// in can have only its interior mips mapped, and it then has bytes to
 /// stage though neither its first nor its last page is there.
 fn any_mapped(at: *const u8, len: usize) -> bool {
-    any_mapped_by(at as usize, len, |p, n| readable(p, n, false).0)
+    any_mapped_by(at as usize, len, |p, n| readable(p, n, false, 16).0)
 }
 
 /// [`any_mapped`] with the question about a range of pages passed in (how
@@ -1816,7 +1825,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
             .get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1"))
         {
             // By page, without the walk: whole pages, cut to the range.
-            let (there, _) = readable(start, len, false);
+            let (there, _) = readable(start, len, false, 1);
             return (there as u64 * 4096).min(len as u64);
         }
         // By 64 KiB block, one page asked of each: the title's memory is
@@ -1832,7 +1841,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         let mut block = start & !(BLOCK - 1);
         while block < end {
             let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
+            if readable(lo, 1, true, 1).0 == 1 {
                 there += (hi - lo) as u64;
             }
             block = block.saturating_add(BLOCK);
@@ -1979,7 +1988,7 @@ fn mapped_prefix(at: *const u8, len: usize) -> u64 {
     let end = block.saturating_add(len);
     while block < end {
         let n = (end - block).min(BLOCK);
-        if readable(block, 1, true).0 != 1 {
+        if readable(block, 1, true, 1).0 != 1 {
             break;
         }
         there += n as u64;
