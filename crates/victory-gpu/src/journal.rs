@@ -106,15 +106,25 @@ fn reading(s: usize) -> RwLockReadGuard<'static, Pages> {
     SLOTS[s].0.read().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Notes pages `[first, last)` as written by asking `now`. One shard is held
-/// at a time, so a record never waits on another record's shard.
-pub(crate) fn record(first: usize, last: usize, now: u64) {
-    for (s, from, to) in Runs::new(first, last) {
-        let mut p = writing(s);
-        for page in from..to {
+/// Notes `pages` (in whatever order) as written by asking `now`, one shard
+/// held at a time, so a record never waits on another record's shard.
+fn insert(pages: impl Iterator<Item = usize>, now: u64) {
+    let n = shards();
+    let mut held: Option<(usize, RwLockWriteGuard<'static, Pages>)> = None;
+    for page in pages {
+        let s = shard(page, n);
+        if held.as_ref().map(|h| h.0) != Some(s) {
+            held = Some((s, writing(s)));
+        }
+        if let Some((_, p)) = held.as_mut() {
             p.written.insert(page, now);
         }
     }
+}
+
+/// Notes pages `[first, last)` as written by asking `now`.
+pub(crate) fn record(first: usize, last: usize, now: u64) {
+    insert(first..last, now);
 }
 
 /// The journal's pages of `[first, last)` as last written: `(page, asking)`
@@ -139,24 +149,44 @@ pub(crate) fn any_since(first: usize, last: usize, since: u64) -> bool {
     false
 }
 
+/// The kernel's answer to [`ask`]: its room is held until this is dropped,
+/// so an asking never allocates and the one buffer serves every thread.
+pub(crate) struct Answer {
+    room: std::sync::MutexGuard<'static, Vec<usize>>,
+    count: usize,
+}
+
+impl Answer {
+    /// The pages the kernel found written, as the addresses it gives.
+    pub(crate) fn pages(&self) -> &[usize] {
+        &self.room[..self.count]
+    }
+
+    /// Notes the answer's pages as written by asking `now`.
+    pub(crate) fn record(&self, now: u64) {
+        insert(self.pages().iter().map(|&at| at / PAGE), now);
+    }
+}
+
 /// Asks the kernel for the pages of `[first, last)` written since it last
-/// reset them, notes them as written by asking `now`: `Some(())` on an
-/// answer, `None` if the memory is not write-watched (the caller then looks
-/// at the guards).
+/// reset them: `Some` answer, or `None` if the memory is not write-watched
+/// (the caller then looks at the guards).
 ///
-/// The answer's room is one buffer for all askings: this is the one place a
-/// kernel call is made, and it costs 30-70 microseconds whatever the range,
-/// so askings were serialised by the journal's lock before and are by this
-/// one now (never by a page shard: a copy reads pages meanwhile).
-pub(crate) fn ask(first: usize, last: usize, now: u64) -> Option<()> {
+/// This is the one place a kernel call is made, and it costs 30-70
+/// microseconds whatever the range: askings were serialised by the journal's
+/// lock before and are by the answer's room now, never by a page shard (a
+/// copy reads pages meanwhile).
+pub(crate) fn ask(first: usize, last: usize) -> Option<Answer> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     static ROOM: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-    let mut room = ROOM.lock().unwrap_or_else(|e| e.into_inner());
-    let room = &mut *room;
+    let mut guard = ROOM.lock().unwrap_or_else(|e| e.into_inner());
+    let room = &mut *guard;
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     room.resize(count.max(room.len()), 0);
     let mut granularity = 0;
+    #[cfg(test)]
+    note_kernel_ask();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -171,21 +201,25 @@ pub(crate) fn ask(first: usize, last: usize, now: u64) -> Option<()> {
     if failed {
         return None;
     }
-    // The kernel's pages in ascending order as it gives them, one shard held
-    // at a time whatever the order.
-    let mut held: Option<(usize, RwLockWriteGuard<'static, Pages>)> = None;
-    let n = shards();
-    for &at in &room[..count] {
-        let page = at / PAGE;
-        let s = shard(page, n);
-        if held.as_ref().map(|h| h.0) != Some(s) {
-            held = Some((s, writing(s)));
-        }
-        if let Some((_, p)) = held.as_mut() {
-            p.written.insert(page, now);
-        }
-    }
-    Some(())
+    Some(Answer { room: guard, count })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The kernel askings of this thread (each test runs on its own).
+    static KERNEL_ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn note_kernel_ask() {
+    KERNEL_ASKED.with(|n| n.set(n.get() + 1));
+}
+
+/// The kernel askings of this thread so far: a test asserts one was (not)
+/// made.
+#[cfg(test)]
+pub(crate) fn kernel_asks() -> usize {
+    KERNEL_ASKED.with(|n| n.get())
 }
 
 /// The pages recorded, all shards: what a test proves the bench fired with.

@@ -6,6 +6,10 @@
 //! buffers), so what one asks is kept here for the others: a journal of
 //! each page's last write, numbered by the asking.
 //!
+//! The pools' own pages (xmem's GPU memory, committed privately) can be
+//! guarded instead of asked about: their asking costs the span, a guard costs
+//! only what was written ([`guard_pools`], `VICTORY_GUARD_POOLS`).
+//!
 //! Physical-page views (xmem's sections) cannot be write-watched. There a
 //! copy leaves each 64 KiB block it took read-only, and our vectored handler
 //! takes the first write to it: it notes the block as written and gives the
@@ -262,11 +266,20 @@ fn ask_run(a: &mut Ahead, pieces: &[(usize, usize)]) {
 /// them in the journal under the ahead asking; false (and nothing changed)
 /// if the range is not write-watched memory of one reservation.
 fn ask_kernel(a: &mut Ahead, first: usize, last: usize) -> bool {
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
-    if crate::journal::ask(first, last, a.asked).is_none() {
+    // A pool the guards hold is left to `writes`, which costs what was
+    // written in it, not what its span is ([`guard_pools`]).
+    if guard_pools()
+        && first < last
+        && (crate::guards::block_known(first * PAGE) || is_pool(first * PAGE))
+    {
         return false;
     }
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let Some(answer) = crate::journal::ask(first, last) else {
+        return false;
+    };
+    answer.record(a.asked);
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
@@ -352,7 +365,8 @@ fn covers(pieces: &[(usize, usize)], first: usize, last: usize) -> bool {
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the
 /// kernel just reported. `None` if the memory is not write-watched (nor,
-/// with `guarded`, view memory, which is then guarded).
+/// with `guarded`, view memory, which is then guarded, nor a pool the guards
+/// hold, [`guard_pools`]).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // Asked ahead with the submission's other ranges: the journal has it.
@@ -365,34 +379,161 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if let Some(now) = covered {
         return Some((now, crate::journal::pages(first, last)));
     }
-    let now = next_asking();
+    // A pool the guards hold answers out of its own blocks, without a walk of
+    // the pages asked about ([`guard_pools`]). Pages only a verifying asking
+    // found are kept too: the copy needs them.
+    let mut verified: Vec<usize> = Vec::new();
+    if guard_pools() && !guarded {
+        if !verify_due(first)
+            && let Some(written) = guarded_range(start, end, true)
+        {
+            return Some(guarded_answer(first, last, &written));
+        }
+        if verify_due(first) {
+            verified = guarded_range(start, end, true).unwrap_or_default();
+        }
+    }
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    let guarded = match crate::journal::ask(first, last, now) {
-        Some(()) => Vec::new(),
-        None => {
-            if !guarded {
-                return None;
-            }
-            #[cfg(feature = "diagnostics")]
-            let guarding = std::time::Instant::now();
-            let written = guard(first * PAGE, last * PAGE);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
-            written?
+    let now = next_asking();
+    let answer = crate::journal::ask(first, last);
+    let guarded = if answer.is_some() {
+        Vec::new()
+    } else {
+        if !guarded {
+            return None;
         }
+        #[cfg(feature = "diagnostics")]
+        let guarding = std::time::Instant::now();
+        // Verified already on this asking: the guards' answer is taken.
+        let written =
+            match guarded_range(first * PAGE, last * PAGE, !guarded || !verified.is_empty()) {
+                Some(written) => written,
+                None if verified.is_empty() => return None,
+                None => verified.clone(),
+            };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
+        written
     };
+    // The kernel's pages, the guarded ones and the verified ones all count as
+    // written by this asking.
+    #[cfg(feature = "diagnostics")]
+    let kernel = answer.as_ref().map(|answer| answer.pages());
+    if let Some(answer) = &answer {
+        answer.record(now);
+    }
+    for page in guarded.into_iter().chain(verified.iter().copied()) {
+        crate::journal::record(page, page + 1, now);
+    }
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
         add(C::Watches, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
-    }
-    for page in guarded {
-        crate::journal::record(page, page + 1, now);
+        if !verified.is_empty() {
+            // What the kernel found and the guards had not: a write that made
+            // no fault (the card's, or one through another view).
+            let found: std::collections::BTreeSet<usize> = kernel
+                .into_iter()
+                .flatten()
+                .map(|&at| at / PAGE)
+                .collect();
+            add(C::GuardMissed, verified.iter().filter(|p| !found.contains(p)).count() as u64);
+        }
     }
     Some((now, crate::journal::pages(first, last)))
+}
+
+/// [`writes`]' answer for a range the guards answered: the asking's number
+/// and the journal's pages of the range, with the pages the guards found
+/// written noted under it.
+fn guarded_answer(first: usize, last: usize, written: &[usize]) -> (u64, Vec<(usize, u64)>) {
+    let now = next_asking();
+    for &page in written {
+        crate::journal::record(page, page + 1, now);
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::Guarded, 1);
+        add(C::GuardSpan, ((last - first) * PAGE) as u64);
+    }
+    (now, crate::journal::pages(first, last))
+}
+
+/// Whether the pools' own pages are watched by our guards instead of the
+/// kernel's page walk: `VICTORY_GUARD_POOLS=1`, off unless asked for (the
+/// kernel is asked about every range, as before).
+///
+/// An asking costs what its span is, not what was written in it: the world's
+/// 2,409 askings over 10.7 GB a frame are 2.0 us each in the quiet, 625 us
+/// apiece while other threads map and unmap memory (the title's own churn,
+/// `tools/copybench` b). A guard costs what is written: one fault per 64 KiB
+/// block, 8.2 us round trip in the same bench (d), and an asking about a span
+/// whose blocks are all clean costs a search of the guards' sets (e: 1.0 ms
+/// a frame against 4.7, quiet, with 240 blocks written a frame).
+///
+/// What a guard cannot see is a write that makes no fault: the card's into
+/// host memory, or one through another view of the same pages. So the kernel
+/// still answers about each range as the verifier, on one frame in
+/// [`verify_every`], and the pages only it found are counted
+/// (`copystat::C::GuardMissed`).
+pub(crate) fn guard_pools() -> bool {
+    #[cfg(test)]
+    if let Some(on) = tests::POOLS.with(|v| v.get()) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Off unless asked for: a guard that misses a write leaves a texture
+    // silently wrong, so the asking stays the default until a run's counter
+    // reads no pages missed.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_POOLS").is_some_and(|v| v == "1"))
+}
+
+/// Every how many frames the kernel verifies a range's guards (the range's
+/// first block decides which frame, so the askings of a frame are a share of
+/// the spans, not all of them at once). `VICTORY_GUARD_VERIFY=1` verifies at
+/// every asking, `0` never.
+fn verify_every() -> u64 {
+    #[cfg(test)]
+    if let Some(n) = tests::VERIFY.with(|v| v.get()) {
+        return n;
+    }
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_GUARD_VERIFY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    })
+}
+
+/// Whether this asking of the range starting at `first` is also verified by
+/// the kernel.
+fn verify_due(first: usize) -> bool {
+    let every = verify_every();
+    if every == 0 {
+        return false;
+    }
+    crate::frame::current()
+        .wrapping_add((first as u64) >> 6)
+        .is_multiple_of(every)
+}
+
+/// Whether `start` is memory the guards can hold as a pool: committed private
+/// memory (the title's allocations, xmem's GPU memory) the layer's own copies
+/// may make read-only.
+fn is_pool(start: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.State == MEM_COMMIT && info.Type == MEM_PRIVATE && info.Protect == PAGE_READWRITE
 }
 
 /// The unit a write-back job holds and a copy guards: one page.
@@ -680,10 +821,11 @@ pub(crate) fn write_failed(at: usize, len: usize) {
     forget(at, len);
 }
 
-/// For view memory: the pages of `[start, end)`'s blocks written since
-/// they were last guarded (all of a block's pages), guarding them again
-/// before the caller copies them. `None` if the memory is not a view.
-fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+/// For view memory, and for a pool with `pools`: the pages of `[start, end)`'s
+/// blocks written since they were last guarded (all of a block's pages),
+/// guarding them again before the caller copies them. `None` if the memory is
+/// neither a view nor, with `pools`, a pool the guards can hold.
+fn guarded_range(start: usize, end: usize, pools: bool) -> Option<Vec<usize>> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -694,12 +836,18 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
         && crate::guards::block_known(start);
-    if !known && !is_view(start, end) {
+    if !known && !is_view(start, end) && !(pools && is_pool(start)) {
         return None;
     }
     install();
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     Some(crate::guards::reguard(first, last))
+}
+
+/// [`guarded_range`] for view memory alone (the tests' entry).
+#[cfg(test)]
+fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    guarded_range(start, end, false)
 }
 
 /// Whether `[start, end)` is view memory. The title's views lie in
@@ -1165,6 +1313,19 @@ mod tests {
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+    thread_local! {
+        /// The kernel askings `writes` and the ahead asking made on this
+        /// thread (each test runs on its own).
+        /// `VICTORY_GUARD_POOLS` and `VICTORY_GUARD_VERIFY` for one test: the
+        /// environment is read once a process.
+        pub(super) static POOLS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+        pub(super) static VERIFY: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+
+    fn kernel_asked() -> usize {
+        crate::journal::kernel_asks()
+    }
+
     /// A copy's whole range is known mapped, and only that: not one byte
     /// past its end, and nothing before it was copied.
     #[test]
@@ -1291,6 +1452,9 @@ mod tests {
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
+        // The kernel's answering: the pools' guarding is off unless
+        // `VICTORY_GUARD_POOLS=1`.
+        tests::POOLS.with(|v| v.set(Some(false)));
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
             VirtualAlloc(
@@ -1312,6 +1476,8 @@ mod tests {
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
         assert_eq!(again, [(p / PAGE + 1, now)]);
+        // Nor is a plain allocation write-watched: with the pools' guarding
+        // off (its default) its asking is not answered at all.
         let mut plain = vec![0u8; PAGE];
         assert!(
             writes(
@@ -1321,6 +1487,101 @@ mod tests {
             )
             .is_none()
         );
+        tests::POOLS.with(|v| v.set(None));
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A pool's asking is the guards' to answer: the kernel is not asked at
+    /// all, the title's write is reported at the next asking, and a span
+    /// nothing was written in reports nothing. The default off asks the
+    /// default off) asks the kernel, as every asking did before.
+    #[test]
+    fn a_pools_asking_is_answered_by_the_guards_not_the_kernel() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        forget_askings();
+        tests::POOLS.with(|v| v.set(Some(true)));
+        tests::VERIFY.with(|v| v.set(Some(0)));
+        let (start, end) = (p, p + 4 * PAGE);
+        let before = kernel_asked();
+        let (now, written) = writes(start, end, false).expect("a pool the guards hold");
+        // A block that was never guarded counts as written: the first asking
+        // reports the whole range (the copy takes it whole, as a new
+        // texture's first refresh does anyway).
+        assert_eq!(written.len(), 4, "a block never guarded counts as written");
+        assert_eq!(kernel_asked(), before, "the guards answered, the kernel was not asked");
+        let (_, written) = writes(start, end, false).expect("a pool the guards hold");
+        assert!(written.iter().all(|&(_, w)| w <= now), "nothing written since");
+        assert_eq!(kernel_asked(), before, "still the guards");
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
+        let (later, written) = writes(start, end, false).expect("a pool the guards hold");
+        assert!(later > now);
+        assert_eq!(
+            written.iter().filter(|&&(_, w)| w == later).map(|&(p, _)| p).collect::<Vec<_>>(),
+            [p / PAGE + 1],
+            "the page the title wrote, under this asking"
+        );
+        assert_eq!(kernel_asked(), before, "still the guards");
+        tests::VERIFY.with(|v| v.set(None));
+        // The default: the kernel answers the same range, as before.
+        tests::POOLS.with(|v| v.set(Some(false)));
+        let (_, off) = writes(start, end, false).expect("watched");
+        assert!(kernel_asked() > before, "off, the kernel is asked");
+        assert!(off.iter().any(|&(page, _)| page == p / PAGE + 1));
+        forget_askings();
+        // The pool is gone: the guards drop what they held of it, so the next
+        // allocation at these addresses starts unknown (as `XMemFree` tells
+        // the layer).
+        title_memory_remapped(start, 4 * PAGE);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// The kernel's asking verifies the guards: on the frame a range is due it
+    /// is asked as well, and a page only it found (a write that made no fault:
+    /// the card's, or one through another view) is kept in the journal, so no
+    /// copy goes without it.
+    #[test]
+    fn the_kernels_asking_verifies_what_the_guards_hold() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        forget_askings();
+        tests::POOLS.with(|v| v.set(Some(true)));
+        tests::VERIFY.with(|v| v.set(Some(1)));
+        let (start, end) = (p, p + 4 * PAGE);
+        let (_, written) = writes(start, end, false).expect("a pool the guards hold");
+        assert_eq!(written.len(), 4, "a block never guarded counts as written");
+        let before = kernel_asked();
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + 2 * PAGE + 8) as *mut u8).write(1) };
+        let (now, written) = writes(start, end, false).expect("a pool the guards hold");
+        assert!(kernel_asked() > before, "the verifier asked the kernel");
+        assert!(
+            written.iter().any(|&(page, w)| page == p / PAGE + 2 && w == now),
+            "the page the asking found is kept"
+        );
+        tests::POOLS.with(|v| v.set(None));
+        tests::VERIFY.with(|v| v.set(None));
+        forget_askings();
+        title_memory_remapped(start, 4 * PAGE);
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
@@ -1331,6 +1592,10 @@ mod tests {
     /// nothing in *its* range was written.
     #[test]
     fn a_range_is_known_clean_until_an_asking_finds_it_written() {
+        // A pool the guards hold is left to `writes`, not asked ahead: this
+        // is the asking of everything else, with the pools' guarding off
+        // (its default).
+        tests::POOLS.with(|v| v.set(Some(false)));
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
             VirtualAlloc(
@@ -1370,6 +1635,7 @@ mod tests {
         );
         ask_once_end();
         forget_askings();
+        tests::POOLS.with(|v| v.set(None));
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }

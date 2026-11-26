@@ -139,9 +139,13 @@ pub(crate) enum Shape {
 }
 
 /// The section starting at instruction `start` of a block: its restore
-/// index and the shapes of the values it writes.
+/// index and the shapes of the values it writes. The `v_readlane_b32`s of
+/// its values at constant lanes right after the restore (`end + 1` up to
+/// `after`) belong to it: they pick one lane of a partial result (lane 63
+/// of a wave64 reduction whose halves the code joined with lane 31's).
 pub(crate) struct Section {
     pub end: usize,
+    pub after: usize,
     pub shapes: HashMap<Value, Shape>,
 }
 
@@ -149,6 +153,12 @@ pub(crate) struct Section {
 pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
     let insts = &p.blocks[block].insts;
     let wave: u32 = if p.wave64 { 64 } else { 32 };
+    // Every lane of the (console) wave, as `simulate` counts them.
+    let every = if wave == 64 {
+        u64::MAX
+    } else {
+        u64::from(u32::MAX)
+    };
     let mut out = HashMap::new();
     let mut i = 0;
     while i < insts.len() {
@@ -180,9 +190,21 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes });
-        i = end + 1;
+        let (vec, mut uni) = simulate(&insts[i + 1..end], wave, saved);
+        let mut after = end + 1;
+        // Only a read the section's value answers with one scalar belongs to
+        // it: one that picks a lane of a result that is not one value for
+        // every lane stays a lane read the normal lowering emits.
+        while let Some(inst) = insts.get(after)
+            && let Some((w, lane)) = readlane(inst, &vec, wave)
+            && single(lane, every).is_some()
+        {
+            uni.insert(w, lane);
+            after += 1;
+        }
+        let shapes = shapes(vec, uni, wave);
+        out.insert(i, Section { end, after, shapes });
+        i = after;
     }
     out
 }
@@ -268,7 +290,35 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+/// A `v_readlane_b32` at a constant lane of a value the section wrote:
+/// what it writes and that lane's value.
+fn readlane(inst: &Inst, vec: &HashMap<Value, Vec<Sym>>, wave: u32) -> Option<(Value, Sym)> {
+    let Fields::Valu(v) = &inst.fields else {
+        return None;
+    };
+    if inst.name() != "v_readlane_b32" {
+        return None;
+    }
+    let (Some(Operand::Scalar { code, .. }), Some(&Operand::Vector { reg, .. }), Some(lane)) =
+        (v.dst, v.src.first(), v.src.get(1))
+    else {
+        return None;
+    };
+    let l = match *lane {
+        Operand::Const(c) => crate::resource::inline(c)?,
+        Operand::Literal(x) => x,
+        _ => return None,
+    };
+    let lanes = vec.get(&inst.read(Reg::V(reg))?)?;
+    let s = *lanes.get(l as usize).filter(|_| l < wave)?;
+    Some((inst.write(Reg::S(code))?, s))
+}
+
+/// Each lane's value of the vector values the section writes, and the
+/// uniform values.
+type Simulated = (HashMap<Value, Vec<Sym>>, HashMap<Value, Sym>);
+
+fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -289,7 +339,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 .then(|| constant(inst))
                 .flatten();
             let Some(k) = lo else {
-                return shapes(vec, uni, wave);
+                return (vec, uni);
             };
             exec = (if name == "s_mov_b64" {
                 k
@@ -304,7 +354,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 .then(|| constant(inst))
                 .flatten()
             else {
-                return shapes(vec, uni, wave);
+                return (vec, uni);
             };
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
@@ -664,7 +714,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             .collect();
         vec.insert(dst, merged);
     }
-    shapes(vec, uni, wave)
+    (vec, uni)
 }
 
 fn constant(inst: &Inst) -> Option<u64> {
@@ -700,7 +750,23 @@ fn shapes(
         u64::from(u32::MAX)
     };
     let mut out = HashMap::new();
-    let single = |s: Sym| match s {
+    for (v, s) in uni {
+        if let Some(sh) = single(s, all) {
+            out.insert(v, sh);
+        }
+    }
+    for (v, lanes) in vec {
+        if let Some(sh) = per_lane(&lanes, all) {
+            out.insert(v, sh);
+        }
+    }
+    out
+}
+
+/// One value for every lane of the wave (a constant, a uniform, or a
+/// reduction over all of it), else none.
+fn single(s: Sym, all: u64) -> Option<Shape> {
+    match s {
         Sym::K(k) => Some(Shape::K(k)),
         Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
         Sym::Red {
@@ -718,18 +784,7 @@ fn shapes(
             high,
         } if lanes == all => Some(Shape::ActiveF64(lo, hi, mask, high)),
         _ => None,
-    };
-    for (v, s) in uni {
-        if let Some(sh) = single(s) {
-            out.insert(v, sh);
-        }
     }
-    for (v, lanes) in vec {
-        if let Some(sh) = per_lane(&lanes, all) {
-            out.insert(v, sh);
-        }
-    }
-    out
 }
 
 fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
@@ -947,6 +1002,32 @@ mod tests {
             per_lane(&vec![red(u64::MAX); 64], u64::MAX),
             Some(Shape::Active(Op::AddU, x, m, 0))
         );
+    }
+
+    #[test]
+    fn only_a_value_every_lane_shares_takes_a_lane_read_in() {
+        let (x, m) = (Value(1), Value(2));
+        let all = u64::from(u32::MAX);
+        let red = |op: Option<Op>, lanes: u64| Sym::Red {
+            op,
+            src: x,
+            mask: m,
+            ident: 0,
+            lanes,
+        };
+        // One value for the whole wave: the section can answer a lane read of it.
+        assert!(single(Sym::K(7), all).is_some());
+        assert!(single(Sym::Uni(x), all).is_some());
+        assert!(single(Sym::Own(x), all).is_some());
+        assert_eq!(
+            single(red(Some(Op::AddU), all), all),
+            Some(Shape::Active(Op::AddU, x, m, 0))
+        );
+        // A reduction over some of the lanes, or a per-lane value: it cannot,
+        // so the read stays a lane read the normal lowering emits.
+        assert_eq!(single(red(Some(Op::AddU), 0b11), all), None);
+        assert_eq!(single(red(None, all), all), None);
+        assert_eq!(single(red(Some(Op::AddU), all), u64::MAX), None);
     }
 
     #[test]
