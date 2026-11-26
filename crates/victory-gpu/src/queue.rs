@@ -835,13 +835,6 @@ extern "system" fn present(
         && let Some(source) = crate::resource::host_copy(resource)
         && let Some(host) = crate::host::host()
     {
-        // Diagnostics: the state the title left the texture in, for `blinks`.
-        // The present's list takes it from there (and moves nothing of its
-        // own when it is already in `COPY_SOURCE`); the title's state is not
-        // written here, so a list submitted meanwhile never records a move
-        // from a state the card is not in.
-        #[cfg(feature = "diagnostics")]
-        let state = source.state.load(Ordering::Relaxed);
         // Diagnostics: whether the frame shown is our copy as the title left
         // it, or one whose newest bytes no submitted list uploaded yet.
         #[cfg(feature = "diagnostics")]

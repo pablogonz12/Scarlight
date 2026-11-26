@@ -165,7 +165,6 @@ fn present_overlay_composites_pixels_and_recovers_from_initialization_failure() 
     host.execute(&[&list]);
 
     let red_copy = crate::resource::test_copy(&red, SOURCE_STATE);
-    let black_copy = crate::resource::test_copy(&black, SOURCE_STATE);
     assert_ne!(
         host.present(std::ptr::null_mut(), &red_copy, 1, false),
         Some(true),
