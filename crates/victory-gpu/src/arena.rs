@@ -55,11 +55,11 @@ fn on() -> bool {
     *ON.get_or_init(|| switch(std::env::var("VICTORY_ARENA").ok().as_deref()))
 }
 
-/// [`on`]'s answer for a value of `VICTORY_ARENA`. Only `1` is on: a switch
-/// that corrupts the picture when the import is refused must not be reached
-/// by a typo.
+/// [`on`]'s answer for a value of `VICTORY_ARENA`. Only the exact value `1` is
+/// on: a switch that corrupts the picture when the import is refused must not
+/// be reached by a typo or by a stray space.
 fn switch(value: Option<&str>) -> bool {
-    value.is_some_and(|v| v.trim() == "1")
+    value == Some("1")
 }
 
 /// Why a range is not in place (counted in [`TURNED`], by this order).
@@ -328,24 +328,34 @@ impl State {
         let lo = lo.next_multiple_of(K64 as u64);
         let hi = hi & !(K64 as u64 - 1);
         let (start, bytes) = grid_part(lo, hi, at, end)?;
-        if let Some(slot) = self.parts.get(&(start, bytes)) {
-            return match slot {
-                Slot::Open(part) => Ok(part.resolved(at, end)),
-                Slot::Refused(why) => Err(*why),
-            };
+        // An open part that holds the range is taken, whatever its key: two
+        // parts can cover one range, and the older one may be the open one.
+        if let Some(part) = self.open_part(at, end) {
+            return Ok(part.resolved(at, end));
+        }
+        if let Some(Slot::Refused(why)) = self.parts.get(&(start, bytes)) {
+            return Err(*why);
         }
         if self.locked.saturating_add(bytes) > most {
             return Err(Why::Budget);
         }
-        let made = make_part(device, start, bytes);
-        let slot = match made {
+        let slot = match make_part(device, start, bytes) {
             Ok(part) => {
                 self.locked += bytes;
                 STATS[0].fetch_add(1, Ordering::Relaxed);
                 STATS[2].fetch_add(bytes, Ordering::Relaxed);
                 Slot::Open(part)
             }
-            Err(why) => Slot::Refused(why),
+            Err(failed) => {
+                if failed.retained {
+                    // The placement is kept alive for a submission whose end
+                    // is not known: its pages are locked, so its bytes are
+                    // charged like an open part's and never given back.
+                    self.locked += bytes;
+                    STATS[3].fetch_add(1, Ordering::Relaxed);
+                }
+                Slot::Refused(failed.why)
+            }
         };
         let why = match &slot {
             Slot::Open(_) => Ok(()),
@@ -368,14 +378,28 @@ impl State {
     }
 }
 
+/// A part that was not opened, and whether its memory is still held (a
+/// placement kept alive for a copy whose end is not known).
+struct Failure {
+    why: Why,
+    retained: bool,
+}
+
+impl Failure {
+    /// Nothing was opened or kept.
+    fn plain(why: Why) -> Failure {
+        Failure { why, retained: false }
+    }
+}
+
 /// A part of `[start, start + bytes)` opened on the title's own pages, if it
 /// can be and the canary finds the region both ways.
-fn make_part(device: &ID3D12Device, start: u64, bytes: u64) -> Result<Part, Why> {
+fn make_part(device: &ID3D12Device, start: u64, bytes: u64) -> Result<Part, Failure> {
     // The pages may have changed since the runtime reported them.
     if !private_whole(start as usize, bytes as usize) {
-        return Err(Why::NotCommitted);
+        return Err(Failure::plain(Why::NotCommitted));
     }
-    let placed: Placed = place_part(device, start, bytes).map_err(|e| if e.is_none() { Why::NotCommitted } else { Why::Host })?;
+    let placed: Placed = place_part(device, start, bytes).map_err(|e| Failure::plain(if e.is_none() { Why::NotCommitted } else { Why::Host }))?;
     match prove(device, &placed.buffer, start, bytes) {
         Proof::Proven(pages) => {
             PROVEN.fetch_add(pages, Ordering::Relaxed);
@@ -389,9 +413,10 @@ fn make_part(device: &ID3D12Device, start: u64, bytes: u64) -> Result<Part, Why>
         found => {
             // The heap and the buffer are dropped here: the pages are
             // unlocked and every ask after this one is a copy.
-            if found == Proof::Unfinished {
-                // The canary's copy may still read these pages: the heap
-                // and the buffer stay with it rather than being released
+            let retained = found == Proof::Unfinished;
+            if retained {
+                // The canary's copy may still read or write these pages: the
+                // heap and the buffer stay with it rather than being released
                 // under a submission (the fork does the same).
                 std::mem::forget(placed);
             }
@@ -406,7 +431,7 @@ fn make_part(device: &ID3D12Device, start: u64, bytes: u64) -> Result<Part, Why>
                     Proof::Unfinished => "the canary's copy never finished",
                 }
             );
-            return Err(Why::Canary);
+            return Err(Failure { why: Why::Canary, retained });
         }
     }
     Ok(Part { base: start, bytes, heap: placed.heap, buffer: placed.buffer, gpu: placed.gpu })
@@ -470,26 +495,36 @@ fn prove(device: &ID3D12Device, buffer: &ID3D12Resource, base: u64, bytes: u64) 
             std::ptr::copy_nonoverlapping(sent.as_ptr(), at as *mut u8, SAMPLE);
         }
         let read = rig.fetch(buffer, offset, SAMPLE);
+        if !matches!(&read, Ok(got) if got == &sent) {
+            // Nothing was written through the buffer: the title's bytes can
+            // go back now. A copy whose end is not known is left alone (no
+            // store, no restore, the placement kept), because the GPU may
+            // still be reading or writing the pages.
+            match read {
+                Ok(_) => {
+                    // SAFETY: as above: the title's bytes go back.
+                    unsafe { std::ptr::copy_nonoverlapping(their.as_ptr(), at as *mut u8, SAMPLE) };
+                    return Proof::Elsewhere;
+                }
+                Err(_) => {
+                    std::mem::forget(rig);
+                    return Proof::Unfinished;
+                }
+            }
+        }
         let mut ours = [0u8; SAMPLE];
         sentinel(&mut ours, 0xa5);
         let stored = rig.store(buffer, offset, &ours);
-        let written = stored.is_ok() && shows(at, &ours);
-        // SAFETY: as above: the title's bytes go back the way they came.
-        unsafe { std::ptr::copy_nonoverlapping(their.as_ptr(), at as *mut u8, SAMPLE) };
-        match read {
-            Ok(got) if got == sent => {}
-            Ok(_) => return Proof::Elsewhere,
-            // The fetch's copy was handed to the GPU: its end is not known,
-            // and the buffer must not be dropped under it.
-            Err(_) => {
-                std::mem::forget(rig);
-                return Proof::Unfinished;
-            }
-        }
         if stored.is_err() {
+            // The store was handed to the GPU: the sentinel may land at the
+            // title's address later, so the saved bytes are not put back
+            // over it. The placement stays with the copy.
             std::mem::forget(rig);
             return Proof::Unfinished;
         }
+        let written = shows(at, &ours);
+        // SAFETY: as above: the title's bytes go back the way they came.
+        unsafe { std::ptr::copy_nonoverlapping(their.as_ptr(), at as *mut u8, SAMPLE) };
         if !written {
             return Proof::Elsewhere;
         }
@@ -582,8 +617,7 @@ mod tests {
     #[test]
     fn only_a_plain_one_turns_the_arena_on() {
         assert!(switch(Some("1")));
-        assert!(switch(Some(" 1 ")));
-        for value in [None, Some(""), Some("0"), Some("on"), Some("true"), Some("2"), Some("1 0")] {
+        for value in [None, Some(""), Some("0"), Some(" 1 "), Some("1 "), Some("on"), Some("true"), Some("2"), Some("1 0")] {
             assert!(!switch(value), "{value:?} must not open title memory");
         }
     }
@@ -764,7 +798,7 @@ mod tests {
             state.census().1 >> 20
         );
         eprintln!(
-            "arena bench: a copy of {} KiB on this card: {copy_ms:.3} ms; a copied region pays two per submission, an arena region none: {N} regions = {} copies ({} KiB) and {:.3} ms per submission saved",
+            "arena bench (estimate: two copies at the one measured cost): a copy of {} KiB on this card: {copy_ms:.3} ms; a copied region pays two per submission, an arena region none: {N} regions = {} copies ({} KiB) and about {:.3} ms per submission saved",
             bytes >> 10,
             2 * N,
             2 * N * (bytes >> 10),
