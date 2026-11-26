@@ -5114,6 +5114,7 @@ impl Host {
                 }
             })
             .as_ref()
+    }
 }
 
 /// What an adapter's identity says about mesh shaders on its driver.
