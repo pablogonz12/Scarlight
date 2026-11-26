@@ -153,6 +153,11 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if !at.is_null() && kind & MEM_COMMIT != 0 && protect == PAGE_READWRITE {
+        // Committed private memory the GPU may use: the arena's registry
+        // (`VICTORY_ARENA=1`, off by default; a no-op when off).
+        victory_gpu::title_memory_committed(at as usize, size);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -847,8 +852,19 @@ pub extern "system" fn XMemMapPhysicalPages(
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
             return std::ptr::null_mut();
         };
-        // One view per run of consecutive slices of one section.
-        let run = 1 + pages[i + 1..]
+        // One view per run of consecutive slices of one section, but never
+        // past the placeholder the run starts in: the title splits its pool
+        // into placeholders of its own, and consecutive pages say nothing
+        // about where one ends. A call across two is refused, and its range
+        // has already been unmapped. Ask the host where that placeholder
+        // ends (Marvisak/VIctory #1264's triage), before the scan, so it
+        // covers only the pages this call maps (a page per placeholder
+        // would otherwise be searched once more on every page).
+        let at = base + i * PAGE;
+        // 0: not a reserved placeholder, so the run is as long as it comes.
+        let room = if clipping() { placeholder_room(at) / PAGE } else { 0 };
+        let most = if room > 0 { room.min(n - i) } else { n - i };
+        let run = 1 + pages[i + 1..i + most]
             .iter()
             .zip(1..)
             .take_while(|&(page, k)| {
@@ -857,7 +873,26 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+        // The scan stopped at the room and pages went on: clipped there.
+        if run == most && most < n - i {
+            let clipped = CLIPPED_RUNS.fetch_add(1, Ordering::Relaxed) + 1;
+            if clipped == 1 || clipped.is_multiple_of(1024) {
+                tracing::info!(
+                    address = format_args!("{at:#x}"),
+                    pages = run,
+                    clipped,
+                    "a mapping run stops at the end of its placeholder"
+                );
+            } else {
+                tracing::debug!(
+                    address = format_args!("{at:#x}"),
+                    pages = run,
+                    clipped,
+                    "a mapping run stops at the end of its placeholder"
+                );
+            }
+        }
+        if !map(&mut physical, at, run * PAGE, first) {
             return std::ptr::null_mut();
         }
         i += run;
@@ -892,6 +927,52 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
         }
     }
     1
+}
+
+/// How many bytes from `base` to the end of the placeholder it lies in: the
+/// most one call can map as one view there. 0 when the host does not report
+/// a reserved placeholder at `base` (an address already shown, or the title's
+/// own memory), so the caller maps page by page as before.
+fn placeholder_room(base: usize) -> usize {
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: `VirtualQueryEx` fills `info` for the region holding `base`.
+    let got = unsafe {
+        VirtualQueryEx(
+            GetCurrentProcess(),
+            base as *const c_void,
+            &mut info,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if got == 0 || info.State != MEM_RESERVE {
+        return 0;
+    }
+    (info.BaseAddress as usize)
+        .saturating_add(info.RegionSize)
+        .saturating_sub(base)
+}
+
+/// Batched mapping runs that stopped at the end of their placeholder
+/// (`VICTORY_MAP_CLIP`; reported in the counters line of `victory-gpu`).
+static CLIPPED_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a batched run is clipped to the placeholder it starts in;
+/// `VICTORY_MAP_CLIP=0` maps it as it comes (a title that splits its
+/// placeholders would get the refused batch of before).
+fn clip_from(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
+}
+
+fn clipping() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        clip_from(std::env::var("VICTORY_MAP_CLIP").ok().as_deref())
+    });
+    *ON
+}
+
+#[cfg(test)]
+pub(crate) fn clipped_runs() -> usize {
+    CLIPPED_RUNS.load(Ordering::Relaxed)
 }
 
 /// Maps the physical pages shown at `[from, from + len)` at `to` as well,
@@ -1515,6 +1596,73 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
+    /// Titles split one pool of 64 KiB placeholders into per-page ones, and
+    /// the pages of a batch say nothing about where their placeholder ends:
+    /// a run of consecutive slices that starts in one placeholder and ends
+    /// outside it must be clipped to the room the host reports, not handed
+    /// to the host whole (which is refused, after the range was unmapped).
+    #[test]
+    fn a_run_of_mappings_stops_at_the_end_of_its_placeholder() {
+        let pages = allocate(2);
+        for (k, page) in pages.iter().enumerate() {
+            assert!(write_physical(std::slice::from_ref(page), 0, &[b'0' + k as u8]));
+        }
+        // Two 64 KiB pages reserved as one pool, then split in two
+        // placeholders of their own, as the title hands its pool out.
+        let pool = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!pool.is_null());
+        let second = pool.wrapping_byte_add(PAGE);
+        // SAFETY: our own placeholder; the range freed stays a placeholder.
+        assert_ne!(
+            unsafe {
+                VirtualFree(
+                    second,
+                    PAGE,
+                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+                )
+            },
+            0
+        );
+        for at in [pool, second] {
+            assert_eq!(query(at).host.State, MEM_RESERVE, "a placeholder of its own");
+        }
+        // Two consecutive slices of one section, the run crossing from the
+        // first placeholder into the second.
+        let before = clipped_runs();
+        assert_eq!(XMemMapPhysicalPages(pool, 2, pages.as_ptr()), pool);
+        assert_eq!(clipped_runs(), before + 1, "one run clipped, none refused");
+        // Each page shows its own bytes: the clip maps the first, then the
+        // rest in the placeholder that follows.
+        for (k, at) in [pool, second].into_iter().enumerate() {
+            assert_eq!(
+                // SAFETY: mapped read-write.
+                unsafe { at.cast::<u8>().read() },
+                b'0' + k as u8,
+                "page {k} at its own address"
+            );
+        }
+        assert_eq!(XMemMapPhysicalPages(pool, 2, std::ptr::null()), pool);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// The clip's off switch: `VICTORY_MAP_CLIP=0` maps a run as it comes,
+    /// everything else (unset, empty, `1`) clips.
+    #[test]
+    fn the_map_clip_can_be_turned_off() {
+        assert!(clip_from(None));
+        assert!(clip_from(Some("1")));
+        assert!(!clip_from(Some("0")));
+        assert!(!clip_from(Some(" 0 ")));
+        // An unser switch is not one.
+        assert!(clip_from(Some("off")));
+    }
+
     #[test]
     fn mapping_no_pages_changes_nothing() {
         let pages = allocate(2);
@@ -1673,14 +1821,18 @@ mod tests {
             let at = view as usize;
             [(at / PAGE, asking), (at / PAGE + 1, asking)]
         };
-        // A newly mapped view is reported written once, by that asking; the
-        // next asking finds nothing new (its pages keep the asking that did).
+        // Both views show one section at two addresses, so the guards never
+        // make their blocks read-only (a write through the other view would
+        // go unseen: `inplace::aliased`): every asking reports the pages
+        // again, under its own number. The single-view case, where a block
+        // is guarded and clean, is
+        // `physical_writes_open_the_title_views_before_the_bytes_land`.
         for view in [a, b] {
             let (mapped, pages) = taken(view);
             assert_eq!(pages, both(view, mapped), "newly mapped");
             let (settled, pages) = taken(view);
             assert!(settled > mapped);
-            assert_eq!(pages, both(view, mapped), "nothing written since");
+            assert_eq!(pages, both(view, settled), "an aliased view is never clean");
         }
 
         // A write through our own view of the pages lands in both views'

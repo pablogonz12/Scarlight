@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
+use crate::compare::{changed_runs, first_difference, last_difference};
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
@@ -1063,63 +1064,6 @@ fn give_back(v: Vec<u8>) {
 
 const NOT_WATCHED: u8 = 2;
 
-/// Where `a` and `b` (of one length) first differ, compared eight bytes at
-/// a time.
-fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
-    let whole = a.len().min(b.len()) / 8 * 8;
-    let from = a[..whole]
-        .as_chunks::<8>().0.iter()
-        .zip(b[..whole].chunks_exact(8))
-        .position(|(x, y)| x != y)
-        .map_or(whole, |word| word * 8);
-    a[from..].iter().zip(&b[from..]).position(|(x, y)| x != y).map(|i| from + i)
-}
-
-/// Where `a` and `b` (of one length) last differ.
-fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
-    let whole = a.len().min(b.len()) / 8 * 8;
-    if let Some(i) = a[whole..].iter().zip(&b[whole..]).rposition(|(x, y)| x != y) {
-        return Some(whole + i);
-    }
-    let word = a[..whole]
-        .as_chunks::<8>().0.iter()
-        .zip(b[..whole].chunks_exact(8))
-        .rposition(|(x, y)| x != y)?
-        * 8;
-    a[word..word + 8]
-        .iter()
-        .zip(&b[word..word + 8])
-        .rposition(|(x, y)| x != y)
-        .map(|i| word + i)
-}
-
-#[cfg(test)]
-mod difference_tests {
-    use super::{first_difference, last_difference};
-
-    /// The word-wise searches agree with the byte-wise ones they replace.
-    #[test]
-    fn differences_are_found_as_byte_by_byte() {
-        let base: Vec<u8> = (0..61u32).map(|i| (i * 7 + 3) as u8).collect();
-        let same = base.clone();
-        assert_eq!(first_difference(&base, &same), None);
-        assert_eq!(last_difference(&base, &same), None);
-        for len in [0usize, 1, 7, 8, 9, 16, 23, 61] {
-            for at in 0..len {
-                for other in at..len {
-                    let (a, mut b) = (&base[..len], base[..len].to_vec());
-                    b[at] ^= 0x80;
-                    b[other] ^= 0x01;
-                    let first = a.iter().zip(&b).position(|(x, y)| x != y);
-                    let last = a.iter().zip(&b).rposition(|(x, y)| x != y);
-                    assert_eq!(first_difference(a, &b), first, "{len} {at} {other}");
-                    assert_eq!(last_difference(a, &b), last, "{len} {at} {other}");
-                }
-            }
-        }
-    }
-}
-
 /// The unit shader writes are looked for and put back in.
 const PIECE: usize = 64 << 10;
 
@@ -1480,7 +1424,7 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                             std::slice::from_raw_parts((before + at) as *const u8, n),
                         )
                     };
-                    if now != old {
+                    if !crate::compare::equal(now, old) {
                         pieces.push((at, n));
                     }
                     at += n;
@@ -1647,79 +1591,6 @@ static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// [`MERGED`], taken.
 pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
-}
-
-/// The runs of bytes where `now` differs from `was` (of one length), as
-/// (offset, bytes) in order: every differing byte is in a run and no equal
-/// byte is.
-fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
-    #[inline]
-    fn all_differ_8(a: u64, b: u64) -> bool {
-        let d = a ^ b;
-        d.wrapping_sub(0x0101_0101_0101_0101) & !d & 0x8080_8080_8080_8080 == 0
-    }
-    #[inline]
-    unsafe fn load_u64(ptr: *const u8, off: usize) -> u64 {
-        unsafe { ptr.add(off).cast::<u64>().read_unaligned() }
-    }
-    let n = now.len().min(was.len());
-    let (np, wp) = (now.as_ptr(), was.as_ptr());
-    let mut runs = Vec::new();
-    let mut i = 0;
-    while i < n {
-        // Equal bytes: 64 bytes at a time, then 8 bytes at a time.
-        while i + 64 <= n {
-            let eq = unsafe {
-                load_u64(np, i) == load_u64(wp, i)
-                    && load_u64(np, i + 8) == load_u64(wp, i + 8)
-                    && load_u64(np, i + 16) == load_u64(wp, i + 16)
-                    && load_u64(np, i + 24) == load_u64(wp, i + 24)
-                    && load_u64(np, i + 32) == load_u64(wp, i + 32)
-                    && load_u64(np, i + 40) == load_u64(wp, i + 40)
-                    && load_u64(np, i + 48) == load_u64(wp, i + 48)
-                    && load_u64(np, i + 56) == load_u64(wp, i + 56)
-            };
-            if !eq {
-                break;
-            }
-            i += 64;
-        }
-        while i + 8 <= n && unsafe { load_u64(np, i) == load_u64(wp, i) } {
-            i += 8;
-        }
-        while i < n && unsafe { *np.add(i) == *wp.add(i) } {
-            i += 1;
-        }
-        if i >= n {
-            break;
-        }
-        let first = i;
-        // Differing bytes: 64 bytes at a time, then 8 bytes at a time.
-        while i + 64 <= n {
-            let diff = unsafe {
-                all_differ_8(load_u64(np, i), load_u64(wp, i))
-                    && all_differ_8(load_u64(np, i + 8), load_u64(wp, i + 8))
-                    && all_differ_8(load_u64(np, i + 16), load_u64(wp, i + 16))
-                    && all_differ_8(load_u64(np, i + 24), load_u64(wp, i + 24))
-                    && all_differ_8(load_u64(np, i + 32), load_u64(wp, i + 32))
-                    && all_differ_8(load_u64(np, i + 40), load_u64(wp, i + 40))
-                    && all_differ_8(load_u64(np, i + 48), load_u64(wp, i + 48))
-                    && all_differ_8(load_u64(np, i + 56), load_u64(wp, i + 56))
-            };
-            if !diff {
-                break;
-            }
-            i += 64;
-        }
-        while i + 8 <= n && unsafe { all_differ_8(load_u64(np, i), load_u64(wp, i)) } {
-            i += 8;
-        }
-        while i < n && unsafe { *np.add(i) != *wp.add(i) } {
-            i += 1;
-        }
-        runs.push((first, i - first));
-    }
-    runs
 }
 
 #[cfg(test)]
@@ -2246,6 +2117,9 @@ impl Shadow {
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
+        // Before the snapshot's bytes are read: a remap this does not see
+        // stays marked, so the copy-back leaves those bytes alone.
+        let generation = crate::watch::remap_generation();
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
         if keeps() {
@@ -2264,10 +2138,15 @@ impl Shadow {
                     continue;
                 }
                 for piece in self.pieces(from, to) {
-                    if kept.0[piece] {
-                        continue;
-                    }
                     let (lo, hi) = self.piece(piece);
+                    if kept.0[piece] {
+                        // Kept until the runtime unmapped or remapped the
+                        // block: what is there now is not what was kept.
+                        if !crate::watch::remapped_any(self.start as usize + lo, hi - lo) {
+                            continue;
+                        }
+                        kept.0[piece] = false;
+                    }
                     let whole = from <= lo && hi <= to;
                     let (lo, hi) = (lo.max(from), hi.min(to));
                     // SAFETY: as below; `hi <= total`.
@@ -2275,9 +2154,17 @@ impl Shadow {
                         std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
                     }
                     kept.0[piece] = whole;
+                    crate::watch::remapped_taken(generation, self.start as usize + lo, hi - lo);
                 }
             }
             return;
+        }
+        // The parts' bytes are taken afresh: a remapping before them is in
+        // the snapshot now, so a copy-back may put the GPU's bytes back.
+        for &(from, to) in &parts {
+            if from < to {
+                crate::watch::remapped_taken(generation, self.start as usize + from, to - from);
+            }
         }
         if wide_back() {
             // Noted, and taken with the submission's other snapshots when
@@ -2361,6 +2248,14 @@ impl Shadow {
                 self.changed(at, at + n);
             }
             let mut title = vec![0u8; PIECE];
+            // The runtime's remapping is held off from each test to the last
+            // byte written, once for this copy-back and not once a piece: a
+            // remap already under way is waited for 2 ms only, since it may
+            // itself be waiting for the blocks this copy-back's job holds.
+            // The writes go on as before without the reading. Nothing
+            // differing means nothing to read or write: no guard asked for.
+            let _reading = (!differing.is_empty())
+                .then(|| crate::watch::title_memory_reading_within(std::time::Duration::from_millis(2)));
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
@@ -2420,9 +2315,25 @@ impl Shadow {
                 let held = unsafe { std::slice::from_raw_parts_mut(base.add(at), n) };
                 let differs = merge_back(host, held, title);
                 if differs {
-                    crate::watch::writing(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                    written += n;
+                    // Only the bytes the runtime did not unmap or remap
+                    // while the submission was pending: what it shows there
+                    // is someone else's now, so the copy's bytes stay out
+                    // (FIND-14).
+                    let base = start + at;
+                    if !crate::watch::remapped_any(base, n) {
+                        crate::watch::writing(base, n);
+                        crate::host::write_mapped(base as *mut u8, title.as_ptr(), n);
+                        written += n;
+                    } else {
+                        for (from, to) in crate::watch::unremapped_runs(base, n) {
+                            let (at, n) = (from - base, to - from);
+                            crate::watch::writing(from, n);
+                            // SAFETY: `at` is inside the bytes merged above.
+                            let bytes = unsafe { title.as_ptr().add(at) };
+                            crate::host::write_mapped(from as *mut u8, bytes, n);
+                            written += n;
+                        }
+                    }
                 }
             }
             // Our write shows as a title write at the copy's next refresh,
@@ -3280,9 +3191,13 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
-        // Rounded up so that views ending in the buffer's last 256 bytes fit.
-        // Shaders write some buffers (unordered access), so not upload memory.
-        let size = len.next_multiple_of(1 << 16);
+        // Rounded up to whole slots of the small buffers' pool, so that views
+        // ending in the buffer's last 256 bytes fit and a root descriptor's
+        // read past the title buffer's end stays in this copy up to the
+        // rounded width, none when the length is whole slots already
+        // (`Host::shared_buffer`). Shaders write some buffers (unordered
+        // access), so not upload memory.
+        let size = len.next_multiple_of(crate::placed::SLOT_BYTES);
         // In place, if asked for and the memory can be opened
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
