@@ -28,6 +28,15 @@ wrothgaril, Yaekai.
 
 andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VIctory #2614), BlueKaiman, kais7654, pushkarreddyy, shh.
 
+## Ports of fork pull requests
+
+Code reimplemented here from a fork's pull request, because the fork's tree had diverged from ours;
+the design and the author are credited in the commit's `Co-authored-by:` and here.
+
+- **Marvisak/VIctory #2401** (Mumogg) — the Wine `ExitProcess` hook that makes a host driver
+  compiler crash cost one pipeline instead of the run ([`pipeline/wine.rs`](crates/victory-gpu/src/pipeline/wine.rs)),
+  adapted to our pipeline workers and library.
+
 ## Design notes
 
 - **fuzeofficial** ([Marvisak/VIctory #2608](https://github.com/Marvisak/VIctory/pull/2608)), GPL-3.0: the
@@ -156,6 +165,12 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   GPL-3.0: a rectangle list's fourth corner is completed opposite the right angle, wherever the three
   corners put it. This tree's geometry stage (`emit::rect_list_gs`) already finds the corner in any order; the
   rule is now in the CPU expansion too (`right_angle`, `right_corners` in `crates/victory-gpu/src/primitive.rs`).
+
+- **fxceless/victory-fork [PR #980](https://github.com/fxceless/victory-fork/pull/980)** (fxceless), GPL-3.0:
+  the arena, the layer a resident stands on: a title region opened as a D3D12 heap and a buffer placed over it, so
+  the GPU reads and writes the title's own memory (`crates/victory-gpu/src/arena.rs`, `VICTORY_ARENA=1`, off by
+  default). The part grid, the region registry, the budget and the canary are reimplemented on this tree's
+  `inplace`; the canary here proves each part **both ways** with our own `Rig` (#188), which the fork's tests do not.
 
 ## Tools
 
