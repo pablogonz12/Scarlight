@@ -469,6 +469,13 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Pipeline requests that had to wait for their pipeline (it was not made
+/// yet), since the last call: what a frame's pipeline wait budget paid for.
+#[cfg(windows)]
+pub(crate) fn take_demanded() -> u64 {
+    make::take_demanded()
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

@@ -827,7 +827,96 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
-/// Buffer to buffer: both are host memory, copied at submission.
+/// What a title buffer copy does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CopyPlan {
+    /// One `CopyBufferRegion` on the host GPU: both sides have a host copy of
+    /// their range, so the GPU moves the bytes between them and title memory
+    /// gets them after the submission (like a shader write) instead of a
+    /// kernel read and write of title memory at submission time.
+    Gpu,
+    /// On the CPU, as always: a side without a host copy, or
+    /// `VICTORY_GPU_COPIES=0`.
+    Title,
+}
+
+/// [`CopyPlan`] for a copy whose sides do or do not have host copies: the
+/// whole decision, so it can be tested without a device.
+pub(crate) fn copy_plan(enabled: bool, src_hosted: bool, dst_hosted: bool) -> CopyPlan {
+    if enabled && src_hosted && dst_hosted {
+        CopyPlan::Gpu
+    } else {
+        CopyPlan::Title
+    }
+}
+
+/// Records a GPU copy of `len` bytes at `src_address` into `dst_address`
+/// through the buffers' host copies, in this list where the copy was
+/// recorded: `false` (nothing recorded) unless both ranges are inside their
+/// host copies.
+///
+/// The source's host copy is brought up to date by the submission-time steps,
+/// before the list runs (so after every CPU-side step recorded before this
+/// one), and the destination is marked GPU-written there: nothing refreshes
+/// title memory over it, and once the submission has run it is copied back
+/// like a shader write. Buffers are in the `COMMON` state, which a buffer copy
+/// promotes to and from without a barrier.
+#[cfg(windows)]
+pub(crate) fn record_gpu_copy(
+    list: &crate::host::HostList,
+    dst: &std::sync::Arc<crate::shadow::Shadow>,
+    dst_address: usize,
+    src: &std::sync::Arc<crate::shadow::Shadow>,
+    src_address: usize,
+    len: usize,
+) -> bool {
+    let (Some((dst_buffer, dst_offset)), Some((src_buffer, src_offset))) =
+        (dst.gpu_range(dst_address, len), src.gpu_range(src_address, len))
+    else {
+        return false;
+    };
+    // The source first: the copy reads the host copy's bytes, and the refresh
+    // is what makes them the title's (the pages a CPU copy would read).
+    src.refresh(list, src_address as u64, len as u64);
+    // Then the destination, brought up to date first: the bytes kept for the
+    // copy-back are its baseline, and title memory may have moved on since
+    // this host copy was last read (a stale baseline would leave the title's
+    // newer bytes there for a copy the GPU does not change). In place there
+    // is nothing to bring up: it is title memory.
+    if !dst.in_place() {
+        dst.refresh(list, dst_address as u64, len as u64);
+    }
+    dst.gpu_writes(list, dst_address as u64, len as u64);
+    // SAFETY: an open list and live buffers, both inside their resources.
+    unsafe {
+        list.list
+            .CopyBufferRegion(&dst_buffer, dst_offset, &src_buffer, src_offset, len as u64)
+    };
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::gpu_copy(len);
+    true
+}
+
+/// A title buffer copy of `len` bytes at `from` into `to`: on the host GPU
+/// when both ranges have a host copy, else on the CPU as always.
+#[cfg(windows)]
+fn buffer_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: usize) {
+    let src = crate::shadow::peek(from as u64, len as u64);
+    let dst = crate::shadow::peek(to as u64, len as u64);
+    if let (Some(s), Some(d)) = (&src, &dst)
+        && matches!(
+            copy_plan(crate::host::gpu_copies(), src.is_some(), dst.is_some()),
+            CopyPlan::Gpu
+        )
+        && record_gpu_copy(list, d, to as usize, s, from as usize, len)
+    {
+        return;
+    }
+    list.defer_copy(to, from, len);
+}
+
+/// Buffer to buffer: both are host memory, copied at submission, or on the
+/// host GPU through their host copies when both have one.
 extern "system" fn copy_buffer_region(
     this: This,
     dst: This,
@@ -840,8 +929,9 @@ extern "system" fn copy_buffer_region(
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
+        && let Ok(len) = usize::try_from(len)
     {
-        list.defer_copy(to, from, len as usize);
+        buffer_copy(list, to, from, len);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
@@ -894,7 +984,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            buffer_copy(list, to, from, a.min(b) as usize);
         }
     }
     #[cfg(not(windows))]
@@ -2261,5 +2351,232 @@ mod tests {
         assert_eq!(idle_most(Some(31 * GIB), 16), (256, 512 * MIB));
         assert_eq!(idle_most(Some(32 * GIB), 16), (256, 512 * MIB));
         assert_eq!(idle_most(Some(64 * GIB), 32), (256, 512 * MIB));
+    }
+
+    /// The copy decision, without a device: only a copy whose source and
+    /// destination both have a host copy goes to the host GPU, and the switch
+    /// turns every one of them back into a CPU copy.
+    #[test]
+    fn a_copy_goes_to_the_gpu_only_when_both_sides_have_a_host_copy() {
+        assert_eq!(copy_plan(true, true, true), CopyPlan::Gpu);
+        assert_eq!(copy_plan(true, true, false), CopyPlan::Title);
+        assert_eq!(copy_plan(true, false, true), CopyPlan::Title);
+        assert_eq!(copy_plan(true, false, false), CopyPlan::Title);
+        assert_eq!(copy_plan(false, true, true), CopyPlan::Title);
+    }
+
+    /// A title buffer copy between two buffers with host copies is one
+    /// `CopyBufferRegion`: the source's host copy is brought up to date, the
+    /// destination is marked GPU-written (so title memory there is left alone
+    /// until the copy-back), the GPU's bytes land in the destination's host
+    /// copy, and the submission's copy-back puts them into title memory.
+    #[cfg(windows)]
+    #[test]
+    fn a_gpu_copy_refreshes_its_source_marks_its_destination_and_copies_back() {
+        use crate::host::StepKind;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const LEN: usize = 64 << 10;
+        // SAFETY: two private committed ranges, as the title's buffers are.
+        let (src, dst) = unsafe {
+            let make = || {
+                let p = VirtualAlloc(
+                    std::ptr::null(),
+                    LEN,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                );
+                assert!(!p.is_null());
+                p.cast::<u8>()
+            };
+            (make(), make())
+        };
+        // SAFETY: both ranges are LEN committed bytes; a pattern with no zero
+        // in it, so a copy that did not happen shows.
+        unsafe {
+            for i in 0..LEN {
+                src.add(i).write((i % 251) as u8 + 1);
+            }
+            dst.write_bytes(0, LEN);
+        }
+        crate::shadow::register(src as usize, src as u64, LEN as u64);
+        crate::shadow::register(dst as usize, dst as u64, LEN as u64);
+        let (Some(from), Some(to)) = (
+            crate::shadow::find(src as u64, LEN as u64),
+            crate::shadow::find(dst as u64, LEN as u64),
+        ) else {
+            panic!("no host copies of the two buffers");
+        };
+        let list = host.new_list().unwrap();
+        assert!(record_gpu_copy(
+            &list,
+            &to,
+            dst as usize,
+            &from,
+            src as usize,
+            LEN
+        ));
+        // The source's refresh first (the bytes the copy reads), then the
+        // destination's GPU write (nothing may copy title memory over it
+        // before the copy-back).
+        // In place the destination's host copy *is* title memory
+        // ([`crate::shadow::Shadow::gpu_writes`] returns early): the GPU's
+        // copy lands there, so there is no snapshot to take and nothing to
+        // copy back for it.
+        // The source's copy, then the destination's own refresh (its
+        // baseline), then its GPU write; in place the destination is title
+        // memory: no refresh of it and no GPU write step.
+        let expected: &[StepKind] = if to.in_place() {
+            &[StepKind::Refresh]
+        } else {
+            &[StepKind::Refresh, StepKind::Refresh, StepKind::GpuWrite]
+        };
+        assert_eq!(list.step_kinds(), expected);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: inside the destination's host copy, which is mapped.
+        let copy = unsafe {
+            std::slice::from_raw_parts(crate::shadow::bytes_of(&to, dst as usize, LEN).unwrap(), LEN)
+        };
+        assert_eq!(copy[..4], [1, 2, 3, 4], "the GPU's bytes are in the copy");
+        // SAFETY: the destination's title memory, committed above.
+        let title = unsafe { std::slice::from_raw_parts(dst, LEN) };
+        assert!(title == copy, "the copy-back put the GPU's bytes back");
+        list.reset();
+        crate::shadow::unregister(src as usize, src as u64);
+        crate::shadow::unregister(dst as usize, dst as u64);
+        // SAFETY: the two ranges allocated above.
+        unsafe {
+            VirtualFree(src.cast(), 0, MEM_RELEASE);
+            VirtualFree(dst.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    /// What a title buffer copy costs on the CPU against the host GPU, at the
+    /// size the world's copies come in: a 64 MiB copy read and written through
+    /// the kernel (`copy_mapped`, 86 MB/s in the world), the same copy as
+    /// `CopyBufferRegion` on the host GPU, and the whole GPU path including
+    /// the refresh it needs and the copy-back afterwards. Run with
+    /// `cargo xwin test --release -p victory-gpu -- --ignored --nocapture gpu_copy_benchmark`.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "benchmark"]
+    fn gpu_copy_benchmark() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let host = crate::host::host().expect("a host D3D12 device");
+        const LEN: usize = 64 << 20;
+        const RUNS: usize = 8;
+        // SAFETY: two private committed ranges of LEN, as title buffers are.
+        let (src, dst) = unsafe {
+            let make = || {
+                let p = VirtualAlloc(
+                    std::ptr::null(),
+                    LEN,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                );
+                assert!(!p.is_null());
+                p.cast::<u8>()
+            };
+            (make(), make())
+        };
+        // SAFETY: both ranges are LEN committed bytes.
+        unsafe {
+            for i in 0..LEN {
+                src.add(i).write((i % 251) as u8 + 1);
+            }
+            dst.write_bytes(0, LEN);
+        }
+        let mb = LEN as f64 / 1e6;
+        let rate = |time: std::time::Duration, copies: usize| {
+            format!(
+                "{:.2} ms/copy, {:.0} MB/s",
+                time.as_secs_f64() * 1e3 / copies as f64,
+                mb * copies as f64 / time.as_secs_f64()
+            )
+        };
+        // The CPU path, exactly as a title copy runs today.
+        let started = std::time::Instant::now();
+        for _ in 0..RUNS {
+            crate::host::copy_mapped(dst, src, LEN, true);
+        }
+        println!("CPU copy (copy_mapped): {}", rate(started.elapsed(), RUNS));
+        crate::shadow::register(src as usize, src as u64, LEN as u64);
+        crate::shadow::register(dst as usize, dst as u64, LEN as u64);
+        let (Some(from), Some(to)) = (
+            crate::shadow::find(src as u64, LEN as u64),
+            crate::shadow::find(dst as u64, LEN as u64),
+        ) else {
+            panic!("no host copies of the two buffers");
+        };
+        let (dst_buffer, dst_offset) = to.gpu_range(dst as usize, LEN).expect("the destination");
+        let (src_buffer, src_offset) = from.gpu_range(src as usize, LEN).expect("the source");
+        // The GPU copy alone: copies recorded in one list, one submission.
+        let list = host.new_list().unwrap();
+        for _ in 0..RUNS {
+            // SAFETY: an open list and live buffers.
+            unsafe {
+                list.list.CopyBufferRegion(
+                    &dst_buffer,
+                    dst_offset,
+                    &src_buffer,
+                    src_offset,
+                    LEN as u64,
+                )
+            };
+        }
+        let started = std::time::Instant::now();
+        list.close();
+        host.execute(&[&list]);
+        println!(
+            "GPU copy (CopyBufferRegion, recorded): {}",
+            rate(started.elapsed(), RUNS)
+        );
+        list.reset();
+        // The whole GPU path: each copy's refresh and copy-back with it, first
+        // with every byte of the destination new, then with the copy's bytes
+        // already in place (a copy the title repeats, whose copy-back writes
+        // nothing).
+        let whole = |runs: usize| {
+            let started = std::time::Instant::now();
+            for _ in 0..runs {
+                let list = host.new_list().unwrap();
+                assert!(record_gpu_copy(
+                    &list,
+                    &to,
+                    dst as usize,
+                    &from,
+                    src as usize,
+                    LEN
+                ));
+                list.close();
+                host.execute(&[&list]);
+                list.reset();
+            }
+            started.elapsed()
+        };
+        let first = whole(RUNS);
+        println!(
+            "GPU copy end to end, every byte new (refresh, copy, copy-back): {}",
+            rate(first, RUNS)
+        );
+        let again = whole(RUNS);
+        println!(
+            "GPU copy end to end, bytes already in place (copy-back writes nothing): {}",
+            rate(again, RUNS)
+        );
+        crate::shadow::unregister(src as usize, src as u64);
+        crate::shadow::unregister(dst as usize, dst as u64);
+        // SAFETY: the two ranges allocated above.
+        unsafe {
+            VirtualFree(src.cast(), 0, MEM_RELEASE);
+            VirtualFree(dst.cast(), 0, MEM_RELEASE);
+        }
     }
 }

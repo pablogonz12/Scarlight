@@ -47,18 +47,18 @@
 //! 16,352 of 16,384 pages read zeros with the handle closed, none with it
 //! open (the test below). `VICTORY_LIBRARY_HANDLE=0`: closed, as before.
 //!
-//! The list has a cap ([`EARLY_MAX`] keys). A run that finds more goes to
-//! a title with more pipelines than the cap: the extra keys are dropped,
-//! not put in the place of older ones, so the list keeps the pipelines
-//! that were drawn with first (the ones the measured scene needs) and the
-//! tail of a title's creation order is left to its own workers. Both
-//! [`save`] and the first read of the list say how many keys were listed,
-//! the cap, and how many were dropped, so a run never truncates in silence.
-//!
 //! Each build keeps its own library, in `dir/<build>` ([`KEPT`] of them;
 //! `VICTORY_LIBRARY_PRUNE=0` keeps every one): the entries are named after
 //! translated shaders, so the first run of a new build used to write its
 //! few pipelines over the library the build before it had warmed.
+//!
+//! The early list has a cap ([`EARLY_MAX`] keys). A title with more
+//! pipelines than the cap keeps the first this many keys — the ones drawn
+//! with first, which are the ones the measured scene needs — and the tail
+//! of its creation order is dropped, not put in the place of older keys,
+//! so its own workers still make them. Both [`save`] and the first read of
+//! the list say how many keys were listed, the cap, and how many requests
+//! were refused, so a run never truncates in silence.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -558,7 +558,7 @@ const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most. A title that asks
 /// for more keeps the first this many keys (the ones drawn with first) and
-/// loses the tail; `save` logs how many were dropped. Our own lists are
+/// loses the tail; `save` logs how many requests were refused. Our own lists are
 /// 2,238 keys and 1,785 buildable pipelines, so nothing measured is near
 /// it: the cap is a guard against a title whose keys never repeat, not a
 /// tuning value, and it moves only with a measurement of a list that
@@ -792,14 +792,15 @@ pub(crate) fn save(now: bool) {
             )
         });
     }
-    let written = library_written        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+    let written = library_written
+        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
         Ok(()) => tracing::info!(
             bytes,
             early = used.len(),
             cap = EARLY_MAX,
             truncated = dropped > 0,
-            dropped,
+            refused = dropped,
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
@@ -849,12 +850,10 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
 static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
-/// Keys refused since the start because the list was at [`EARLY_MAX`].
+/// Requests refused since the start because the list was at [`EARLY_MAX`].
+/// Per request, not per key: two pipelines of one refused key each reach
+/// [`note_used`] once, so the same key counts once for each of them.
 static DROPPED: AtomicU64 = AtomicU64::new(0);
-/// The keys [`DROPPED`] counts: a refused key is not in the list, so a title
-/// asking for it twice (two pipelines with one description) asks again for a
-/// key that was never stored, and one pipeline dropped must count once.
-static REFUSED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
@@ -864,9 +863,9 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
         let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
-        // A list at the cap may have been truncated when it was written;
-        // the file holds only the keys, so say that it is full rather than
-        // that keys were dropped (the save that wrote it logged the count).
+        // A file at the cap may have been written truncated, but only a
+        // full one (`at_cap`) is what the file can say: the save that wrote
+        // it logged whether it actually dropped keys.
         let at_cap = set.len() >= EARLY_MAX;
         tracing::info!(
             pipelines = set.len(),
@@ -896,7 +895,6 @@ fn insert_capped(set: &mut HashSet<String>, cap: usize, key: &str) -> bool {
     set.insert(key.to_owned())
 }
 
-/// The title pipeline with `key` was drawn or dispatched with.
 /// A draw or dispatch requested the title pipeline with `key`.
 pub(crate) fn note_used(key: &str) {
     let mut used = used();
@@ -904,22 +902,17 @@ pub(crate) fn note_used(key: &str) {
     if insert_capped(set, EARLY_MAX, key) {
         USED_CHANGED.store(true, Ordering::Relaxed);
     } else if set.len() >= EARLY_MAX && !set.contains(key) {
+        // A save must write and log the count even when the list itself did
+        // not change, so the refusal is what makes it eligible.
+        USED_CHANGED.store(true, Ordering::Relaxed);
         // Logged once, when the cap is first reached, and counted for every
         // key after it: a run never loses the tail without a word.
-        // The next save must write and log the count even when the list
-        // itself did not change: a refusal alone is not a reason to save.
-        USED_CHANGED.store(true, Ordering::Relaxed);
-        let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
-        let first = refused.get_or_insert_with(HashSet::new).insert(key.to_owned());
-        if !first {
-            return;
-        }
         let dropped = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
         if dropped == 1 {
             tracing::warn!(
                 cap = EARLY_MAX,
                 "early pipeline list at its cap: further keys are dropped, not listed \
-                 (logged once; the count is in the next save)"
+                 (logged once; the refused count is in the next save, per request)"
             );
         }
     }

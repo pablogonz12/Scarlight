@@ -48,12 +48,13 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 /// The switches that may be changed live, in the order they are logged.
-const NAMES: [&str; 20] = [
+const NAMES: [&str; 21] = [
     "VICTORY_ASYNC_WRITEBACK",
     "VICTORY_TEXTURE_WAIT_US",
     "VICTORY_TEXTURE_IN_PLACE",
     "VICTORY_TEXTURE_INPLACE_MAX_MB",
     "VICTORY_TEXTURE_KEEP",
+    "VICTORY_GPU_COPIES",
     "VICTORY_TEXTURE_REFRESH_EVERY",
     "VICTORY_CARD_BUFFERS",
     "VICTORY_CARD_BUFFERS_MIN_MB",
