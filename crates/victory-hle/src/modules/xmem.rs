@@ -803,8 +803,14 @@ pub extern "system" fn XMemMapPhysicalPages(
         // into placeholders of its own, and consecutive pages say nothing
         // about where one ends. A call across two is refused, and its range
         // has already been unmapped. Ask the host where that placeholder
-        // ends (Marvisak/VIctory #1264's triage).
-        let mut run = 1 + pages[i + 1..]
+        // ends (Marvisak/VIctory #1264's triage), before the scan, so it
+        // covers only the pages this call maps (a page per placeholder
+        // would otherwise be searched once more on every page).
+        let at = base + i * PAGE;
+        // 0: not a reserved placeholder, so the run is as long as it comes.
+        let room = if clipping() { placeholder_room(at) / PAGE } else { 0 };
+        let most = if room > 0 { room.min(n - i) } else { n - i };
+        let run = 1 + pages[i + 1..i + most]
             .iter()
             .zip(1..)
             .take_while(|&(page, k)| {
@@ -813,30 +819,26 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
-        if run > 1 && clipping() {
-            let at = base + i * PAGE;
-            let room = placeholder_room(at) / PAGE;
-            if room > 0 && room < run {
-                run = room.max(1);
-                let clipped = CLIPPED_RUNS.fetch_add(1, Ordering::Relaxed) + 1;
-                if clipped == 1 || clipped.is_multiple_of(1024) {
-                    tracing::info!(
-                        address = format_args!("{at:#x}"),
-                        pages = run,
-                        clipped,
-                        "a mapping run stops at the end of its placeholder"
-                    );
-                } else {
-                    tracing::debug!(
-                        address = format_args!("{at:#x}"),
-                        pages = run,
-                        clipped,
-                        "a mapping run stops at the end of its placeholder"
-                    );
-                }
+        // The scan stopped at the room and pages went on: clipped there.
+        if run == most && most < n - i {
+            let clipped = CLIPPED_RUNS.fetch_add(1, Ordering::Relaxed) + 1;
+            if clipped == 1 || clipped.is_multiple_of(1024) {
+                tracing::info!(
+                    address = format_args!("{at:#x}"),
+                    pages = run,
+                    clipped,
+                    "a mapping run stops at the end of its placeholder"
+                );
+            } else {
+                tracing::debug!(
+                    address = format_args!("{at:#x}"),
+                    pages = run,
+                    clipped,
+                    "a mapping run stops at the end of its placeholder"
+                );
             }
         }
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+        if !map(&mut physical, at, run * PAGE, first) {
             return std::ptr::null_mut();
         }
         i += run;
