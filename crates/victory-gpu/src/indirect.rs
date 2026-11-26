@@ -1287,7 +1287,11 @@ void main() {
         let kept = (0..RECORDS as usize).filter(|&i| out[i * 4] > 0).count();
         assert_eq!(kept, 1, "one of the two fits either way");
         let (spent, out, refused, biggest) = run(&mut harness, &rest0);
-        assert_eq!(spent, BUDGET_CAP - 50, "it took nothing: 50 are left");
+        // Which record reserves first is the compare-exchange loop's order,
+        // not the record order: the 200-cost one leaves 50, the 100-cost one
+        // 150. The kept record says which (CodeRabbit, PR #233).
+        let expected = if out[0] > 0 { BUDGET_CAP - 50 } else { BUDGET_CAP - 150 };
+        assert_eq!(spent, expected, "it took nothing: what it left is the rest of its size");
         assert_eq!((refused, biggest), (1, 0));
         let kept = (0..RECORDS as usize).filter(|&i| out[i * 4] > 0).count();
         assert_eq!(kept, 1);
