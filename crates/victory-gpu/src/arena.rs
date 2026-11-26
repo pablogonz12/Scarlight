@@ -441,6 +441,12 @@ fn prove(device: &ID3D12Device, buffer: &ID3D12Resource, base: u64, bytes: u64) 
     if bytes < K64 as u64 {
         return Proof::Unmade;
     }
+    // The samples must lie inside the buffer the caller gave, or the copy
+    // below reads past it (a placement always covers its part).
+    // SAFETY: a live buffer; the description is its own.
+    if unsafe { buffer.GetDesc() }.Width < bytes {
+        return Proof::Unmade;
+    }
     let Ok(mut rig) = Rig::new(device) else {
         return Proof::Unmade;
     };
@@ -687,12 +693,14 @@ mod tests {
     fn warp_the_canary_refuses_a_buffer_that_is_not_the_titles() {
         let _once = crate::warptest::lock();
         let Some(device) = device() else { return };
-        let mut rig = Rig::new(&device).unwrap();
-        let card = rig.committed(D3D12_HEAP_TYPE_DEFAULT, SAMPLE as u64, D3D12_RESOURCE_STATE_COMMON).unwrap();
-        rig.store(&card, 0, &[0u8; SAMPLE]).unwrap();
         // SAFETY: an allocation of the test's own.
         unsafe {
             let bytes = K64;
+            let mut rig = Rig::new(&device).unwrap();
+            // A buffer of the same size that is *not* over the title's pages:
+            // a placement of card memory of its own.
+            let card = rig.committed(D3D12_HEAP_TYPE_DEFAULT, bytes as u64, D3D12_RESOURCE_STATE_COMMON).unwrap();
+            rig.store(&card, 0, &[0u8; SAMPLE]).unwrap();
             let base = mem::VirtualAlloc(std::ptr::null(), bytes, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE).cast::<u8>();
             assert!(!base.is_null());
             std::ptr::write_bytes(base, 0x22, bytes);
