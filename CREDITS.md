@@ -28,8 +28,21 @@ wrothgaril, Yaekai.
 
 andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VIctory #2614), BlueKaiman, kais7654, pushkarreddyy, shh.
 
+## Ports of fork pull requests
+
+Code reimplemented here from a fork's pull request, because the fork's tree had diverged from ours;
+the design and the author are credited in the commit's `Co-authored-by:` and here.
+
+- **Marvisak/VIctory #2401** (Mumogg) — the Wine `ExitProcess` hook that makes a host driver
+  compiler crash cost one pipeline instead of the run ([`pipeline/wine.rs`](crates/victory-gpu/src/pipeline/wine.rs)),
+  adapted to our pipeline workers and library.
+
 ## Design notes
 
+- **fuzeofficial** ([Marvisak/VIctory #2608](https://github.com/Marvisak/VIctory/pull/2608)), GPL-3.0: the
+  idea of cutting a command list at its texture read-backs and running the part after one in a submission
+  of its own, so a copy or draw recorded behind a read-back is prepared after its bytes are in title
+  memory (`crate::list::cut_read_back`). Reimplemented on the parts a queue already runs.
 - **Marvisak/VIctory [#2478](https://github.com/Marvisak/VIctory/pull/2478)** (HoLa-Lee), GPL-3.0: the idea
   of reading a texture once every N frames at most, round-robin by the texture's address, its measurements
   (a frame of world entry at 6,814 ms of texture work, 145-522 ms at 8), and its name for the switch,
@@ -162,6 +175,12 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
   corners put it. This tree's geometry stage (`emit::rect_list_gs`) already finds the corner in any order; the
   rule is now in the CPU expansion too (`right_angle`, `right_corners` in `crates/victory-gpu/src/primitive.rs`).
 
+- **fxceless/victory-fork [PR #980](https://github.com/fxceless/victory-fork/pull/980)** (fxceless), GPL-3.0:
+  the arena, the layer a resident stands on: a title region opened as a D3D12 heap and a buffer placed over it, so
+  the GPU reads and writes the title's own memory (`crates/victory-gpu/src/arena.rs`, `VICTORY_ARENA=1`, off by
+  default). The part grid, the region registry, the budget and the canary are reimplemented on this tree's
+  `inplace`; the canary here proves each part **both ways** with our own `Rig` (#188), which the fork's tests do not.
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
@@ -174,6 +193,15 @@ Missing or wrong name? Open an issue.
   enables blending on one, so those targets are made to write unblended, per target and with independent
   blending turned on only where it was needed (`crates/victory-gpu/src/pipeline/host.rs`,
   `VICTORY_HOST_BLEND=0`). Its host-pipeline device test used `D3DCompile`; ours checks the state itself.
+- **avatarmanz/VIctory-7900XTX [2be0515c](https://github.com/avatarmanz/VIctory-7900XTX/commit/2be0515cb)**, GPL-3.0:
+  a page the title maps at more than one address, where a guard at one address can be written through another: the
+  guarded blocks of the views beside it are given back to write together, under the one look
+  (`crates/victory-gpu/src/watch.rs`, `VICTORY_GUARD_ALIASES=0`).
+- **avatarmanz/VIctory-7900XTX [200a9cc5](https://github.com/avatarmanz/VIctory-7900XTX/commit/200a9cc5e)**
+  (after fxceless/victory-fork [c36971b2](https://github.com/fxceless/victory-fork/commit/c36971b2)), GPL-3.0: the
+  dwords of one console buffer load read by one `rawBufferLoad` for every four of them instead of a call a dword,
+  behind `VICTORY_SHADER_OPT=64` (off by default, worth nothing on the card that measured it)
+  (`crates/victory-shader/src/emit/lower/wide.rs`).
 - **avatarmanz/VIctory-7900XTX [17c4717b](https://github.com/avatarmanz/VIctory-7900XTX/commit/17c4717b4)**
   (after fxceless/victory-fork [c36971b2](https://github.com/fxceless/victory-fork/commit/c36971b2)), GPL-3.0:
   `VICTORY_CARD_BUFFERS_MIN_KB`, so that title buffers' copies under the MiB floor can go into the card's memory
