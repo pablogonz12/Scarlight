@@ -7534,9 +7534,12 @@ impl Host {
         let texture = &source.texture;
         let state = D3D12_RESOURCE_STATES(source.state.load(Ordering::Relaxed) as i32);
         // What decides against composing also settles the extent: the base
-        // plane's, so the copy below and the back buffer agree.
+        // plane's, so the copy below and the back buffer agree. The compositor
+        // forces the synchronous `p.copy` path (`composition.is_some()` sets
+        // `slot = None` below), so two-plane composition works even when
+        // `late_free_present()` (`VICTORY_RELAY=1`) is enabled.
         let mut overlay = overlay
-            .filter(|_| fill.is_none() && !late_free_present())
+            .filter(|_| fill.is_none())
             .and_then(|(overlay, state)| {
                 let extent = crate::present_compositor::extent(texture, overlay)?;
                 Some((overlay, D3D12_RESOURCE_STATES(state as i32), extent))
