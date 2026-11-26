@@ -48,6 +48,7 @@ windows-core = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+victory-gpu = { workspace = true, features = ["test-hooks"] }
 
 # A pipe for a test of a read that stays pending (`modules::dstorage`).
 [target.'cfg(windows)'.dev-dependencies]

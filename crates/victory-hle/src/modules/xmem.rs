@@ -8,7 +8,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::alloc::{Layout, alloc, dealloc};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -375,6 +375,36 @@ struct Physical {
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// The section, slice index and title address of every mapped page: which
+    /// views show a page we write through our own views
+    /// ([`Physical::written_views`]).
+    aliases: BTreeSet<(usize, usize, usize)>,
+}
+
+impl Physical {
+    /// The section a slice is of, as it is identified among views: the
+    /// allocation itself, alive while any view or page holds it.
+    fn section(slice: &Slice) -> usize {
+        Arc::as_ptr(&slice.section) as usize
+    }
+
+    /// The title addresses showing the bytes `[within, within + bytes)` of a
+    /// view that starts at `slice`: the write through our own view lands in
+    /// their blocks too, and the GPU side's write watch has to hear of it. By
+    /// section and slice index, not by page number, which the title may hand
+    /// out again for another allocation's pages.
+    fn written_views(&self, slice: &Slice, within: usize, bytes: usize) -> Vec<usize> {
+        let (section, first) = (Self::section(slice), slice.index + within / PAGE);
+        let end = if bytes == 0 {
+            first
+        } else {
+            slice.index + (within + bytes).div_ceil(PAGE)
+        };
+        self.aliases
+            .range((section, first, 0)..(section, end, 0))
+            .map(|entry| entry.2)
+            .collect()
+    }
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -547,6 +577,54 @@ pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
     runs(pages, offset, len).is_some()
 }
 
+/// Whether writes into physical pages tell the GPU side's write watch where
+/// the title sees them (`VICTORY_STREAM_PAGES=0` turns it off): they go
+/// through our own views, so they do not fault into its handler.
+fn stream_pages() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("VICTORY_STREAM_PAGES").is_none_or(|v| v != "0")
+    });
+    *ON
+}
+
+/// A write into physical pages through our own view of them, as the GPU
+/// side's write watch is told of it ([`write_physical`], [`PageWindow`]):
+/// before the write the title's blocks showing the pages are opened (as a
+/// kernel write's are by `kernel_will_write`), after it the pages are noted
+/// written where the title sees them.
+///
+/// Told only at the end, an armed page kept the bytes streaming put there as
+/// its old ones, and a copy-back put the copy's stale bytes back over them;
+/// and a block a copy-back job holds is given over to this write first, so
+/// the job does not put its bytes over the streamed ones afterwards.
+struct PhysicalWrite;
+
+impl PhysicalWrite {
+    /// Opens the guarded blocks of every title view showing `[within,
+    /// within + bytes)` of `slice`, before our write in `slice` lands. These
+    /// writes do not fault (they are not at the title's addresses), so this
+    /// is the only way the watch hears of them first.
+    fn begin(slice: &Slice, within: usize, bytes: usize) {
+        if !stream_pages() {
+            return;
+        }
+        for at in physical().written_views(slice, within, bytes) {
+            victory_gpu::kernel_will_write(at, PAGE);
+        }
+    }
+
+    /// After the write: the pages as the title's views show them now are
+    /// noted written — a view mapped while the write was under way was never
+    /// opened by [`PhysicalWrite::begin`].
+    fn end(slice: &Slice, within: usize, bytes: usize) {
+        if !stream_pages() {
+            return;
+        }
+        let shown = physical().written_views(slice, within, bytes);
+        victory_gpu::mapped_pages_written(shown.into_iter());
+    }
+}
+
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view
@@ -558,60 +636,16 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     };
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
-        // Before the write, never after: the guards are on the title's views
-        // of the same pages, and told afterwards they save what we wrote
-        // (Marvisak/VIctory #2503).
-        mark_written(slice, *n, within, (data.len() - done).min(n * PAGE - within));
         let Some(mut view) = View::map(slice, *n) else {
             return false;
         };
         let k = (n * PAGE - within).min(data.len() - done);
+        PhysicalWrite::begin(slice, within, k);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        PhysicalWrite::end(slice, within, k);
         (within, done) = (0, done + k);
     }
     true
-}
-
-/// Tells the GPU side's write watch that bytes
-/// `[within, within + len)` of a run of `n` pages from `slice` are about to
-/// change through a view of our own: it saves an armed page's bytes before
-/// they change (`watch::writing`), so this has to come before the write.
-/// Called afterwards, it saves the bytes just written, and
-/// `copy_back_marked` then puts its stale copy back over them (streamed
-/// textures lost after a DirectStorage burst; Marvisak/VIctory #2503).
-fn mark_written(slice: &Slice, n: usize, within: usize, len: usize) {
-    for (at, bytes) in title_ranges(slice, n, within, len) {
-        victory_gpu::kernel_will_write(at, bytes);
-    }
-}
-
-/// The title's own views over bytes `[within, within + len)` of a run of `n`
-/// pages from `slice`, as addresses and lengths: the guards a write through
-/// our own view must open first.
-fn title_ranges(slice: &Slice, n: usize, within: usize, len: usize) -> Vec<(usize, usize)> {
-    let end = within.saturating_add(len);
-    let physical = physical();
-    let mut out = Vec::new();
-    for (at, (view_len, view)) in &physical.views {
-        if !Arc::ptr_eq(&view.section, &slice.section) {
-            continue;
-        }
-        // Where this view sits in the run's own bytes, which may start
-        // before the run (a view holding several pages of one section).
-        // Signed and saturating: a section's page indexes are large
-        // numbers, and a view may start before the run.
-        let head = (view.index as i64 - slice.index as i64).saturating_mul(PAGE as i64);
-        let lo = head.max(within as i64);
-        let hi = head
-            .saturating_add(*view_len as i64)
-            .min(end as i64)
-            .min((n as i64).saturating_mul(PAGE as i64));
-        if hi <= lo {
-            continue;
-        }
-        out.push((*at + (lo - head) as usize, (hi - lo) as usize));
-    }
-    out
 }
 
 /// Views a worker keeps for its next page destination: a load sends
@@ -657,6 +691,8 @@ pub(crate) struct PageWindow {
     key: (usize, usize, usize, usize),
     /// The cache slot the view goes back to, and whose old view it replaces.
     slot: usize,
+    /// What the view shows, for the write watch ([`PageWindow::drop`]).
+    slice: Slice,
     within: usize,
     len: usize,
     /// Mapped for this window alone: unmapped when it drops.
@@ -673,6 +709,10 @@ impl PageWindow {
 
 impl Drop for PageWindow {
     fn drop(&mut self) {
+        // Whatever the decode wrote, the pages changed where the title sees
+        // them: tell the write watch, which guards those blocks and cannot
+        // see a write through this view.
+        PhysicalWrite::end(&self.slice, self.within, self.len);
         let Some(view) = self.view.take() else {
             return;
         };
@@ -710,8 +750,10 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         within,
         len,
     );
-    // Before the write, as in `write_physical` (Marvisak/VIctory #2503).
-    mark_written(slice, *n, within, len);
+    // Before anything is decoded into it, and never after: opening a block a
+    // copy-back job holds stops the job's stale bytes landing on top, and
+    // the end-of-decode report in `Drop` still tells views mapped meanwhile.
+    PhysicalWrite::begin(slice, within, len);
     let budget = cache_bytes();
     let hit = CACHED.with(|cached| {
         let mut cached = cached.borrow_mut();
@@ -729,12 +771,22 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
             view: Some(view),
             key,
             slot,
+            slice: slice.clone(),
             within,
             len,
             own: false,
         });
     }
-    let view = View::map(slice, *n)?;
+    let view = match View::map(slice, *n) {
+        Some(view) => view,
+        None => {
+            // The handoff must not outlive a failed acquisition: a block left
+            // marked as taken makes a pending copy-back skip the GPU's results
+            // for it while the physical pages keep their stale bytes.
+            PhysicalWrite::end(slice, within, len);
+            return None;
+        }
+    };
     // A window longer than the budget (a big tile) is this request's alone:
     // keeping it would hold that much of the title's memory.
     if budget == 0 || len > budget {
@@ -742,6 +794,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
             view: Some(view),
             key,
             slot: 0,
+            slice: slice.clone(),
             within,
             len,
             own: true,
@@ -766,6 +819,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         view: Some(view),
         key,
         slot,
+        slice: slice.clone(),
         within,
         len,
         own: false,
@@ -998,6 +1052,12 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    let section = Physical::section(&slice);
+    for page in 0..len / PAGE {
+        physical
+            .aliases
+            .insert((section, slice.index + page, base + page * PAGE));
+    }
     physical.views.insert(base, (len, slice));
     true
 }
@@ -1076,6 +1136,12 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        let section = Physical::section(&slice);
+        for page in 0..size / PAGE {
+            physical
+                .aliases
+                .remove(&(section, slice.index + page, at + page * PAGE));
+        }
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
@@ -1723,5 +1789,123 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// DirectStorage writes into physical pages through our own views of them
+    /// (`write_physical`, `page_window`), at no address the GPU side's write
+    /// watch guards: the title's views of the same pages keep their blocks
+    /// read-only and never fault, so the write has to be told to the watch
+    /// where the title reads them, and to every view, not just one.
+    #[test]
+    fn storage_writes_are_reported_to_every_view_of_the_pages() {
+        let pages = allocate(2);
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                2 * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            )
+        };
+        let (a, b) = (reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 2, pages.as_ptr()), b);
+        // A host copy of each view takes it: its blocks are guarded, clean.
+        let taken = |view: *mut c_void| {
+            let at = view as usize;
+            victory_gpu::written_pages(at, at + 2 * PAGE).expect("view memory")
+        };
+        let both = |view: *mut c_void, asking: u64| {
+            let at = view as usize;
+            [(at / PAGE, asking), (at / PAGE + 1, asking)]
+        };
+        // Both views show one section at two addresses, so the guards never
+        // make their blocks read-only (a write through the other view would
+        // go unseen: `inplace::aliased`): every asking reports the pages
+        // again, under its own number. The single-view case, where a block
+        // is guarded and clean, is
+        // `physical_writes_open_the_title_views_before_the_bytes_land`.
+        for view in [a, b] {
+            let (mapped, pages) = taken(view);
+            assert_eq!(pages, both(view, mapped), "newly mapped");
+            let (settled, pages) = taken(view);
+            assert!(settled > mapped);
+            assert_eq!(pages, both(view, settled), "an aliased view is never clean");
+        }
+
+        // A write through our own view of the pages lands in both views'
+        // blocks without a fault there; both are noted written, by a new
+        // asking of their own.
+        assert!(write_physical(&pages, 0, &vec![0x5a; PAGE + 1]));
+        let (first, one) = taken(a);
+        assert_eq!(one, both(a, first));
+        let (second, two) = taken(b);
+        assert!(second > first);
+        assert_eq!(two, both(b, second), "the view at the second address too");
+
+        // A decode into a window in place reports its pages when it is done.
+        let mut window = page_window(&pages, 0, 2 * PAGE).expect("one run");
+        window.bytes()[0] = 0x11;
+        window.bytes()[PAGE] = 0x22;
+        drop(window);
+        let (ours, written) = taken(a);
+        assert!(ours > first, "the window's write is a newer asking");
+        assert_eq!(written, both(a, ours));
+        assert_eq!(page_bytes(pages[0])[0], 0x11);
+        assert_eq!(page_bytes(pages[1])[0], 0x22);
+
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 2, std::ptr::null()), b);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// Told only once the write has landed, the watch's blocks were still
+    /// read-only and clean as the bytes went in: a page armed for a copy-back
+    /// kept the streamed bytes as its old ones and the copy put its stale
+    /// bytes back over them, and a block a copy-back job held was written over
+    /// after the stream. The write opens the title's blocks first.
+    #[test]
+    fn physical_writes_open_the_title_views_before_the_bytes_land() {
+        let pages = allocate(2);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        let at = a as usize;
+        // A host copy of the view takes both pages: guarded, clean.
+        let taken = || victory_gpu::written_pages(at, at + 2 * PAGE).expect("view memory");
+        // A newly mapped view is reported written once; then it is clean.
+        let (mapped, reported) = taken();
+        assert_eq!(reported, [(at / PAGE, mapped), (at / PAGE + 1, mapped)]);
+        let (settled, reported) = taken();
+        assert_eq!(reported, [(at / PAGE, mapped), (at / PAGE + 1, mapped)]);
+        assert!(victory_gpu::page_guarded(at) && victory_gpu::page_guarded(at + PAGE));
+
+        // The page the write lands in is opened before it does: its block is
+        // no longer read-only, and the next asking finds it written anew.
+        assert!(write_physical(&pages, PAGE, &[7]));
+        assert!(!victory_gpu::page_guarded(at + PAGE), "opened first");
+        assert!(victory_gpu::page_guarded(at), "only the page written");
+        let (asking, written) = taken();
+        assert!(asking > settled);
+        assert_eq!(written, [(at / PAGE, mapped), (at / PAGE + 1, asking)]);
+
+        // A decode's window opens its pages too, and stays open while it lasts.
+        let window = page_window(&pages, PAGE, PAGE).expect("one run");
+        assert!(!victory_gpu::page_guarded(at + PAGE), "a window's pages");
+        drop(window);
+        let (after, windowed) = taken();
+        assert!(after > asking);
+        assert_eq!(windowed, [(at / PAGE, mapped), (at / PAGE + 1, after)]);
+
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 }

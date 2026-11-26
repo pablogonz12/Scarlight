@@ -2263,14 +2263,21 @@ impl Shadow {
                 // From the first byte that differs to the last: title
                 // memory is read and written there only (a shader that sets
                 // a few words of a piece cost a read, a walk and a write of
-                // all 64 KiB of it). The snapshot's bytes are read here and
-                // nowhere else before they are written below.
+                // all 64 KiB of it).
+                // A write gave this block over after the job took it (a
+                // physical-page write through our own view, told to the watch
+                // first): the title's bytes are newer than the GPU's, so the
+                // merge leaves them and the write-back does not undo it.
+                if crate::watch::given_over(start + at) {
+                    continue;
+                }
+                // The snapshot's bytes are read here and nowhere else before
+                // they are written below.
                 let found = {
                     // SAFETY: inside the snapshot's allocation (`writing`),
                     // read only for this comparison.
                     let old = unsafe { std::slice::from_raw_parts(base.add(at), n) };
-                    first_difference(host, old)
-                        .map(|first| (first, last_difference(host, old).unwrap_or(first)))
+                    first_difference(host, old).map(|first| (first, last_difference(host, old).unwrap_or(first)))
                 };
                 let Some((first, last)) = found else {
                     continue;
@@ -2287,6 +2294,11 @@ impl Shadow {
                     crate::watch::back_open(start + at, n);
                 }
                 if !crate::host::read_into((start + at) as *const u8, title) {
+                    continue;
+                }
+                // Read again after the read: a write may have taken the block
+                // meanwhile, and its bytes are newer than ours.
+                if crate::watch::given_over(start + at) {
                     continue;
                 }
                 // Title memory with the GPU's bytes put in; the copy and its

@@ -339,6 +339,26 @@ pub(crate) fn opened(blocks: &[usize]) {
     }
 }
 
+/// Forgets the clean notes of the blocks holding `addresses`, written through
+/// another view of the same physical pages (xmem's `write_physical`, a
+/// DirectStorage page destination): what guards those blocks stays in place,
+/// but a host copy of the memory is stale again.
+pub(crate) fn written_through(addresses: impl Iterator<Item = usize>) {
+    for at in addresses {
+        let block = at / BLOCK;
+        let mut g = slot(shard(block, shards()));
+        if g.protected.contains(&block) {
+            g.clean.remove(block);
+        }
+    }
+}
+
+/// Whether the block holding `at` is read-only by our hand.
+pub(crate) fn guarded(at: usize) -> bool {
+    let block = at / BLOCK;
+    reading(shard(block, shards())).protected.contains(&block)
+}
+
 /// Guards the view blocks of `[first, last)` again, returning the pages of
 /// those written since they were last guarded (all of a block's pages).
 /// `watch::guard` has checked that the range is view memory.
