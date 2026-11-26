@@ -36,6 +36,10 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
 - **Marvisak/VIctory #2401** (Mumogg) — the Wine `ExitProcess` hook that makes a host driver
   compiler crash cost one pipeline instead of the run ([`pipeline/wine.rs`](crates/victory-gpu/src/pipeline/wine.rs)),
   adapted to our pipeline workers and library.
+- **fever308/victory-corgi `38e367763`** (fever308) — the bounded, size-bucketed pool of mapped `UPLOAD`
+  buffers that a list copies title memory through: a buffer a list let go of is kept by its size class and reused by
+  the next copy, and only after every submission in the air has finished
+  ([`upload_pool.rs`](crates/victory-gpu/src/upload_pool.rs), `VICTORY_UPLOAD_POOL=0` off).
 
 ## Design notes
 

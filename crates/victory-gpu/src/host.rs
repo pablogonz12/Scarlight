@@ -1819,7 +1819,7 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
-    uploads: Vec<ID3D12Resource>,
+    uploads: Vec<crate::upload_pool::Entry>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
     /// Host objects the list's commands name (pipelines, root signatures,
@@ -1875,13 +1875,13 @@ impl Deferred {
         self.gpu_written.forget();
     }
 
-    /// Holds `buffer` (`size` bytes of upload memory) until the list is
+    /// Holds `entry` (an upload buffer of its class size) until the list is
     /// reset.
-    fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
+    fn hold_upload(&mut self, entry: crate::upload_pool::Entry) {
         ALIVE[6].fetch_add(1, Ordering::Relaxed);
-        ALIVE[7].fetch_add(size, Ordering::Relaxed);
-        self.upload_bytes += size;
-        self.uploads.push(buffer);
+        ALIVE[7].fetch_add(entry.bytes(), Ordering::Relaxed);
+        self.upload_bytes += entry.bytes();
+        self.uploads.push(entry);
     }
 }
 
@@ -1889,6 +1889,12 @@ impl Drop for Deferred {
     fn drop(&mut self) {
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        // The buffers go back to the pool through `retire`: kept while any
+        // submission in the air could still read them, and only then kept
+        // for the next copy (crate::upload_pool).
+        if !self.uploads.is_empty() {
+            retire(std::mem::take(&mut self.uploads));
+        }
     }
 }
 
@@ -5687,13 +5693,18 @@ impl HostList {
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// reset: kept by its size class and reused by the next copy that asks
+    /// for it ([`crate::upload_pool`], `VICTORY_UPLOAD_POOL=0` off).
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().hold_upload(buffer.clone(), size);
+        let entry = crate::upload_pool::take(size, |class| {
+            let (buffer, data) = host.upload_buffer(class)?;
+            name(&buffer, || format!("list upload {class:#x}"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            Some((buffer, data, gpu))
+        })?;
+        let (buffer, data) = (entry.resource(), entry.data());
+        self.deferred().hold_upload(entry);
         Some((buffer, data))
     }
 
@@ -5704,11 +5715,15 @@ impl HostList {
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
-            name(&buffer, || format!("list scratch {len:#x}"));
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            self.deferred().hold_upload(buffer, len);
+            let entry = crate::upload_pool::take(len, |class| {
+                let (buffer, data) = host.upload_buffer(class)?;
+                name(&buffer, || format!("list scratch {class:#x}"));
+                // SAFETY: a live buffer.
+                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                Some((buffer, data, gpu))
+            })?;
+            let (gpu, data) = (entry.gpu(), entry.data());
+            self.deferred().hold_upload(entry);
             return Some((gpu, data));
         }
         // The chunk in use while `len` fits in what is left of it, else the
