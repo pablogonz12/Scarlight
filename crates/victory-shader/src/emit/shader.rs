@@ -184,6 +184,15 @@ pub(crate) struct Shader {
     pub rovs: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Ballots made to learn whether a DPP source lane is in EXEC.
+    #[cfg(test)]
+    pub exec_ballots: u32,
+    /// Pixel `v_readfirstlane`s that keep a helper lane's own value.
+    #[cfg(test)]
+    pub helper_readfirst: u32,
+    /// `dx.op.discard`s a pixel program makes.
+    #[cfg(test)]
+    pub pixel_discards: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -241,6 +250,12 @@ impl Shader {
             flags: 0,
             rovs: false,
             nonuniform_handles: 0,
+            #[cfg(test)]
+            exec_ballots: 0,
+            #[cfg(test)]
+            helper_readfirst: 0,
+            #[cfg(test)]
+            pixel_discards: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
