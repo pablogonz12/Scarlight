@@ -255,6 +255,28 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
     parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
 }
 
+/// `VICTORY_SHADER_SWIZZLE_ZERO`:
+/// - unset: a `ds_swizzle_b32` read whose source lane is inactive in the
+///   compute program (absent, or masked out by EXEC) reads zero, as the
+///   console's does: that lane never wrote the register.
+/// - `0`: the plain read of the source lane, whatever its EXEC bit, as
+///   before (the value of a register no lane wrote is undefined).
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+pub fn shader_swizzle_zero() -> bool {
+    static ZERO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ZERO.get_or_init(|| {
+        parse_swizzle_zero(std::env::var("VICTORY_SHADER_SWIZZLE_ZERO").ok().as_deref())
+    })
+}
+
+/// `VICTORY_SHADER_SWIZZLE_ZERO`'s value; on unless it is `0`. Pure, for
+/// testing.
+fn parse_swizzle_zero(value: Option<&str>) -> bool {
+    !matches!(value.map(str::trim), Some("0"))
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
@@ -278,6 +300,7 @@ pub const SWITCHES: &[&str] = &[
     "VICTORY_F16_SUM_WIDE",
     "VICTORY_FIRSTLANE_OWN",
     "VICTORY_FIRST_HALF",
+    "VICTORY_FSPX",
     "VICTORY_GROUP_SPLIT",
     "VICTORY_GROUP_SYNC",
     "VICTORY_INT_CLAMP",
@@ -286,6 +309,7 @@ pub const SWITCHES: &[&str] = &[
     "VICTORY_SHADER_LOOP_LIMIT",
     "VICTORY_SHADER_LOOP_LIMIT_CS",
     "VICTORY_SHADER_OPT",
+    "VICTORY_SHADER_SWIZZLE_ZERO",
     "VICTORY_STRICT_JOINS",
     "VICTORY_TITLE_VIEW_CLAMP",
     "VICTORY_WAVE_DEEP_SKIPS",
@@ -423,10 +447,8 @@ pub struct UserData {
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let part = crate::program_part(&c).ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let native = crate::native_programs(part)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -942,6 +964,16 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::{parse_compute_loop_limit, parse_loop_limit};
+
+    #[test]
+    fn the_swizzle_zero_switch_is_off_only_for_zero() {
+        let on = super::parse_swizzle_zero;
+        assert!(on(None));
+        assert!(!on(Some("0")));
+        assert!(!on(Some(" 0 ")));
+        assert!(on(Some("1")));
+        assert!(on(Some("on")));
+    }
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {

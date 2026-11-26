@@ -60,6 +60,10 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   GPL-3.0: narrowing a host shader resource view of a streamed texture to the mips whose memory is
   there, and remaking it when more levels arrive or a host copy fills the chain
   (`crates/victory-gpu/src/texture.rs`, `crates/victory-gpu/src/descriptor/host.rs`).
+- **fxceless/victory-fork [#1014](https://github.com/fxceless/victory-fork/pull/1014)** (Martin Hartfelder),
+  GPL-3.0: a group of 64 threads to a 64 KiB piece in the card compare's hash, thread `t` hashing steps `t`,
+  `t + 64`... of the piece and the first thread folding the lanes in order, instead of one thread walking the
+  piece 16 bytes at a time (`crates/victory-gpu/src/host.rs`, `VICTORY_CARD_HASH_WIDE`).
 - **Marvisak/VIctory [#2736](https://github.com/Marvisak/VIctory/pull/2736)** (brainbudt), GPL-3.0: copying
   tiled textures as runs of whole micro-tile columns (one call per row and depth slice, 4-32 bytes at a
   time) instead of one closure call per span, its `detile_throughput` benchmark, and its idea of keeping
@@ -160,6 +164,9 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   and D3D12 requires a heap of each kind before such a signature is set (the debug layer's id 1419; NVIDIA removes
   the device). `VICTORY_SAMPLER_HEAP=0` turns it off.
 
+- **JMAN730/project-flamingo** ([#666](https://github.com/JMAN730/project-flamingo/pull/666)), GPL-3.0: page
+  numbers of freed physical pages are handed out again instead of only ever growing, and allocation stops at the
+  title's 21-bit `number >> 4` field (`crates/victory-hle/src/modules/xmem.rs`, `VICTORY_PAGE_RECYCLE=0`).
 - **Marvisak/VIctory [#2507](https://github.com/Marvisak/VIctory/pull/2507)** (TheGrayOrange), GPL-3.0: the
   DirectStorage staging buffer takes the capacities the console documents (0, 16, 20, 24, 28, 32 MiB) and refuses
   any other size, keeping the one the scheduler has (`crates/victory-hle/src/modules/dstorage.rs`).
@@ -175,6 +182,10 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   `crates/victory-gpu/src/texture.rs`'s `Staging::refresh_pages`, `VICTORY_DETILE_DIRTY=0`). Its own page table
   and its per-page reads are not taken: our subresource ranges come from the layout (`Layout::mip_extents`) and
   the written pages are read in runs, with the rows outside the window skipped whole.
+- **DexNom/VIctory [76749ce5](https://github.com/DexNom/VIctory/commit/76749ce58da23a43a3500454a8b69c53f05aa477)** (DexNom), GPL-3.0: a
+  wave64 lane mask parked in two SGPRs and restored one `s_mov_b32` at a time is recognised as the mask it was
+  copied from when both words still trace back to the same known pair through scalar moves
+  (`crates/victory-shader/src/structure.rs`); `VICTORY_DX_LANE_MASK_MOVES=0` keeps the split pair opaque.
 
 - **Marvisak/VIctory [#2163](https://github.com/Marvisak/VIctory/pull/2163)** (0xkn0wh3r3), GPL-3.0: the
   built-in BCPack table's first BC7 dictionary entry has its 32 indices right after its width bytes, where
@@ -185,6 +196,21 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   title memory in the console's layout, by kind (`VICTORY_TEXTURE_BACK`, off by default), with each read-back's
   allocation and fence tracked so a remapped or released allocation is not landed
   (`crates/victory-gpu/src/texback.rs`).
+- **fxceless/victory-fork [PR #1024](https://github.com/fxceless/victory-fork/pull/1024),
+  [#1030](https://github.com/fxceless/victory-fork/pull/1030),
+  [#1036](https://github.com/fxceless/victory-fork/pull/1036),
+  [#1040](https://github.com/fxceless/victory-fork/pull/1040),
+  [#1042](https://github.com/fxceless/victory-fork/pull/1042)** (Bartosz), GPL-3.0: four lowerings and a
+  hardware rule from the console line, ported: a cube texture's level query in a pixel program
+  (`image_get_lod`), an inactive compute lane's swizzle read as zero (`VICTORY_SHADER_SWIZZLE_ZERO=0` turns it
+  off), 16-bit compares that ignore `op_sel` as RDNA2 does, `v_div_fixup_f16`, and saturating `v.clamp` on the
+  packed 16-bit integer add/sub/mad (`crates/victory-shader/src/emit/`).
+
+- **Belobug/VIctory-Belobug-AMD `ambient.rs`**, via **fxceless/victory-fork [PR #1093](https://github.com/fxceless/victory-fork/pull/1093)**
+  (m335671), GPL-3.0: the least indirect light, a compute pass after the program that resolves it, shaded from the
+  scene's depth alone and packed as R9G9B9E5 words (`crates/victory-gpu/src/ambient_floor.rs`,
+  `VICTORY_AMBIENT_FLOOR`). Its program name and both table offsets are not taken: the runner names the program and
+  the views, so no title's own hold in this tree.
 
 - **fxceless/victory-fork [PR #976](https://github.com/fxceless/victory-fork/pull/976)** (MoscaLosca), GPL-3.0: a
   compute or mesh dispatch asking for more than the host's 65,535 groups in `x` runs as pieces, each told where
@@ -209,6 +235,11 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   AVX2, checked at run time, with the eight-byte walk kept as the fallback (`crates/victory-gpu/src/compare.rs`,
   `VICTORY_AVX2_COMPARE=1`; on his machine 14 -> 4-7 ms of compares a frame). His compares run on threads of their
   own; ours already do (`wide` in `shadow.rs`).
+- **Marvisak/VIctory [#2773](https://github.com/Marvisak/VIctory/pull/2773)** (kais7654), GPL-3.0: the idea
+  that a format's uses are the host's `CheckFeatureSupport` answer, and a use it does not take left out of the
+  resource it makes -- a typeless format, which the device reports no use for, keeping the uses of its
+  description (`crates/victory-gpu/src/resource.rs` `uses_taken`/`taken_flags`, `VICTORY_FORMAT_USES=0`). The
+  views side is in from the round before (`descriptor::host::fits`, `VICTORY_TYPED_UAV`).
 - **HUMAN** ([HumanlyDev/HUMAN](https://github.com/HumanlyDev/HUMAN)) by HumanlyDev and bdycounter-sudo,
   GPL-3.0-or-later: one immediate sampler constant used both for normal and for comparison sampling takes two
   static sampler slots (`crates/victory-shader/src/emit/lower.rs`, `samplers`/`cmp_samplers`), where our bit
@@ -217,8 +248,28 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   GPL-3.0: a rectangle list's fourth corner is completed opposite the right angle, wherever the three
   corners put it. This tree's geometry stage (`emit::rect_list_gs`) already finds the corner in any order; the
   rule is now in the CPU expansion too (`right_angle`, `right_corners` in `crates/victory-gpu/src/primitive.rs`).
+D
+- **JMAN730/project-flamingo [#734](https://github.com/JMAN730/project-flamingo/pull/734)** (Yaekai, with swarm,
+  Blitz Studios and axknxla), GPL-3.0: the two-plane present compositor for the Series S menu -- the fullscreen
+  triangle, its premultiplied blend, the explicit root signature for Wine, the retry after an initialization that
+  failed, and the pair check that leaves every other present on the base-only path -- reimplemented for this
+  tree's presenter (`crates/victory-gpu/src/present_compositor.rs`, `Host::present_overlay`), whose present keeps
+  its own late-free lists and present fill. It supersedes the same idea in fxceless/victory-fork
+  [#188](https://github.com/fxceless/victory-fork/pull/188) (sagouindupm), GPL-3.0, which bundled it with an
+  `ffxDispatch` stand-in that our #162 now makes unnecessary.
+- **codec-d/CGBJ (cool_fox) `1ad6e67aa`**, GPL-3.0: the retail two-plane present's plane stride is 72 bytes
+  (`RetailPlane`, asserted at compile time) and not the common parameter prefix's size; and no barrier is
+  recorded into the state a presented texture is already in (`COPY_SOURCE -> COPY_SOURCE` is illegal, and
+  that is where a title leaves one). The second rule is in `host::moved` (`crates/victory-gpu/src/host.rs`);
+  the stride was already ours (`queue::second_plane_resource`, 0x48).
 - **avatarmanz/VIctory-7900XTX [350c68648](https://github.com/avatarmanz/VIctory-7900XTX/commit/350c68648)** (avatarmanz), GPL-3.0: a texture's first upload started ahead on a copy queue of its own (`texture/ahead.rs`) and a slot shown only once that upload ran (`descriptor/host.rs::show_after`, 3bab23c06), which there ended a device loss every ~16 minutes. Reimplemented on this tree's texture path: `crates/victory-gpu/src/texture/ahead.rs`, the copy queue made at device creation and a submission's wait on its fence in `crates/victory-gpu/src/host.rs`, `VICTORY_UPLOAD_AHEAD=1` and `VICTORY_SHOW_AFTER`.
 
+- **codec-d/cool_fox [`18bdf7932`](https://github.com/codec-d/cool_fox/commit/18bdf7932)**, GPL-3.0: the
+  buffer-view pass keeps its slot table, its once-a-frame gate and the refresh interval of unwatched host
+  copies on the heap that owns them rather than in process-wide tables keyed by the heap's address, and an
+  unwatched copy keeps its interval only while its views read inside the span the last refresh copied.
+  Reimplemented in `crates/victory-gpu/src/buffersweep.rs` (this tree has no deferred list refresh to scope,
+  so its `strides_gpu` filter has nothing to guard here).
 - **fxceless/victory-fork [PR #980](https://github.com/fxceless/victory-fork/pull/980)** (fxceless), GPL-3.0:
   the arena, the layer a resident stands on: a title region opened as a D3D12 heap and a buffer placed over it, so
   the GPU reads and writes the title's own memory (`crates/victory-gpu/src/arena.rs`, `VICTORY_ARENA=1`, off by
@@ -234,6 +285,12 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   `VirtualQueryEx`) instead of trusting the pages to end at the same boundary, so a run across two placeholders
   is clipped rather than refused after its range was unmapped (`crates/victory-hle/src/modules/xmem.rs`,
   `VICTORY_MAP_CLIP=0` turns it off).
+
+- **codec-d/cool_fox [`8cc31ab37`](https://github.com/codec-d/cool_fox/commit/8cc31ab37)**, GPL-3.0: an XMA
+  voice whose input the title publishes again while the context stays enabled decodes on instead of staying
+  ended, and the decode pass publishes only whole blocks (a short one only as the flushed tail), trying a few
+  frames for a block and no more so a voice that produces nothing cannot hold the lock
+  (`crates/victory-hle/src/modules/audio.rs`, `VICTORY_XMA_REFILL`).
 
 ## Tools
 
@@ -290,3 +347,10 @@ D
 - **Yoshi-233 [coolfox/main PR #7](https://github.com/Yoshi-233), from fxceless/victory-fork [9bf4a0f](https://github.com/fxceless/victory-fork/commit/9bf4a0f)**,
   GPL-3.0: the RGB dump decodes the packed 16-bit BGR targets (B5G6R5, B5G5R5A1, B4G4R4A4, host formats 85, 86,
   115) and keeps padded rows aligned (diagnostics only) (`crates/victory-gpu/src/capture.rs`).
+- **fever308/victory-corgi [0aa32360e](https://github.com/fever308/victory-corgi/commit/0aa32360e)**, after
+  **fxceless/victory-fork [#1152](https://github.com/fxceless/victory-fork/pull/1152)** and
+  **[#1170](https://github.com/fxceless/victory-fork/pull/1170)**, GPL-3.0: a texture copied back for the title's
+  CPU takes only the mip and array slices the list's texture UAVs expose (the union of the views, instead of every
+  mip and slice), leaves the texels it did not take as they were, and the texture's recorded state is put back
+  after the copy, behind `VICTORY_TEXTURE_BACK_UNION=1` (off by default) (`crates/victory-gpu/src/texback.rs`,
+  `crates/victory-gpu/src/host.rs`, `crates/victory-gpu/src/draw.rs`, `crates/victory-gpu/src/descriptor/host.rs`).
