@@ -3565,7 +3565,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// in the card's memory a mirror in it).
 pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
-    let map = buffers();
+    let map = buffers_read(); // #212 moved the map behind an RwLock; this call site kept the old accessor
     let key = map
         .range(..=(address, usize::MAX))
         .rev()
