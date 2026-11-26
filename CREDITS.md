@@ -290,3 +290,10 @@ D
 - **Yoshi-233 [coolfox/main PR #7](https://github.com/Yoshi-233), from fxceless/victory-fork [9bf4a0f](https://github.com/fxceless/victory-fork/commit/9bf4a0f)**,
   GPL-3.0: the RGB dump decodes the packed 16-bit BGR targets (B5G6R5, B5G5R5A1, B4G4R4A4, host formats 85, 86,
   115) and keeps padded rows aligned (diagnostics only) (`crates/victory-gpu/src/capture.rs`).
+- **fever308/victory-corgi [0aa32360e](https://github.com/fever308/victory-corgi/commit/0aa32360e)**, after
+  **fxceless/victory-fork [#1152](https://github.com/fxceless/victory-fork/pull/1152)** and
+  **[#1170](https://github.com/fxceless/victory-fork/pull/1170)**, GPL-3.0: a texture copied back for the title's
+  CPU takes only the mip and array slices the list's texture UAVs expose (the union of the views, instead of every
+  mip and slice), leaves the texels it did not take as they were, and the texture's recorded state is put back
+  after the copy, behind `VICTORY_TEXTURE_BACK_UNION=1` (off by default) (`crates/victory-gpu/src/texback.rs`,
+  `crates/victory-gpu/src/host.rs`, `crates/victory-gpu/src/draw.rs`, `crates/victory-gpu/src/descriptor/host.rs`).
