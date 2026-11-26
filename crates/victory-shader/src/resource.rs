@@ -149,6 +149,10 @@ pub struct Resources {
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
     pub descriptors: Vec<Descriptor>,
+    /// The effective bytes of fixed loads through a built [`CODE`]
+    /// descriptor ([`Tracer::track`]'s `s_buffer_*` arm): the descriptor's
+    /// base plus the load's own byte offset, which can lie below the base.
+    pub code_reads: Vec<Address>,
     /// Direct descriptor sources with a draw-evaluable index.
     pub root_indexed_views: Vec<RootIndexedView>,
     /// User SGPRs holding root parameters: value on entry, layout index,
@@ -231,17 +235,17 @@ pub fn track(
     let mut offset_at =
         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
     for (b, block) in p.blocks.iter().enumerate() {
-        t.at.set(Some(b));
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
+            t.at.set(Some(site));
             let fail = |what| ShaderError::Unsupported {
                 offset: inst.machine.offset,
                 what,
             };
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
-            let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
-                let source = t.descriptor(inst, op, b).map_err(fail)?;
+            let mut descriptor = |op: &Operand, role| -> Result<Source, ShaderError> {
+                let source = t.descriptor(inst, op, site).map_err(fail)?;
                 // A descriptor the code keeps per lane ([`Tracer::lane_copies`])
                 // is the same in every lane: its loop is lowered as it stands
                 // and needs no proof.
@@ -254,8 +258,12 @@ pub fn track(
                 {
                     offset.push((v, load));
                 }
-                out.descriptors.push(Descriptor { site, role, source });
-                Ok(())
+                out.descriptors.push(Descriptor {
+                    site,
+                    role,
+                    source: source.clone(),
+                });
+                Ok(source)
             };
             match &inst.fields {
                 Fields::Image { rsrc, .. } if inst.name().starts_with("image_bvh") => {
@@ -279,25 +287,45 @@ pub fn track(
                             out.bvh.push((site, BvhNodes::Memory { word1, word3 }));
                         }
                         _ => {
-                            descriptor(rsrc, Role::Resource)?;
+                            let _ = descriptor(rsrc, Role::Resource)?;
                             out.bvh.push((site, BvhNodes::Resource));
                         }
                     }
                 }
                 Fields::Image { rsrc, sampler, .. } => {
-                    descriptor(rsrc, Role::Resource)?;
+                    let _ = descriptor(rsrc, Role::Resource)?;
                     if let Some(s) = sampler {
-                        descriptor(s, Role::Sampler)?;
+                        let _ = descriptor(s, Role::Sampler)?;
                     }
                 }
                 // Cache invalidations name a buffer's address space but do
                 // not read its descriptor; the host has no cache to drop.
                 Fields::Buffer { rsrc, .. } if !inst.name().ends_with("_inv") => {
-                    descriptor(rsrc, Role::Resource)?
+                    let _ = descriptor(rsrc, Role::Resource)?;
                 }
                 Fields::Buffer { .. } => {}
-                Fields::Smem { base, .. } if inst.name().starts_with("s_buffer_") => {
-                    descriptor(base, Role::Resource)?;
+                Fields::Smem {
+                    base,
+                    offset,
+                    soffset,
+                    ..
+                } if inst.name().starts_with("s_buffer_") => {
+                    let source = descriptor(base, Role::Resource)?;
+                    // A load through a descriptor built around the code
+                    // table reads the descriptor's base plus the load's own
+                    // byte offset, which can lie before the base (`s_sub_u32`
+                    // against `s_getpc_b64`): record the byte it reads, so
+                    // [`crate::emit::lower`] starts the table low enough.
+                    if let Source::Built { address, .. } = source
+                        && address.param == CODE
+                        && matches!(soffset, Operand::Scalar { code: NULL, .. })
+                    {
+                        out.code_reads.push(Address {
+                            param: CODE,
+                            offset: address.offset.wrapping_add(*offset as u32),
+                            dynamic: address.dynamic,
+                        });
+                    }
                 }
                 Fields::Smem {
                     base,
@@ -418,8 +446,8 @@ struct Tracer<'a> {
     meets: std::cell::RefCell<Meets>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
-    /// The block of the access being traced ([`Self::live`]).
-    at: std::cell::Cell<Option<usize>>,
+    /// The block and instruction index of the access being traced ([`Self::live`]).
+    at: std::cell::Cell<Option<Site>>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -1120,8 +1148,20 @@ impl<'a> Tracer<'a> {
         self.address(lo, hi, extra)
     }
 
-    /// The source of the descriptor operand `op` of `inst`, in block `at`.
-    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
+    /// The lanes that execute `site` and read its operands: block reachability
+    /// plus any per-lane EXEC guard for vector instructions.
+    fn active(&self, site: Site, lanes: &Structured) -> Known {
+        let mut known = vec![(lanes.reach[site.0], true)];
+        if !matches!(self.inst(site).fields, Fields::Smem { .. })
+            && let Some(&Some(guard)) = lanes.guards.get(site.0).and_then(|g| g.get(site.1))
+        {
+            known.push((guard, true));
+        }
+        known
+    }
+
+    /// The source of the descriptor operand `op` of `inst`, at `at`.
+    fn descriptor(&self, inst: &Inst, op: &Operand, at: Site) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
@@ -1129,8 +1169,8 @@ impl<'a> Tracer<'a> {
             .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
-        // Only the lanes that reach the access read the descriptor.
-        let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        // Only the lanes that run the access read the descriptor.
+        let mut known = self.lanes.map(|l| self.active(at, l)).unwrap_or_default();
         self.classify(&words, &mut Vec::new(), &mut known)
     }
 
@@ -1282,7 +1322,7 @@ impl<'a> Tracer<'a> {
         let (Some(at), Some(lanes)) = (self.at.get(), self.lanes) else {
             return t;
         };
-        let mut known = vec![(lanes.reach[at], true)];
+        let mut known = self.active(at, lanes);
         for _ in 0..MAX_JOINS {
             let Term::Value(v) = t else { break };
             let Some((block, i)) = self.phis[v.0 as usize] else {
@@ -3851,5 +3891,42 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn guarded_image_sample_after_early_out_strip_tracks_only_active_edge() {
+        // Entry sets in_bounds = (s2 > v0) via v_cmpx and has an early-out `s_cbranch_execz`
+        // to S_ENDPGM. After `without_early_outs` strips that branch, `b_join` has `reach = TRUE`
+        // including the `!in_bounds` edge skipping `s_load_dwordx8 s[12:19]`; `Tracer::active`
+        // uses `image_sample_lz`'s `guard = in_bounds` to eliminate that edge cleanly.
+        let words: [u32; 19] = [
+            0xBE84_0300, // 0: s_mov_b32 s4, s0
+            0xBE85_0380, // 1: s_mov_b32 s5, 0
+            0xBE86_0301, // 2: s_mov_b32 s6, s1
+            0xBE87_0380, // 3: s_mov_b32 s7, 0
+            0xF408_0203, // 4..5: s_load_dwordx4 s[8:11], s[6:7], 0x0 (sampler)
+            0xFA00_0000,
+            0x7D88_0002, // 6: v_cmp_gt_u32 vcc, s2, v0 (in_bounds into vcc)
+            0xBE95_3C6A, // 7: s_and_saveexec_b32 s21, vcc (exec shares the exact `in_bounds` mask)
+            0xBF88_0009, // 8: s_cbranch_execz -> +9 words (18: S_ENDPGM)
+            0xBF86_0002, // 9: s_cbranch_vccz -> +2 words (12: skip image load when !in_bounds)
+            0xF40C_0302, // 10..11: s_load_dwordx8 s[12:19], s[4:5], 0x0 (image)
+            0xFA00_0000,
+            0xF09C_0F08, // 12..13: image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+            0x0043_0C02,
+            0xF408_0A02, // 14..15: s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xFA00_0040,
+            0xE070_1000, // 16..17: buffer_store_dword v12, v16, s[40:43], 0 offen
+            0x800A_0C10,
+            0xBF81_0000, // 18: s_endpgm
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let eo = crate::ir::without_early_outs(&p).expect("early-out stripped");
+        let st = crate::structure::structure(&eo).unwrap();
+        let layout = [param(Table, 0, 1), param(Table, 1, 1)];
+        let r = track(&eo, &layout, HwStage::Cs, Some(&st))
+            .expect("guard in active() should prune the !in_bounds edge after early-out strip");
+        assert_eq!(r.descriptors.len(), 3);
     }
 }

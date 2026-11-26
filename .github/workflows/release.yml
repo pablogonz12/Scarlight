@@ -95,8 +95,11 @@ jobs:
           sudo apt-get update
           # glslang: vkd3d-proton's meson.build wants glslangValidator even with
           # -Denable_tests=false (it validates the builtin shaders it compiles).
+          # mingw-w64-tools: the cross build runs x86_64-w64-mingw32-widl on the
+          # .idl files (meson.build:76); the mingw-w64 package alone has no widl
+          # (v11.14.1's first run failed exactly there).
           sudo apt-get install -y --no-install-recommends \
-            build-essential meson ninja-build mingw-w64 python3 glslang-tools
+            build-essential meson ninja-build mingw-w64 mingw-w64-tools python3 glslang-tools
           # A short id is enough to check out once the history is here, and it is
           # readable in the release notes; the full id is in VERSION and here.
           git clone --quiet "$VKD3D_REPO" vkd3d-src
