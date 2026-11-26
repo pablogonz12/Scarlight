@@ -39,6 +39,10 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
 
 ## Design notes
 
+- **fuzeofficial** ([Marvisak/VIctory #2608](https://github.com/Marvisak/VIctory/pull/2608)), GPL-3.0: the
+  idea of cutting a command list at its texture read-backs and running the part after one in a submission
+  of its own, so a copy or draw recorded behind a read-back is prepared after its bytes are in title
+  memory (`crate::list::cut_read_back`). Reimplemented on the parts a queue already runs.
 - **Marvisak/VIctory [#2478](https://github.com/Marvisak/VIctory/pull/2478)** (HoLa-Lee), GPL-3.0: the idea
   of reading a texture once every N frames at most, round-robin by the texture's address, its measurements
   (a frame of world entry at 6,814 ms of texture work, 145-522 ms at 8), and its name for the switch,

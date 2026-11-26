@@ -1845,6 +1845,11 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    /// Title memory the read-backs of `backs` write once the list has run,
+    /// `[start, end)`: a copy recorded after one of these reads title bytes
+    /// older than the read-back unless the two run in submissions of their
+    /// own (`crate::list::read_back_cuts`).
+    read_backs: Vec<(usize, usize)>,
     /// Title textures of the kinds copied back ([`crate::texback`]) that
     /// the list's shaders write, copied when the list closes.
     back_wanted: Vec<crate::texback::Target>,
@@ -1852,6 +1857,13 @@ struct Deferred {
     texture_backs: Vec<crate::texback::Back>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+}
+
+/// Whether any `[start, end)` in `ranges` overlaps `[at, at + len)`.
+#[cfg(any(windows, test))]
+fn overlaps(ranges: &[(usize, usize)], at: usize, len: usize) -> bool {
+    let end = at.saturating_add(len);
+    ranges.iter().any(|&(start, stop)| start < end && at < stop)
 }
 
 impl Deferred {
@@ -5649,6 +5661,26 @@ impl HostList {
         self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
     }
 
+    /// Notes `[start, start + len)` of title memory as written by this
+    /// list's read-backs once it has run (`defer_read_back`).
+    pub(crate) fn note_read_back(&self, start: usize, len: usize) {
+        self.deferred().read_backs.push((start, start.saturating_add(len)));
+    }
+
+    /// Whether this list writes title memory after its submission has run
+    /// (a read back), so a copy or draw recorded after one must run in a
+    /// submission of its own.
+    pub(crate) fn has_read_backs(&self) -> bool {
+        !self.deferred().read_backs.is_empty()
+    }
+
+    /// Whether a read-back write of this list lands in `[start, start + len)`
+    /// of title memory.
+    pub(crate) fn reads_after_read_back(&self, start: usize, len: usize) -> bool {
+        let deferred = self.deferred();
+        crate::host::overlaps(&deferred.read_backs, start, len)
+    }
+
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
@@ -6067,8 +6099,9 @@ impl Batch {
 
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
-/// them (tiled memory, page mappings), which read as zeros here; a title
-/// destination (`title_dst`) that is not all mapped is left alone.
+/// them (tiled memory, page mappings), which read as zeros here, and a title
+/// destination (`title_dst`) may have pages the title has taken away, which
+/// are left alone.
 ///
 /// The source is read through the kernel (`ReadProcessMemory`), which
 /// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
@@ -6114,9 +6147,14 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         return;
     }
     // The copy failed: a source page is not there, or the destination is
-    // not all mapped. Then the destination stays as it is (the kernel may
-    // have written its first pages).
+    // not all mapped. One direction of a copy the title asked for is its
+    // destination: a page it has taken away holds nothing to write, but the
+    // rest must be written. Dropping the copy because *one* page of the
+    // destination went away left the title's copy undone and the
+    // destination's previous contents in place (a stale surface, not a
+    // missing one).
     if title_dst && !ask_first && !crate::texture::committed(dst, len) {
+        write_regions(dst, src, len);
         return;
     }
     #[cfg(feature = "diagnostics")]
@@ -6130,6 +6168,59 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
+}
+
+/// Writes into title memory the regions of `[dst, dst + len)` the title still
+/// has, and leaves the pages it has taken away alone (counted as
+/// `DestGone`): the destination of a copy the title asked for is written
+/// wherever it can be, not dropped whole for one hole.
+fn write_regions(dst: *mut u8, src: *const u8, len: usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
+        PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    };
+    // No mapping changes under the queries and the fallback writes: a region
+    // found there stays there (see `crate::watch::title_memory_reading`). Not
+    // taken when a remap is under way or a caller holds it: the copy still
+    // runs, page by page.
+    let _mapped = crate::watch::title_memory_reading_now();
+    let mut offset = 0;
+    while offset < len {
+        let to = dst.wrapping_add(offset);
+        let remaining = len - offset;
+        // SAFETY: the query inspects an address and fills a local structure.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let size = unsafe { VirtualQuery(to.cast(), &mut info, size_of_val(&info)) };
+        let n = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            .saturating_sub(to as usize)
+            .min(remaining);
+        if size != size_of_val(&info) || n == 0 {
+            break;
+        }
+        // A destination page this writes to must take the write: a committed
+        // read-only or execute-only page is left alone, as an unmapped one is
+        // (a write there is an access violation, and `read_pieces` leaves no
+        // zeros in it either).
+        let there = info.State == MEM_COMMIT
+            && (info.Protect & PAGE_GUARD) == 0
+            && matches!(
+                info.Protect & 0xff,
+                PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+            );
+        if there {
+            let from = src.wrapping_add(offset);
+            if !read(from, to, n, true) {
+                // A mapping may change between query and read, and the
+                // source may have a hole of its own.
+                read_pieces(from, to, n, true);
+            }
+        } else {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::DestGone, n as u64);
+        }
+        offset += n;
+    }
 }
 
 /// After a failed bulk read into host memory, skip contiguous holes. Never
@@ -6217,7 +6308,7 @@ fn read_mark(src: *const u8, dst: *mut u8, len: usize, mark: bool, title_dst: bo
     // write would fault.
     if plain(src as usize, len)
         && (!title_dst || plain_dst(dst as usize, len))
-        && !overlaps(src as usize, dst as usize, len)
+        && !copies_overlap(src as usize, dst as usize, len)
     {
         // SAFETY: the layer has copied this whole range before and its first
         // and last pages read just now; the destination is mapped writable
@@ -6282,7 +6373,7 @@ fn plain_dst(at: usize, len: usize) -> bool {
 /// Whether `[a, a + len)` and `[b, b + len)` share a byte: the plain copy
 /// needs them apart, and a title may hand us copies that overlap (D3D12
 /// leaves intersecting copies undefined; the layer contains them).
-fn overlaps(a: usize, b: usize, len: usize) -> bool {
+fn copies_overlap(a: usize, b: usize, len: usize) -> bool {
     a.abs_diff(b) < len
 }
 
@@ -7619,6 +7710,52 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
     }
 
+    /// A copy into title memory writes the destination's committed regions
+    /// and leaves the pages the title has taken away alone: one missing page
+    /// must not drop the rest of the copy.
+    #[test]
+    fn a_copy_into_title_memory_writes_the_regions_the_title_still_has() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        const TOTAL: usize = 2 << 20;
+        const CHUNK: usize = 512 << 10;
+        // SAFETY: reserving a 2 MiB private virtual range for the title's side.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), TOTAL, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        let base = base.cast::<u8>();
+        // SAFETY: committing the first and third 512 KiB, zeroed.
+        unsafe {
+            assert!(!VirtualAlloc(base.cast(), CHUNK, MEM_COMMIT, PAGE_READWRITE).is_null());
+            assert!(
+                !VirtualAlloc(base.add(2 * CHUNK).cast(), CHUNK, MEM_COMMIT, PAGE_READWRITE)
+                    .is_null()
+            );
+            base.write_bytes(0, CHUNK);
+            base.add(2 * CHUNK).write_bytes(0, CHUNK);
+        }
+        let src = vec![0x6Du8; TOTAL];
+        super::copy_mapped(base, src.as_ptr(), TOTAL, true);
+        // SAFETY: both slices are committed and readable; then release the range.
+        unsafe {
+            assert!(std::slice::from_raw_parts(base, CHUNK).iter().all(|&b| b == 0x6D));
+            assert!(
+                std::slice::from_raw_parts(base.add(2 * CHUNK), CHUNK)
+                    .iter()
+                    .all(|&b| b == 0x6D)
+            );
+            VirtualFree(base.cast(), 0, MEM_RELEASE);
+        }
+        // A destination with no page left is nothing to write, not a fault.
+        // SAFETY: reserving and releasing a range with nothing committed.
+        unsafe {
+            let none = VirtualAlloc(std::ptr::null(), CHUNK, MEM_RESERVE, PAGE_NOACCESS);
+            assert!(!none.is_null());
+            super::copy_mapped(none.cast(), src.as_ptr(), CHUNK, true);
+            VirtualFree(none.cast(), 0, MEM_RELEASE);
+        }
+    }
     #[test]
     fn ram_idle_ms_scales_with_pressure() {
         use super::ram_idle_ms;
@@ -7637,6 +7774,137 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+
+/// Read-back ranges and what a list does after one (`crate::list::read_back`):
+/// the parts a title list is recorded in, and how cheaply a copy is checked
+/// against them.
+#[cfg(test)]
+mod read_back_tests {
+    use super::overlaps;
+
+    /// One thing a list records, as far as read-backs matter.
+    #[derive(Clone, Copy)]
+    enum Op {
+        /// A texture to buffer copy: the rows it writes to title memory.
+        ReadBack(usize, usize),
+        /// A buffer to buffer copy of `len` bytes at `dst` from `src`.
+        Copy(usize, usize, usize),
+        /// A buffer to texture copy from title memory at `at`.
+        Upload(usize, usize),
+        /// A draw or dispatch, which prepares its reads at submission.
+        Draw,
+    }
+
+    /// The parts a list records its `ops` in, by the rule the paucity of
+    /// the code allows: a copy or upload that reads pending read-back rows,
+    /// and any draw after one, starts a new part (title memory there holds
+    /// the bytes from before the read-back until the part has run).
+    fn parts(ops: &[Op]) -> Vec<usize> {
+        let mut parts = vec![0];
+        let mut read_backs: Vec<(usize, usize)> = Vec::new();
+        for op in ops {
+            let cut = match *op {
+                Op::ReadBack(at, len) => {
+                    read_backs.push((at, at + len));
+                    false
+                }
+                Op::Copy(dst, src, len) => overlaps(&read_backs, src, len) || overlaps(&read_backs, dst, len),
+                Op::Upload(at, len) => overlaps(&read_backs, at, len),
+                Op::Draw => !read_backs.is_empty(),
+            };
+            if cut {
+                parts.push(0);
+                read_backs.clear();
+            }
+            *parts.last_mut().expect("a part") += 1;
+        }
+        parts
+    }
+
+    #[test]
+    fn a_read_back_range_covers_its_rows_only() {
+        let rows = [(0x1000, 0x1040)];
+        assert!(overlaps(&rows, 0x1000, 16), "the first row");
+        assert!(overlaps(&rows, 0x1030, 16), "the last row");
+        assert!(overlaps(&rows, 0x1000, 0x40), "the whole range");
+        assert!(overlaps(&rows, 0xff0, 0x20), "overlapping the start");
+        assert!(overlaps(&rows, 0x1020, 0x40), "running past the end");
+        assert!(!overlaps(&rows, 0x1040, 16), "the byte after the range");
+        assert!(!overlaps(&rows, 0xfe0, 0x20), "ending where the range starts");
+        assert!(!overlaps(&rows, 0x2000, 16), "elsewhere");
+        assert!(!overlaps(&[], 0x1000, 16), "no read-backs");
+        // A range that records nothing touches nothing, and one that would
+        // wrap ends at the top of memory.
+        assert!(!overlaps(&[(0x1000, 0x1000)], 0x1000, 16), "an empty read-back range");
+        assert!(overlaps(&[(usize::MAX - 8, usize::MAX)], usize::MAX - 4, 16));
+    }
+
+    #[test]
+    fn a_copy_after_a_read_back_of_its_rows_starts_a_new_part() {
+        // The title reads a texture back into a buffer, then copies that
+        // buffer elsewhere in the same list: the copy's bytes are the
+        // read-back's only once the read-back has run.
+        let ops = [
+            Op::Copy(0x9000, 0x8000, 0x100),
+            Op::ReadBack(0x8000, 0x40),
+            Op::Copy(0xa000, 0x8000, 0x40),
+        ];
+        assert_eq!(parts(&ops), [2, 1], "the copy after the read-back waits for it");
+        // A copy of bytes the read-back did not write stays in the part.
+        let apart = [
+            Op::ReadBack(0x8000, 0x40),
+            Op::Copy(0xa000, 0x8000 + 0x40, 0x40),
+            Op::Copy(0xa000, 0x8000 - 0x40, 0x40),
+        ];
+        assert_eq!(parts(&apart), [3], "a copy beside the read-back rows");
+        // A copy that writes over the read-back's rows reads nothing, but
+        // it overwrites the bytes the read-back lands on: same cut.
+        let over = [Op::ReadBack(0x8000, 0x40), Op::Copy(0x8000, 0x2000, 0x40)];
+        assert_eq!(parts(&over), [1, 1]);
+    }
+
+    #[test]
+    fn a_draw_or_an_upload_after_a_read_back_starts_a_new_part() {
+        // A draw prepares the buffers and textures it reads at submission.
+        let drawn = [
+            Op::ReadBack(0x8000, 0x40),
+            Op::Draw,
+            Op::Draw,
+        ];
+        assert_eq!(parts(&drawn), [1, 2], "both draws wait for the read-back");
+        // The metering targets the title reads back every frame are small
+        // float targets; the world's draws come after them.
+        let upload = [
+            Op::ReadBack(0x8000, 0x10),
+            Op::Upload(0x8000, 0x10),
+            Op::Upload(0x9000, 0x10),
+        ];
+        assert_eq!(parts(&upload), [1, 2], "the upload of the read-back's bytes waits");
+        // Nothing pending, nothing cut: a list of draws is one part.
+        assert_eq!(parts(&[Op::Draw, Op::Draw, Op::Copy(0, 0x1000, 16)]), [3]);
+    }
+
+    #[test]
+    fn a_lists_read_backs_are_checked_quickly() {
+        // Every copy, upload and draw of a list is checked against its
+        // read-backs: the world records a few thousand commands a frame, and
+        // the check must not show up in it.
+        let ranges: Vec<(usize, usize)> = (0..64).map(|i| (0x1000 + i * 0x1000, 0x1000 + i * 0x1000 + 0x40)).collect();
+        let started = std::time::Instant::now();
+        let mut hits = 0u32;
+        for i in 0..4096 {
+            let at = 0x1000 + (i * 37) % 0x40000;
+            hits += u32::from(overlaps(&ranges, at, 16));
+        }
+        let elapsed = started.elapsed();
+        eprintln!("{} checks against {} read-back ranges took {elapsed:?}", 4096, ranges.len());
+        assert!(hits > 0, "the probes reach some of the ranges");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "4096 checks against 64 ranges took {elapsed:?}"
+        );
+    }
+}
 
 #[cfg(test)]
 mod copy_source_state_tests {

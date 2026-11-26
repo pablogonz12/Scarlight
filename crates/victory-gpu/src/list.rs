@@ -153,6 +153,21 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     crate::copystat::recorded(started);
 }
 
+/// As [`with_state`], for a call that reads title memory when its list is
+/// prepared (a draw's vertices, a dispatch's views): a list with pending
+/// texture read-backs is cut first, so this call's reads are prepared with
+/// the read-backs' bytes in title memory.
+#[cfg(windows)]
+fn with_state_after_read_back(
+    this: This,
+    f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State),
+) {
+    if host_list_after_read_back(this, None).is_none() {
+        return;
+    }
+    with_state(this, f);
+}
+
 /// The submission of `lists` has run: each gives its descriptor tables'
 /// slots back ([`crate::draw::State::tables_done`]). A list cut at waits
 /// keeps them: its state goes with its last part.
@@ -371,6 +386,156 @@ pub(crate) fn cut_list(this: This) -> bool {
     !list.earlier.is_empty() || !list.gate.is_empty()
 }
 
+/// Whether a list is cut at its texture read-backs ([`read_back`]), so the
+/// part after one runs in a submission of its own.
+///
+/// A read-back's texels reach title memory once the list that copied them
+/// to a host buffer of ours has run ([`crate::host::HostList::defer_read_back`]).
+/// A copy recorded after one in the same submission prepares its reads
+/// before that, so it reads the title bytes from before the read-back: a
+/// buffer the title fills from a texture and then copies within one list
+/// (`CopyTextureRegion` then `CopyBufferRegion`), or across the lists of one
+/// `ExecuteCommandLists`, came out stale. Cutting the recording there (and
+/// running the parts one after the other) makes the later part prepare its
+/// reads with the read-back's bytes in title memory.
+///
+/// On by default; `VICTORY_SPLIT_READBACKS=0` records without the cut, as
+/// before.
+#[cfg(windows)]
+fn read_back_cuts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        // A part of its own needs the queue to run parts
+        // ([`crate::queue::cuts`]), and a submission sent ahead of the wait
+        // ([`crate::host::late`]) writes its read-backs when it is settled,
+        // after the next submission's copies were prepared.
+        std::env::var_os("VICTORY_SPLIT_READBACKS").is_none_or(|v| v != "0")
+            && crate::queue::cuts()
+            && !crate::host::late()
+    })
+}
+
+/// Closes the host list `this` records into and records into a fresh one
+/// from here on, keeping the closed one as a part that runs in a submission
+/// of its own ([`read_back_cuts`]). Whether it cut.
+#[cfg(windows)]
+fn cut_read_back(this: This) -> bool {
+    let Some(fresh) = fresh_list() else {
+        // shortcut: recorded on, the copy that reads the read-back's bytes
+        // may find the title's older ones.
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!("no host list to cut a list at its read back: a copy after it may read stale bytes")
+        });
+        return false;
+    };
+    // SAFETY: the title passes one of our lists; a list is recorded by one
+    // thread at a time and is not submitted while it records.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    let Some(current) = list.host.as_ref() else {
+        return false;
+    };
+    current.close();
+    static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+        tracing::info!(parts = list.earlier.len() + 2, "a list is cut at a texture read back");
+    }
+    let Some(done) = list.host.replace(fresh) else {
+        return false;
+    };
+    // The waits before any work so far stand before the part that is done.
+    let waits = std::mem::take(&mut list.gate);
+    list.earlier.push(Part { waits, host: done });
+    // What the title set so far, on the new host list.
+    if let Some(host) = list.host.as_ref() {
+        list.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replay(host);
+    }
+    true
+}
+
+/// The host list `this` records into, cut onto a fresh part first when its
+/// pending read-backs write `range` (or anything, with `None`).
+#[cfg(windows)]
+fn host_list_after_read_back<'a>(
+    this: This,
+    range: Option<(usize, usize)>,
+) -> Option<&'a crate::host::HostList> {
+    let current = host_list(this)?;
+    if !read_back_cuts() {
+        return Some(current);
+    }
+    let cut = match range {
+        Some((start, len)) => current.reads_after_read_back(start, len),
+        None => current.has_read_backs(),
+    };
+    if cut && cut_read_back(this) {
+        host_list(this)
+    } else {
+        Some(current)
+    }
+}
+
+/// As [`host_list_after_read_back`] for a copy of `len` bytes at `dst` from
+/// `src` of title memory: either end in a read-back's rows cuts the list.
+#[cfg(windows)]
+fn host_list_after_buffers<'a>(
+    this: This,
+    dst: usize,
+    src: usize,
+    len: usize,
+) -> Option<&'a crate::host::HostList> {
+    let current = host_list(this)?;
+    if !read_back_cuts() {
+        return Some(current);
+    }
+    if (current.reads_after_read_back(src, len) || current.reads_after_read_back(dst, len))
+        && cut_read_back(this)
+    {
+        return host_list(this);
+    }
+    Some(current)
+}
+
+/// As [`host_list_after_read_back`] for a texture copy whose source is
+/// `src`: a buffer of title memory the list reads (an upload) or a texture
+/// the title wrote itself (an upload of title bytes) sees the read-backs.
+#[cfg(windows)]
+fn list_for_texture_copy<'a>(this: This, src: &CopyLocation) -> Option<&'a crate::host::HostList> {
+    const FOOTPRINT: u32 = 1;
+    let current = host_list(this)?;
+    if !read_back_cuts() || !current.has_read_backs() {
+        return Some(current);
+    }
+    let cut = if src.kind == FOOTPRINT {
+        src.footprint
+            .bytes()
+            .and_then(|bytes| {
+                buffer_range(src.resource, src.footprint.offset, bytes)
+                    .map(|data| (data as usize, bytes as usize))
+            })
+            .is_some_and(|(data, bytes)| current.reads_after_read_back(data, bytes))
+    } else {
+        crate::resource::host_resource(src.resource)
+            .is_some_and(crate::texture::title_written)
+    };
+    if cut && cut_read_back(this) {
+        host_list(this)
+    } else {
+        Some(current)
+    }
+}
+
+/// Whether a queue's entry (one submission) starts at a part: the part has
+/// waits of its own, or the part before it wrote title memory once it had
+/// run and so must be waited for first ([`cut_read_back`]).
+#[cfg(any(windows, test))]
+fn starts_entry(waits: bool, flush: bool) -> bool {
+    flush || waits
+}
+
 /// What a queue is given for submitted lists that were cut at their waits:
 /// the waits it stands at, the host lists it runs once they are met, and
 /// the order those run in.
@@ -393,6 +558,12 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
     // The lists taken: where its one host list is (entry, place), or none
     // for a list of several parts.
     let mut seen: Vec<(This, Option<(usize, usize)>)> = Vec::new();
+    // A part whose read-backs write title memory once it has run
+    // ([`cut_read_back`]) runs before what is prepared next: the part after
+    // it starts an entry of its own, so the queue gives it a submission of
+    // its own. Carried across the lists taken, a read-back that ends one
+    // list's last part ends its entry for the next list too.
+    let mut flush = false;
     for &this in lists {
         if this.is_null() {
             continue;
@@ -449,7 +620,8 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         ));
         let mut last = None;
         for (waits, detached) in pieces {
-            if !waits.is_empty() {
+            let read_backs = detached.host().has_read_backs();
+            if starts_entry(!waits.is_empty(), flush) {
                 parts.push((waits, Vec::new(), Vec::new()));
             }
             let entry = parts.len() - 1;
@@ -458,6 +630,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             order.push(place);
             taken.push(detached);
             last = Some((entry, place));
+            flush = read_backs;
         }
         seen.push((this, if single { last } else { None }));
     }
@@ -855,9 +1028,9 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
-        && let Some(to) = buffer_range(dst, dst_offset, len)
+    if let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
+        && let Some(list) = host_list_after_buffers(this, to as usize, from as usize, len as usize)
     {
         list.defer_copy(to, from, len as usize);
     }
@@ -883,9 +1056,6 @@ fn unlike(dst: This, src: This) -> bool {
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
-        let Some(list) = host_list(this) else {
-            return;
-        };
         if let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
@@ -894,8 +1064,18 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
                 return;
             }
             // A source the title fills itself is uploaded first (upstream
-            // PR #671): a copy read whatever the host texture held.
-            if crate::texture::title_written(from) {
+            // PR #671): a copy read whatever the host texture held, and an
+            // upload reads title bytes a read-back may have written
+            // (`cut_read_back`).
+            let title_src = crate::texture::title_written(from);
+            let Some(list) = (if title_src {
+                host_list_after_read_back(this, None)
+            } else {
+                host_list(this)
+            }) else {
+                return;
+            };
+            if title_src {
                 crate::texture::upload(list, src, from);
             }
             // Depth textures shaders also write: what they wrote, first.
@@ -912,7 +1092,10 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            let bytes = a.min(b) as usize;
+            if let Some(list) = host_list_after_buffers(this, to as usize, from as usize, bytes) {
+                list.defer_copy(to, from, bytes);
+            }
         }
     }
     #[cfg(not(windows))]
@@ -951,11 +1134,10 @@ extern "system" fn copy_texture_region(
         use windows::core::Interface;
         const FOOTPRINT: u32 = 1;
         // SAFETY: the title passes both locations (null is tolerated).
-        let (Some(list), Some(&dst), Some(&src)) =
-            (host_list(this), unsafe { dst.as_ref() }, unsafe {
-                src.as_ref()
-            })
-        else {
+        let (Some(&dst), Some(&src)) = (unsafe { dst.as_ref() }, unsafe { src.as_ref() }) else {
+            return;
+        };
+        let Some(list) = list_for_texture_copy(this, &src) else {
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
@@ -1147,6 +1329,9 @@ fn read_back(
             .CopyTextureRegion((&raw const to).cast(), 0, 0, 0, (&raw const from).cast(), host_box)
     };
     list.defer_read_back(buffer, data, [row as usize, rows as usize, pitch as usize]);
+    // The title's buffer holds these rows once the list has run: what a
+    // later command copies from here would read before then is stale.
+    list.note_read_back(data as usize, bytes as usize);
     Ok(())
 }
 
@@ -1336,9 +1521,9 @@ extern "system" fn clear_dsv(
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
-        && dst != 0
+    if dst != 0
         && src != 0
+        && let Some(list) = host_list_after_buffers(this, dst as usize, src as usize, len as usize)
     {
         let len = len as usize;
         list.defer(move || {
@@ -1483,7 +1668,7 @@ extern "system" fn ignored_state(_: This) {}
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, with_state};
+    use super::{This, with_state, with_state_after_read_back};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -1619,18 +1804,22 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
+        with_state_after_read_back(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        with_state_after_read_back(this, |list, s| s.dispatch(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6).
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
-        with_state(this, |list, s| s.dispatch_mesh(list, x, y, z));
+        if y * z != 1 {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
+        }
+        with_state_after_read_back(this, |list, s| s.dispatch_mesh(list, x, y, z));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
     /// shortcut: dispatches whose group count is in GPU memory (indirect)
@@ -1648,7 +1837,7 @@ mod state {
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x, 1, 1));
+        with_state_after_read_back(this, |list, s| s.dispatch_mesh(list, x, 1, 1));
     }
     pub(super) extern "system" fn draw_indexed(
         this: This,
@@ -1659,7 +1848,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
+        with_state_after_read_back(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
     }
@@ -1737,7 +1926,7 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        with_state(this, |list, s| {
+        with_state_after_read_back(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
@@ -2640,5 +2829,45 @@ mod tests {
         assert_eq!(idle_most(Some(31 * GIB), 16), (256, 512 * MIB));
         assert_eq!(idle_most(Some(32 * GIB), 16), (256, 512 * MIB));
         assert_eq!(idle_most(Some(64 * GIB), 32), (256, 512 * MIB));
+    }
+}
+
+/// The parts a submission of several lists is run in
+/// ([`detach_parts`], [`starts_entry`]): which part lands in which entry, as
+/// the queues run them one entry at a time.
+#[cfg(test)]
+mod part_entry_tests {
+    use super::starts_entry;
+
+    /// The entries the parts (`(waits, read-backs)`, lists one after
+    /// another) are given, as how many parts each holds.
+    fn entries(parts: &[(bool, bool)]) -> Vec<usize> {
+        let mut entries = vec![0];
+        let mut flush = false;
+        for &(waits, read_back) in parts {
+            if starts_entry(waits, flush) {
+                entries.push(0);
+            }
+            *entries.last_mut().expect("an entry") += 1;
+            flush = read_back;
+        }
+        entries.retain(|&held| held > 0);
+        entries
+    }
+
+    #[test]
+    fn a_read_back_that_ends_one_list_ends_its_entry_for_the_next() {
+        // List A ends with a read-back, list B (the same submission) copies
+        // what it wrote: B's copy must be prepared after A's read-back has
+        // run, so it starts an entry of its own.
+        let two = [(false, false), (false, true), (false, false)];
+        assert_eq!(entries(&two), [2, 1], "B's part waits for A's read-back");
+        // Without the read-back the lists share the entry, as before.
+        let one = [(false, false), (false, false), (false, false)];
+        assert_eq!(entries(&one), [3], "nothing to wait for: one submission");
+        // Waits still start an entry of their own, and a read-back before a
+        // wait does not add a second one.
+        assert_eq!(entries(&[(true, false)]), [1]);
+        assert_eq!(entries(&[(false, true), (true, false)]), [1, 1]);
     }
 }
