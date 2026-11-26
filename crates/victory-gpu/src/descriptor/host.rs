@@ -1479,9 +1479,13 @@ impl HostHeap {
         };
         // SAFETY: a live resource while a slot still shows it.
         let mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+        // The same window as `narrow_to_resident` narrowed to: in the host
+        // copy's levels, which may lack the title's top ones.
+        let dropped = crate::resource::dropped_mips(n.resource);
         let want = crate::texture::wanted(
             n.asked,
-            crate::texture::resident(n.resource),
+            crate::texture::resident(n.resource)
+                .map(|window| crate::resource::resident_in_host(window, dropped, mips)),
             mips,
             crate::texture::is_host_written(n.resource),
         );
@@ -1681,6 +1685,11 @@ fn narrow_to_resident(
     }
     // SAFETY: a live resource.
     let mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+    // A copy that lost the title's top mips names its own levels (the view
+    // was rebased before this): the window resident in title memory moves
+    // with them.
+    let dropped = crate::resource::dropped_mips(resource);
+    let resident = crate::resource::resident_in_host(resident, dropped, mips);
     let asked = match desc.ViewDimension {
         D3D12_SRV_DIMENSION_TEXTURE2D => {
             // SAFETY: the union member of a 2D view.
@@ -1728,6 +1737,58 @@ fn narrow_to_resident(
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::ViewNarrowed, 1);
     Some((first, count))
+}
+
+/// A shader view of a title texture, rebased onto its host copy, which may
+/// lack the title's top `dropped` mip levels
+/// ([`crate::resource::dropped_mips`]): the levels the view names, and its
+/// minimum level of detail, are the title's.
+fn drop_mips(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, dropped: u32) {
+    if dropped == 0 {
+        return;
+    }
+    let rebase = |most: &mut u32, levels: &mut u32, clamp: &mut f32| {
+        (*most, *levels) = crate::resource::rebase_mip_range(*most, *levels, dropped);
+        *clamp = (*clamp - dropped as f32).max(0.0);
+    };
+    // SAFETY: each arm reads the union member the view dimension selects.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let v = &mut desc.Anonymous.Texture2D;
+                rebase(
+                    &mut v.MostDetailedMip,
+                    &mut v.MipLevels,
+                    &mut v.ResourceMinLODClamp,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let v = &mut desc.Anonymous.Texture2DArray;
+                rebase(
+                    &mut v.MostDetailedMip,
+                    &mut v.MipLevels,
+                    &mut v.ResourceMinLODClamp,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let v = &mut desc.Anonymous.TextureCube;
+                rebase(
+                    &mut v.MostDetailedMip,
+                    &mut v.MipLevels,
+                    &mut v.ResourceMinLODClamp,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let v = &mut desc.Anonymous.TextureCubeArray;
+                rebase(
+                    &mut v.MostDetailedMip,
+                    &mut v.MipLevels,
+                    &mut v.ResourceMinLODClamp,
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 /// A view description from its words, with the format as the host has it.
@@ -2486,6 +2547,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 let mut desc = desc.as_ref().map(srv_desc);
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
+                }
+                if let Some(d) = desc.as_mut() {
+                    drop_mips(d, crate::resource::dropped_mips(resource));
                 }
                 // A texture only part of which is mapped (streaming in):
                 // sample the mips that are there, not the zeros of the ones

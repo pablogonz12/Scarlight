@@ -843,6 +843,8 @@ mod library;
 mod make;
 #[cfg(windows)]
 mod warm;
+#[cfg(windows)]
+mod wine;
 
 #[cfg(windows)]
 pub use warm::{Report as WarmUpReport, report_shader_caches, warm_up};
