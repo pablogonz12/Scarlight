@@ -5672,7 +5672,13 @@ impl HostList {
                     // source's host copy (not title memory, which is behind):
                     // the copy comes out of the host copy then.
                     match ahead_bytes(src, len) {
-                        Some(bytes) => write_mapped(dst as *mut u8, bytes, len),
+                        Some(bytes) => {
+                            // The destination's guards open first, as
+                            // `copy_mapped` does: a write through a guarded
+                            // page fails piecemeal and is not reported.
+                            crate::watch::writing(dst, len);
+                            write_mapped(dst as *mut u8, bytes, len);
+                        }
                         None => copy_mapped(dst as *mut u8, src as *const u8, len, true),
                     }
                     // With the submission's one asking: the journal learns it.
