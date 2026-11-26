@@ -171,6 +171,10 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   the GPU reads and writes the title's own memory (`crates/victory-gpu/src/arena.rs`, `VICTORY_ARENA=1`, off by
   default). The part grid, the region registry, the budget and the canary are reimplemented on this tree's
   `inplace`; the canary here proves each part **both ways** with our own `Rig` (#188), which the fork's tests do not.
+- **fever308/victory-corgi [f4c1175a1](https://github.com/fever308/victory-corgi/commit/f4c1175a1)**, GPL-3.0: the
+  blocks view memory is guarded by, sharded across cache-line-aligned locks with contiguous block runs a shard and
+  the shards of a range taken in ascending order, so a copy does not stop the title's write faults elsewhere
+  (`crates/victory-gpu/src/guards.rs`, `VICTORY_GUARD_SHARDS=1` for the one lock of before).
 
 ## Tools
 
