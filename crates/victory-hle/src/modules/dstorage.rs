@@ -408,11 +408,13 @@ fn overlap() -> bool {
 }
 
 /// Whether a queue that submits itself leaves its reads into physical pages
-/// for the title's Submit: `VICTORY_DSTORAGE_HELD=0` submits them at once, as
-/// the layer did before (a start-up switch).
+/// for the title's Submit: `VICTORY_DSTORAGE_HELD=1` opts in (a start-up
+/// switch, off by default: a loader that enqueues below a full queue relies
+/// on the queue's own self-submit and polls the status array, so a status
+/// entry held until a Submit that never comes leaves it waiting for ever).
 fn held_reads() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_DSTORAGE_HELD").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| std::env::var("VICTORY_DSTORAGE_HELD").is_ok_and(|v| v == "1"))
 }
 
 struct Lanes {
@@ -445,6 +447,10 @@ struct Lanes {
 struct Lane {
     class: usize,
     capacity: usize,
+    /// Whether its own half-full submission leaves reads into physical
+    /// pages for the title's Submit (see [`held_reads`]); read once, when
+    /// the queue is created.
+    held_reads: bool,
     /// Bytes started, for round robin among the lanes of a class.
     clock: u64,
     /// Enqueued, not yet submitted.
@@ -857,14 +863,14 @@ impl Lanes {
     }
 
     /// As [`Lanes::submit`]; `explicit` false when a half-full queue submits
-    /// itself, which leaves reads into physical pages for the title's
-    /// Submit: their page lists point into the title's page table, which the
-    /// title fills for the batch in its own submit path, right before
-    /// Submit, so until then they name no page or a page that now holds
-    /// something else (a local profile names the title's addresses). A
-    /// status entry behind a held read waits with it.
+    /// itself, which, with [`held_reads`] on, leaves reads into physical
+    /// pages for the title's Submit: their page lists point into the title's
+    /// page table, which the title fills for the batch in its own submit
+    /// path, right before Submit, so until then they name no page or a page
+    /// that now holds something else (a local profile names the title's
+    /// addresses). A status entry behind a held read waits with it. Off, its
+    /// default, a self-submission moves them like any other command.
     fn submit_as(&mut self, id: u64, explicit: bool) -> usize {
-        let explicit = explicit || !held_reads();
         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
             return 0;
         };
@@ -880,6 +886,7 @@ impl Lanes {
         let Some(lane) = self.lanes.get_mut(&id) else {
             return 0;
         };
+        let explicit = explicit || !lane.held_reads;
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
@@ -916,6 +923,7 @@ impl Lane {
         Lane {
             class: priority.clamp(-1, 1).wrapping_add(1) as usize,
             capacity: usize::from(capacity),
+            held_reads: held_reads(),
             clock: 0,
             unsubmitted: Vec::new(),
             held: Vec::new(),
@@ -1785,11 +1793,15 @@ mod tests {
     }
 
     fn new_queue(source_type: u64) -> *mut c_void {
+        new_queue_of(source_type, 0x80)
+    }
+
+    fn new_queue_of(source_type: u64, capacity: u16) -> *mut c_void {
         let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
             call(factory(), 0x50);
         let desc = QueueDesc {
             source_type,
-            capacity: 0x80,
+            capacity,
             priority: 0,
             name: c"test".as_ptr(),
             unknown: 1,
@@ -1797,6 +1809,16 @@ mod tests {
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
         queue
+    }
+
+    /// Makes a queue hold its reads into physical pages, as
+    /// `VICTORY_DSTORAGE_HELD=1` does; the switch is read when the queue is
+    /// created.
+    fn hold_reads(queue: *mut c_void) {
+        // SAFETY: a queue we created and the test still holds.
+        let id = unsafe { &*queue.cast::<Instance<Queue>>() }.state.id;
+        let mut lanes = scheduler().expect("a scheduler").lock();
+        lanes.lanes.get_mut(&id).expect("its lane").held_reads = true;
     }
 
     fn request(
@@ -2563,13 +2585,55 @@ mod tests {
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
         assert_eq!(seen, plain);
     }
+    /// A loader that enqueues below half a queue's capacity relies on the
+    /// queue submitting itself and polls the status entry; it never calls
+    /// Submit. With held reads on (an opt-in), this waits for ever.
+    #[test]
+    fn a_page_reads_status_completes_without_the_titles_submit() {
+        use crate::modules::xmem;
+        let (mut given, mut page) = (1usize, [0usize; 1]);
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut given, page.as_mut_ptr()),
+            1
+        );
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, page.as_ptr()), mapped);
+
+        let list = Box::leak(Box::new([page[0]]));
+        let plain = pattern(4096);
+        // Half of four: enqueueing the status submits the queue itself.
+        let (queue, array) = (new_queue_of(1, 4), status_array(1));
+        let r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            list.as_mut_ptr().cast(),
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        enqueue(queue, &r);
+        enqueue_status(queue, array, 0);
+        // No Submit: the title polls the entry.
+        assert_eq!(wait(array, 0), S_OK);
+        // SAFETY: the page is mapped read-write.
+        let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
+        assert_eq!(seen, plain);
+    }
+
     #[test]
     fn a_queue_that_submits_itself_holds_reads_into_pages() {
-        if !held_reads() {
-            return; // VICTORY_DSTORAGE_HELD=0 submits the held reads at once
-        }
         let mut l = lanes(STAGING);
         l.lanes.insert(0, Lane::new(0, 64));
+        // The opt-in path (`VICTORY_DSTORAGE_HELD=1`), whatever the test
+        // environment says: the default must not hold.
+        l.lanes.get_mut(&0).unwrap().held_reads = true;
         let array = status_array(1).cast::<Instance<StatusArray>>();
         read(&mut l, 0, PAGE_DESTINATION, 16);
         read(&mut l, 0, 0, 16);
@@ -2593,9 +2657,6 @@ mod tests {
 
     #[test]
     fn a_page_list_the_title_changes_before_its_submit() {
-        if !held_reads() {
-            return; // VICTORY_DSTORAGE_HELD=0 submits the held reads at once
-        }
         use crate::modules::xmem;
         let (mut given, mut pages) = (2usize, [0usize; 2]);
         assert_eq!(
@@ -2626,6 +2687,9 @@ mod tests {
         };
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
+        // The opt-in path (`VICTORY_DSTORAGE_HELD=1`), whatever the test
+        // environment says.
+        hold_reads(queue);
         let array = status_array(1);
         let r = request(
             PAGE_DESTINATION | MEMORY_SOURCE,
