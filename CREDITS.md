@@ -39,6 +39,10 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
 
 ## Design notes
 
+- **fuzeofficial** ([Marvisak/VIctory #2608](https://github.com/Marvisak/VIctory/pull/2608)), GPL-3.0: the
+  idea of cutting a command list at its texture read-backs and running the part after one in a submission
+  of its own, so a copy or draw recorded behind a read-back is prepared after its bytes are in title
+  memory (`crate::list::cut_read_back`). Reimplemented on the parts a queue already runs.
 - **Marvisak/VIctory [#2478](https://github.com/Marvisak/VIctory/pull/2478)** (HoLa-Lee), GPL-3.0: the idea
   of reading a texture once every N frames at most, round-robin by the texture's address, its measurements
   (a frame of world entry at 6,814 ms of texture work, 145-522 ms at 8), and its name for the switch,
@@ -157,10 +161,20 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   `crates/victory-shader/src/dxbc.rs`; `Source::bytes()` for both the raw and the `SGD5` paths,
   `apps/victory/src/shader.rs`). Reimplemented on this tree's `victory translate`, which has no `warm` command.
 
+- **HUMAN** ([HumanlyDev/HUMAN](https://github.com/HumanlyDev/HUMAN)) by HumanlyDev and bdycounter-sudo,
+  GPL-3.0-or-later: one immediate sampler constant used both for normal and for comparison sampling takes two
+  static sampler slots (`crates/victory-shader/src/emit/lower.rs`, `samplers`/`cmp_samplers`), where our bit
+  per slot made the normal use sample with a comparison sampler.
 - **Marvisak/VIctory [`8ff791351`](https://github.com/Marvisak/VIctory/commit/8ff791351)** (Marvis),
   GPL-3.0: a rectangle list's fourth corner is completed opposite the right angle, wherever the three
   corners put it. This tree's geometry stage (`emit::rect_list_gs`) already finds the corner in any order; the
   rule is now in the CPU expansion too (`right_angle`, `right_corners` in `crates/victory-gpu/src/primitive.rs`).
+
+- **fxceless/victory-fork [PR #980](https://github.com/fxceless/victory-fork/pull/980)** (fxceless), GPL-3.0:
+  the arena, the layer a resident stands on: a title region opened as a D3D12 heap and a buffer placed over it, so
+  the GPU reads and writes the title's own memory (`crates/victory-gpu/src/arena.rs`, `VICTORY_ARENA=1`, off by
+  default). The part grid, the region registry, the budget and the canary are reimplemented on this tree's
+  `inplace`; the canary here proves each part **both ways** with our own `Rig` (#188), which the fork's tests do not.
 
 ## Tools
 
@@ -194,8 +208,15 @@ Missing or wrong name? Open an issue.
   records, arrays and structures are copied at the call, and a recording the title resets or releases without
   submitting is not run further.
 
-- **avatarmanz/VIctory-7900XTX [3a99ee610](https://github.com/avatarmanz/VIctory-7900XTX/commit/3a99ee610)**
   (avatarmanz), GPL-3.0-or-later: the title's `ExecuteCommandLists` and `Signal` put in a line of ours and made by
   a thread of ours, so the recording does not wait for its own submission (`VICTORY_ASYNC_SUBMIT=1`, off by
   default, needs `VICTORY_THIN=1`; `crates/victory-gpu/src/queue/behind.rs`), with the order the title asks for
   kept: a wait, a present, our own submission and a fence read take the line in first.
+- **Belobug/VIctory-Belobug-AMD [4d291d4](https://github.com/Belobug/VIctory-Belobug-AMD/commit/4d291d4)**
+  (davutsimsekk) via **Yoshi-233**, GPL-3.0: operandless VOP1 (`v_nop`, `v_pipeflush`, `v_clrexcp`) ignores its
+  source field, so a marker byte there is not an extra dword and no longer swallows the next instruction, and the
+  VOP3 encoding of `v_cmpx*` writes EXEC rather than its VDST, for both wave sizes
+  (`crates/victory-shader/src/gfx10/{mod.rs,fields.rs}`).
+- **Yoshi-233 [coolfox/main PR #7](https://github.com/Yoshi-233), from fxceless/victory-fork [9bf4a0f](https://github.com/fxceless/victory-fork/commit/9bf4a0f)**,
+  GPL-3.0: the RGB dump decodes the packed 16-bit BGR targets (B5G6R5, B5G5R5A1, B4G4R4A4, host formats 85, 86,
+  115) and keeps padded rows aligned (diagnostics only) (`crates/victory-gpu/src/capture.rs`).
