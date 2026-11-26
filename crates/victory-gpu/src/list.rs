@@ -1804,13 +1804,21 @@ fn unread_bound() -> std::time::Duration {
     })
 }
 
-/// The unread waits seen: address, when a look first found it unreadable, and
-/// whether the bound's warning has been logged.
-fn unread_seen() -> &'static std::sync::Mutex<Vec<(u64, std::time::Instant, bool)>> {
-    static SEEN: std::sync::OnceLock<std::sync::Mutex<Vec<(u64, std::time::Instant, bool)>>> =
+/// The unread waits seen: address, the bytes waited for there, when a look
+/// first found it unreadable, and whether the bound's warning has been
+/// logged. The bytes are part of the key: a 32-bit wait at an address reads
+/// while a 64-bit wait there does not, and one must not restart the other's
+/// bound.
+fn unread_seen() -> &'static std::sync::Mutex<Vec<(u64, usize, std::time::Instant, bool)>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<Vec<(u64, usize, std::time::Instant, bool)>>> =
         std::sync::OnceLock::new();
     SEEN.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
+
+/// How many unread waits are tracked at once: far above the five queues the
+/// title submits (one wait per queue at most), so churn is a diagnostic, not
+/// a policy.
+const UNREAD_SEEN_MAX: usize = 64;
 
 impl ValueWait {
     /// Whether the memory holds what is waited for now.
@@ -1840,7 +1848,7 @@ impl ValueWait {
     pub(crate) fn met(&self) -> bool {
         #[cfg(all(windows, feature = "diagnostics"))]
         let started = std::time::Instant::now();
-        let met = self.holds();
+        let met = self.holds(true);
         #[cfg(all(windows, feature = "diagnostics"))]
         {
             use crate::copystat::{C, add};
@@ -1850,15 +1858,22 @@ impl ValueWait {
         met
     }
 
+    /// [`Self::met`] for a line that only reports the wait (the first waits of
+    /// a list, a capture): it does not start the unread-wait bound, so a look
+    /// taken for the log cannot age a wait the queue has not checked.
+    pub(crate) fn met_peek(&self) -> bool {
+        self.holds(false)
+    }
+
     /// Off Windows there is no title memory to read (this crate is built
     /// there for the unit tests and rustdoc only): the wait counts as met.
     #[cfg(not(windows))]
-    fn holds(&self) -> bool {
+    fn holds(&self, _track: bool) -> bool {
         true
     }
 
     #[cfg(windows)]
-    fn holds(&self) -> bool {
+    fn holds(&self, track: bool) -> bool {
         let bytes = if self.wide { 8 } else { 4 };
         if self.address == 0 {
             return true;
@@ -1869,12 +1884,12 @@ impl ValueWait {
         if *ASK.get_or_init(|| std::env::var_os("VICTORY_WAIT_ASK").is_some_and(|v| v == "1"))
             && !crate::texture::committed(self.address as *const u8, bytes)
         {
-            return self.unread_met();
+            return self.unread_met_tracked(track);
         }
         // The low `bytes` bytes; the rest stays zero.
         let mut raw = [0u8; 8];
         if !crate::host::read_into(self.address as *const u8, &mut raw[..bytes]) {
-            return self.unread_met();
+            return self.unread_met_tracked(track);
         }
         if unread_holds() && (1..ALWAYS).contains(&self.comparison) {
             self.unread_read();
@@ -1892,35 +1907,62 @@ impl ValueWait {
     /// one warning: memory that never reads would hold its queue forever
     /// (nothing releases a held queue on a timer, only a submission, a signal
     /// or a present).
-    fn unread_met(&self) -> bool {
-        self.unread_met_at(std::time::Instant::now(), unread_bound())
+    /// [`Self::unread_met`]; a look that only reports the wait (`track`
+    /// false) finds the entry it has but never starts one, so a diagnostic
+    /// look cannot start the bound of the queue's own check
+    /// ([`Self::met_peek`]).
+    fn unread_met_tracked(&self, track: bool) -> bool {
+        self.unread_met_at(std::time::Instant::now(), unread_bound(), track)
     }
 
-    /// `unread_met` with the time and bound given.
-    fn unread_met_at(&self, now: std::time::Instant, bound: std::time::Duration) -> bool {
+    /// `unread_met` with the time, bound and whether to start tracking given.
+    fn unread_met_at(
+        &self,
+        now: std::time::Instant,
+        bound: std::time::Duration,
+        track: bool,
+    ) -> bool {
         if !unread_holds() || !(1..ALWAYS).contains(&self.comparison) {
             return true;
         }
         if bound.is_zero() {
             return false;
         }
+        let bytes = if self.wide { 8 } else { 4 };
         let mut seen = unread_seen().lock().unwrap_or_else(|e| e.into_inner());
-        let i = match seen.iter().position(|&(at, ..)| at == self.address) {
+        let i = match seen
+            .iter()
+            .position(|&(at, n, ..)| at == self.address && n == bytes)
+        {
             Some(i) => i,
             None => {
-                if seen.len() >= 64 {
-                    seen.retain(|&(_, first, _)| now.duration_since(first) < bound);
+                if !track {
+                    return false;
                 }
-                seen.push((self.address, now, false));
+                if seen.len() >= UNREAD_SEEN_MAX {
+                    // Room for one more: the newest entry goes, so the oldest
+                    // waits keep the time they have already stood on. (Taking
+                    // out every expired entry would restart a wait that is
+                    // close to its bound each time another address arrives.)
+                    let newest = seen
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|(_, entry)| entry.2)
+                        .map(|(i, _)| i);
+                    if let Some(i) = newest {
+                        seen.swap_remove(i);
+                    }
+                }
+                seen.push((self.address, bytes, now, false));
                 return false;
             }
         };
-        let (_, first, warned) = seen[i];
+        let (_, _, first, warned) = seen[i];
         if now.duration_since(first) < bound {
             return false;
         }
         if !warned {
-            seen[i].2 = true;
+            seen[i].3 = true;
             tracing::warn!(
                 address = format_args!("{:#x}", self.address),
                 comparison = self.comparison,
@@ -1935,10 +1977,11 @@ impl ValueWait {
     /// The wait reads after standing on unreadable memory: the bound starts
     /// over if it is unreadable again.
     fn unread_read(&self) {
+        let bytes = if self.wide { 8 } else { 4 };
         unread_seen()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|&(at, ..)| at != self.address);
+            .retain(|&(at, n, ..)| !(at == self.address && n == bytes));
     }
 
     /// Where the value waited for is: address and bytes.
@@ -2026,7 +2069,7 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
             comparison,
             reference,
             wide,
-            met = wait.met(),
+            met = wait.met_peek(),
             "a list waits for a memory value"
         );
     }
@@ -2035,7 +2078,7 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
         crate::capture::op(std::ptr::from_ref(host) as usize, || {
             format!(
                 "WAIT VALUE at {address:#x} comparison {comparison} reference {reference:#x} wide {wide} met {}",
-                wait.met()
+                wait.met_peek()
             )
         });
     }
@@ -2434,13 +2477,13 @@ mod tests {
         };
         let bound = std::time::Duration::from_millis(2000);
         let first = std::time::Instant::now();
-        assert!(!wait.unread_met_at(first, bound), "held at the first look");
+        assert!(!wait.unread_met_at(first, bound, true), "held at the first look");
         assert!(
-            !wait.unread_met_at(first + std::time::Duration::from_millis(1999), bound),
+            !wait.unread_met_at(first + std::time::Duration::from_millis(1999), bound, true),
             "still held below the bound"
         );
         assert!(
-            wait.unread_met_at(first + bound, bound),
+            wait.unread_met_at(first + bound, bound, true),
             "met at the bound, so the queue runs"
         );
         let warned = unread_seen()
@@ -2451,18 +2494,115 @@ mod tests {
             .count();
         assert_eq!(warned, 1, "one warning for the address");
         assert!(
-            wait.unread_met_at(first + bound, bound),
+            wait.unread_met_at(first + bound, bound, true),
             "still met after the bound"
         );
         wait.unread_read();
         assert!(
-            !wait.unread_met_at(first + bound, bound),
+            !wait.unread_met_at(first + bound, bound, true),
             "the bound starts over once it reads"
         );
         assert!(
-            !wait.unread_met_at(first, std::time::Duration::ZERO),
+            !wait.unread_met_at(first, std::time::Duration::ZERO, true),
             "VICTORY_WAIT_UNREAD_MS=0 waits forever"
         );
+    }
+
+    /// A look taken for a log line (`met_peek`) does not start the bound: the
+    /// queue's own first check still has the whole bound to stand on.
+    #[cfg(windows)]
+    #[test]
+    fn a_peek_does_not_start_the_unread_bound() {
+        let wait = ValueWait {
+            address: 0x7FF0_0000_2000,
+            comparison: 3,
+            reference: 5,
+            wide: false,
+        };
+        let bound = std::time::Duration::from_millis(2000);
+        let first = std::time::Instant::now();
+        assert!(!wait.met_peek(), "a peek reports the wait as held");
+        assert!(
+            !wait.unread_met_at(first + bound, bound, true),
+            "the queue's first check starts the bound, the peek did not"
+        );
+        assert!(
+            wait.unread_met_at(first + bound + bound, bound, true),
+            "met a bound after the queue's first check"
+        );
+        wait.unread_read();
+    }
+
+    /// The bound is tracked per address and width: a 32-bit wait reads where
+    /// a 64-bit wait there does not, and its read does not restart the wider
+    /// wait's bound.
+    #[cfg(windows)]
+    #[test]
+    fn a_narrower_wait_does_not_restart_a_wider_bound() {
+        let wide = ValueWait {
+            address: 0x7FF0_0000_3000,
+            comparison: 3,
+            reference: 5,
+            wide: true,
+        };
+        let narrow = ValueWait { wide: false, ..wide };
+        let bound = std::time::Duration::from_millis(2000);
+        let first = std::time::Instant::now();
+        assert!(!wide.unread_met_at(first, bound, true));
+        narrow.unread_read();
+        let entries = unread_seen()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&(at, ..)| at == wide.address)
+            .count();
+        assert_eq!(entries, 1, "one entry for the address, the wide wait's");
+        assert!(
+            wide.unread_met_at(first + bound, bound, true),
+            "met at the bound it started before the narrow wait read"
+        );
+        wide.unread_read();
+    }
+
+    /// At the cap the newest entry makes room, so an old wait keeps the time
+    /// it has stood on and still reaches its bound.
+    #[cfg(windows)]
+    #[test]
+    fn a_full_table_keeps_the_oldest_waits() {
+        let bound = std::time::Duration::from_millis(2000);
+        let first = std::time::Instant::now();
+        // This test owns the table while it runs (the suite runs one test at
+        // a time, `--test-threads=1`): what it finds goes back afterwards.
+        let reused = std::mem::take(&mut *unread_seen().lock().unwrap_or_else(|e| e.into_inner()));
+        let waits: Vec<ValueWait> = (0..UNREAD_SEEN_MAX)
+            .map(|i| ValueWait {
+                address: 0x7FF0_0001_0000 + i as u64 * 8,
+                comparison: 3,
+                reference: 5,
+                wide: false,
+            })
+            .collect();
+        for w in &waits {
+            assert!(!w.unread_met_at(first, bound, true));
+        }
+        let newcomer = ValueWait {
+            address: 0x7FF0_0002_0000,
+            ..waits[0]
+        };
+        assert!(
+            !newcomer.unread_met_at(first + bound, bound, true),
+            "a new address at the cap starts its own bound"
+        );
+        assert!(
+            waits[0].unread_met_at(first + bound, bound, true),
+            "the first wait is still tracked and reaches its bound"
+        );
+        assert_eq!(
+            unread_seen().lock().unwrap_or_else(|e| e.into_inner()).len(),
+            UNREAD_SEEN_MAX,
+            "the table stays at its cap"
+        );
+        *unread_seen().lock().unwrap_or_else(|e| e.into_inner()) = reused;
     }
 
     #[cfg(windows)]
