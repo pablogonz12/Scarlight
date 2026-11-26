@@ -137,7 +137,7 @@ impl Registry {
     }
 
     /// Regions in it and their bytes.
-    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn census(&self) -> (u64, u64) {
         (self.regions.len() as u64, self.regions.values().copied().sum())
     }
