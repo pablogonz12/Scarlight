@@ -59,6 +59,8 @@ pub mod query;
 pub mod queue;
 mod reflection;
 pub mod resource;
+#[cfg(any(windows, test))]
+mod scratchfill;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
