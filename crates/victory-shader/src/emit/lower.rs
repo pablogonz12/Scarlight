@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, flags};
+use super::shader::{Shader, USER_GROUP_BASE, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -27,6 +27,16 @@ pub(super) mod intersect;
 #[path = "group_wide.rs"]
 mod group_wide;
 use group_wide::{all_group_blocks, lane_regions};
+/// The wide reads of a console buffer load (`bitcode::opt::WIDE`).
+#[path = "lower/wide.rs"]
+mod wide;
+
+/// The form a test asks for the wide reads to take, whatever the process's
+/// `VICTORY_SHADER_OPT` says (`None`: the switch again).
+#[cfg(test)]
+pub(super) fn wide_for_test(wide: Option<bool>) {
+    wide::FORCE.with(|f| *f.borrow_mut() = wide);
+}
 
 type Why = &'static str;
 
@@ -68,6 +78,11 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Buffer loads in the module as the lowering left it, before the
+    /// clean-up: a test counts them (one a dword or, with
+    /// `bitcode::opt::WIDE`, one for every four).
+    #[cfg(test)]
+    pub buffer_loads: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -110,6 +125,15 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
+
+/// Whether a 16-bit interpolation applies its output modifier (omod) and
+/// clamp (`VICTORY_INTERP_F16_OMOD_CLAMP=0` leaves both out).
+fn interp_f16_omod_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_INTERP_F16_OMOD_CLAMP").map_or(true, |v| v != "0")
+    })
+}
 
 /// The f16 bits of inline float constant `c` (240..=248: 0.5, -0.5, 1.0,
 /// -1.0, 2.0, -2.0, 4.0, -4.0, 1/(2 pi)).
@@ -949,6 +973,24 @@ fn f16_nearest_on() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_F16_NEAREST").is_some_and(|v| v == "1"))
+}
+
+/// Whether a dispatch of more groups in `x` than the host runs is split into
+/// several, each told where its groups start ([`Lower::compute_id`]): on,
+/// `VICTORY_GROUP_SPLIT=0` as before (the first 65,535 groups only).
+fn group_split_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_GROUP_SPLIT.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GROUP_SPLIT").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`group_split_on`], for its thread only.
+    pub(super) static TEST_GROUP_SPLIT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -2265,6 +2307,11 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        #[cfg(test)]
+        let buffer_loads = {
+            let k = |s: &str| super::bitcode::census::KINDS.iter().position(|k| *k == s).expect("kind");
+            self.s.m.census().counts[k("buffer_load")]
+        };
         Ok(Lowered {
             wave_size,
             cmp_samplers,
@@ -2275,6 +2322,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            buffer_loads,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2413,12 +2462,26 @@ impl<'a> Lower<'a> {
     }
 
     /// A component of a compute thread or group id, read in the entry block.
+    ///
+    /// The host runs a console dispatch of more than 65,535 groups in `x` as
+    /// several dispatches of at most that many (its own limit), one after the
+    /// other. A later one starts at group `x` 65,535: the host says where in
+    /// [`USER_GROUP_BASE`], which this adds to the id. Every id the host
+    /// derives from the group id (`SV_DispatchThreadID`, the mesh stage's
+    /// group) is built from this op too, so all of them move with it.
+    /// `VICTORY_GROUP_SPLIT=0`: the id is the console's own again (and a
+    /// dispatch over the host's limit runs only its first 65,535 groups).
     fn compute_id(&mut self, name: &str, opcode: u32, c: u8) -> Val {
-        let (entry, c) = (self.s.entry, self.s.m.i32(u32::from(c)));
-        Val::I32(
-            self.s
-                .op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[c]),
-        )
+        let (entry, component) = (self.s.entry, self.s.m.i32(u32::from(c)));
+        let id = self.s.op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[component]);
+        // Only the group id of `x` moves, and only it: a thread's id in its
+        // group (`threadIdInGroup`, opcode 95) is the group's own, and `y`
+        // and `z` are the console's.
+        if c != 0 || opcode != 94 || !group_split_on() {
+            return Val::I32(id);
+        }
+        let base = self.host_word(RootType::Other(USER_GROUP_BASE), 0, 0);
+        Val::I32(self.s.m.bin(entry, Bin::Add, id, base))
     }
 
     fn find_input(&self, row: u8, channel: u8) -> Option<(usize, u8)> {
@@ -5736,8 +5799,13 @@ impl<'a> Lower<'a> {
             let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
+            let wide = wide::loads();
             let mut raw = Vec::new();
-            for k in 0..count {
+            if wide {
+                let dwords = self.raw_dwords(h, addr, count);
+                raw.extend(dwords.into_iter().map(|x| (x, zero)));
+            }
+            for k in 0..if wide { 0 } else { count } {
                 let b = self.cur;
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(b, Bin::Add, addr, off);
@@ -5775,6 +5843,12 @@ impl<'a> Lower<'a> {
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
+            if wide::loads() {
+                for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+                return Ok(());
+            }
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -9042,9 +9116,21 @@ impl<'a> Lower<'a> {
                     self.as_int(f)
                 } else if f16 {
                     let z = self.s.m.f32(0);
-                    let f = half(self, h)?.unwrap_or(z);
+                    let mut f = half(self, h)?.unwrap_or(z);
+                    if interp_f16_omod_clamp()
+                        && let Fields::Valu(v) = &inst.fields
+                    {
+                        if v.omod != 0 {
+                            let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
+                            let k = self.s.m.f32(factor.to_bits());
+                            f = self.s.m.bin(c, Bin::Mul, f, k);
+                        }
+                        if v.clamp {
+                            f = self.unary(7, f);
+                        }
+                    }
                     let lo = to_f16(self, f);
-                    self.low_half(inst, reg, lo)
+                    return self.write_half(inst, lo, None);
                 } else if matches!(eval, Eval::Mode(1)) {
                     // The whole dword of a flat input: both halves.
                     let h = 2 * attribute.channel;
@@ -9742,11 +9828,13 @@ impl<'a> Lower<'a> {
                     let width = self.s.m.extract(c, d, 0);
                     let width = self.s.m.cast(c, Cast::UiToFp, width, self.s.t.f32);
                     let texels = self.s.m.bin(c, Bin::Mul, longer, width);
-                    // log2 = natural logarithm / ln 2; a length of 0 gives
-                    // minus infinity, which the sampler clamps to level 0.
-                    let ln = self.unary(23, texels);
-                    let per_ln2 = self.s.m.f32(std::f32::consts::LOG2_E.to_bits());
-                    let lod = self.s.m.bin(c, Bin::Mul, ln, per_ln2);
+                    // DXIL `Log` is already base 2 (it was scaled by
+                    // log2(e) once more: levels 1.44 times too coarse). A
+                    // length of 0 gives minus infinity, which the sampler
+                    // clamps to level 0. `sampleLevel` has no clamp: the
+                    // console's minimum level (`_cl`) is applied here.
+                    let lod = self.unary(23, texels);
+                    let lod = if has_cl { self.binary(35, lod, clamp) } else { lod };
                     args.extend(&os);
                     args.push(lod);
                     self.s.op(
@@ -10766,8 +10854,12 @@ impl<'a> Lower<'a> {
                 .min(self.s.threads.map_or(u32::MAX, |t| t[0]))
         });
         let mut indices = [z; 3];
+        // Each corner is a 9-bit vertex index with its edge flag above it
+        // (bits 9, 19, 29), which only the console's edge-flag rasterising
+        // reads: with the flag in the index it named a vertex past the
+        // written ones, and the triangle was culled.
         for (k, slot) in indices.iter_mut().enumerate() {
-            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x3FF));
+            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x1FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
             if let Some(n) = written {
@@ -11190,7 +11282,7 @@ mod valu_int;
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, TEST_GROUP_SPLIT, USER_GROUP_BASE, buffer_format, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -11584,8 +11676,8 @@ mod tests {
     // Descriptor words read as numbers: kept in their own file (lower.rs is at the size limit).
     mod desc_data;
     mod mad_u16_lerp;
+    mod vop3p_dot;
     mod mul24_hi;
-
     /// Tables of 2D textures at s0 and samplers at s1.
     fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
         let range = |kind, user_data, slot| UsedResource {
@@ -11863,5 +11955,29 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    /// A program that reads its group id reads the host's base too, so that a
+    /// dispatch the host runs in pieces moves its ids; `VICTORY_GROUP_SPLIT=0`
+    /// leaves the id as the console's.
+    #[test]
+    fn a_program_that_reads_its_group_id_gets_the_group_base() {
+        let words = [
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        let group_id_x = 1 << 7;
+        let base = |l: &Lowered| {
+            l.user_data
+                .iter()
+                .any(|u| u.root == RootType::Other(USER_GROUP_BASE))
+        };
+        TEST_GROUP_SPLIT.set(Some(true));
+        assert!(base(&lowers_cs(&words, group_id_x, false, [1, 1, 1]).expect("group id")));
+        TEST_GROUP_SPLIT.set(Some(false));
+        assert!(!base(&lowers_cs(&words, group_id_x, false, [1, 1, 1]).expect("group id")));
+        TEST_GROUP_SPLIT.set(None);
     }
 }
