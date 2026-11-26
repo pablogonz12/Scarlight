@@ -328,7 +328,7 @@ pub(crate) struct State {
     /// The clears a stand-in made in this list: (view heap, the title
     /// address of the view, the resource it views) → dynamic slot, one per
     /// view a program names, however many dispatches of it do not run.
-    stand_in_slots: std::collections::HashMap<(usize, u64, usize), u32>,
+    stand_in_slots: std::collections::HashMap<(usize, u64, usize, Option<[u32; 10]>), u32>,
     /// The bound dispatch ran ([`State::dispatch`]); its stand-ins take its
     /// place when it did not.
     dispatch_ran: bool,
@@ -1065,6 +1065,28 @@ impl State {
     /// descriptors its tables hold.
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
+    /// Binds the heaps the title set on this list, once per change: what a
+    /// root signature with directly indexed heaps needs, and what a clear's
+    /// GPU descriptor handle names (`ClearUnorderedAccessViewUint` requires
+    /// the heap it lies in to be set on the list).
+    fn bind_heaps(&mut self, list: &HostList) {
+        if self.host_heaps == self.heaps {
+            return;
+        }
+        let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .filter_map(|&h| crate::descriptor::heap(h as This).host())
+            .map(|h| Some(h.heap.clone()))
+            .collect();
+        heaps.iter().flatten().for_each(|h| list.keep(h));
+        // SAFETY: an open list and heaps of ours.
+        unsafe { list.list.SetDescriptorHeaps(&heaps) };
+        self.host_heaps = self.heaps;
+        self.host_roots = [0; 2];
+    }
+
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
@@ -1074,20 +1096,7 @@ impl State {
         }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
-            // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
-            self.host_roots = [0; 2];
-        }
+        self.bind_heaps(list);
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
         let tested = if !compute && self.depth_state == DEPTH_READ {
@@ -2186,6 +2195,11 @@ impl State {
     /// or without a host pipeline), the stand-ins `VICTORY_STAND_IN` names
     /// for its program take its place ([`Self::instead`]).
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        // A zero in any dimension is a dispatch of no work: nothing runs, and
+        // nothing stands in for it either.
+        if x == 0 || y == 0 || z == 0 {
+            return;
+        }
         self.dispatch_ran = false;
         self.run_dispatch(list, x, y, z);
         if !self.dispatch_ran {
@@ -2360,13 +2374,15 @@ impl State {
                 );
             }
         }
-        #[cfg(test)]
-        if rules.iter().any(|r| r.program == program) {
-            // Counted per program that has a rule, not per call: a program
-            // no rule names (one the title only now has a hash for) stands
-            // nothing in, and main's hashing gives it one.
-            INSTEAD.fetch_add(1, Ordering::Relaxed);
+        if !rules.iter().any(|r| r.program == program) {
+            // A program no rule names stands nothing in: counted or not,
+            // nothing below applies to it.
+            return;
         }
+        // Counted per program that has a rule, not per call: the number says
+        // how many programs a stand-in took the place of.
+        #[cfg(test)]
+        INSTEAD.fetch_add(1, Ordering::Relaxed);
         self.stand_in(list, program, rules);
     }
 
@@ -2404,6 +2420,21 @@ impl State {
                     continue;
                 }
             };
+            // The rule's view lies at an offset the title's record gives: one
+            // outside the bound heap would have the view read 12 bytes the
+            // heap does not hold.
+            if heap.index(at).is_none() {
+                if first {
+                    tracing::warn!(
+                        program,
+                        view = %rule.view(),
+                        at = format_args!("{at:#x}"),
+                        "stand-in: the rule's view lies outside the bound view heap"
+                    );
+                }
+                crate::stand_in::note(false);
+                continue;
+            }
             // The formats of the view and of the texture it views, the
             // title's; the size, for the log.
             let Some(View::Unordered(resource, _, words)) = crate::descriptor::view(at) else {
@@ -2413,11 +2444,18 @@ impl State {
                 crate::stand_in::note(false);
                 continue;
             };
-            let format = words.map_or(0, |w| w[0]);
             let desc = crate::resource::host_resource(resource as This)
                 // SAFETY: a live resource.
                 .map(|t| unsafe { t.GetDesc() });
-            let own = desc.map_or(0, |d| d.Format.0);
+            let own = desc.map_or(0, |d| d.Format.0 as u32);
+            // A view without a format of its own (a default UAV) takes the
+            // texture's; a typeless one says nothing of words or colours, so
+            // it stays unresolved (the fill refuses it).
+            let format = match words {
+                Some(w) => w[0],
+                None if own != 0 && !crate::stand_in::typeless(own) => own,
+                None => 0,
+            };
             let size = desc.map(|d| (d.Width, d.Height));
             let fill = crate::stand_in::fill(format, rule.value);
             if first {
@@ -2457,7 +2495,10 @@ impl State {
                 crate::stand_in::note(false);
                 continue;
             }
-            let key = (std::ptr::from_ref(heap) as usize, at, resource);
+            // The description is part of the key: another view of the same
+            // resource at the same address (another mip, another format) is
+            // another clear target.
+            let key = (std::ptr::from_ref(heap) as usize, at, resource, words);
             let index = match self.stand_in_slots.get(&key) {
                 Some(&index) => index,
                 None => {
@@ -2477,8 +2518,16 @@ impl State {
                     index
                 }
             };
+            // The heap the view and the clear's handles lie in must be set on
+            // the list (`ClearUnorderedAccessViewUint`); a dispatch that did
+            // not run never bound it.
+            self.bind_heaps(list);
             // What the program would have written it in: unordered access.
             crate::list::ensure_state(list, resource as This, UNORDERED_ACCESS);
+            // Some compute-written textures are also read by the title CPU:
+            // the clear is what the program would have written, so it is
+            // registered as the normal unordered-access path registers it.
+            list.texture_written(resource as This);
             // SAFETY: an open list, a live resource in unordered access
             // state, and the view of it just made in the bound heap.
             unsafe {

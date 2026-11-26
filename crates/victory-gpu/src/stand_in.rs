@@ -205,10 +205,40 @@ pub(crate) enum Fill {
 /// Whether `format` (a host format code) is an integer one, which a float
 /// clear does not take.
 pub(crate) fn integer(format: u32) -> bool {
-    matches!(
-        format,
-        3 | 4 | 7 | 8 | 12 | 13 | 17 | 18 | 30 | 31 | 36 | 37 | 42 | 43 | 56 | 57 | 61 | 62
-    )
+    // The DXGI formats whose clear takes words (ClearUnorderedAccessViewUint):
+    // every UINT and SINT view, named by its DXGI_FORMAT code. A UNORM, SNORM
+    // or TYPELESS view takes the float clear instead, so it is not here.
+    const WORD_VIEWS: [u32; 21] = [
+        3,  // R32G32B32A32_UINT
+        7,  // R32G32B32_UINT
+        12, // R16G16B16A16_UINT
+        17, // R32G32_UINT
+        25, // R10G10B10A2_UINT
+        30, // R8G8B8A8_UINT
+        36, // R16G16_UINT
+        42, // R32_UINT
+        50, // R8G8_UINT
+        57, // R16_UINT
+        62, // R8_UINT
+        4,  // R32G32B32A32_SINT
+        8,  // R32G32B32_SINT
+        14, // R16G16B16A16_SINT
+        18, // R32G32_SINT
+        32, // R8G8B8A8_SINT
+        38, // R16G16_SINT
+        43, // R32_SINT
+        52, // R8G8_SINT
+        58, // R16_SINT
+        64, // R8_SINT
+    ];
+    WORD_VIEWS.contains(&format)
+}
+
+/// Whether `format` is a typeless DXGI format (`_TYPELESS`), which says
+/// neither words nor colours: a view of it that names no format of its own
+/// is left unresolved.
+pub(crate) fn typeless(format: u32) -> bool {
+    matches!(format, 1 | 5 | 9 | 15 | 19 | 23 | 27 | 33 | 39 | 44 | 48 | 53 | 60)
 }
 
 /// The packing a console format implies for an integer view of it, if it
@@ -488,9 +518,25 @@ mod tests {
     #[test]
     fn an_integer_view_takes_a_word_whatever_its_width() {
         // R8_UINT: all ones is its mask (the low 8 bits are what it keeps).
-        assert_eq!(fill(61, Value::Raw(u32::MAX)), Ok(Fill::Uint([u32::MAX; 4])));
-        assert_eq!(fill(56, Value::Raw(0)), Ok(Fill::Uint([0; 4])));
+        assert_eq!(fill(62, Value::Raw(u32::MAX)), Ok(Fill::Uint([u32::MAX; 4])));
+        assert_eq!(fill(57, Value::Raw(0)), Ok(Fill::Uint([0; 4])));
         assert_eq!(fill(42, Value::Raw(0x3daaaaab)), Ok(Fill::Uint([0x3daaaaab; 4])));
+        // R8G8_UINT and R8_SINT take words too.
+        assert_eq!(fill(50, Value::Raw(0xff)), Ok(Fill::Uint([0xff; 4])));
+        assert_eq!(fill(64, Value::Raw(0xffff_ffff)), Ok(Fill::Uint([u32::MAX; 4])));
+        // 61 is R8_UNORM and 56 R16_UNORM (and 13, 31, 37 are SNORM): a
+        // normalized view takes the float clear, so a word is no value for it.
+        for format in [13, 31, 37, 56, 61] {
+            assert!(!integer(format), "{format} is a normalized view");
+            assert_eq!(
+                fill(format, Value::Raw(u32::MAX)),
+                Err("a float view takes a colour, or zero"),
+                "{format}"
+            );
+        }
+        assert!(integer(25), "R10G10B10A2_UINT takes words");
+        assert!(integer(14) && integer(52) && integer(58), "the SINT views");
+        assert!(!integer(27) && !integer(60), "a typeless view is no word view");
     }
 
     #[test]
