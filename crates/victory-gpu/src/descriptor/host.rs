@@ -1279,8 +1279,20 @@ impl HostHeap {
         self.keep(index, kept.flatten());
     }
 
-    /// Makes slot `index` (a dynamic one) a structured buffer alias with
-    /// element width `stride`, for a shader that declares a structured SRV
+    /// Makes slot `index` (a dynamic one) the unordered access view `view`
+    /// names, without a null stand-in: whether it did. A stand-in's clear
+    /// (`stand_in.rs`) needs a view of the resource it clears, not one of
+    /// nothing.
+    pub(crate) fn uav_at(&self, index: u32, view: &View) -> bool {
+        let kept = make(view, self.cpu(index));
+        let made = kept.is_some();
+        if made {
+            self.keep(index, kept.flatten());
+        }
+        made
+    }
+
+    /// Makes slot `index` (a dynamic one) a structured buffer alias with    /// element width `stride`, for a shader that declares a structured SRV
     /// where the title binds a raw buffer SRV (`draw::fullscreen_structured_alias`
     /// names the verified passes). The title's own slot keeps its raw view.
     pub(crate) fn make_structured_at(&self, index: u32, view: &View, stride: u32) -> bool {
@@ -1438,7 +1450,7 @@ impl HostHeap {
         };
     }
 
-    fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    pub(crate) fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
         }

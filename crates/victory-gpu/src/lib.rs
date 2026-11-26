@@ -65,6 +65,8 @@ pub mod signature;
 #[cfg(all(windows, test))]
 mod test_device;
 #[cfg(windows)]
+mod stand_in;
+#[cfg(windows)]
 mod texback;
 #[cfg(windows)]
 mod texture;
