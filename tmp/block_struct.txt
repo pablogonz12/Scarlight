@@ -1,4 +1,0 @@
-            present_compositor_retry: Mutex::new(Retry::new()),
-        };
-        host.log_features();
-        Ok(host)
