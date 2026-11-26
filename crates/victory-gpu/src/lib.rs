@@ -37,6 +37,7 @@ mod declareonce;
 #[allow(dead_code)]
 #[cfg(windows)]
 mod arena;
+mod resident;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
