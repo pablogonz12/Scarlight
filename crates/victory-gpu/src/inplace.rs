@@ -735,16 +735,21 @@ pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size:
 // census needs them to say which view memory is one run of a section (one
 // placed buffer could show it) and which is scattered pages.
 
+/// Views up to this size live in `by_section_small` so one huge view in a
+/// section never widens the range scan for small 64 KiB mappings.
+const SMALL_VIEW_MAX: usize = 256 << 10;
+
 struct Views {
     /// By address: bytes, the section's handle, the offset in it.
     views: BTreeMap<usize, (usize, usize, u64)>,
-    /// Secondary index by `(section, offset, base)` -> view length in bytes,
-    /// so alias lookups (`beside`) are O(log N + k) instead of scanning every
-    /// mapped view.
-    by_section: BTreeMap<(usize, u64, usize), usize>,
-    /// Largest view length ever inserted for each section, bounding how far
-    /// before `offset` a view starting earlier could still overlap `[offset, end)`.
-    max_len: BTreeMap<usize, u64>,
+    /// Secondary index for small views (`len <= SMALL_VIEW_MAX`), keyed by
+    /// `(section, offset, base)` -> view length in bytes.
+    by_section_small: BTreeMap<(usize, u64, usize), usize>,
+    /// Secondary index for large views (`len > SMALL_VIEW_MAX`), keyed by
+    /// `(section, offset, base)` -> view length in bytes.
+    by_section_large: BTreeMap<(usize, u64, usize), usize>,
+    /// Largest large-view length inserted for each section.
+    large_max_len: BTreeMap<usize, u64>,
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
 }
@@ -753,47 +758,102 @@ impl Views {
     fn insert(&mut self, at: usize, len: usize, section: usize, offset: u64) {
         if let Some((old_len, old_section, old_offset)) = self.views.insert(at, (len, section, offset))
         {
-            self.by_section.remove(&(old_section, old_offset, at));
-            let _ = old_len;
+            if old_len <= SMALL_VIEW_MAX {
+                self.by_section_small.remove(&(old_section, old_offset, at));
+            } else {
+                self.by_section_large.remove(&(old_section, old_offset, at));
+            }
         }
-        self.by_section.insert((section, offset, at), len);
-        let max = self.max_len.entry(section).or_insert(0);
-        if (len as u64) > *max {
-            *max = len as u64;
+        if len <= SMALL_VIEW_MAX {
+            self.by_section_small.insert((section, offset, at), len);
+        } else {
+            self.by_section_large.insert((section, offset, at), len);
+            let max = self.large_max_len.entry(section).or_insert(0);
+            if (len as u64) > *max {
+                *max = len as u64;
+            }
         }
     }
 
     fn remove(&mut self, base: usize) {
-        if let Some((_, section, offset)) = self.views.remove(&base) {
-            self.by_section.remove(&(section, offset, base));
+        if let Some((len, section, offset)) = self.views.remove(&base) {
+            if len <= SMALL_VIEW_MAX {
+                self.by_section_small.remove(&(section, offset, base));
+            } else {
+                self.by_section_large.remove(&(section, offset, base));
+            }
         }
     }
 
     /// The views of `section` that show any of the bytes `[offset, offset + len)`,
-    /// other than the view at `at` itself. O(log N + k) via `by_section`.
+    /// other than the view at `at` itself. O(log N + k) via `by_section_small`
+    /// and `by_section_large`.
     fn beside(&self, at: usize, section: usize, offset: u64, len: usize) -> Vec<(usize, usize)> {
-        let Some(&max_len) = self.max_len.get(&section) else {
-            return Vec::new();
-        };
         let end = offset.saturating_add(len as u64);
         if end <= offset {
             return Vec::new();
         }
-        let lo = offset.saturating_sub(max_len);
-        self.by_section
-            .range((section, lo, 0)..(section, end, 0))
+        let lo_small = offset.saturating_sub(SMALL_VIEW_MAX as u64);
+        let mut out: Vec<(usize, usize)> = self
+            .by_section_small
+            .range((section, lo_small, 0)..(section, end, 0))
             .filter_map(|(&(_, o, base), &bytes)| {
                 (base != at && o < end && offset < o.saturating_add(bytes as u64))
                     .then_some((base, bytes))
             })
-            .collect()
+            .collect();
+        if let Some(&large_max) = self.large_max_len.get(&section) {
+            let lo_large = offset.saturating_sub(large_max);
+            out.extend(
+                self.by_section_large
+                    .range((section, lo_large, 0)..(section, end, 0))
+                    .filter_map(|(&(_, o, base), &bytes)| {
+                        (base != at && o < end && offset < o.saturating_add(bytes as u64))
+                            .then_some((base, bytes))
+                    }),
+            );
+        }
+        out
+    }
+
+    /// Zero-allocation check whether any view of `section` other than `at`
+    /// overlaps `[offset, offset + len)`.
+    fn has_beside(&self, at: usize, section: usize, offset: u64, len: usize) -> bool {
+        let end = offset.saturating_add(len as u64);
+        if end <= offset {
+            return false;
+        }
+        let lo_small = offset.saturating_sub(SMALL_VIEW_MAX as u64);
+        if self
+            .by_section_small
+            .range((section, lo_small, 0)..(section, end, 0))
+            .any(|(&(_, o, base), &bytes)| {
+                base != at && o < end && offset < o.saturating_add(bytes as u64)
+            })
+        {
+            return true;
+        }
+        if let Some(&large_max) = self.large_max_len.get(&section) {
+            let lo_large = offset.saturating_sub(large_max);
+            if self
+                .by_section_large
+                .range((section, lo_large, 0)..(section, end, 0))
+                .any(|(&(_, o, base), &bytes)| {
+                    base != at && o < end && offset < o.saturating_add(bytes as u64)
+                })
+            {
+                return true;
+            }
+        }
+        false
     }
 }
 
 static VIEWS: RwLock<Views> = RwLock::new(Views {
     views: BTreeMap::new(),
-    by_section: BTreeMap::new(),
-    max_len: BTreeMap::new(),
+    by_section_small: BTreeMap::new(),
+    by_section_large: BTreeMap::new(),
+    large_max_len: BTreeMap::new(),
     sections: Vec::new(),
 });
 
@@ -857,7 +917,7 @@ pub(crate) fn aliased(at: usize) -> bool {
         return false;
     };
     // The bytes of the view that `at` lies in, of the section's offsets.
-    !v.beside(base, section, offset, bytes).is_empty()
+    v.has_beside(base, section, offset, bytes)
 }
 
 /// Reference linear scan of `views` for tests verifying [`Views::beside`].
@@ -1721,8 +1781,9 @@ mod tests {
         // overwrites, and removals.
         let mut indexed = Views {
             views: BTreeMap::new(),
-            by_section: BTreeMap::new(),
-            max_len: BTreeMap::new(),
+            by_section_small: BTreeMap::new(),
+            by_section_large: BTreeMap::new(),
+            large_max_len: BTreeMap::new(),
             sections: Vec::new(),
         };
         for (&base, &(len, sec, off)) in &views {
