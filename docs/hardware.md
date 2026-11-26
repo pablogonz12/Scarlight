@@ -56,19 +56,6 @@ A report only needs numbers and text: no screenshots, game files or hashes of ga
 - [bug report](https://github.com/pablogonz12/Scarlight/issues/new?template=bug-report.yml) for a
   crash, a hang or a wrong picture.
 
-Three settings decide what a report's numbers mean, and the form asks for all three:
-
-- the `MESA_SHADER_CACHE_*` values the run used — directory, `DISABLE`, `MAX_SIZE`, or "defaults".
-  A warm cache builds the 751 programs of the set in 148 ms and a cold one in 37,672 ms, so two
-  reports with different caches are not comparable runs (the play script in [linux.md](linux.md)
-  sets them);
-- any `VICTORY_*` switch set, or "none": the tables are in
-  [linux.md](linux.md#switches), and a switch can change both the load path and the picture;
-- the `host device features` line from the startup log (`VICTORY_LOG=info`): it names the adapter,
-  vendor and device id, the highest shader model, the mesh-shader and ray-tracing tiers, 64-bit
-  integer shader ops (`Int64ShaderOps`, not an atomics guarantee) and the shared-resource import
-  tier — which optional paths the run took is decided by it.
-
 A row moves when a report shows the build reaching the world and the picture being right enough to
 look at. A card that fails is at least as useful: a failure on a gated path is our bug, and a failure
 in the driver goes to Mesa with the report attached.

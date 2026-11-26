@@ -38,6 +38,8 @@ pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queue_state: AtomicU8,
+    /// Its worker was lost to it ([`worker_lost`]): it will not be made.
+    lost: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     /// A pass over the screen (see [`GraphicsState::screen_pass`]): made by
     /// the screen workers, out of the world's budget.
@@ -69,6 +71,7 @@ impl Pending {
             screen: screen_pool() && graphics.as_ref().is_some_and(|g| g.screen_pass()),
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
+            lost: AtomicBool::new(false),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
@@ -114,6 +117,9 @@ impl Pending {
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
+        None if p.lost.load(Ordering::Relaxed) => {
+            Some(format!("lost to the driver's compiler {:?}", p.shaders))
+        }
         None => Some("being made".into()),
         Some(None) => {
             let failed: Vec<String> = p
@@ -164,23 +170,13 @@ pub(crate) fn waiting() -> u64 {
 
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
-/// Pipeline requests that had to wait for their pipeline, since the last
-/// call: what the frame's wait budget was spent on (counted per request,
-/// not once per pipeline: a pipeline made long ago costs nothing here).
-static DEMANDED: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) fn take_demanded() -> u64 {
-    DEMANDED.swap(0, Ordering::Relaxed)
-}
-
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
     }
-    if p.made.get().is_none() {
-        DEMANDED.fetch_add(1, Ordering::Relaxed);
+    if p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) {
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
@@ -314,7 +310,7 @@ fn wait(p: &Pending, frame: u64) {
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
+    while p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
@@ -446,24 +442,7 @@ fn workers(kind: usize) -> bool {
             } else {
                 format!("victory-pipelines-{i}")
             };
-            let spawned = std::thread::Builder::new()
-                .name(name)
-                .spawn(move || {
-                    // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                    }
-                    loop {
-                        next(kind).make();
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
-                    }
-                });
+            let spawned = std::thread::Builder::new().name(name).spawn(move || work(kind));
             if let Err(e) = spawned {
                 tracing::warn!(error = %e, "no pipeline worker");
             } else {
@@ -472,6 +451,69 @@ fn workers(kind: usize) -> bool {
         }
         running
     })
+}
+
+/// A pipeline worker of one kind: makes what is queued for it, until the
+/// run ends.
+fn work(kind: usize) {
+    // Below the title's own threads (loading, recording).
+    // SAFETY: a plain call on our own thread.
+    unsafe {
+        use windows::Win32::System::Threading::*;
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+    super::wine::hook();
+    loop {
+        let p = next(kind);
+        MAKING_NOW.set(Some(p.clone()));
+        p.make();
+        MAKING_NOW.set(None);
+        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+            drained();
+        } else {
+            super::library::save(false);
+        }
+    }
+}
+
+thread_local! {
+    /// The pipeline this worker is making.
+    static MAKING_NOW: std::cell::Cell<Option<Arc<Pending>>> = const { std::cell::Cell::new(None) };
+}
+
+/// The host driver's compiler crashed under this thread (Wine, see
+/// [`super::wine`]), which will not run again. If it is a worker making a
+/// pipeline: the pipeline counts as lost from now on (nothing waits for
+/// it, its draws are dropped), the name it holds in the library is let
+/// go, and another worker takes this one's place. False for any other
+/// thread.
+pub(super) fn worker_lost() -> bool {
+    let Ok(Some(p)) = MAKING_NOW.try_with(std::cell::Cell::take) else {
+        return false;
+    };
+    p.lost.store(true, Ordering::Relaxed);
+    tracing::error!(
+        shaders = ?p.shaders,
+        "the host driver's compiler crashed making a pipeline: its draws are dropped, the run goes on",
+    );
+    super::library::abandon();
+    {
+        let (lock, done) = &DONE;
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        done.notify_all();
+    }
+    if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+        drained();
+    }
+    // The replacement works the same queue as the lost one.
+    let kind = usize::from(p.screen);
+    if let Err(e) = std::thread::Builder::new()
+        .name("victory-pipelines-again".into())
+        .spawn(move || work(kind))
+    {
+        tracing::warn!(error = %e, "no pipeline worker in place of the lost one");
+    }
+    true
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
@@ -508,6 +550,18 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// A pipeline whose worker was lost to the driver's compiler is not
+    /// waited for (nor started again): its draws are dropped.
+    #[test]
+    fn a_lost_pipeline_is_not_waited_for() {
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        p.lost.store(true, Ordering::Relaxed);
+        let started = Instant::now();
+        assert!(ready(&p).is_none());
+        assert!(started.elapsed() < Duration::from_secs(1), "a lost pipeline was waited for");
+        assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED, "a lost pipeline was queued");
     }
 
     #[test]
