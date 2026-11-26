@@ -106,6 +106,8 @@ mod valu_tests;
 mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
+#[cfg(test)]
+mod wide_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
@@ -118,9 +120,16 @@ pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit, view_heap_limit,
+    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
+    USER_VIEW_BIAS, set_view_heap_limit, title_view_clamp, title_view_limit, view_heap_limit,
 };
+
+/// The host's dynamic slots in a view heap (`victory-gpu`'s `DYNAMIC`): tables
+/// a draw needs made afresh are made there. They follow the title's slots, at
+/// a place shaders know before the title's heap is made, so a shader that
+/// names a view slot the title made itself is clamped below them
+/// ([`title_view_limit`]) instead of naming one of the host's tables.
+pub const DYNAMIC_VIEWS: u32 = 1 << 18;
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -221,7 +230,9 @@ pub fn group_sync() -> u8 {
 ///   and identities, 4 one instruction for one value, 8 what a branch taken
 ///   says about its condition, 16 one read for one place within a block,
 ///   32 a first-lane read of two host waves without the round that asks
-///   which half has a lane (where every lane has one).
+///   which half has a lane (where every lane has one), 64 the dwords of one
+///   console buffer load read one call for every four (`bitcode::opt::WIDE`,
+///   off unless asked: `127` is every pass).
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
@@ -239,7 +250,7 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
             Some(hex) => u32::from_str_radix(hex, 16).ok(),
             None => v.parse().ok(),
         });
-    parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
+    parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -255,16 +266,22 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
 /// from then on, and the test in `key_tests` fails if the sources read one
 /// that is in none of the three lists.
 pub const SWITCHES: &[&str] = &[
+    "VICTORY_CODE_READS",
+    "VICTORY_ANISO_POINT_MIP",
+    "VICTORY_INTERP_F16_OMOD_CLAMP",
     "VICTORY_F16_NEAREST",
     "VICTORY_F16_SUM_WIDE",
     "VICTORY_FIRSTLANE_OWN",
     "VICTORY_FIRST_HALF",
+    "VICTORY_GROUP_SPLIT",
     "VICTORY_GROUP_SYNC",
     "VICTORY_MESH_OUTPUT_STRICT",
+    "VICTORY_SHADER_DIV_FIXUP_F16",
     "VICTORY_SHADER_LOOP_LIMIT",
     "VICTORY_SHADER_LOOP_LIMIT_CS",
     "VICTORY_SHADER_OPT",
     "VICTORY_STRICT_JOINS",
+    "VICTORY_TITLE_VIEW_CLAMP",
     "VICTORY_WAVE_DEEP_SKIPS",
     "VICTORY_WAVE_LOCAL",
     "VICTORY_WAVE_OWN_BITS",
@@ -807,7 +824,7 @@ fn emit_program(
             .enumerate()
             .map(|(n, &w)| {
                 let mut s = StaticSampler::from_words(w);
-                if l.cmp_samplers >> n & 1 != 0 {
+                if l.cmp_samplers.get(n).copied().unwrap_or(false) {
                     s.filter |= 0x80;
                 }
                 s
@@ -922,13 +939,17 @@ mod tests {
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
-        let all = super::bitcode::opt::ALL;
-        assert_eq!(parse_shader_opt(None), all);
+        let (all, usual) = (super::bitcode::opt::ALL, super::bitcode::opt::DEFAULT);
+        assert_eq!(usual, 63, "the passes of the builds before the wide reads");
+        assert_eq!(parse_shader_opt(None), usual);
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
+        assert_eq!(parse_shader_opt(Some("127")), all);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
-        assert_eq!(parse_shader_opt(Some("on")), all);
+        assert_eq!(parse_shader_opt(Some("on")), usual);
+        assert_eq!(all & usual, usual, "everything but the wide reads");
+        assert_eq!(all & !usual, super::bitcode::opt::WIDE);
     }
 
     #[test]

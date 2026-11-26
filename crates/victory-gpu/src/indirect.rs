@@ -83,11 +83,18 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = count * instances;
         draw_counts = uint2(count, instances);
     } else if (kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+        uint3 want = src_args.Load3(src_at);
+        uint3 g = min(want, uint3(65535u, 65535u, 65535u));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
         }
+        // Diagnostics, in the budget buffer's words 12 and 16 (beside the
+        // mesh notes at 4 and 8): what the record asked, before the clamp
+        // that keeps the first 65,535 groups only.
+        uint was;
+        budget.InterlockedMax(12, want.x, was);
+        budget.InterlockedAdd(16, min(want.x, 1u << 24), was);
         cost = g.x * g.y * g.z * 64u;
         groups = g;
     } else {
@@ -127,14 +134,15 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         over = before >= BUDGET || BUDGET - before < cost;
     }
-    // Diagnostics, in the budget's words after the budget (the frame line
-    // tells them): the records that ran empty for want of it, and the
-    // largest cost one of them had (below 2^22 the cost is not told).
+    // Diagnostics, in the budget buffer's words after the dispatch notes
+    // (bytes 20 and 24; the frame line tells them): the records that ran
+    // empty for want of the budget, and the largest cost one of them had
+    // (below 2^22 the cost is not told).
     if (over) {
         uint was;
-        budget.InterlockedAdd(12, 1, was);
+        budget.InterlockedAdd(20, 1, was);
         if (cost >= (1u << 22)) {
-            budget.InterlockedMax(16, cost, was);
+            budget.InterlockedMax(24, cost, was);
         }
     }
     if (kind <= 1) {
@@ -1194,8 +1202,8 @@ void main() {
     /// the budget, so every record after it runs empty; taking nothing
     /// leaves the 50 that no record of this pair wants, and the next record
     /// of the list that fits runs. Either way one record is refused, and the
-    /// clamp says so in the budget's words after the budget (word 3: the
-    /// records refused, word 4: the largest cost of one, 0 under 2^22).
+    /// clamp says so in the budget's words after the dispatch notes (word 5:
+    /// the records refused, word 6: the largest cost of one, 0 under 2^22).
     #[test]
     fn a_record_that_does_not_fit_takes_the_rest_or_nothing() {
         let _once = crate::warptest::lock();
@@ -1268,8 +1276,8 @@ void main() {
                 (
                     notes.read_volatile(),
                     std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), total / 4).to_vec(),
-                    notes.add(3).read_volatile(),
-                    notes.add(4).read_volatile(),
+                    notes.add(5).read_volatile(),
+                    notes.add(6).read_volatile(),
                 )
             }
         };
