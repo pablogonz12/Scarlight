@@ -909,9 +909,14 @@ extern "system" fn present(
         }
         // Diagnostics: whether the frame shown is black or skipped.
         #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
+        blinks(
+            frame,
+            resource,
+            source.state.load(Ordering::Relaxed),
+            shown,
+        );
         #[cfg(not(feature = "diagnostics"))]
-        let _ = (state, shown);
+        let _ = shown;
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
