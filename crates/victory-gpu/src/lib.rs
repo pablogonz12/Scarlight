@@ -18,10 +18,16 @@
 #[cfg(windows)]
 mod ambient;
 #[cfg(any(windows, test))]
+mod bindcache;
+#[cfg(any(windows, test))]
 mod bound;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
+// Byte compares (`VICTORY_AVX2_COMPARE`): used by the Windows paths'
+// copy-back (`shadow`); the walks and their tests run anywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod compare;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(any(windows, test))]
@@ -35,6 +41,10 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
+// Guarded blocks of view memory, sharded so copies and write faults do not
+// queue on one lock (`VICTORY_GUARD_SHARDS=1` for one lock, as before).
+#[cfg(windows)]
+mod guards;
 pub mod dxgi;
 #[cfg(windows)]
 mod dxc;
@@ -59,6 +69,8 @@ pub mod query;
 pub mod queue;
 mod reflection;
 pub mod resource;
+#[cfg(any(windows, test))]
+mod scratchfill;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
@@ -78,6 +90,8 @@ mod test_device;
 mod texback;
 #[cfg(windows)]
 mod texture;
+#[cfg(windows)]
+mod upload_pool;
 #[cfg(all(test, windows))]
 mod warptest;
 #[cfg(windows)]
