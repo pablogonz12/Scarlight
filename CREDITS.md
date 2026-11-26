@@ -176,6 +176,12 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   default). The part grid, the region registry, the budget and the canary are reimplemented on this tree's
   `inplace`; the canary here proves each part **both ways** with our own `Rig` (#188), which the fork's tests do not.
 
+- **codec-d/cool_fox [`8cc31ab37`](https://github.com/codec-d/cool_fox/commit/8cc31ab37)**, GPL-3.0: an XMA
+  voice whose input the title publishes again while the context stays enabled decodes on instead of staying
+  ended, and the decode pass publishes only whole blocks (a short one only as the flushed tail), trying a few
+  frames for a block and no more so a voice that produces nothing cannot hold the lock
+  (`crates/victory-hle/src/modules/audio.rs`, `VICTORY_XMA_REFILL`).
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
