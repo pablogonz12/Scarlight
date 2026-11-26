@@ -13,8 +13,9 @@
 //!
 //! - `VICTORY_TEXTURE_WAIT_US` ([`crate::texture::wait_us`]) is a per-refresh
 //!   budget: a change takes effect at the next refresh.
-//! - `VICTORY_CARD_BUFFERS`, `VICTORY_CARD_BUFFERS_MIN_MB` and
-//!   `VICTORY_CARD_BUFFERS_MB` ([`crate::shadow`]) decide what new copies go
+//! - `VICTORY_CARD_BUFFERS`, `VICTORY_CARD_BUFFERS_MIN_MB` (or the finer
+//!   `VICTORY_CARD_BUFFERS_MIN_KB`, under a MiB) and `VICTORY_CARD_BUFFERS_MB`
+//!   ([`crate::shadow`]) decide what new copies go
 //!   to the card; copies already there stay until they are let go, which is
 //!   how the run behaves anyway while the budget fills.
 //! - `VICTORY_CARD_REHASH_RUNS` ([`crate::host::rehash_runs`]) picks whether a
@@ -57,6 +58,7 @@ const NAMES: [&str; 20] = [
     "VICTORY_TEXTURE_REFRESH_EVERY",
     "VICTORY_CARD_BUFFERS",
     "VICTORY_CARD_BUFFERS_MIN_MB",
+    "VICTORY_CARD_BUFFERS_MIN_KB",
     "VICTORY_CARD_BUFFERS_MB",
     "VICTORY_CARD_REHASH_RUNS",
     "VICTORY_CARD_HASH_SPAN",
@@ -289,5 +291,6 @@ mod tests {
         assert!(needs_quiet("VICTORY_ASYNC_WRITEBACK"));
         assert!(!needs_quiet("VICTORY_TEXTURE_WAIT_US"));
         assert!(!needs_quiet("VICTORY_CARD_BUFFERS_MIN_MB"));
+        assert!(!needs_quiet("VICTORY_CARD_BUFFERS_MIN_KB"));
     }
 }
