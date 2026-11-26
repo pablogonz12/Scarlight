@@ -508,8 +508,8 @@ fn guarded_answer(
 }
 
 /// Whether the pools' own pages are watched by our guards instead of the
-/// kernel's page walk (`VICTORY_GUARD_POOLS=0` asks the kernel about every
-/// range, as before).
+/// kernel's page walk: `VICTORY_GUARD_POOLS=1`, off unless asked for (the
+/// kernel is asked about every range, as before).
 ///
 /// An asking costs what its span is, not what was written in it: the world's
 /// 2,409 askings over 10.7 GB a frame are 2.0 us each in the quiet, 625 us
@@ -530,7 +530,10 @@ pub(crate) fn guard_pools() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_POOLS").is_none_or(|v| v != "0"))
+    // Off unless asked for: a guard that misses a write leaves a texture
+    // silently wrong, so the asking stays the default until a run's counter
+    // reads no pages missed.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_POOLS").is_some_and(|v| v == "1"))
 }
 
 /// Every how many frames the kernel verifies a range's guards (the range's
@@ -1494,8 +1497,8 @@ mod tests {
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
-        // The kernel's answering, as it was before the pools were guarded
-        // (`VICTORY_GUARD_POOLS=0`).
+        // The kernel's answering: the pools' guarding is off unless
+        // `VICTORY_GUARD_POOLS=1`.
         tests::POOLS.with(|v| v.set(Some(false)));
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
@@ -1519,8 +1522,7 @@ mod tests {
         assert!(later > now);
         assert_eq!(again, [(p / PAGE + 1, now)]);
         // Nor is a plain allocation write-watched: with the pools' guarding
-        // off (`VICTORY_GUARD_POOLS=0`, this test's setting) its asking is
-        // not answered at all.
+        // off (its default) its asking is not answered at all.
         let mut plain = vec![0u8; PAGE];
         assert!(
             writes(
@@ -1537,8 +1539,8 @@ mod tests {
 
     /// A pool's asking is the guards' to answer: the kernel is not asked at
     /// all, the title's write is reported at the next asking, and a span
-    /// nothing was written in reports nothing. `VICTORY_GUARD_POOLS=0` (the
-    /// switch off) asks the kernel, as every asking did before.
+    /// nothing was written in reports nothing. The default off asks the
+    /// default off) asks the kernel, as every asking did before.
     #[test]
     fn a_pools_asking_is_answered_by_the_guards_not_the_kernel() {
         // SAFETY: a fresh write-watched allocation, freed at the end.
@@ -1576,10 +1578,10 @@ mod tests {
         );
         assert_eq!(kernel_asked(), before, "still the guards");
         tests::VERIFY.with(|v| v.set(None));
-        // The switch off: the kernel answers the same range, as before.
+        // The default: the kernel answers the same range, as before.
         tests::POOLS.with(|v| v.set(Some(false)));
         let (_, off) = writes(start, end, false).expect("watched");
-        assert!(kernel_asked() > before, "VICTORY_GUARD_POOLS=0 asks the kernel");
+        assert!(kernel_asked() > before, "off, the kernel is asked");
         assert!(off.iter().any(|&(page, _)| page == p / PAGE + 1));
         forget_askings();
         // The pool is gone: the guards drop what they held of it, so the next
@@ -1636,7 +1638,8 @@ mod tests {
     #[test]
     fn a_range_is_known_clean_until_an_asking_finds_it_written() {
         // A pool the guards hold is left to `writes`, not asked ahead: this
-        // is the asking of everything else, with the pools' guarding off.
+        // is the asking of everything else, with the pools' guarding off
+        // (its default).
         tests::POOLS.with(|v| v.set(Some(false)));
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
