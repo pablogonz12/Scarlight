@@ -176,6 +176,10 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   `crates/victory-gpu/src/texture.rs`'s `Staging::refresh_pages`, `VICTORY_DETILE_DIRTY=0`). Its own page table
   and its per-page reads are not taken: our subresource ranges come from the layout (`Layout::mip_extents`) and
   the written pages are read in runs, with the rows outside the window skipped whole.
+- **DexNom/VIctory [76749ce5](https://github.com/DexNom/VIctory/commit/76749ce58da23a43a3500454a8b69c53f05aa477)** (DexNom), GPL-3.0: a
+  wave64 lane mask parked in two SGPRs and restored one `s_mov_b32` at a time is recognised as the mask it was
+  copied from when both words still trace back to the same known pair through scalar moves
+  (`crates/victory-shader/src/structure.rs`); `VICTORY_DX_LANE_MASK_MOVES=0` keeps the split pair opaque.
 
 - **Marvisak/VIctory [#2163](https://github.com/Marvisak/VIctory/pull/2163)** (0xkn0wh3r3), GPL-3.0: the
   built-in BCPack table's first BC7 dictionary entry has its 32 indices right after its width bytes, where
@@ -195,6 +199,12 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   (`image_get_lod`), an inactive compute lane's swizzle read as zero (`VICTORY_SHADER_SWIZZLE_ZERO=0` turns it
   off), 16-bit compares that ignore `op_sel` as RDNA2 does, `v_div_fixup_f16`, and saturating `v.clamp` on the
   packed 16-bit integer add/sub/mad (`crates/victory-shader/src/emit/`).
+
+- **Belobug/VIctory-Belobug-AMD `ambient.rs`**, via **fxceless/victory-fork [PR #1093](https://github.com/fxceless/victory-fork/pull/1093)**
+  (m335671), GPL-3.0: the least indirect light, a compute pass after the program that resolves it, shaded from the
+  scene's depth alone and packed as R9G9B9E5 words (`crates/victory-gpu/src/ambient_floor.rs`,
+  `VICTORY_AMBIENT_FLOOR`). Its program name and both table offsets are not taken: the runner names the program and
+  the views, so no title's own hold in this tree.
 
 - **fxceless/victory-fork [PR #976](https://github.com/fxceless/victory-fork/pull/976)** (MoscaLosca), GPL-3.0: a
   compute or mesh dispatch asking for more than the host's 65,535 groups in `x` runs as pieces, each told where
@@ -219,6 +229,11 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   AVX2, checked at run time, with the eight-byte walk kept as the fallback (`crates/victory-gpu/src/compare.rs`,
   `VICTORY_AVX2_COMPARE=1`; on his machine 14 -> 4-7 ms of compares a frame). His compares run on threads of their
   own; ours already do (`wide` in `shadow.rs`).
+- **Marvisak/VIctory [#2773](https://github.com/Marvisak/VIctory/pull/2773)** (kais7654), GPL-3.0: the idea
+  that a format's uses are the host's `CheckFeatureSupport` answer, and a use it does not take left out of the
+  resource it makes -- a typeless format, which the device reports no use for, keeping the uses of its
+  description (`crates/victory-gpu/src/resource.rs` `uses_taken`/`taken_flags`, `VICTORY_FORMAT_USES=0`). The
+  views side is in from the round before (`descriptor::host::fits`, `VICTORY_TYPED_UAV`).
 - **HUMAN** ([HumanlyDev/HUMAN](https://github.com/HumanlyDev/HUMAN)) by HumanlyDev and bdycounter-sudo,
   GPL-3.0-or-later: one immediate sampler constant used both for normal and for comparison sampling takes two
   static sampler slots (`crates/victory-shader/src/emit/lower.rs`, `samplers`/`cmp_samplers`), where our bit

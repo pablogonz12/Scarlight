@@ -1274,6 +1274,41 @@ mod tests {
 
     use super::*;
 
+    /// The families whose driver has no mesh shaders are named by device
+    /// id, and every other adapter is left to the D3D12 tier: the RX 9070 XT
+    /// (0x7550) must not lose mesh pipelines to this check.
+    #[test]
+    fn only_the_families_without_mesh_shaders_are_named() {
+        assert_eq!(amd_mesh_family(AMD, 0x687f), Some("gfx9 (Vega)"), "Vega 10");
+        assert_eq!(amd_mesh_family(AMD, 0x66af), Some("gfx9 (Vega)"), "Vega 20");
+        assert_eq!(amd_mesh_family(AMD, 0x15d8), Some("gfx9 APU"), "Raven");
+        assert_eq!(amd_mesh_family(AMD, 0x164c), Some("gfx9 APU"), "Lucienne");
+        assert_eq!(amd_mesh_family(AMD, 0x15e7), Some("gfx9 APU"), "Renoir");
+        assert_eq!(amd_mesh_family(AMD, 0x731f), Some("gfx10.1 (RDNA1)"), "16");
+        assert_eq!(amd_mesh_family(AMD, 0x7360), Some("gfx10.1 (RDNA1)"), "14");
+        // Mesh shaders exist from RDNA2 up, and on the test machine: no
+        // refusal, the D3D12 tier decides as before.
+        assert_eq!(amd_mesh_family(AMD, 0x73bf), None, "Navi 21 (RDNA2)");
+        assert_eq!(amd_mesh_family(AMD, 0x744c), None, "Navi 31 (RDNA3)");
+        assert_eq!(amd_mesh_family(AMD, 0x7550), None, "RX 9070 XT (RDNA4)");
+        // Van Gogh and Mendocino are APUs of RDNA2, not Vega: they keep
+        // their mesh pipelines.
+        assert_eq!(amd_mesh_family(AMD, 0x163f), None, "Van Gogh (gfx1033)");
+        assert_eq!(amd_mesh_family(AMD, 0x1506), None, "Mendocino (gfx1037)");
+        // Intel, NVIDIA and Microsoft adapters: not ours to guess at.
+        assert_eq!(amd_mesh_family(0x8086, 0xe20b), None, "Arc B580");
+        assert_eq!(amd_mesh_family(0x10de, 0x2684), None, "RTX 4090");
+    }
+
+    /// Only a named family refuses a mesh pipeline: an adapter DXGI cannot
+    /// describe is not a refusal, and a listed one is.
+    #[test]
+    fn an_unidentified_adapter_is_not_a_refusal() {
+        assert!(!MeshIdentity::Refused("gfx9 (Vega)").safe(), "a named family refuses");
+        assert!(MeshIdentity::Other.safe(), "an unlisted family keeps its pipelines");
+        assert!(MeshIdentity::Unknown.safe(), "a failed lookup must not refuse every card");
+    }
+
     #[test]
     fn warp_adapter_accepts_only_software() {
         let _once = crate::warptest::lock();
@@ -5282,6 +5317,60 @@ impl Host {
         }
     }
 
+    /// Whether a mesh pipeline may be handed to this driver at all: the
+    /// D3D12 tier says it can ([`Self::mesh_shaders`]), and the adapter is
+    /// not of a family whose driver has no mesh shaders. RADV offers
+    /// `VK_EXT_mesh_shader` from RDNA2 (GFX10.3) up; below that a mesh
+    /// pipeline is either refused by the driver or — on GFX9 — aborts it,
+    /// and an abort takes the whole run down where a refused pipeline only
+    /// skips the draws that name it.
+    pub(crate) fn mesh_pipelines_safe(&self) -> bool {
+        self.mesh_identity().safe()
+    }
+
+    /// The family this adapter is of, where RADV does not expose mesh
+    /// shaders on it (`None`: it does, or the adapter is not AMD and the
+    /// D3D12 tier decides). Named in the refusal, so a log says why.
+    pub(crate) fn mesh_family(&self) -> Option<&'static str> {
+        match self.mesh_identity() {
+            MeshIdentity::Refused(family) => Some(family),
+            MeshIdentity::Other | MeshIdentity::Unknown => None,
+        }
+    }
+
+    /// What the adapter's id says, asking again once when the query fails:
+    /// a failed lookup is [`MeshIdentity::Unknown`], not "identified and not
+    /// in a listed family", which is [`MeshIdentity::Other`]. The vendor and
+    /// device ids, or none when DXGI will not give them.
+    fn mesh_identity(&self) -> MeshIdentity {
+        for _ in 0..2 {
+            if let Some((vendor, device)) = self.adapter_ids() {
+                return match amd_mesh_family(vendor, device) {
+                    Some(family) => MeshIdentity::Refused(family),
+                    None => MeshIdentity::Other,
+                };
+            }
+        }
+        // Said once: the gate cannot tell a GFX9 adapter from an NVIDIA one
+        // without an id, and refusing every unidentified adapter would take
+        // mesh pipelines from cards that run them.
+        static SAID_UNKNOWN: std::sync::Once = std::sync::Once::new();
+        SAID_UNKNOWN.call_once(|| {
+            tracing::warn!(
+                "the adapter could not be identified: mesh pipelines are left to the \
+                 D3D12 tier, so a gfx9 card could take the abort this gate exists for"
+            );
+        });
+        MeshIdentity::Unknown
+    }
+
+    /// The adapter's vendor and device ids, if DXGI answers.
+    fn adapter_ids(&self) -> Option<(u32, u32)> {
+        let adapter = self.adapter.clone()?;
+        // SAFETY: a plain DXGI query on the adapter the device was made on.
+        let desc = unsafe { adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()? };
+        Some((desc.VendorId, desc.DeviceId))
+    }
     /// The views a clear takes, made now if a rule asks for one.
     fn uavs(&self) -> Option<&Uavs> {
         self.uavs
@@ -5439,6 +5528,50 @@ impl Host {
                 }
             })
             .as_ref()
+    }
+}
+
+/// What an adapter's identity says about mesh shaders on its driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeshIdentity {
+    /// A family whose driver refuses or aborts a mesh pipeline; named for the log.
+    Refused(&'static str),
+    /// Identified, and not in a listed family: the D3D12 tier decides.
+    Other,
+    /// The query failed twice: we do not know what card this is.
+    Unknown,
+}
+
+impl MeshIdentity {
+    /// Whether a mesh pipeline may go to the driver. Only a named family
+    /// says no: an unknown adapter keeps the pipelines it has always kept.
+    fn safe(self) -> bool {
+        !matches!(self, MeshIdentity::Refused(_))
+    }
+}
+
+/// An AMD adapter's vendor id.
+const AMD: u32 = 0x1002;
+
+/// The family an AMD `device` id is of, where RADV does not expose mesh
+/// shaders on it; `None` where it does (RDNA2 and newer) and for any other
+/// vendor.
+fn amd_mesh_family(vendor: u32, device: u32) -> Option<&'static str> {
+    if vendor != AMD {
+        return None;
+    }
+    match device {
+        // Vega 10 (gfx900), Vega 12 (gfx904), Vega 20 (gfx906): the 82 mesh
+        // programs abort RADV's compiler here instead of being refused.
+        0x6860..=0x687f | 0x69a0..=0x69af | 0x66a0..=0x66af => Some("gfx9 (Vega)"),
+        // Vega APUs: Raven Ridge, Raven2, Picasso, Renoir, Cezanne,
+        // Lucienne (gfx902/gfx909/gfx90c). Van Gogh (0x163f, gfx1033) and
+        // Mendocino (0x1506, gfx1037) are RDNA2 and stay out of this arm.
+        0x15d8 | 0x15dd | 0x15e7 | 0x1636 | 0x1638 | 0x164c => Some("gfx9 APU"),
+        // Navi 10/12/14 (gfx1010-1012): the 82 create, but the driver does
+        // not advertise VK_EXT_mesh_shader, so a mesh draw cannot run.
+        0x7310..=0x731f | 0x7340..=0x734f | 0x7360..=0x736f => Some("gfx10.1 (RDNA1)"),
+        _ => None,
     }
 }
 

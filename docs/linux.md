@@ -222,6 +222,7 @@ detail to act on.
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | Diagnostics build only. Omits draws and dispatches, indirect ones included, whose pipeline has a listed 16-digit shader hash; the profile's `skip.shaders` is used when this is unset |
 | `VICTORY_SKIP_WAVE64=mesh,compute` | Diagnostics build only. Omits draws and dispatches whose pipeline has a 64-lane program in a listed stage (diagnostic on 32-lane hosts); the profile's `skip.stages` is used when this is unset |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | Stops translated shader loops after `n` iterations per lane instead of 2^20; a real loop longer than `n` is cut short too, so 32 is a diagnostic value and 256-1024 a safer probe |
+| `VICTORY_FSPX=0` | Leaves the console upscaler's `FSPX` images (`ACCC` parts, no `DXIL` part) refused, as when only a `DXIL` part was known; for telling a translated program from a raw one |
 | `VICTORY_SHADER_LOOP_LIMIT_CS=<n>` | Diagnostics build only. Sets that limit for compute programs alone (unset, they follow `VICTORY_SHADER_LOOP_LIMIT`); a low general limit also cuts genuine compute loops short, since a lane that reaches the limit leaves the program without its writes |
 | `VICTORY_D3D12_DEBUG=1` | Host D3D12 debug layer; `VICTORY_D3D12_GBV=1` adds GPU-based validation (slow) |
 | `VICTORY_D3D12_DRED=1` | On a GPU failure, logs the allocation hit and the commands in flight |
