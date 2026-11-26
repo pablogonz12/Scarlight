@@ -109,6 +109,13 @@ impl Source {
             s => vec![s],
         }
     }
+
+    /// Whether every path to this descriptor reads the resource heap itself
+    /// (an index the title made, not a table), when `heap` says so of a leaf.
+    pub fn heap_only(&self, heap: impl Fn(&Self) -> bool) -> bool {
+        let l = self.leaves();
+        !l.is_empty() && l.iter().all(|s| heap(s))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -865,6 +872,7 @@ impl<'a> Tracer<'a> {
             })) != Some(v)
             || f.abs != 0
             || f.neg != 0
+            || f.clamp
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -891,6 +899,7 @@ impl<'a> Tracer<'a> {
             && let Fields::Valu(f) = &inst.fields
             && f.abs == 0
             && f.neg == 0
+            && !f.clamp
             && f.sdwa.is_none()
             && f.dpp.is_none()
             && let Some(t) = f.src.first().and_then(|s| self.vterm(inst, s))
@@ -1621,6 +1630,7 @@ impl<'a> Tracer<'a> {
             && let Fields::Valu(f) = &inst.fields
             && f.abs == 0
             && f.neg == 0
+            && !f.clamp
             && f.sdwa.is_none()
             && f.dpp.is_none()
             && let Some(t) = f.src.first().and_then(|s| self.raw(inst, s))
@@ -2695,6 +2705,35 @@ pub(crate) mod tests {
         let a = r.scalar[0].1;
         assert_eq!((a.param, a.offset), (CODE, 4));
         assert!(a.dynamic.is_some(), "the lane's index is the computed term");
+    }
+
+    /// VOP3 integer `clamp` saturates, so a clamped add is no wrapping sum:
+    /// address analysis must not decompose one into the code's base plus an
+    /// index (`VIC-BT-010`, the resource side of project-flamingo #675).
+    #[test]
+    fn a_clamped_vector_add_is_not_wrapping_address_math() {
+        let r = track_words(
+            &[
+                0xBE82_1F00, // 0x00: s_getpc_b64 s[2:3]
+                0xD70F_8457, // v_add_co_u32 v87, s4, v74, s2, with clamp
+                0x0000_054A,
+                0xD528_0458,
+                0x0010_0680, // v_add_co_ci_u32 v88, s4, 0, s3, s4
+                0x7E0C_0557, // v_readfirstlane_b32 s6, v87
+                0x7E0E_0558, // v_readfirstlane_b32 s7, v88
+                0xF400_0203,
+                0xFA00_0000, // s_load_dword s8, s[6:7], 0x0
+                S_ENDPGM,
+            ],
+            &[],
+            HwStage::Cs,
+        );
+        assert_eq!(r.scalar.len(), 1);
+        let a = r.scalar[0].1;
+        assert_eq!(
+            a.param, MEMORY,
+            "a clamped add is not the code's base plus an index: {a:?}"
+        );
     }
 
     #[test]
