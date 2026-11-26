@@ -59,6 +59,10 @@ pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
+    /// The copy queue a texture's first upload runs on (`crate::texture::
+    /// ahead`, `VICTORY_UPLOAD_AHEAD`) and its fence; `None` when the device
+    /// would not make one, and then such uploads are the list's, as before.
+    copy: Option<(ID3D12CommandQueue, ID3D12Fence)>,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     event: HANDLE,
@@ -82,6 +86,10 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    /// The [`Host::shared_buffer`]s small enough to share heaps. Leaked: a
+    /// placed buffer's slot goes back to it when the host destroys the
+    /// buffer, on a thread that holds no `Host` ([`crate::placed`]).
+    small_buffers: &'static crate::placed::Pool,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -664,6 +672,27 @@ fn create() -> windows::core::Result<Host> {
             ..Default::default()
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+        // The queue family a texture's first upload runs in, beside the
+        // drawing queue (`VICTORY_UPLOAD_AHEAD`): copies there run while this
+        // thread prepares the frame. A device that will not make one leaves
+        // the uploads on the lists.
+        let copy = match device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+            Type: D3D12_COMMAND_LIST_TYPE_COPY,
+            ..Default::default()
+        }) {
+            Ok(queue) => match device.CreateFence(0, D3D12_FENCE_FLAG_NONE) {
+                Ok(fence) => Some((queue, fence)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no fence for the copy queue");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "no copy queue: texture uploads stay on the lists");
+                None
+            }
+        };
+        tracing::info!(copy = copy.is_some(), "host queues (drawing, copy)");
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -690,9 +719,11 @@ fn create() -> windows::core::Result<Host> {
             crate::inplace::check_at_startup(&device);
         }
         Ok(Host {
+            small_buffers: Box::leak(Box::new(crate::placed::Pool::new(device.clone()))),
             device,
             queue,
             fence,
+            copy,
             submitted: Mutex::new(0),
             event,
             rtvs,
@@ -3121,6 +3152,56 @@ impl Host {
         })
     }
 
+    /// Runs a closed list of ours on the drawing queue and waits for it: the
+    /// list-path side of the upload microbench (`crate::texture::ahead`).
+    #[cfg(test)]
+    pub(crate) fn run_raw(&self, list: &ID3D12CommandList) -> bool {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        *submitted += 1;
+        let value = *submitted;
+        // SAFETY: a closed list of ours; the fence and event are the host's.
+        match unsafe {
+            self.queue.ExecuteCommandLists(&[Some(list.clone())]);
+            self.queue
+                .Signal(&self.fence, value)
+                .and_then(|()| self.fence.SetEventOnCompletion(value, self.event))
+        } {
+            Ok(()) => {
+                // SAFETY: a plain wait on our event.
+                unsafe { WaitForSingleObject(self.event, INFINITE) };
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "the drawing queue would not run a list");
+                false
+            }
+        }
+    }
+
+    /// The copy queue made beside the drawing one, and its fence: where a
+    /// texture's first upload runs ahead of the frame (`crate::texture::
+    /// ahead`, `VICTORY_UPLOAD_AHEAD`).
+    pub(crate) fn copy_queue(&self) -> Option<(&ID3D12CommandQueue, &ID3D12Fence)> {
+        self.copy.as_ref().map(|(queue, fence)| (queue, fence))
+    }
+
+    /// The drawing queue waits on the copy queue's `value`: what a submission
+    /// samples after an upload ahead is there when its lists run
+    /// (`VICTORY_SHOW_AFTER`).
+    pub(crate) fn wait_copy(&self, value: u64) -> bool {
+        let Some((_, fence)) = self.copy.as_ref() else {
+            return false;
+        };
+        // SAFETY: our queues and fence; the copy queue signals `value`.
+        match unsafe { self.queue.Wait(fence, value) } {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, value, "the drawing queue will not wait for the copy queue");
+                false
+            }
+        }
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         #[cfg(feature = "diagnostics")]
@@ -4372,6 +4453,11 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // A texture's first upload may have been started ahead, on the copy
+        // queue (`VICTORY_UPLOAD_AHEAD`): this submission's lists see it only
+        // once the copies have run (`VICTORY_SHOW_AFTER`,
+        // `crate::texture::ahead`).
+        crate::texture::ahead::synchronise();
         crate::watch::ask_once_end();
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
@@ -5815,6 +5901,24 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// Whether a step this list has recorded writes part of
+    /// `[start, start + len)` of title memory when the list is submitted: an
+    /// upload of that memory started ahead of the submission would copy the
+    /// bytes such a step replaces (the list's own upload runs after it).
+    pub(crate) fn writes_title(&self, start: usize, len: usize) -> bool {
+        let end = start.saturating_add(len);
+        let overlaps = |dst: usize, n: usize| dst < end && start < dst.saturating_add(n);
+        let deferred = self.deferred();
+        deferred
+            .copies
+            .iter()
+            .any(|step| matches!(step, Step::Copy(dst, _, n) if overlaps(*dst, *n)))
+            || deferred
+                .writes
+                .iter()
+                .any(|&(dst, _, n)| overlaps(dst, n))
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
@@ -6611,7 +6715,8 @@ fn present_result(status: HRESULT) -> windows::core::Result<bool> {
 }
 
 /// The frame rate, shown in the window's caption every second and logged
-/// every few seconds.
+/// every few seconds. Its once-a-second tick also releases one of the small
+/// buffers' spare heaps.
 struct Meter {
     since: std::time::Instant,
     frames: u32,
@@ -6716,6 +6821,11 @@ impl Meter {
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
+        }
+        // One heap that small buffers left empty goes back a second; only the
+        // presenter's lock is held here, and nothing but presenting takes it.
+        if let Some(host) = host() {
+            host.small_buffers.release_spare();
         }
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
@@ -6917,6 +7027,9 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                if let Some(host) = host() {
+                    host.small_buffers.log();
+                }
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
@@ -7272,6 +7385,34 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         .fold(state, |s, &(_, _, bits)| s & !bits)
 }
 
+/// The memory of [`Host::shared_buffer`]'s buffers: system memory that the
+/// CPU maps write-back.
+pub(crate) const SHARED_HEAP: D3D12_HEAP_PROPERTIES = D3D12_HEAP_PROPERTIES {
+    Type: D3D12_HEAP_TYPE_CUSTOM,
+    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+    MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+    CreationNodeMask: 0,
+    VisibleNodeMask: 0,
+};
+
+/// The description of a [`Host::shared_buffer`] of `width_bytes`.
+pub(crate) fn shared_buffer_desc(width_bytes: u64) -> D3D12_RESOURCE_DESC {
+    D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: width_bytes.max(1),
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    }
+}
+
 impl Host {
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
@@ -7296,30 +7437,20 @@ impl Host {
     /// A buffer in system memory that the CPU maps (write-back, so reading
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
-    /// the common state (buffers move out of it implicitly).
-    pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    /// the common state (buffers move out of it implicitly), zeroed over
+    /// `width_bytes`. One of up to [`crate::placed::SLOT_BYTES`] shares a
+    /// heap ([`crate::placed`]), and past its width lie other buffers'
+    /// bytes: a caller whose shaders may read it through a root descriptor
+    /// past that width asks for whole slots, which keeps such a read in its
+    /// own buffer up to the slot's end.
+    pub(crate) fn shared_buffer(&self, width_bytes: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if let Some(placed) = self.small_buffers.buffer(width_bytes) {
+            return Some(placed);
+        }
         MADE[2].fetch_add(1, Ordering::Relaxed);
-        MADE[3].fetch_add(size, Ordering::Relaxed);
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_CUSTOM,
-            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
-            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
-            ..Default::default()
-        };
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(1),
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            ..Default::default()
-        };
+        MADE[3].fetch_add(width_bytes, Ordering::Relaxed);
+        let desc = shared_buffer_desc(width_bytes);
+        let heap = SHARED_HEAP;
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
         // SAFETY: plain creation and mapping of a CPU-visible buffer.
@@ -7341,7 +7472,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
-                tracing::warn!(error = %e, size, "no shared buffer");
+                tracing::warn!(error = %e, width_bytes, "no shared buffer");
                 None
             }
         }
