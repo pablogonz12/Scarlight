@@ -1709,7 +1709,10 @@ mod state {
         _payload: u64,
     ) {
         super::count_draw();
-        if indirect != 0 {
+        if super::mesh_dispatch_indirect(indirect) {
+            // Counted with the indirect executions dropped (the frame line's
+            // `indirect` number), not silently left out of every count.
+            super::INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
@@ -1763,6 +1766,13 @@ fn count_draw() {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether a `DispatchMeshX`'s group count is in a buffer (indirect), which
+/// this build does not run: its dispatch is dropped and counted as an
+/// indirect execution dropped (like a draw through an unknown signature).
+fn mesh_dispatch_indirect(indirect: u64) -> bool {
+    indirect != 0
+}
+
 /// Draws of the kinds the host does not run yet (indirect, mesh), and
 /// dispatches, counted per frame for the log.
 /// shortcut: dropped until their shaders translate (decision 0007).
@@ -1791,6 +1801,12 @@ extern "system" fn execute_indirect(
 ) {
     count_draw();
     let Some((stride, args)) = crate::signature::layout(signature) else {
+        // The signature's argument kinds are not known, so the execution is
+        // dropped before any of the counts below: it is counted here, or it
+        // would be the one drop neither `dropped` nor `indirect` shows.
+        #[cfg(all(windows, feature = "diagnostics"))]
+        crate::pipeline::note_why("indirect signature with no known layout".to_owned());
+        INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return;
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
@@ -2296,6 +2312,15 @@ pub(crate) fn slot_offset_for_test(list: This, offset: usize) -> usize {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// A mesh dispatch whose group count is in a buffer cannot run here; it
+    /// must be counted as an indirect execution dropped (it used to return
+    /// before every count, so the frame line showed neither it nor a drop).
+    #[test]
+    fn an_indirect_mesh_dispatch_is_counted_as_dropped() {
+        assert!(mesh_dispatch_indirect(1));
+        assert!(!mesh_dispatch_indirect(0));
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
