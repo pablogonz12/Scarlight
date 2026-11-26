@@ -1423,9 +1423,9 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
 
 /// One compare of a copy (`find_pieces`): where the copy's bytes are and
 /// its snapshot's, the title address the copy starts at, the offsets
-/// `[from, to)` looked at, the copy's number and whether its snapshot
-/// outlives the submission (`crate::picked`).
-#[derive(Clone, Copy)]
+/// `[from, to)` looked at, the copy's number and, per page of the range,
+/// whether its snapshot piece is one the copy may leave out
+/// (`crate::picked`; `None`: every page is compared).
 struct Scan {
     data: usize,
     before: usize,
@@ -1433,13 +1433,13 @@ struct Scan {
     from: usize,
     to: usize,
     id: u64,
-    keep: bool,
+    baseline: Option<Vec<bool>>,
 }
 
 impl Scan {
     /// A range whose snapshot is gone: nothing to compare.
     fn none() -> Scan {
-        Scan { data: 0, before: 0, start: 0, from: 0, to: 0, id: 0, keep: false }
+        Scan { data: 0, before: 0, start: 0, from: 0, to: 0, id: 0, baseline: None }
     }
 }
 
@@ -1462,7 +1462,7 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
                     from,
                     to,
                     id: shadow.id(),
-                    keep: crate::picked::on() && shadow.baseline_kept(),
+                    baseline: if crate::picked::on() { shadow.baseline_pages(from, to) } else { None },
                 },
                 None => Scan::none(),
             }
@@ -1523,12 +1523,16 @@ fn find_pieces(scans: Vec<Scan>) -> Vec<Vec<(usize, usize)>> {
         }));
     };
     let count = scans.len();
+    // This compare's turn: the same for every span of it, so that a copy
+    // with several spans in one submission is covered by the sweep
+    // (`crate::picked`).
+    let turn = crate::picked::next_turn();
     for (which, scan) in scans.iter().enumerate() {
         let (data, before, start) = (scan.data, scan.before, scan.start);
         // The spans of the range this look examines (`crate::picked`), or
         // the range whole.
         let mut place = 0;
-        for (from, to) in crate::picked::spans(scan.id, start, scan.from, scan.to, scan.keep) {
+        for (from, to) in crate::picked::spans(turn, scan.id, start, scan.from, scan.to, scan.baseline.as_deref()) {
             let mut at = from;
             while at < to {
                 // Cut where pieces end, so that every job sees whole pieces.
@@ -1658,7 +1662,7 @@ mod wide_tests {
             *byte ^= 0x01;
         }
         let (data, before) = (now.as_ptr() as usize, old.as_ptr() as usize);
-        let scan = |start: usize, from: usize, to: usize| Scan { data, before, start, from, to, id: 0, keep: false };
+        let scan = |start: usize, from: usize, to: usize| Scan { data, before, start, from, to, id: 0, baseline: None };
         let mut scans = Vec::new();
         let mut wanted = Vec::new();
         for start in [0usize, 4096, PIECE - 16, 0xd_b790_df00] {
@@ -2114,13 +2118,38 @@ impl Shadow {
         self.id
     }
 
-    /// Whether the snapshot is kept from one submission to the next
-    /// ([`keeps`]), its pieces taken again only where something changed the
-    /// copy: only then may a compare leave pages out and find them later
-    /// (`crate::picked`), a page's difference outliving the submission that
-    /// left it out.
-    pub(crate) fn baseline_kept(&self) -> bool {
-        keeps() && self.kept.lock().unwrap_or_else(|e| e.into_inner()).1
+    /// Per page of offsets `[from, to)` of the copy, from the range's
+    /// first, whether a compare may leave that page out and find its
+    /// difference later (`crate::picked`): its snapshot piece is kept from
+    /// one submission to the next ([`keeps`]), was taken whole, and has not
+    /// been taken again since — so both the copy's bytes and their
+    /// reference stay as they are until the page's turn comes. `None` where
+    /// nothing may be left out: no kept snapshot, memory not write-watched
+    /// (a refresh copies it whole), or the copy placed in title memory.
+    pub(crate) fn baseline_pages(&self, from: usize, to: usize) -> Option<Vec<bool>> {
+        if !keeps() || self.place.is_some() || self.unwatched() || from >= to {
+            return None;
+        }
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        if !kept.1 || kept.0.is_empty() {
+            return None;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = cut_to_copy(start, end - start, from, to);
+        if from >= to {
+            return None;
+        }
+        let base = start / PAGE;
+        let first = (start + from) / PAGE - base;
+        let last = (start + to - 1) / PAGE - base;
+        let mut out = vec![false; last - first + 1];
+        for page in first..=last {
+            // A page the range holds in part is not left out: the rest of
+            // it belongs to another range.
+            let whole = (base + page) * PAGE >= start + from && (base + page + 1) * PAGE <= start + to;
+            out[page - first] = whole && kept.0.get(page).copied().unwrap_or(false);
+        }
+        Some(out)
     }
 
     /// Offset of a title address from the buffer's start.

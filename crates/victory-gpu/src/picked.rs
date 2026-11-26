@@ -8,20 +8,23 @@
 //! 24 MB. Most of a declared range was not written. Which pages were is
 //! learned from the compares themselves: a page that differed is looked at
 //! again every time, on the ground that a page written once is written
-//! again; of the others, one page in [`SLICE`] is looked at each time, in
-//! turn, so that every page of a range is looked at once in `SLICE` (64)
-//! submissions and nothing stays missed. Ranges of at most [`SMALL`] pages
-//! are compared whole: the rotation would find a change there late for no
-//! saving.
+//! again; of the others, one page in [`slice`] is looked at each time, in
+//! turn, so that every page of a range is looked at once in 64 submissions
+//! and nothing stays missed. The turn is the pass's, not a range's
+//! (`next_turn`): every page of every span of a submission is looked at on
+//! the same rule, so a copy with two spans in one submission covers both.
+//! Ranges of at most [`slice`] pages are compared whole: the rotation would
+//! find a change there late for no saving.
 //!
-//! What is found late is not landed late, and nothing is lost: the compare
-//! reads the copy against its snapshot, and a page left out keeps both as
-//! they were, so the difference is still there when its turn comes and is
+//! What is found late is not landed late, and nothing is lost, as long as
+//! the page's bytes and their reference stay as they are between looks:
+//! the compare reads the copy against its snapshot, and a page left out
+//! keeps both, so the difference is still there when its turn comes and is
 //! then put back into title memory as any other (`Shadow::copy_back`). That
-//! needs the snapshot to outlive the submission: with
-//! `VICTORY_KEEP_SNAPSHOTS=1` it does, and only then is anything left out
-//! (`Shadow::baseline_kept`); a copy whose snapshot is taken anew for each
-//! submission is compared whole, as before.
+//! is why only pages whose snapshot piece is *kept* and current are left
+//! out (`Shadow::baseline_pages`: `VICTORY_KEEP_SNAPSHOTS=1`, a piece
+//! taken whole and not taken again since), and why unwatched memory, which
+//! a refresh copies whole, is never left out.
 //!
 //! The idea, the rotation and the numbers are
 //! avatarmanz/VIctory-7900XTX's (`VICTORY_PICKED_WRITES`, 69 -> 6 ms of
@@ -46,8 +49,7 @@ fn slice() -> usize {
 
 /// A range of at most this many pages is compared whole.
 fn small() -> usize {
-    static SMALL: OnceLock<usize> = OnceLock::new();
-    *SMALL.get_or_init(|| slice().max(1))
+    slice().max(1)
 }
 
 /// Whether picked writes are on. Off unless `VICTORY_PICKED_WRITES=1`.
@@ -59,103 +61,83 @@ pub(crate) fn on() -> bool {
         }
         if !std::env::var_os("VICTORY_KEEP_SNAPSHOTS").is_some_and(|v| v == "1") {
             tracing::warn!(
-                "VICTORY_PICKED_WRITES=1 needs VICTORY_KEEP_SNAPSHOTS=1 (the snapshot must outlive the submission, or a page \
-                 left out is lost); every declared range is compared whole"
+                "VICTORY_PICKED_WRITES=1 needs VICTORY_KEEP_SNAPSHOTS=1 (a page left out is only found again if \
+                 its snapshot piece is kept and current); every declared range is compared whole"
             );
         }
         true
     })
 }
 
-/// Since the last frame-rate line: pages compared and pages left out (zero
-/// when nothing is picked).
+/// Since the last frame-rate line: bytes compared and bytes left out.
 static COUNTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// What the picked compares did since the last line, for the frame line.
 pub(crate) fn log(frames: f64) {
-    let c: Vec<f64> = COUNTS.iter().map(|c| c.swap(0, Relaxed) as f64 / frames).collect();
+    let c: Vec<f64> = COUNTS.iter().map(|c| c.swap(0, Relaxed) as f64 / frames / (1 << 20) as f64).collect();
     if c.iter().all(|&v| v == 0.0) {
         return;
     }
-    tracing::info!("pages compared per frame: {:.1} of {} looked at (picked writes)", c[0], c[1]);
+    tracing::info!("compared per frame with picked writes: {:.1} MB of {:.1} MB declared", c[0], c[0] + c[1]);
 }
 
-/// The pages a copy's compares look at, learned as they find: over the
-/// pages of one copy, counted from the copy's first page.
+/// The pass's turn: one per compare of a submission's ranges, the same for
+/// every span of it (see [`spans`]).
+pub(crate) fn next_turn() -> u64 {
+    static TURN: AtomicU64 = AtomicU64::new(0);
+    TURN.fetch_add(1, Relaxed)
+}
+
+/// The pages a copy's compares have found written: looked at every time
+/// from then on, counted from the copy's first page.
 #[derive(Default)]
-struct Sweep {
-    /// Pages a compare found written: looked at every time.
+struct Learned {
     learned: BTreeSet<usize>,
-    /// How many looks it has had: the page examined this time is the one
-    /// whose number is the turn's, modulo [`slice`].
-    turn: u64,
 }
 
-impl Sweep {
-    fn examines(&self, page: usize, turn: u64) -> bool {
-        self.learned.contains(&page) || page % slice() == (turn as usize) % slice()
-    }
-}
-
-/// Copies with a set, and their bounds.
-static SETS: Mutex<BTreeMap<u64, Sweep>> = Mutex::new(BTreeMap::new());
+/// Copies with a set.
+static SETS: Mutex<BTreeMap<u64, Learned>> = Mutex::new(BTreeMap::new());
 
 /// At most this many copies keep a set (the world has a few hundred live).
 const KEPT: usize = 4096;
 
 /// The offsets of a copy of title memory from `start` (`id` is the copy's,
-/// [`crate::shadow::Shadow::id`]) that its compare examines this time: the
+/// [`crate::shadow::Shadow::id`]) that its compare examines on `turn`: the
 /// pages the shaders wrote so far and this turn's page in [`slice`], of
 /// `[from, to)`.
 ///
-/// `[from, to)` whole where nothing is picked, where the range is small,
-/// and where the caller says the copy's snapshot does not outlive the
-/// submission (`keep`: [`crate::shadow::Shadow::baseline_kept`]).
-pub(crate) fn spans(id: u64, start: usize, from: usize, to: usize, keep: bool) -> Vec<(usize, usize)> {
-    spans_on(on(), id, start, from, to, keep)
-}
-
-/// [`spans`], with the switch given: what the tests of the rule use, so
-/// that they run whatever the environment says.
-fn spans_on(picked: bool, id: u64, start: usize, from: usize, to: usize, keep: bool) -> Vec<(usize, usize)> {
+/// `[from, to)` whole where `baseline` is `None` (nothing picked, a range
+/// too small for the rotation), and where a page's snapshot piece is not
+/// one the copy may leave out: `baseline` holds that per page of the range,
+/// from its first, as [`crate::shadow::Shadow::baseline_pages`] gives it.
+pub(crate) fn spans(
+    turn: u64,
+    id: u64,
+    start: usize,
+    from: usize,
+    to: usize,
+    baseline: Option<&[bool]>,
+) -> Vec<(usize, usize)> {
     if from >= to {
         return Vec::new();
     }
     let base = start / PAGE;
     let first = (start + from) / PAGE - base;
     let last = (start + to - 1) / PAGE - base;
-    if !picked || !keep || last - first < small() {
-        COUNTS[0].fetch_add((to - from) as u64, Relaxed);
-        return vec![(from, to)];
-    }
-    let turn = {
-        let mut sets = SETS.lock().unwrap_or_else(|e| e.into_inner());
-        if sets.len() >= KEPT && !sets.contains_key(&id) {
-            sets.clear();
+    let skip = match baseline {
+        Some(baseline) if last - first >= small() && baseline.len() == last - first + 1 => baseline,
+        _ => {
+            COUNTS[0].fetch_add((to - from) as u64, Relaxed);
+            return vec![(from, to)];
         }
-        let sweep = sets.entry(id).or_default();
-        let turn = sweep.turn;
-        sweep.turn = turn.wrapping_add(1);
-        turn
     };
-    spans_turn(turn, id, base, start, from, to)
-}
-
-/// [`spans_on`] of a turn given rather than taken: the looks of a copy in
-/// the order a sweep runs them (the tests and the benchmark take them so).
-fn spans_turn(turn: u64, id: u64, base: usize, start: usize, from: usize, to: usize) -> Vec<(usize, usize)> {
-    let first = (start + from) / PAGE - base;
-    let last = (start + to - 1) / PAGE - base;
-    let exams: Vec<bool> = {
-        let sets = SETS.lock().unwrap_or_else(|e| e.into_inner());
-        // (A copy no compare has had yet, or whose set went with the
-        // table's clear: nothing learned, its turn's page only.)
-        let exams = |page: usize| match sets.get(&id) {
-            Some(sweep) => sweep.examines(page, turn),
-            None => page % slice() == (turn as usize) % slice(),
-        };
-        (first..=last).map(exams).collect()
-    };
+    let exams: Vec<bool> = (first..=last)
+        .map(|page| {
+            let learned = SETS.lock().unwrap_or_else(|e| e.into_inner()).get(&id).is_some_and(|s| s.learned.contains(&page));
+            // (A page whose snapshot piece is not current is never left out.)
+            !skip[page - first] || learned || page % slice() == (turn as usize) % slice()
+        })
+        .collect();
     let mut out: Vec<(usize, usize)> = Vec::new();
     let mut run: Option<(usize, usize)> = None;
     for (page, &examined) in (first..=last).zip(&exams) {
@@ -185,19 +167,15 @@ fn spans_turn(turn: u64, id: u64, base: usize, start: usize, from: usize, to: us
 /// The pages of the copy from `start` that the pieces `[at, at + n)` of
 /// `found` hold are learned: they are compared every time from now on.
 pub(crate) fn found(id: u64, start: usize, found: &[(usize, usize)]) {
-    found_on(on(), id, start, found);
-}
-
-/// [`found`], with the switch given (see [`spans_on`]).
-fn found_on(picked: bool, id: u64, start: usize, found: &[(usize, usize)]) {
-    if !picked || found.is_empty() {
+    if found.is_empty() {
         return;
     }
     let base = start / PAGE;
     let mut sets = SETS.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(sweep) = sets.get_mut(&id) else {
-        return;
-    };
+    if sets.len() >= KEPT && !sets.contains_key(&id) {
+        sets.clear();
+    }
+    let sweep = sets.entry(id).or_default();
     for &(at, n) in found {
         if n == 0 {
             continue;
@@ -216,7 +194,7 @@ pub(crate) fn forget(id: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{PAGE, found_on, slice, spans_on};
+    use super::{PAGE, found, slice, spans};
     use std::collections::BTreeSet;
 
     /// A deterministic stand-in for a random number generator (no crate of
@@ -234,13 +212,22 @@ mod tests {
         }
     }
 
-    /// One look of a copy of title memory from `start`: `changed` are the
-    /// numbers (`address / PAGE`) of the pages that differ from the
-    /// snapshot. Returns the changed pages this look found, and learns them
-    /// as the compare does (`found` is told the pieces that differ).
-    fn look(id: u64, start: usize, from: usize, to: usize, keep: bool, changed: &BTreeSet<usize>) -> BTreeSet<usize> {
+    /// One look of a copy of title memory from `start` on `turn`: `changed`
+    /// are the numbers (`address / PAGE`) of the pages that differ from the
+    /// snapshot, `baseline` which pages may be left out. Returns the changed
+    /// pages found, and learns them as the compare does (`found` is told
+    /// the pieces that differ).
+    fn look(
+        turn: u64,
+        id: u64,
+        start: usize,
+        from: usize,
+        to: usize,
+        baseline: Option<&[bool]>,
+        changed: &BTreeSet<usize>,
+    ) -> BTreeSet<usize> {
         let mut out = BTreeSet::new();
-        for (a, e) in spans_on(true, id, start, from, to, keep) {
+        for (a, e) in spans(turn, id, start, from, to, baseline) {
             let pieces: Vec<(usize, usize)> = changed
                 .iter()
                 .copied()
@@ -248,7 +235,7 @@ mod tests {
                 .map(|page| (page * PAGE - start, PAGE))
                 .collect();
             out.extend(pieces.iter().map(|&(at, _)| (start + at) / PAGE));
-            found_on(true, id, start, &pieces);
+            found(id, start, &pieces);
         }
         out
     }
@@ -268,13 +255,14 @@ mod tests {
                 changed.insert(start / PAGE + rng.below(pages));
             }
             // The whole scan: one look, every changed page.
-            let whole = look(2000 + case, start, from, to, false, &changed);
+            let whole = look(0, 2000 + case, start, from, to, None, &changed);
             assert_eq!(whole, changed, "{case}: a whole scan finds every changed page");
             // The picked path: look after look.
+            let allowed = vec![true; pages];
             let id = 3000 + case;
             let mut picked = BTreeSet::new();
-            for _ in 0..slice() + 1 {
-                picked.extend(look(id, start, from, to, true, &changed));
+            for turn in 0..slice() + 1 {
+                picked.extend(look(turn as u64, id, start, from, to, Some(&allowed), &changed));
             }
             assert_eq!(picked, whole, "{case}: {pages} pages");
         }
@@ -286,37 +274,51 @@ mod tests {
     fn a_page_left_out_is_found_on_its_turn() {
         let start = 0x2_0000;
         let pages = slice() * 4;
+        let allowed = vec![true; pages];
         let mut changed = BTreeSet::new();
         changed.insert(start / PAGE + pages - 1);
         let mut seen = BTreeSet::new();
         for turn in 0..slice() {
-            let found = look(7, start, 0, pages * PAGE, true, &changed);
+            let found = look(turn as u64, 7, start, 0, pages * PAGE, Some(&allowed), &changed);
             assert!(found.is_empty() || found == changed, "{turn}: nothing but the page changed");
             seen.extend(found);
         }
         assert_eq!(seen, changed, "the last page is found within a sweep");
     }
 
-    /// Where the snapshot does not outlive the submission, every byte of
-    /// the range is compared, as without the switch; and a small range is
-    /// whole whatever the baseline.
+    /// Where nothing is picked, or the range is small, every byte of it is
+    /// compared, as without the switch; and a page the copy may not leave
+    /// out (its snapshot piece is not current) is looked at every time.
     #[test]
-    fn without_a_kept_snapshot_the_range_is_compared_whole() {
+    fn a_page_that_may_not_be_left_out_is_looked_at_every_time() {
         let start = 0x3_0000;
-        let to = slice() * 8 * PAGE;
-        assert_eq!(spans_on(true, 11, start, 0, to, false), vec![(0, to)]);
-        assert_eq!(spans_on(true, 12, start, 0, slice() * PAGE, true), vec![(0, slice() * PAGE)]);
+        let pages = slice() * 8;
+        let to = pages * PAGE;
+        assert_eq!(spans(0, 11, start, 0, to, None), vec![(0, to)]);
+        let allowed = vec![true; slice()];
+        assert_eq!(spans(0, 12, start, 0, slice() * PAGE, Some(&allowed)), vec![(0, slice() * PAGE)]);
+        // One page among many may not be left out: it is compared on every
+        // turn, the others by rotation.
+        let mut baseline = vec![true; pages];
+        baseline[5] = false;
+        for turn in 0..4u64 {
+            let looked = spans(turn, 13, start, 0, to, Some(&baseline));
+            let covers = |at: usize| looked.iter().any(|&(a, e)| a <= at && at < e);
+            assert!(covers(5 * PAGE), "{turn}: page 5 is compared every time");
+        }
     }
 
     /// The spans are of the range, in order, never overlapping; over a
-    /// sweep they cover it.
+    /// sweep they cover it — also when a copy has two spans in one look,
+    /// which share the pass's turn: each span covers its own pages over the
+    /// same turns, so no page is left out for good.
     #[test]
     fn the_spans_are_of_the_range_and_cover_it_over_a_sweep() {
         let start = 0x10_0000;
         let to = slice() * 3 * PAGE;
         let mut covered = vec![false; to];
-        for _ in 0..slice() {
-            let looked = spans_on(true, 13, start, PAGE, to, true);
+        for turn in 0..slice() {
+            let looked = spans(turn as u64, 14, start, PAGE, to, Some(&vec![true; to / PAGE]));
             assert!(!looked.is_empty());
             let mut at = PAGE;
             for (a, e) in looked {
@@ -328,76 +330,84 @@ mod tests {
             }
         }
         assert!(covered[PAGE..].iter().all(|&c| c), "every byte gets its turn");
-        assert_eq!(spans_on(true, 14, start, PAGE, PAGE, true), Vec::new(), "an empty range");
-    }
-}
+        assert_eq!(spans(0, 15, start, PAGE, PAGE, Some(&[true])), Vec::new(), "an empty range");
 
-/// What the compare of 4,096 pages (256 MB) costs whole and picked, with
-/// one page in 64 of them changed (the frame the switch is for: a declared
-/// range whose shaders set a few words). The picked path is the spans and
-/// the compares they leave out, as `find_pieces` runs them.
-///
-/// `cargo test --release -p victory-gpu --lib compare_of_4k_pages -- --nocapture`
-#[test]
-fn compare_of_4k_pages_whole_and_picked() {
-    use std::time::Instant;
-    let pages = 4096;
-    let len = pages * PAGE;
-    // The copy and its snapshot, page 0 of the run's title memory.
-    let start = 0x1_0000_0000usize;
-    let mut data = vec![0xa5u8; len];
-    let before = vec![0xa5u8; len];
-    // 1 page in 64 changed, as the shaders of a frame leave it.
-    let changed: Vec<usize> = (0..pages).filter(|page| page % 64 == 37).collect();
-    for &page in &changed {
-        for byte in &mut data[page * PAGE..(page + 1) * PAGE] {
-            *byte ^= 0x01;
-        }
-    }
-    // Whole: every page compared, as `find_pieces` does without the switch.
-    let whole = |data: &[u8], before: &[u8]| -> Vec<(usize, usize)> {
-        let mut pieces = Vec::new();
-        for page in 0..pages {
-            let (at, n) = (page * PAGE, PAGE);
-            if data[at..at + n] != before[at..at + n] {
-                pieces.push((at, n));
+        // Two spans of one copy in one submission (a `hand_back_now` work
+        // item each), the same turn: every page of both is looked at over
+        // the sweep.
+        let pages = slice() * 4;
+        let all = vec![true; pages * 2];
+        let mut seen = vec![false; pages * 2];
+        for turn in 0..slice() as u64 {
+            for (from, to) in [(0usize, pages * PAGE), (pages * PAGE, pages * 2 * PAGE)] {
+                for (a, e) in spans(turn, 16, start, from, to, Some(&all[from / PAGE..to / PAGE])) {
+                    let first = a / PAGE;
+                    let last = (e - 1) / PAGE;
+                    for page in first..=last {
+                        seen[page] = true;
+                    }
+                }
             }
         }
-        pieces
-    };
-    // Picked: the spans of a look, and only those pages compared.
-    let picked = |turn: u64, data: &[u8], before: &[u8]| -> Vec<(usize, usize)> {
-        let mut pieces = Vec::new();
-        // (The pages of the copy, counted from its first: 0..pages.)
-        for (a, e) in spans_turn(turn, 1, start / PAGE, start, 0, len) {
-            let mut at = a;
-            while at < e {
-                let n = (PAGE - (start + at) % PAGE).min(e - at);
+        assert!(seen.iter().all(|&s| s), "both spans are covered over a sweep");
+    }
+
+    /// What the compare of 4,096 pages (256 MB) costs whole and picked,
+    /// with one page in 64 of them changed (the frame the switch is for).
+    ///
+    /// `cargo test --release -p victory-gpu --lib compare_of_4k_pages -- --nocapture`
+    #[test]
+    fn compare_of_4k_pages_whole_and_picked() {
+        use std::time::Instant;
+        let pages = 4096;
+        let len = pages * PAGE;
+        let start = 0x1_0000_0000usize;
+        let mut data = vec![0xa5u8; len];
+        let before = vec![0xa5u8; len];
+        // 1 page in 64 changed, as the shaders of a frame leave it.
+        let changed: Vec<usize> = (0..pages).filter(|page| page % 64 == 37).collect();
+        for &page in &changed {
+            for byte in &mut data[page * PAGE..(page + 1) * PAGE] {
+                *byte ^= 0x01;
+            }
+        }
+        let whole = |data: &[u8], before: &[u8]| -> Vec<(usize, usize)> {
+            let mut pieces = Vec::new();
+            for page in 0..pages {
+                let (at, n) = (page * PAGE, PAGE);
                 if data[at..at + n] != before[at..at + n] {
                     pieces.push((at, n));
                 }
-                at += n;
             }
-        }
-        pieces
-    };
-    let time = |mut f: Box<dyn FnMut()>| {
-        let started = Instant::now();
-        for _ in 0..4 {
+            pieces
+        };
+        let picked = |turn: u64, data: &[u8], before: &[u8], baseline: &[bool]| -> Vec<(usize, usize)> {
+            let mut pieces = Vec::new();
+            for (a, e) in spans(turn, 1, start, 0, len, Some(baseline)) {
+                let mut at = a;
+                while at < e {
+                    let n = (PAGE - (start + at) % PAGE).min(e - at);
+                    if data[at..at + n] != before[at..at + n] {
+                        pieces.push((at, n));
+                    }
+                    at += n;
+                }
+            }
+            pieces
+        };
+        let time = |f: &mut dyn FnMut()| {
+            let started = Instant::now();
             f();
-        }
-        started.elapsed() / 4
-    };
-    let mut whole_found = Vec::new();
-    let whole_us = time(Box::new(|| whole_found = whole(&data, &before)));
-    let mut picked_found = Vec::new();
-    // The look whose turn's pages are the changed ones (page 37 in 64):
-    // it compares them and nothing else.
-    let picked_us = time(Box::new(|| picked_found = picked(37, &data, &before)));
-    assert_eq!(whole_found.len(), changed.len(), "a whole scan finds them all");
-    assert_eq!(picked_found.len(), changed.len(), "the look of their turn finds them all");
-    eprintln!(
-        "4,096 pages, {} changed: whole {whole_us:?}, picked {picked_us:?}",
-        changed.len()
-    );
+            started.elapsed()
+        };
+        let baseline = vec![true; pages];
+        let mut whole_found = Vec::new();
+        let whole_us = time(&mut || whole_found = whole(&data, &before));
+        let mut picked_found = Vec::new();
+        // The look whose turn's pages are the changed ones (page 37 in 64).
+        let picked_us = time(&mut || picked_found = picked(37, &data, &before, &baseline));
+        assert_eq!(whole_found.len(), changed.len(), "a whole scan finds them all");
+        assert_eq!(picked_found.len(), changed.len(), "the look of their turn finds them all");
+        eprintln!("4,096 pages, {} changed: whole {whole_us:?}, picked {picked_us:?}", changed.len());
+    }
 }
