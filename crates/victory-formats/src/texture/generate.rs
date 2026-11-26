@@ -57,12 +57,19 @@ fn table<'a>(header: &'a str, name: &str) -> Result<Vec<(Vec<&'a str>, &'a str)>
         .find(&format!(" {name}[]"))
         .ok_or_else(|| format!("no table {name}"))?;
     let body = &header[start..];
+    // A checkout with CRLF line endings writes `=\r\n{`: the body starts at
+    // the brace whatever lies before it, and `lines` with `trim` drops the
+    // carriage returns of the rows.
     let open = body
-        .find("=\n{")
-        .ok_or_else(|| format!("{name}: no body"))?;
-    let end = body.find("\n};").ok_or_else(|| format!("{name}: no end"))?;
+        .find("={")
+        .ok_or_else(|| format!("{name}: no body"))?
+        + 2;
+    let end = body[open..]
+        .find("\n};")
+        .map(|end| end + open)
+        .ok_or_else(|| format!("{name}: no end"))?;
     let mut rows = vec![];
-    for line in body[open + 3..end].lines() {
+    for line in body[open..end].lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
