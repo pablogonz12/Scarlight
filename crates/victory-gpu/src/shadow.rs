@@ -188,16 +188,26 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
 }
 
 /// Resolve `(min_bytes, max_bytes)` from the adapter's local VRAM budget and
-/// optional explicit MiB overrides from `VICTORY_CARD_BUFFERS_MIN_MB` /
-/// `VICTORY_CARD_BUFFERS_MB`.
+/// optional explicit overrides: `VICTORY_CARD_BUFFERS_MIN_MB` (or the finer
+/// `VICTORY_CARD_BUFFERS_MIN_KB`) and `VICTORY_CARD_BUFFERS_MB`.
 fn resolve_card_limits(
     local_vram_budget: Option<u64>,
     min_mb_override: Option<u64>,
+    min_kb_override: Option<u64>,
     max_mb_override: Option<u64>,
 ) -> (u64, u64) {
     const MIB: u64 = 1 << 20;
+    const KIB: u64 = 1 << 10;
     let (default_min_mb, default_max_mb) = default_card_limits_mb(local_vram_budget);
-    let min_bytes = min_mb_override.unwrap_or(default_min_mb).saturating_mul(MIB).max(MIB);
+    // A floor of a MiB is not a floor of the copies: nearly all of them are
+    // smaller (few bytes each), and in the PC's memory every load, store and
+    // atomic a shader does on one crosses the bus. MIN_KB says the least in
+    // KiB, so that 64 puts every title buffer's copy on the card (after
+    // fxceless c36971b2); unset, the floor is the one of before.
+    let min_bytes = match (min_kb_override, min_mb_override) {
+        (Some(kib), _) => kib.saturating_mul(KIB),
+        (None, mb) => mb.unwrap_or(default_min_mb).saturating_mul(MIB).max(MIB),
+    };
     let max_bytes = max_mb_override.unwrap_or(default_max_mb).saturating_mul(MIB);
     (min_bytes, max_bytes)
 }
@@ -205,7 +215,8 @@ fn resolve_card_limits(
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB`.
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (or `VICTORY_CARD_BUFFERS_MIN_KB`, which
+/// can go under a MiB) and `VICTORY_CARD_BUFFERS_MB`.
 /// Defaults scale with the adapter's local VRAM budget (1 MiB / 1024 MB on
 /// `<= 12 GiB` budgets, 1 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
 /// on `>= 20 GiB` budgets), and explicit env vars always override. Both are
@@ -225,11 +236,12 @@ fn card_limits() -> (u64, u64) {
         let (min_bytes, max_bytes) = resolve_card_limits(
             vram_budget,
             env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
+            env_mb("VICTORY_CARD_BUFFERS_MIN_KB"),
             env_mb("VICTORY_CARD_BUFFERS_MB"),
         );
         tracing::info!(
             vram_budget_mb = vram_budget.map(|b| b >> 20),
-            card_buffers_min_mb = min_bytes >> 20,
+            card_buffers_min_kb = min_bytes >> 10,
             card_buffers_max_mb = max_bytes >> 20,
             "card buffer limits"
         );
@@ -2234,6 +2246,9 @@ impl Shadow {
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
+        // Before the snapshot's bytes are read: a remap this does not see
+        // stays marked, so the copy-back leaves those bytes alone.
+        let generation = crate::watch::remap_generation();
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
         if keeps() {
@@ -2252,10 +2267,15 @@ impl Shadow {
                     continue;
                 }
                 for piece in self.pieces(from, to) {
-                    if kept.0[piece] {
-                        continue;
-                    }
                     let (lo, hi) = self.piece(piece);
+                    if kept.0[piece] {
+                        // Kept until the runtime unmapped or remapped the
+                        // block: what is there now is not what was kept.
+                        if !crate::watch::remapped_any(self.start as usize + lo, hi - lo) {
+                            continue;
+                        }
+                        kept.0[piece] = false;
+                    }
                     let whole = from <= lo && hi <= to;
                     let (lo, hi) = (lo.max(from), hi.min(to));
                     // SAFETY: as below; `hi <= total`.
@@ -2263,9 +2283,17 @@ impl Shadow {
                         std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
                     }
                     kept.0[piece] = whole;
+                    crate::watch::remapped_taken(generation, self.start as usize + lo, hi - lo);
                 }
             }
             return;
+        }
+        // The parts' bytes are taken afresh: a remapping before them is in
+        // the snapshot now, so a copy-back may put the GPU's bytes back.
+        for &(from, to) in &parts {
+            if from < to {
+                crate::watch::remapped_taken(generation, self.start as usize + from, to - from);
+            }
         }
         if wide_back() {
             // Noted, and taken with the submission's other snapshots when
@@ -2349,6 +2377,14 @@ impl Shadow {
                 self.changed(at, at + n);
             }
             let mut title = vec![0u8; PIECE];
+            // The runtime's remapping is held off from each test to the last
+            // byte written, once for this copy-back and not once a piece: a
+            // remap already under way is waited for 2 ms only, since it may
+            // itself be waiting for the blocks this copy-back's job holds.
+            // The writes go on as before without the reading. Nothing
+            // differing means nothing to read or write: no guard asked for.
+            let _reading = (!differing.is_empty())
+                .then(|| crate::watch::title_memory_reading_within(std::time::Duration::from_millis(2)));
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
@@ -2396,9 +2432,25 @@ impl Shadow {
                 let held = unsafe { std::slice::from_raw_parts_mut(base.add(at), n) };
                 let differs = merge_back(host, held, title);
                 if differs {
-                    crate::watch::writing(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                    written += n;
+                    // Only the bytes the runtime did not unmap or remap
+                    // while the submission was pending: what it shows there
+                    // is someone else's now, so the copy's bytes stay out
+                    // (FIND-14).
+                    let base = start + at;
+                    if !crate::watch::remapped_any(base, n) {
+                        crate::watch::writing(base, n);
+                        crate::host::write_mapped(base as *mut u8, title.as_ptr(), n);
+                        written += n;
+                    } else {
+                        for (from, to) in crate::watch::unremapped_runs(base, n) {
+                            let (at, n) = (from - base, to - from);
+                            crate::watch::writing(from, n);
+                            // SAFETY: `at` is inside the bytes merged above.
+                            let bytes = unsafe { title.as_ptr().add(at) };
+                            crate::host::write_mapped(from as *mut u8, bytes, n);
+                            written += n;
+                        }
+                    }
                 }
             }
             // Our write shows as a title write at the copy's next refresh,
@@ -3598,10 +3650,17 @@ mod window_tests {
         assert_eq!(default_card_limits_mb(Some(48 * GIB)), (1, 8192));
 
         // Explicit env overrides always win, clamp min to >= 1 MiB, and saturate on overflow.
-        assert_eq!(resolve_card_limits(Some(32 * GIB), Some(8), Some(4096)), (8 * MIB, 4096 * MIB));
-        assert_eq!(resolve_card_limits(Some(12 * GIB), Some(0), Some(1024)), (MIB, 1024 * MIB));
-        assert_eq!(resolve_card_limits(None, Some(u64::MAX), Some(u64::MAX)), (u64::MAX, u64::MAX));
-        assert_eq!(resolve_card_limits(None, None, None), (MIB, 1024 * MIB));
+        assert_eq!(resolve_card_limits(Some(32 * GIB), Some(8), None, Some(4096)), (8 * MIB, 4096 * MIB));
+        assert_eq!(resolve_card_limits(Some(12 * GIB), Some(0), None, Some(1024)), (MIB, 1024 * MIB));
+        assert_eq!(resolve_card_limits(None, Some(u64::MAX), None, Some(u64::MAX)), (u64::MAX, u64::MAX));
+        assert_eq!(resolve_card_limits(None, None, None, None), (MIB, 1024 * MIB));
+        // MIN_KB goes under the MiB the MiB switch cannot: 64 KiB puts every
+        // title buffer's copy on the card, 0 has none at all, and it wins
+        // over MIN_MB when both are set.
+        assert_eq!(resolve_card_limits(None, None, Some(64), None), (64 << 10, 1024 * MIB));
+        assert_eq!(resolve_card_limits(None, None, Some(0), None), (0, 1024 * MIB));
+        assert_eq!(resolve_card_limits(None, Some(8), Some(64), None), (64 << 10, 1024 * MIB));
+        assert_eq!(resolve_card_limits(None, None, Some(u64::MAX), None), (u64::MAX, 1024 * MIB));
     }
 
     /// An ask that may take any window takes the longest that holds all of
