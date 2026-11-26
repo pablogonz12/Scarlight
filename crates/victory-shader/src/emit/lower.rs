@@ -308,6 +308,8 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
+    /// Whether the exchange pair was zeroed in the entry block ([`Self::zero_exchange_pair`]).
+    wide_zeroed: bool,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
@@ -1608,6 +1610,7 @@ impl<'a> Lower<'a> {
             all_group,
             clane: None,
             pair: None,
+            wide_zeroed: false,
             halves,
             wave_base: None,
             flat: None,
@@ -2254,6 +2257,7 @@ impl<'a> Lower<'a> {
         if halves {
             // two host waves of 32 hold the console's 64 lanes: the second half's sum is
             // read where the first holds it and added (the exchange of [`Self::half_sum`]).
+            self.zero_exchange_pair();
             let c = self.cur;
             let bits = self.as_int(total);
             let (lo, hi) = self.exchange_halves(c, bits);
@@ -3840,6 +3844,36 @@ impl<'a> Lower<'a> {
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
+    /// The exchange pair starts at zero: every lane of the group writes its console wave's two
+    /// dwords in the entry block, before any lane is masked off, and a barrier there orders
+    /// them for all host waves of the group. The widened sum ([`Self::half_sum_wide`]) folds
+    /// in both halves' sums, but a half whose lanes all run elsewhere (a host wave that
+    /// branches over the region) writes nothing, and its dword would otherwise be read as
+    /// whatever the workgroup's LDS held there: WARP leaves such a slot zero, a card leaves
+    /// the last dispatch's dwords, so the same sum came out 0x5246 on WARP and 0x5249 on RADV
+    /// (RX 9070 XT, Mesa 26.3.1), differently per run.
+    fn zero_exchange_pair(&mut self) {
+        let Some(&(slot, false, _)) = self.exchange.as_ref() else {
+            return;
+        };
+        if self.local || self.wide_zeroed {
+            return;
+        }
+        self.wide_zeroed = true;
+        let e = self.s.entry;
+        let pair = self.exchange_pair(slot);
+        let zero = self.s.m.i32(0);
+        let lds = self.s.lds();
+        let ptr = self.s.m.element(e, lds, pair);
+        self.s.m.store(e, ptr, zero);
+        let one = self.s.m.i32(1);
+        let next = self.s.m.bin(e, Bin::Add, pair, one);
+        let ptr = self.s.m.element(e, lds, next);
+        self.s.m.store(e, ptr, zero);
+        // every lane of the group runs the entry block
+        self.group_sync(e);
     }
 
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
