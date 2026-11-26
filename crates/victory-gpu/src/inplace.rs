@@ -620,6 +620,9 @@ fn ask_page(rig: &mut Rig, device: &ID3D12Device, base: *mut u8) -> (Health, Str
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
+    // A reservation released whole is no placeholder any more: an address
+    // used again must not be answered from its old table.
+    placeholders_gone(at, len);
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -961,6 +964,22 @@ fn mapped_bytes_in(v: &Views, start: usize, end: usize) -> u64 {
         }
     }
     there
+}
+
+/// Drops the registrations a release of `[at, at + len)` covers whole: an
+/// address used again is not taken for a placeholder. A range of a
+/// reservation being mapped or unmapped (part of it) leaves it registered.
+pub(crate) fn placeholders_gone(at: usize, len: usize) {
+    let end = at.saturating_add(len);
+    let mut map = PLACEHOLDERS.write().unwrap_or_else(|e| e.into_inner());
+    let gone: Vec<usize> = map
+        .range(at..end)
+        .filter(|&(_, &bytes)| (at + bytes) <= end)
+        .map(|(&base, _)| base)
+        .collect();
+    for base in gone {
+        map.remove(&base);
+    }
 }
 
 /// Drops a region's placeholder note and its views (the tests' cleanup).
@@ -1813,6 +1832,22 @@ mod tests {
         assert_eq!(placeholder_mapped_bytes(second_at, len), Some((2 * K64) as u64));
         placeholder_forget(first_at, len);
         placeholder_forget(second_at, len);
+    }
+
+    /// A reservation released whole is forgotten; a part of one being mapped
+    /// or unmapped is not.
+    #[test]
+    fn a_released_placeholder_is_forgotten() {
+        let base = 0x7_0c00_0000usize;
+        let len = 8 * K64;
+        title_memory_placeholder(base, len);
+        assert!(placeholder_range(base, base + len));
+        // Part of it, as the runtime maps and unmaps a block: it stays.
+        placeholders_gone(base, 2 * K64);
+        assert!(placeholder_range(base, base + len));
+        // Whole: an address used again is not answered from the old table.
+        placeholders_gone(base, len);
+        assert!(!placeholder_range(base, base + len));
     }
 
     /// What the runtime forgets when memory is mapped anew.

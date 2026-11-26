@@ -792,6 +792,9 @@ mod tests {
             }
             CloseHandle(section);
         }
+        // The guards' notes of the range go too: the address is the
+        // kernel's again, and another test's allocation is not this one's.
+        remapped(at, blocks * BLOCK);
         crate::inplace::placeholder_forget(at, blocks * BLOCK);
     }
 
