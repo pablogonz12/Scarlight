@@ -363,6 +363,24 @@ pub(crate) fn builder_runs() -> bool {
     true
 }
 
+/// Whether the structure builder was asked for (`VICTORY_BVH_BUILDER=1`):
+/// then the structures the title's rays walk are the title's own, and
+/// [`crate::reflection`] does not act. Not [`builder_runs`]: that makes the
+/// pipelines, which is the builder's own business at its first dispatch.
+#[cfg(windows)]
+pub(crate) fn builder_asked() -> bool {
+    static ASKED: OnceLock<bool> = OnceLock::new();
+    *ASKED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
+/// Whether the structure builder has run whole: from then on the
+/// structures the title's rays walk are built ([`crate::reflection`] stops
+/// acting).
+#[cfg(windows)]
+pub(crate) fn builder_whole() -> bool {
+    BUILDER.lock().unwrap_or_else(|e| e.into_inner()).whole
+}
+
 /// Whether a console program can store to buffer memory: it has a buffer,
 /// typed-buffer, scalar-memory, flat or global store or atomic, or code
 /// that is not all known (an instruction of those kinds outside our table,
@@ -738,6 +756,14 @@ fn subobject(kind: u32) -> Option<(usize, Option<&'static str>)> {
 
 /// Device method: a pipeline from a stream; the shaders are kept, and the
 /// graphics state for the host pipeline.
+/// Whether the guest's integer color targets bypass their blender
+/// (`VICTORY_INTEGER_BLEND_BYPASS=0` turns the fix off).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn integer_blend_bypass() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_INTEGER_BLEND_BYPASS").as_deref() != Ok("0"))
+}
+
 pub(crate) extern "system" fn create_stream(
     _: This,
     desc: *const StreamDesc,
@@ -778,6 +804,10 @@ pub(crate) extern "system" fn create_stream(
         };
         at += size;
     }
+    #[cfg(windows)]
+    if integer_blend_bypass() {
+        graphics.apply_integer_blend_bypass();
+    }
     hand_out(
         shaders,
         #[cfg(windows)]
@@ -812,6 +842,8 @@ mod library;
 mod make;
 #[cfg(windows)]
 mod warm;
+#[cfg(windows)]
+mod wine;
 
 #[cfg(windows)]
 pub use warm::{Report as WarmUpReport, report_shader_caches, warm_up};
