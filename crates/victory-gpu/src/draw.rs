@@ -2662,8 +2662,9 @@ impl State {
             let _ = list.transition(resource, before);
         }
         // The title's own heaps are not those of the clear: the next bind
-        // sets them again.
-        self.host_heaps = [0; 2];
+        // sets them again, and `None` is what a list that has bound
+        // nothing holds.
+        self.host_heaps = None;
         true
     }
 
