@@ -8,7 +8,6 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::resource::RootIndexedView;
@@ -436,40 +435,6 @@ static DRAWN: AtomicU64 = AtomicU64::new(0);
 /// Draws run on the host so far.
 pub(crate) fn drawn() -> u64 {
     DRAWN.load(Ordering::Relaxed)
-}
-
-/// Draws with no vertices or indices, or no instances, skipped before
-/// their state was prepared, since the last call.
-static EMPTY: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) fn take_empty() -> u64 {
-    EMPTY.swap(0, Ordering::Relaxed)
-}
-
-/// Whether a draw of `items` vertices or indices in `instances` instances
-/// draws nothing and is skipped: counted, and returned before its state is
-/// prepared, so it asks for no host pipeline and spends none of the frame's
-/// pipeline wait budget (upstream Marvisak/VIctory #2654).
-/// On by default; `VICTORY_EMPTY_DRAW_SKIP=0` prepares empty draws as before.
-fn empty_draw(items: u32, instances: u32) -> bool {
-    if !empty_draw_with(empty_draw_on(), items, instances) {
-        return false;
-    }
-    EMPTY.fetch_add(1, Ordering::Relaxed);
-    true
-}
-
-/// Whether the skip is on in this process ([`empty_draw`]'s switch), read
-/// once: `VICTORY_EMPTY_DRAW_SKIP=0` prepares empty draws as before.
-fn empty_draw_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_EMPTY_DRAW_SKIP").is_none_or(|v| v != "0"))
-}
-
-/// The decision [`empty_draw`] makes, for a given setting: `on` and the draw
-/// has no work. Pure, so a test can check both settings in one process.
-fn empty_draw_with(on: bool, items: u32, instances: u32) -> bool {
-    on && (items == 0 || instances == 0)
 }
 
 /// The draws traced since the last present (diagnostics builds, with
@@ -1683,8 +1648,6 @@ impl State {
             std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
-        let mut eligible: Vec<(&std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            Vec::with_capacity(spans.len());
         for (shadow, from, to) in spans.values() {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
@@ -1705,10 +1668,8 @@ impl State {
                     }
                 }
             }
-            eligible.push((shadow, *from, *to - *from));
+            shadow.refresh(list, *from, to - from);
         }
-        // All the spans in under one lock of the list: some 4,600 a frame.
-        crate::shadow::Shadow::refresh_many(list, eligible);
         self.heap_textures(list, heap, host);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -2828,11 +2789,6 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
-        // Nothing to draw: preparing it would ask for its host pipeline and
-        // spend the frame's pipeline wait budget on it.
-        if empty_draw(vertices, instances) {
-            return;
-        }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -2973,10 +2929,6 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
-        // As an empty draw: nothing to draw, and no pipeline to ask for.
-        if empty_draw(indices, instances) {
-            return;
-        }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3499,42 +3451,6 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{empty_draw, take_empty};
-
-    /// An empty draw is skipped and counted, a draw with work is not: the
-    /// check sits above the state preparation, so nothing asks for its host
-    /// pipeline (upstream Marvisak/VIctory #2654). The decision is checked
-    /// under both settings of the switch, which this process cannot change.
-    #[test]
-    fn empty_draws_are_skipped_and_counted() {
-        use super::{empty_draw_on, empty_draw_with};
-        let _ = take_empty();
-        for (items, instances) in [(0, 1), (3, 0), (0, 0)] {
-            assert!(
-                empty_draw_with(true, items, instances),
-                "{items} items {instances} instances"
-            );
-            assert!(
-                !empty_draw_with(false, items, instances),
-                "the off switch prepares {items} items {instances} instances"
-            );
-        }
-        assert!(!empty_draw_with(true, 3, 1));
-        assert!(!empty_draw_with(true, 1, 1));
-        // What this process does with the setting it started with.
-        if empty_draw_on() {
-            for (items, instances) in [(0, 1), (3, 0), (0, 0)] {
-                assert!(empty_draw(items, instances), "{items} items {instances} instances");
-            }
-            assert_eq!(take_empty(), 3);
-            assert!(!empty_draw(3, 1));
-            assert!(!empty_draw(1, 1));
-        } else {
-            assert!(!empty_draw(0, 1));
-        }
-        assert_eq!(take_empty(), 0);
-    }
-
     use super::{
         VertexView, expanded_rectangle_vertices_guarded, rectangle_vertex_range_guarded,
         staging_budget_per_frame,
