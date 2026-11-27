@@ -738,14 +738,127 @@ pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size:
 // census needs them to say which view memory is one run of a section (one
 // placed buffer could show it) and which is scattered pages.
 
+/// Views up to this size live in `by_section_small` so one huge view in a
+/// section never widens the range scan for small 64 KiB mappings.
+const SMALL_VIEW_MAX: usize = 256 << 10;
+
 struct Views {
     /// By address: bytes, the section's handle, the offset in it.
     views: BTreeMap<usize, (usize, usize, u64)>,
+    /// Secondary index for small views (`len <= SMALL_VIEW_MAX`), keyed by
+    /// `(section, offset, base)` -> view length in bytes.
+    by_section_small: BTreeMap<(usize, u64, usize), usize>,
+    /// Secondary index for large views (`len > SMALL_VIEW_MAX`), keyed by
+    /// `(section, offset, base)` -> view length in bytes.
+    by_section_large: BTreeMap<(usize, u64, usize), usize>,
+    /// Largest large-view length inserted for each section.
+    large_max_len: BTreeMap<usize, u64>,
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
 }
 
-static VIEWS: RwLock<Views> = RwLock::new(Views { views: BTreeMap::new(), sections: Vec::new() });
+impl Views {
+    fn insert(&mut self, at: usize, len: usize, section: usize, offset: u64) {
+        if let Some((old_len, old_section, old_offset)) = self.views.insert(at, (len, section, offset))
+        {
+            if old_len <= SMALL_VIEW_MAX {
+                self.by_section_small.remove(&(old_section, old_offset, at));
+            } else {
+                self.by_section_large.remove(&(old_section, old_offset, at));
+            }
+        }
+        if len <= SMALL_VIEW_MAX {
+            self.by_section_small.insert((section, offset, at), len);
+        } else {
+            self.by_section_large.insert((section, offset, at), len);
+            let max = self.large_max_len.entry(section).or_insert(0);
+            if (len as u64) > *max {
+                *max = len as u64;
+            }
+        }
+    }
+
+    fn remove(&mut self, base: usize) {
+        if let Some((len, section, offset)) = self.views.remove(&base) {
+            if len <= SMALL_VIEW_MAX {
+                self.by_section_small.remove(&(section, offset, base));
+            } else {
+                self.by_section_large.remove(&(section, offset, base));
+            }
+        }
+    }
+
+    /// The views of `section` that show any of the bytes `[offset, offset + len)`,
+    /// other than the view at `at` itself. O(log N + k) via `by_section_small`
+    /// and `by_section_large`.
+    fn beside(&self, at: usize, section: usize, offset: u64, len: usize) -> Vec<(usize, usize)> {
+        let end = offset.saturating_add(len as u64);
+        if end <= offset {
+            return Vec::new();
+        }
+        let lo_small = offset.saturating_sub(SMALL_VIEW_MAX as u64);
+        let mut out: Vec<(usize, usize)> = self
+            .by_section_small
+            .range((section, lo_small, 0)..(section, end, 0))
+            .filter_map(|(&(_, o, base), &bytes)| {
+                (base != at && o < end && offset < o.saturating_add(bytes as u64))
+                    .then_some((base, bytes))
+            })
+            .collect();
+        if let Some(&large_max) = self.large_max_len.get(&section) {
+            let lo_large = offset.saturating_sub(large_max);
+            out.extend(
+                self.by_section_large
+                    .range((section, lo_large, 0)..(section, end, 0))
+                    .filter_map(|(&(_, o, base), &bytes)| {
+                        (base != at && o < end && offset < o.saturating_add(bytes as u64))
+                            .then_some((base, bytes))
+                    }),
+            );
+        }
+        out
+    }
+
+    /// Zero-allocation check whether any view of `section` other than `at`
+    /// overlaps `[offset, offset + len)`.
+    fn has_beside(&self, at: usize, section: usize, offset: u64, len: usize) -> bool {
+        let end = offset.saturating_add(len as u64);
+        if end <= offset {
+            return false;
+        }
+        let lo_small = offset.saturating_sub(SMALL_VIEW_MAX as u64);
+        if self
+            .by_section_small
+            .range((section, lo_small, 0)..(section, end, 0))
+            .any(|(&(_, o, base), &bytes)| {
+                base != at && o < end && offset < o.saturating_add(bytes as u64)
+            })
+        {
+            return true;
+        }
+        if let Some(&large_max) = self.large_max_len.get(&section) {
+            let lo_large = offset.saturating_sub(large_max);
+            if self
+                .by_section_large
+                .range((section, lo_large, 0)..(section, end, 0))
+                .any(|(&(_, o, base), &bytes)| {
+                    base != at && o < end && offset < o.saturating_add(bytes as u64)
+                })
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+static VIEWS: RwLock<Views> = RwLock::new(Views {
+    views: BTreeMap::new(),
+    by_section_small: BTreeMap::new(),
+    by_section_large: BTreeMap::new(),
+    large_max_len: BTreeMap::new(),
+    sections: Vec::new(),
+});
 
 /// The views, for reading. Every in-place ask asks [`cover`], and the level-2
 /// default asks it for every window and every title buffer, while the runtime
@@ -771,14 +884,14 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
-    views_write().views.insert(at, (len, section, offset));
     // The bytes of this view may be shown at another address too (the
     // runtime maps a section again elsewhere): the guards of those views
     // come off, all together and under the one look, before anything is
     // copied through this one (after avatarmanz 2be0515c).
     let beside = {
-        let v = views_read();
-        beside_in(&v.views, at, section, offset, len)
+        let mut v = views_write();
+        v.insert(at, len, section, offset);
+        v.beside(at, section, offset, len)
     };
     if !beside.is_empty() {
         ALIASED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -807,12 +920,11 @@ pub(crate) fn aliased(at: usize) -> bool {
         return false;
     };
     // The bytes of the view that `at` lies in, of the section's offsets.
-    !beside_in(&v.views, base, section, offset, bytes).is_empty()
+    v.has_beside(base, section, offset, bytes)
 }
 
-/// The views of `section` that show any of the bytes a view at `at` shows
-/// (`[offset, offset + len)`), other than the view at `at` itself: a page
-/// the title mapped twice. Empty when nothing else shows them.
+/// Reference linear scan of `views` for tests verifying [`Views::beside`].
+#[cfg(test)]
 fn beside_in(
     views: &BTreeMap<usize, (usize, usize, u64)>,
     at: usize,
@@ -842,7 +954,7 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
     let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
     for base in gone {
-        v.views.remove(&base);
+        v.remove(base);
     }
 }
 
@@ -1888,6 +2000,31 @@ mod tests {
         assert!(!beside_in(&views, at, 78, 0, 4 * K64).iter().any(|&(b, _)| b == at));
         // A range past both views: nothing.
         assert!(beside_in(&views, at, 78, 6 * K64 as u64, K64).is_empty());
+
+        // Indexed `Views::beside` agrees with the linear scan across inserts,
+        // overwrites, and removals.
+        let mut indexed = Views {
+            views: BTreeMap::new(),
+            by_section_small: BTreeMap::new(),
+            by_section_large: BTreeMap::new(),
+            large_max_len: BTreeMap::new(),
+            sections: Vec::new(),
+        };
+        for (&base, &(len, sec, off)) in &views {
+            indexed.insert(base, len, sec, off);
+        }
+        assert_eq!(indexed.beside(at, 78, 0, 4 * K64), [(at + 8 * K64, 2 * K64)]);
+        assert_eq!(indexed.beside(at + 8 * K64, 78, 2 * K64 as u64, 2 * K64), [(at, 4 * K64)]);
+        assert!(indexed.beside(at + 12 * K64, 79, 0, K64).is_empty());
+        assert!(indexed.beside(at, 78, 6 * K64 as u64, K64).is_empty());
+        // Overwriting a view updates the secondary index cleanly.
+        indexed.insert(at + 8 * K64, K64, 78, 5 * K64 as u64);
+        assert!(indexed.beside(at, 78, 0, 4 * K64).is_empty());
+        // Removing a view removes it from the secondary index too.
+        indexed.insert(at + 8 * K64, 2 * K64, 78, 2 * K64 as u64);
+        assert_eq!(indexed.beside(at, 78, 0, 4 * K64), [(at + 8 * K64, 2 * K64)]);
+        indexed.remove(at + 8 * K64);
+        assert!(indexed.beside(at, 78, 0, 4 * K64).is_empty());
     }
 
     /// The switch: unset is on (the measured-safe class only), `0` off,
