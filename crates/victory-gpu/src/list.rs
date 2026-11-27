@@ -305,14 +305,44 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         }
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay.
-        host.reset();
-        let bytes = host.scratch_kept();
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < max_lists && idle.1 + bytes <= max_bytes {
-            idle.0.push(Idle(host, bytes));
-            idle.1 += bytes;
-        }
+        reset_before_reuse(host, |host| host.reset(), |host| {
+            let bytes = host.scratch_kept();
+            let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+            if idle.0.len() < max_lists && idle.1 + bytes <= max_bytes {
+                idle.0.push(Idle(host, bytes));
+                idle.1 += bytes;
+            }
+        });
     }
+}
+
+/// A list cannot enter the reusable pool until its reset has returned.
+#[cfg(windows)]
+fn reset_before_reuse<T>(item: T, reset: impl FnOnce(&T), publish: impl FnOnce(T)) {
+    reset(&item);
+    publish(item);
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn a_list_is_not_reused_until_its_background_reset_finishes() {
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+    let idle = Arc::new(Mutex::new(Vec::new()));
+    let (started, waiting) = mpsc::channel();
+    let (release, proceed) = mpsc::channel();
+    let pool = idle.clone();
+    let worker = std::thread::spawn(move || {
+        reset_before_reuse(42, |_| {
+            started.send(()).unwrap();
+            proceed.recv_timeout(Duration::from_secs(5)).unwrap();
+        }, |list| pool.lock().unwrap().push(list));
+    });
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(idle.lock().unwrap().pop().is_none(), "resetting list became reusable");
+    release.send(()).unwrap();
+    worker.join().unwrap();
+    assert_eq!(idle.lock().unwrap().pop(), Some(42));
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut
