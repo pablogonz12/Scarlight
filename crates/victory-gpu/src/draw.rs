@@ -3460,8 +3460,20 @@ impl State {
             },
             None => None,
         };
+        let wide = kind == DISPATCH
+            && std::env::var_os("VICTORY_INDIRECT_WIDE").is_none_or(|v| v != "0")
+            && std::env::var_os("VICTORY_GROUP_SPLIT").is_none_or(|v| v != "0");
+        let wide_slot = wide.then(|| Self::group_base_slot(p)).flatten();
+        let wide_max = wide.then(|| max.checked_mul(16)).flatten();
+        if wide && wide_max.is_none() {
+            why("too many expanded dispatch records");
+            return false;
+        }
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
+            .then(|| match wide_slot {
+                Some(slot) => wide_signature(&p.root, slot),
+                None => host_signature(kind, if wide { 12 } else { stride }),
+            })
             .flatten()
         else {
             why("no host signature");
@@ -3540,7 +3552,15 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
+                let bounded = if wide {
+                    crate::indirect::bound_wide(
+                        list,
+                        (&args.buffer, offset),
+                        count_arg,
+                        (kind, step, records),
+                        wide_slot.is_some(),
+                    )
+                } else if windowed && records > 1 {
                     crate::indirect::bound_ahead(
                         list,
                         (&args.buffer, offset),
@@ -3599,13 +3619,17 @@ impl State {
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
-                max,
+                wide_max.unwrap_or(max),
                 &bounded,
                 at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                if wide { None } else { counter.as_ref().map(|(s, _)| &s.buffer) },
+                if wide { 0 } else { counter.as_ref().map_or(0, |(s, at)| s.offset(*at)) },
             )
         };
+        if wide_slot.is_some() {
+            // ExecuteIndirect resets modified root arguments to zero.
+            self.host_roots[1] = 0;
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
@@ -3624,6 +3648,50 @@ impl State {
         }
         true
     }
+}
+
+/// A command writes the shader's X group base, then dispatches a piece.
+fn wide_signature(root: &ID3D12RootSignature, (param, offset): (u32, u32)) -> Option<ID3D12CommandSignature> {
+    static MADE: std::sync::Mutex<Vec<(ID3D12RootSignature, u32, u32, ID3D12CommandSignature)>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, _, _, signature)) = made.iter().find(|(r, p, o, _)| r == root && *p == param && *o == offset) {
+        return Some(signature.clone());
+    }
+    let signature = make_wide_signature(&crate::host::host()?.device, root, (param, offset))?;
+    made.push((root.clone(), param, offset, signature.clone()));
+    Some(signature)
+}
+
+pub(crate) fn make_wide_signature(device: &ID3D12Device, root: &ID3D12RootSignature, (param, offset): (u32, u32)) -> Option<ID3D12CommandSignature> {
+    let arguments = [
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                    RootParameterIndex: param,
+                    DestOffsetIn32BitValues: offset,
+                    Num32BitValuesToSet: 1,
+                },
+            },
+        },
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        },
+    ];
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: 16,
+        NumArgumentDescs: 2,
+        pArgumentDescs: arguments.as_ptr(),
+        NodeMask: 0,
+    };
+    let mut signature: Option<ID3D12CommandSignature> = None;
+    // SAFETY: the root constant is a slot in this pipeline's live signature.
+    if unsafe { device.CreateCommandSignature(&desc, Some(root), &mut signature) }.is_err() {
+        return None;
+    }
+    signature
 }
 
 /// The host command signature for one argument of `kind` with records

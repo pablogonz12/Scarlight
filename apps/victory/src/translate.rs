@@ -2,6 +2,7 @@
 //! what it cannot handle yet is tallied (decision 0003).
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,8 +22,7 @@ use crate::shader::{MAX_FILE, Source, sources};
 struct Tally {
     containers: usize,
     duplicates: usize,
-    programs: usize,
-    translated: usize,
+    lifted: usize,
     instructions: usize,
     structured: usize,
     vector: usize,
@@ -53,22 +53,11 @@ struct Tally {
     exports: BTreeMap<&'static str, usize>,
     /// Exports still packed as f16 pairs after the export patch.
     compressed: usize,
-    /// Vertex and pixel programs every earlier stage handled, and how far
-    /// emission got with them.
-    emit_programs: usize,
-    emitted: usize,
-    validated: usize,
-    pipelines: usize,
-    /// The same for compute programs.
-    cs_programs: usize,
-    cs_emitted: usize,
-    cs_validated: usize,
-    cs_pipelines: usize,
-    /// The same for mesh programs.
-    ms_programs: usize,
-    ms_emitted: usize,
-    ms_validated: usize,
-    ms_pipelines: usize,
+    /// Counts for all discovered native programs, including stages we cannot emit.
+    vertex_pixel: Emission,
+    compute: Emission,
+    mesh: Emission,
+    other: Emission,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
@@ -76,7 +65,61 @@ struct Tally {
     lines: Vec<String>,
 }
 
+#[derive(Default)]
+struct Emission {
+    found: usize,
+    attempted: usize,
+    emitted: usize,
+    validated: usize,
+    pipelines: usize,
+}
+
+impl Emission {
+    fn merge(&mut self, other: &Self) {
+        self.found += other.found;
+        self.attempted += other.attempted;
+        self.emitted += other.emitted;
+        self.validated += other.validated;
+        self.pipelines += other.pipelines;
+    }
+
+    fn summary(&self, validate: bool, pipelines: bool) -> String {
+        let mut counts = format!(
+            "{} emitted of {} {} ({} reached emission)",
+            self.emitted,
+            self.found,
+            if self.found == 1 {
+                "program"
+            } else {
+                "programs"
+            },
+            self.attempted
+        );
+        if validate {
+            write!(counts, ", {} of {} validated", self.validated, self.found).unwrap();
+        }
+        if pipelines {
+            write!(
+                counts,
+                ", {} of {} pipelines created",
+                self.pipelines, self.found
+            )
+            .unwrap();
+        }
+        counts
+    }
+}
+
 impl Tally {
+    fn stage(&mut self, stage: HwStage) -> &mut Emission {
+        match stage {
+            HwStage::Vs | HwStage::Ps => &mut self.vertex_pixel,
+            HwStage::Cs => &mut self.compute,
+            HwStage::Ms => &mut self.mesh,
+            _ => &mut self.other,
+        }
+    }
+
     fn fail(&mut self, reason: String, example: impl FnOnce() -> String) {
         if self.list {
             let e = example();
@@ -93,8 +136,7 @@ impl Tally {
     fn merge(&mut self, other: Tally) {
         self.containers += other.containers;
         self.duplicates += other.duplicates;
-        self.programs += other.programs;
-        self.translated += other.translated;
+        self.lifted += other.lifted;
         self.instructions += other.instructions;
         self.structured += other.structured;
         self.vector += other.vector;
@@ -118,18 +160,10 @@ impl Tally {
         self.interpolated += other.interpolated;
         self.vertex_values += other.vertex_values;
         self.compressed += other.compressed;
-        self.emit_programs += other.emit_programs;
-        self.emitted += other.emitted;
-        self.validated += other.validated;
-        self.pipelines += other.pipelines;
-        self.cs_programs += other.cs_programs;
-        self.cs_emitted += other.cs_emitted;
-        self.cs_validated += other.cs_validated;
-        self.cs_pipelines += other.cs_pipelines;
-        self.ms_programs += other.ms_programs;
-        self.ms_emitted += other.ms_emitted;
-        self.ms_validated += other.ms_validated;
-        self.ms_pipelines += other.ms_pipelines;
+        self.vertex_pixel.merge(&other.vertex_pixel);
+        self.compute.merge(&other.compute);
+        self.mesh.merge(&other.mesh);
+        self.other.merge(&other.other);
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -238,25 +272,30 @@ pub fn run(
         "containers   {} ({} duplicates skipped)",
         t.containers, t.duplicates
     );
+    let stages = [
+        ("vertex/pixel", &t.vertex_pixel),
+        ("compute", &t.compute),
+        ("mesh", &t.mesh),
+    ];
+    let mut all = Emission::default();
+    all.merge(&t.other);
+    for (_, counts) in &stages {
+        all.merge(counts);
+    }
+    println!("DXIL         {}", all.summary(validate, pipelines));
     println!(
-        "programs     {} translated of {} ({} IR instructions)",
-        t.translated, t.programs, t.instructions
+        "IR           {} lifted of {} programs ({} IR instructions)",
+        t.lifted, all.found, t.instructions
     );
     println!(
         "structured   {} of {} ({} vector instructions, {} guarded, {} on opaque masks; \
          branches {} per lane, {} uniform)",
-        t.structured,
-        t.translated,
-        t.vector,
-        t.guarded,
-        t.opaque,
-        t.lane_branches,
-        t.uniform_branches
+        t.structured, t.lifted, t.vector, t.guarded, t.opaque, t.lane_branches, t.uniform_branches
     );
     println!(
-        "resources    {} of {} tracked (descriptors {} loaded, {} built, {} constant; \
+        "resources    {} of {} lifted programs tracked (descriptors {} loaded, {} built, {} constant; \
          {} scalar accesses; {} with a computed term)",
-        t.tracked, t.translated, t.loaded, t.built, t.constant, t.scalar, t.dynamic
+        t.tracked, t.lifted, t.loaded, t.built, t.constant, t.scalar, t.dynamic
     );
     println!(
         "  used-resource entries {}: {} not traced {:?}; {} traced parameters not listed",
@@ -270,18 +309,12 @@ pub fn run(
          {} vertex values; exports {:?}, {} still f16 pairs)",
         t.io_raised, t.io_programs, t.interpolated, t.vertex_values, t.exports, t.compressed
     );
-    println!(
-        "DXIL         {} emitted of {} vertex and pixel programs; {} validated, {} pipelines",
-        t.emitted, t.emit_programs, t.validated, t.pipelines
-    );
-    println!(
-        "             {} emitted of {} compute programs; {} validated, {} pipelines",
-        t.cs_emitted, t.cs_programs, t.cs_validated, t.cs_pipelines
-    );
-    println!(
-        "             {} emitted of {} mesh programs; {} validated, {} pipelines",
-        t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
-    );
+    for (name, counts) in stages {
+        println!("{name:12} {}", counts.summary(validate, pipelines));
+    }
+    if t.other.found != 0 {
+        println!("other stages {}", t.other.summary(validate, pipelines));
+    }
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -402,10 +435,10 @@ fn translate(
 
 fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
     for p in programs {
-        t.programs += 1;
+        t.stage(p.stage).found += 1;
         match victory_shader::spill::build(&p) {
             Ok(program) => {
-                t.translated += 1;
+                t.lifted += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
                 // Per-lane descriptors are traced on the per-lane form; its
                 // failure is listed after the resources' and I/O's.
@@ -463,11 +496,11 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 };
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
-                    *counter(t, p.stage, 0) += 1;
+                    t.stage(p.stage).attempted += 1;
                     match emit::emit(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
-                            *counter(t, p.stage, 1) += 1;
+                            t.stage(p.stage).emitted += 1;
                             check(shader, t, checks, label);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
@@ -566,7 +599,7 @@ fn check(
         };
         match made {
             Ok(()) => {
-                *counter(t, shader.stage, 3) += 1;
+                t.stage(shader.stage).pipelines += 1;
                 if t.list {
                     t.lines.push(format!("{}  pipeline created", label()));
                 }
@@ -579,7 +612,7 @@ fn check(
     };
     match v.validate(&mut shader.dxil) {
         Ok(()) => {
-            *counter(t, shader.stage, 2) += 1;
+            t.stage(shader.stage).validated += 1;
             if t.list {
                 t.lines.push(format!("{}  validated", label()));
             }
@@ -614,32 +647,6 @@ fn check(
             t.fail(format!("validator: {first}"), label);
         }
     }
-}
-
-/// Emission counts of `stage`'s kind: 0 programs, 1 emitted, 2 validated,
-/// 3 pipelines.
-fn counter(t: &mut Tally, stage: HwStage, k: usize) -> &mut usize {
-    let [a, b, c, d] = match stage {
-        HwStage::Cs => [
-            &mut t.cs_programs,
-            &mut t.cs_emitted,
-            &mut t.cs_validated,
-            &mut t.cs_pipelines,
-        ],
-        HwStage::Ms => [
-            &mut t.ms_programs,
-            &mut t.ms_emitted,
-            &mut t.ms_validated,
-            &mut t.ms_pipelines,
-        ],
-        _ => [
-            &mut t.emit_programs,
-            &mut t.emitted,
-            &mut t.validated,
-            &mut t.pipelines,
-        ],
-    };
-    [a, b, c, d].into_iter().nth(k).expect("0 to 3")
 }
 
 fn tally_io(r: &io::Io, t: &mut Tally) {
@@ -792,4 +799,44 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emission_coverage_includes_early_failures_and_only_requested_checks() {
+        let mut total = Tally::default();
+        let mut worker = Tally::default();
+        worker.stage(HwStage::Cs).found = 3;
+        worker.lifted = 2;
+        worker.tracked = 1;
+        worker.compute.attempted = 1;
+        worker.compute.emitted = 1;
+        worker.compute.validated = 1;
+        worker.stage(HwStage::Hs).found = 1;
+        total.merge(worker);
+
+        assert_eq!(total.other.found, 1);
+        assert_eq!(total.lifted, 2);
+        assert_eq!(total.tracked, 1);
+        let summary = "1 emitted of 3 programs (1 reached emission)";
+        assert_eq!(total.compute.summary(false, false), summary);
+        assert_eq!(
+            total.compute.summary(true, false),
+            format!("{summary}, 1 of 3 validated")
+        );
+        assert_eq!(
+            total.compute.summary(false, true),
+            format!("{summary}, 0 of 3 pipelines created")
+        );
+        let mut all = Emission::default();
+        all.merge(&total.compute);
+        all.merge(&total.other);
+        assert_eq!(
+            all.summary(true, true),
+            "1 emitted of 4 programs (1 reached emission), 1 of 4 validated, 0 of 4 pipelines created"
+        );
+    }
 }
