@@ -396,3 +396,4 @@ D
 - **Manuel Pérez**, [VIctory #114](https://github.com/Marvisak/VIctory/pull/114): run failed asynchronous call cleanup outside the completion lock.
 - **Senchsus**, [VIctory #682](https://github.com/Marvisak/VIctory/pull/682): legacy multiply treats denormal operands as zero.
 - **CaravelaLabs**, [shader decoder change](https://github.com/Belobug/VIctory-Belobug-AMD/commit/3d71ad1a6547836ac1dbd19bfab2d759c965d307): decode the ATC probe immediate, resource width, and cache flags.
+- **beamdotdev**, [fxceless/victory-fork #1146](https://github.com/fxceless/victory-fork/pull/1146), GPL-3.0: reset settled submission lists on an optional background thread.
