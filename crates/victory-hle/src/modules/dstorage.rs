@@ -466,7 +466,7 @@ struct Lane {
     unsubmitted: Vec<Command>,
     /// Left out when the queue submitted itself, until the title's Submit:
     /// reads into physical pages and the status entries behind them.
-    held: Vec<Command>,
+    held: Vec<(Command, std::time::Instant)>,
     /// Submitted, by sequence number: reads not started (with the time
     /// the title enqueued them), status entries not written, reads
     /// running, and failures not yet reported.
@@ -501,7 +501,7 @@ unsafe impl Send for Job {}
 /// file read, and this is what says what the rest is.
 #[derive(Clone, Copy)]
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
-enum Stage {
+pub(super) enum Stage {
     /// Enqueued by the title to the worker's start.
     Queue,
     /// The scheduler's lock, taken again after a request.
@@ -516,14 +516,23 @@ enum Stage {
     /// mapping its physical pages) and, when it could not be written in
     /// place, the copy into it.
     Destination,
+    DestLock,
+    DestGuard,
+    DestCopy,
+    DestRetry,
+    DestMap,
+    DestWaitSubmit,
 }
 
 /// The stages above, in order (`Stage` as an index).
 #[cfg(feature = "diagnostics")]
-const STAGE_COUNT: usize = 6;
+const STAGE_COUNT: usize = 12;
 /// The stages' names, for the summary.
 #[cfg(feature = "diagnostics")]
-const STAGE_NAMES: [&str; STAGE_COUNT] = ["queue", "lock", "read", "inflate", "bcpack", "dest"];
+const STAGE_NAMES: [&str; STAGE_COUNT] = ["queue", "lock", "read", "inflate", "bcpack", "dest", "dest_lock_physical", "dest_guard", "dest_copy", "dest_retry_sleep", "dest_map", "dest_wait_submit"];
+
+#[cfg(feature = "diagnostics")]
+static RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Nanoseconds workers spent in each stage (the diagnostics feature only:
 /// a plain release build has neither the counters nor the clocks).
@@ -534,31 +543,31 @@ static STAGE_NS: [AtomicU64; STAGE_COUNT] = [const { AtomicU64::new(0) }; STAGE_
 /// without it, so the release build's request path is unchanged.
 #[cfg(feature = "diagnostics")]
 #[derive(Clone, Copy)]
-struct Mark(std::time::Instant);
+pub(super) struct Mark(std::time::Instant);
 
 #[cfg(feature = "diagnostics")]
 impl Mark {
-    fn begin() -> Mark {
+    pub(super) fn begin() -> Mark {
         Mark(std::time::Instant::now())
     }
 
     /// Charges `stage` the time since `begin`.
-    fn end(self, stage: Stage) {
+    pub(super) fn end(self, stage: Stage) {
         STAGE_NS[stage as usize].fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 }
 
 #[cfg(not(feature = "diagnostics"))]
 #[derive(Clone, Copy)]
-struct Mark;
+pub(super) struct Mark;
 
 #[cfg(not(feature = "diagnostics"))]
 impl Mark {
-    fn begin() -> Mark {
+    pub(super) fn begin() -> Mark {
         Mark
     }
 
-    fn end(self, _stage: Stage) {}
+    pub(super) fn end(self, _stage: Stage) {}
 }
 
 /// Charges `stage` a time measured by hand.
@@ -581,7 +590,7 @@ fn stage_means_line(requests: u64) {
         use std::fmt::Write;
         let _ = write!(means, "{name} {:.1} ", ns as f64 / n / 1e6);
     }
-    tracing::debug!(mean_ms = means.trim_end(), "dstorage: stages");
+    tracing::debug!(mean_ms = means.trim_end(), retry_count = RETRY_COUNT.swap(0, Ordering::Relaxed), "dstorage: stages");
 }
 
 #[cfg(not(feature = "diagnostics"))]
@@ -984,11 +993,12 @@ impl Lanes {
         // ever (the loading-screen stall). Reads after the last status keep
         // waiting: nothing polls them yet, so their page lists may still be
         // the title's to fill before its Submit.
-        let mut commands = std::mem::take(&mut lane.held);
-        commands.append(&mut lane.unsubmitted);
-        let last_status = commands.iter().rposition(|c| matches!(c, Command::Status(_)));
+        let mut commands: Vec<_> = std::mem::take(&mut lane.held)
+            .into_iter().map(|(command, since)| (command, Some(since))).collect();
+        commands.extend(lane.unsubmitted.drain(..).map(|command| (command, None)));
+        let last_status = commands.iter().rposition(|(c, _)| matches!(c, Command::Status(_)));
         let mut reads = 0;
-        for (index, command) in commands.into_iter().enumerate() {
+        for (index, (command, held_since)) in commands.into_iter().enumerate() {
             let hold = !explicit
                 && match &command {
                     Command::Read(r, _) => {
@@ -998,8 +1008,11 @@ impl Lanes {
                     Command::Status(_) => false,
                 };
             if hold {
-                lane.held.push(command);
+                lane.held.push((command, held_since.unwrap_or_else(std::time::Instant::now)));
                 continue;
+            }
+            if let Some(since) = held_since {
+                charged(Stage::DestWaitSubmit, since.elapsed());
             }
             let seq = self.next_seq;
             self.next_seq += 1;
@@ -1607,6 +1620,7 @@ fn into_destination(
         // GPU side's guard on title buffers; open them first.
         let mark = Mark::begin();
         victory_gpu::kernel_will_write(request.destination as usize, len);
+        mark.end(Stage::DestGuard);
         mark.end(Stage::Destination);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
@@ -1645,7 +1659,11 @@ fn into_destination(
     mark.end(Stage::Destination);
     let mut tries = 0;
     while !written && tries < retries {
+        #[cfg(feature = "diagnostics")]
+        RETRY_COUNT.fetch_add(1, Ordering::Relaxed);
+        let retry = Mark::begin();
         std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
+        retry.end(Stage::DestRetry);
         tries += 1;
         // The list is read again: a late page is a new number, not the one
         // the failed pass used.
