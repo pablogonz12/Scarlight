@@ -67,6 +67,10 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+// `watch`'s journal of written pages, sharded so records and copies do not
+// queue on one lock (`VICTORY_JOURNAL_SHARDS=1` for one lock, as before).
+#[cfg(windows)]
+mod journal;
 pub mod list;
 pub mod object;
 pub mod pipeline;
