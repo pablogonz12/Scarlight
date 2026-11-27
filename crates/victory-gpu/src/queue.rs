@@ -627,6 +627,9 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
                 behind::submit(this, lists);
                 return;
             }
+            // Keep texture decisions and dispatch in the same order when
+            // several title threads submit synchronously.
+            let _ordered = THIN_SUBMISSION.lock().unwrap_or_else(|e| e.into_inner());
             let recordings = crate::list::thin::submitted(lists);
             let backs = recordings.ready();
             dispatch(host, this, &backs);
@@ -678,6 +681,9 @@ pub(crate) struct Plane {
 /// not made for two threads at once.
 #[cfg(windows)]
 static SUBMITTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(windows)]
+static THIN_SUBMISSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(windows)]
 pub(crate) fn submit_list(host: &crate::host::Host, this: This, lists: &[This]) {

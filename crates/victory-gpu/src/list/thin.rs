@@ -9,8 +9,8 @@
 //! its arguments (and copies of what they point at) to a stream of words;
 //! threads of ours run the stream, call by call and in order, through the
 //! list methods there were before, on a list of ours ([`Recording::back`]) that
-//! the title never sees. They begin while the title still records (every
-//! [`CHUNK`] words are handed over), several lists at a time. A submission
+//! the title never sees. Chunks are retained until submission, when lists
+//! are translated in submission order. A submission
 //! waits for its recordings' translation (and, with the line of
 //! `crate::queue::behind`, goes on from there).
 //!
@@ -177,22 +177,13 @@ impl Front {
         let fresh = held(&WORDS).pop().unwrap_or_else(|| Vec::with_capacity(CHUNK + 256));
         let words = std::mem::replace(&mut self.words, fresh);
         STREAMS.fetch_add(1, Relaxed);
-        let schedule = {
+        {
             let mut inner = held(&recording.inner);
             if inner.failed {
                 inner.failed_chunks.push(words);
                 return;
             }
             inner.chunks.push_back(words);
-            #[cfg(test)]
-            if inner.inline_only {
-                return;
-            }
-            !std::mem::replace(&mut inner.scheduled, true)
-        };
-        if schedule {
-            held(&READY).push_back(recording.clone());
-            WORK.notify_one();
         }
     }
 
@@ -284,7 +275,7 @@ impl Recording {
     }
 
     /// Waits until it is translated.
-    pub(crate) fn wait(&self) {
+    pub(crate) fn wait(self: &Arc<Self>) {
         // With no thread of ours (none could be started, or none is asked
         // for) the translation happens here rather than never.
         #[cfg(test)]
@@ -293,6 +284,16 @@ impl Recording {
         let inline_only = false;
         if inline_only || THREADS.load(Relaxed) == 0 {
             self.run();
+        } else {
+            let schedule = {
+                let mut inner = held(&self.inner);
+                !self.done() && !inner.chunks.is_empty()
+                    && !std::mem::replace(&mut inner.scheduled, true)
+            };
+            if schedule {
+                held(&READY).push_back(self.clone());
+                WORK.notify_one();
+            }
         }
         let mut inner = held(&self.inner);
         while !self.done() {
@@ -390,6 +391,9 @@ impl Drop for Recording {
     fn drop(&mut self) {
         let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
         for chunk in &inner.failed_chunks {
+            free_uploads(chunk);
+        }
+        for chunk in &inner.chunks {
             free_uploads(chunk);
         }
         give_back(std::mem::take(&mut inner.failed_chunks));
@@ -1282,6 +1286,63 @@ mod tests {
         recording.abandoned.store(true, Release);
         drop(recording);
         assert!(!held(&BACKS).contains(&ptr));
+    }
+
+    #[test]
+    fn texture_copies_follow_submission_not_recording_order() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        #[repr(C)]
+        struct Props { kind: u32, cpu: u32, pool: u32, creation: u32, visible: u32 }
+        #[repr(C)]
+        struct Desc {
+            dim: u32, align: u64, width: u64, height: u32, depth: u16, mips: u16,
+            format: u32, samples: u32, quality: u32, layout: u32, flags: u32,
+        }
+        let props = Props { kind: 1, cpu: 0, pool: 0, creation: 1, visible: 1 };
+        let desc = Desc { dim: 3, align: 0, width: 4, height: 4, depth: 1, mips: 1,
+            format: 28, samples: 1, quality: 0, layout: 0, flags: 0 };
+        let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let make_texture = || {
+            let mut resource = std::ptr::null();
+            assert_eq!(crate::resource::create_committed(
+                std::ptr::null(), (&raw const props).cast(), 0, (&raw const desc).cast(),
+                0x400, std::ptr::null(), &iid, &mut resource), 0);
+            resource
+        };
+        let (x, y, p, q, r) = (make_texture(), make_texture(), make_texture(), make_texture(), make_texture());
+        let (mut a, mut b, mut c) = (test_list(), test_list(), test_list());
+        for list in [&mut a, &mut c] {
+            held(&list.thin.recording.as_ref().unwrap().inner).inline_only = true;
+        }
+        let ap: This = (&mut *a as *mut List).cast();
+        let bp: This = (&mut *b as *mut List).cast();
+        let cp: This = (&mut *c as *mut List).cast();
+        // B is recorded and handed over first, but A is submitted first.
+        copy_resource(bp, x, y);
+        b.thin.close();
+        assert!(!held(&b.thin.recording.as_ref().unwrap().inner).scheduled);
+        assert!(!crate::texture::host_wrote(x as usize));
+        held(&b.thin.recording.as_ref().unwrap().inner).inline_only = true;
+        copy_resource(ap, y, x);
+        // Within C, the write to Q must be visible to the subsequent read.
+        copy_resource(cp, q, p);
+        copy_resource(cp, r, q);
+        let submitted = submitted(&[ap, bp, cp]);
+        let backs = submitted.ready();
+        assert_eq!(backs.len(), 3);
+        let a_back = super::super::host_list(backs[0]).unwrap();
+        let c_back = super::super::host_list(backs[2]).unwrap();
+        assert!(!a_back.first_use(x as usize), "A must attempt X's upload");
+        assert!(c_back.first_use(q as usize), "C must preserve its earlier write to Q");
+        assert!(crate::texture::host_wrote(x as usize));
+        drop(submitted);
+        drop((a, b, c));
+        for resource in [x, y, p, q, r] {
+            crate::object::slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
+        }
     }
 
     /// Nothing of a submission waits for a thread of ours that is not there:
