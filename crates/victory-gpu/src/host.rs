@@ -7490,13 +7490,18 @@ impl Meter {
             tracing::info!(
                 "copies per frame, by what put the bytes there: {:.1} MB in {} pages the copy had never taken, \
                  {:.1} MB in {} pages the title wrote since their last copy, {:.1} MB in {} ranges no write watch \
-                 answered for (copied whole); the five copies that took the most: {}",
+                 answered for (copied whole), then guarded; the card's copies: {} KiB floor, {} MB in {} copies, \
+                 {:.1} MB of them sent on to the card side; the five copies that took the most: {}",
                 sources[0] as f64 / frames / 1e6,
                 sources[1] as f64 / frames,
                 sources[2] as f64 / frames / 1e6,
                 sources[3] as f64 / frames,
                 sources[4] as f64 / frames / 1e6,
                 sources[5] as f64 / frames,
+                crate::shadow::card_floor_kb(),
+                card[8] >> 20,
+                card[7],
+                card[0] as f64 / frames / 1e6,
                 crate::shadow::top_copies(&top)
             );
             tracing::info!(
