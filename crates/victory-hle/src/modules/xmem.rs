@@ -626,9 +626,7 @@ impl Physical {
     fn insert_view(&mut self, base: usize, len: usize, slice: Slice) {
         let sec = Arc::as_ptr(&slice.section) as usize;
         let idx = slice.index;
-        #[cfg(feature = "diagnostics")]
-        self.census.change(&slice, len, true);
-        if let Some((old_len, old)) = self.views.insert(base, (len, slice)) {
+        if let Some((old_len, old)) = self.views.remove(&base) {
             #[cfg(feature = "diagnostics")]
             self.census.change(&old, old_len, false);
             #[cfg(not(feature = "diagnostics"))]
@@ -636,6 +634,9 @@ impl Physical {
             let old_sec = Arc::as_ptr(&old.section) as usize;
             self.by_section.remove(&(old_sec, old.index, base));
         }
+        #[cfg(feature = "diagnostics")]
+        self.census.change(&slice, len, true);
+        self.views.insert(base, (len, slice));
         self.by_section.insert((sec, idx, base), len);
         let pages = len.div_ceil(PAGE);
         let max = self.max_pages.entry(sec).or_insert(0);
