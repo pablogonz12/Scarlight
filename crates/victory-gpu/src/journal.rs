@@ -188,8 +188,14 @@ impl Answer {
 /// overlapping resets are ordered by the caller.
 pub(crate) fn ask(first: usize, last: usize) -> Option<Answer> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
+    #[cfg(feature = "diagnostics")]
+    let _trace = crate::trace::span_bytes("journal::ask", (last - first) * PAGE);
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
-    let mut room = ROOM.with(|room| std::mem::take(&mut *room.borrow_mut()));
+    let mut room = {
+        #[cfg(feature = "diagnostics")]
+        let _room = crate::trace::span("journal answer buffer (thread local)");
+        ROOM.with(|room| std::mem::take(&mut *room.borrow_mut()))
+    };
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     room.resize(count.max(room.len()), 0);
     let mut granularity = 0;
@@ -198,6 +204,8 @@ pub(crate) fn ask(first: usize, last: usize) -> Option<Answer> {
     // SAFETY: the answer buffer holds `count` entries.
     #[cfg(test)]
     let started = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    let kernel = crate::trace::span_bytes("kernel GetWriteWatch reset", (last - first) * PAGE);
     let failed = unsafe {
         GetWriteWatch(
             WRITE_WATCH_FLAG_RESET,
@@ -208,6 +216,8 @@ pub(crate) fn ask(first: usize, last: usize) -> Option<Answer> {
             &mut granularity,
         )
     } != 0;
+    #[cfg(feature = "diagnostics")]
+    drop(kernel);
     #[cfg(test)]
     BENCH_KERNEL.with(|v| v.set(v.get() + started.elapsed().as_nanos()));
     if failed {
