@@ -728,12 +728,10 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
             }
         }
     }
-    let root = |mut v: Value| {
-        while deep && let Some(&c) = copy.get(&v) {
-            v = c;
-        }
-        v
-    };
+    if deep {
+        copy_through_phis(p, &mut copy);
+    }
+    let root = |v: Value| if deep { follow_copy(&copy, v) } else { v };
     // The region a skip of `b` to `target` leaves out, if it is a pure skip.
     let skipped = |b: usize, target: usize, first: usize| -> Option<Vec<bool>> {
         let mut inside = vec![false; n];
@@ -812,6 +810,39 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
     link(&mut blocks);
     split_irreducible(&mut blocks).ok()?;
     Some(rename(blocks, p.wave64, p.vgprs))
+}
+
+/// Follow scalar copies to their original value.
+fn follow_copy(copy: &std::collections::HashMap<Value, Value>, mut v: Value) -> Value {
+    while let Some(&c) = copy.get(&v) {
+        v = c;
+    }
+    v
+}
+
+/// Record scalar joins whose non-self inputs all carry the same value.
+fn copy_through_phis(p: &Program, copy: &mut std::collections::HashMap<Value, Value>) {
+    let mut added = true;
+    while added {
+        added = false;
+        for phi in p.blocks.iter().flat_map(|b| &b.phis) {
+            if copy.contains_key(&phi.value) || !matches!(phi.reg, Reg::S(_) | Reg::Scc) {
+                continue;
+            }
+            let mut one = None;
+            let mut same = true;
+            for value in phi.args.iter().map(|&a| follow_copy(copy, a)).filter(|&v| v != phi.value) {
+                if *one.get_or_insert(value) != value {
+                    same = false;
+                    break;
+                }
+            }
+            if same && let Some(value) = one {
+                copy.insert(phi.value, value);
+                added = true;
+            }
+        }
+    }
 }
 
 /// Placeholder before renaming.
@@ -1630,6 +1661,20 @@ mod tests {
             .iter()
             .filter(|b| b.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
             .count()
+    }
+
+    #[test]
+    fn scalar_join_allows_only_unchanged_parked_values() {
+        for (then, removable) in [(0xBE96_0314, true), (0xBE96_0387, false)] {
+            let body = [
+                0xBE96_0414, 0xBF06_8001, 0xBF85_0002, then,
+                0xBF82_0001, 0xBE98_0382, 0xBE94_0416,
+            ];
+            let p = skip(&body, &[0x7E02_0214]);
+            assert_eq!(skips(&p), 1);
+            assert!(without_skips(&p, false).is_none());
+            assert_eq!(without_skips(&p, true).is_some(), removable);
+        }
     }
 
     #[test]
