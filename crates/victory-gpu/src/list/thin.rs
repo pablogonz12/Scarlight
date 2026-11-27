@@ -674,16 +674,26 @@ fn word_bytes(words: &[u64]) -> &[u8] {
 /// the title does not initialize: reading the structure's bytes whole (as
 /// [`bytes_of`] does) would read those as bytes of a `&[u8]`, which is not
 /// allowed, and would copy whatever was there into the stream.
-fn location_words(location: &CopyLocation) -> Vec<u64> {
+unsafe fn location_words(location: *const CopyLocation) -> Vec<u64> {
     let mut words = vec![0u64; size_of::<CopyLocation>().div_ceil(8)];
     let place = words.as_mut_ptr().cast::<CopyLocation>();
     // SAFETY: the words are as large as the structure and aligned (as `u64`
     // words are); each field is written to its own place and the padding
     // stays zero.
     unsafe {
-        std::ptr::addr_of_mut!((*place).resource).write(location.resource);
-        std::ptr::addr_of_mut!((*place).kind).write(location.kind);
-        std::ptr::addr_of_mut!((*place).footprint).write(location.footprint);
+        std::ptr::addr_of_mut!((*place).resource).write(std::ptr::addr_of!((*location).resource).read());
+        let kind = std::ptr::addr_of!((*location).kind).read();
+        std::ptr::addr_of_mut!((*place).kind).write(kind);
+        let source = std::ptr::addr_of!((*location).footprint).cast::<u8>();
+        let target = std::ptr::addr_of_mut!((*place).footprint).cast::<u8>();
+        if kind == 0 {
+            target.cast::<u32>().write(source.cast::<u32>().read());
+        } else if kind == 1 {
+            target.cast::<u64>().write(source.cast::<u64>().read());
+            for i in 0..5 {
+                target.add(8 + i * 4).cast::<u32>().write(source.add(8 + i * 4).cast::<u32>().read());
+            }
+        }
     }
     words
 }
@@ -906,10 +916,7 @@ extern "system" fn copy_texture_region(
     }
     let boxed = !source_box.is_null();
     // SAFETY: the title passes both locations (null is not: nothing recorded).
-    let (Some(dst), Some(src)) = (unsafe { dst.as_ref() }, unsafe { src.as_ref() }) else {
-        return;
-    };
-    let (dst, src) = (location_words(dst), location_words(src));
+    let (dst, src) = unsafe { (location_words(dst), location_words(src)) };
     front(this).put_with(
         COPY_TEXTURE,
         &[u64::from(x) | u64::from(y) << 32, u64::from(z) | u64::from(boxed) << 32],
@@ -1293,10 +1300,45 @@ mod tests {
             std::ptr::addr_of_mut!((*place).kind).write(1);
             std::ptr::addr_of_mut!((*place).footprint).write(std::mem::zeroed());
         }
-        let words = location_words(unsafe { &*place });
+        let words = unsafe { location_words(place) };
         assert_eq!(words[1] as u32, 1, "the kind is written down");
         assert_eq!(words[1] >> 32, 0, "the padding after it is not");
         assert_eq!(words.len(), size_of::<CopyLocation>().div_ceil(8));
+    }
+
+    #[test]
+    fn copy_location_active_members_round_trip() {
+        for kind in [0u32, 1] {
+            let mut raw = std::mem::MaybeUninit::<CopyLocation>::uninit();
+            let p = raw.as_mut_ptr();
+            unsafe {
+                std::ptr::addr_of_mut!((*p).resource).write(0x1000 as This);
+                std::ptr::addr_of_mut!((*p).kind).write(kind);
+                let member = std::ptr::addr_of_mut!((*p).footprint).cast::<u8>();
+                if kind == 0 {
+                    member.cast::<u32>().write(37);
+                } else {
+                    member.cast::<u64>().write(512);
+                    for i in 0..5 {
+                        member.add(8 + 4 * i).cast::<u32>().write(10 + i as u32);
+                    }
+                }
+                let words = location_words(p);
+                let copy = words.as_ptr().cast::<CopyLocation>();
+                assert_eq!(std::ptr::addr_of!((*copy).resource).read(), 0x1000 as This);
+                assert_eq!(std::ptr::addr_of!((*copy).kind).read(), kind);
+                let member = std::ptr::addr_of!((*copy).footprint).cast::<u8>();
+                if kind == 0 {
+                    assert_eq!(member.cast::<u32>().read(), 37);
+                    assert!(words[3..].iter().all(|&word| word == 0));
+                } else {
+                    assert_eq!(member.cast::<u64>().read(), 512);
+                    for i in 0..5 {
+                        assert_eq!(member.add(8 + 4 * i).cast::<u32>().read(), 10 + i as u32);
+                    }
+                }
+            }
+        }
     }
 
     /// Upload memory the title allocated and never submitted is let go with
