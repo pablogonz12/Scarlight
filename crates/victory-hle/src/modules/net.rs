@@ -325,9 +325,66 @@ pub extern "system" fn WSAConnectByList(
             return 0;
         }
     }
-    host!("ws2_32.dll", "WSAConnectByList": extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)(
-        s, list, local_len, local, remote_len, remote, timeout, reserved,
-    )
+    static HOST: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let host = *HOST.get_or_init(|| crate::host::function("ws2_32.dll", "WSAConnectByList"));
+    connect_by_list(host, s, list, local_len, local, remote_len, remote, timeout, reserved)
+}
+
+fn connect_by_list(
+    host: Option<usize>, s: Socket, list: *const u8, local_len: *mut u32,
+    local: *mut c_void, remote_len: *mut u32, remote: *mut c_void,
+    timeout: *const c_void, reserved: *mut c_void,
+) -> i32 {
+    type ByList = extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32;
+    if let Some(host) = host {
+        let f: ByList = unsafe { std::mem::transmute(host) };
+        return f(s, list, local_len, local, remote_len, remote, timeout, reserved);
+    }
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| tracing::info!("WSAConnectByList: using host compatibility fallback"));
+    if list.is_null() || !reserved.is_null()
+        || (!local.is_null() && local_len.is_null())
+        || (!remote.is_null() && remote_len.is_null())
+    {
+        wsa_error(WSAEINVAL);
+        return 0;
+    }
+    let count = unsafe { list.cast::<i32>().read() };
+    if !(1..=1024).contains(&count) {
+        wsa_error(WSAEINVAL);
+        return 0;
+    }
+    #[repr(C)]
+    struct Timeval { seconds: i32, micros: i32 }
+    let duration = if timeout.is_null() {
+        None
+    } else {
+        let t = unsafe { &*timeout.cast::<Timeval>() };
+        if t.seconds < 0 || !(0..1_000_000).contains(&t.micros) {
+            wsa_error(WSAEINVAL);
+            return 0;
+        }
+        Some(std::time::Duration::new(t.seconds as u64, t.micros as u32 * 1000))
+    };
+    let start = std::time::Instant::now();
+    let entries = unsafe { std::slice::from_raw_parts(list.add(8).cast::<SocketAddress>(), count as usize) };
+    let host_connect = host!("ws2_32.dll", "connect": extern "system" fn(Socket, *const u8, i32) -> i32);
+    for (index, entry) in entries.iter().enumerate() {
+        if index > 0 && duration.is_some_and(|d| start.elapsed() >= d) {
+            wsa_error(10060); // WSAETIMEDOUT
+            return 0;
+        }
+        if host_connect(s, entry.addr, entry.len) == 0 {
+            let get_local = host!("ws2_32.dll", "getsockname": extern "system" fn(Socket, *mut c_void, *mut u32) -> i32);
+            let get_remote = host!("ws2_32.dll", "getpeername": extern "system" fn(Socket, *mut c_void, *mut u32) -> i32);
+            if (!local.is_null() && get_local(s, local, local_len) != 0)
+                || (!remote.is_null() && get_remote(s, remote, remote_len) != 0) {
+                return 0;
+            }
+            return 1;
+        }
+    }
+    0
 }
 
 pub extern "system" fn WSAJoinLeaf(
@@ -913,6 +970,28 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_connect_by_list_uses_loopback_and_reports_addresses() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = v4(HOME, listener.local_addr().unwrap().port());
+        #[repr(C)]
+        struct Addresses { count: i32, items: [SocketAddress; 1] }
+        let list = Addresses { count: 1, items: [SocketAddress { addr: address.as_ptr(), len: 16 }] };
+        let socket = host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket)(2, 1, 6);
+        let mut local = [0u8; 128];
+        let mut remote = [0u8; 128];
+        let (mut local_len, mut remote_len) = (128u32, 128u32);
+        let ok = connect_by_list(None, socket, (&raw const list).cast(), &mut local_len,
+            local.as_mut_ptr().cast(), &mut remote_len, remote.as_mut_ptr().cast(),
+            std::ptr::null(), std::ptr::null_mut());
+        assert_eq!(ok, 1);
+        assert_eq!(&remote[..16], &address);
+        assert_eq!(local_len, 16);
+        assert_eq!(remote_len, 16);
+        listener.accept().unwrap();
+        host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32)(socket);
+    }
     use victory_pe::ImportSymbol;
 
     fn v4(ip: [u8; 4], port: u16) -> [u8; 16] {
