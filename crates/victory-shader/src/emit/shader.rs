@@ -84,6 +84,7 @@ pub(crate) mod flags {
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
@@ -526,6 +527,11 @@ impl Shader {
                 }
             }
         }
+        // Only declared UAV ranges count; heap-indexed UAVs do not.
+        let compute = self.threads.is_some() && self.mesh.is_none() && self.geometry.is_none();
+        if !self.root_uavs.is_empty() && !self.pixel && !compute {
+            self.flags |= flags::UAVS_EVERY_STAGE;
+        }
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -847,6 +853,9 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::UAVS_EVERY_STAGE != 0 {
+            features |= 0x4;
+        }
         if self.flags & flags::DOUBLES != 0 {
             features |= 0x1;
         }
@@ -996,6 +1005,31 @@ fn reconcile_row_interp(elems: &mut [SigElement]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_uavs_set_feature_only_outside_pixel_and_compute() {
+        use crate::dxbc::{Container, FourCC};
+        use super::super::bitcode::Term;
+
+        for (pixel, threads, declared, expected) in [
+            (false, None, true, true),
+            (false, None, false, false),
+            (true, None, true, false),
+            (false, Some([1, 1, 1]), true, false),
+        ] {
+            let mut shader = Shader::new(pixel);
+            shader.threads = threads;
+            if declared {
+                shader.root_uav_handle(0);
+            }
+            shader.m.terminate(shader.entry, Term::Ret);
+            let bytes = shader.finish();
+            let container = Container::parse(&bytes).unwrap();
+            let data = container.part(FourCC::SFI0).unwrap().data;
+            let features = u64::from_le_bytes(data.try_into().unwrap());
+            assert_eq!(features & 4 != 0, expected);
+        }
+    }
 
     fn elem(name: &str, kind: u8, comp: u8, interp: u8, row: u32, col: u8, usage: u8) -> SigElement {
         SigElement {
