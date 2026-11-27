@@ -583,11 +583,25 @@ mod tests {
     fn pending_pipeline_waits_at_most_one_budget_across_frames() {
         let p = Pending::new(Vec::new(), None);
         let start = Instant::now();
-        for frame in 10_000..10_010 {
+        wait(&p, 10_000);
+        assert!(start.elapsed() >= wait_budget().saturating_sub(Duration::from_millis(20)));
+        let repeat = Instant::now();
+        for frame in 10_001..10_010 {
             wait(&p, frame);
         }
         assert!(p.overdue.load(Ordering::Relaxed));
-        assert!(start.elapsed() < wait_budget() + Duration::from_secs(2));
+        assert!(repeat.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn an_overdue_pipeline_does_not_spend_another_pipelines_wait() {
+        let overdue = Pending::new(Vec::new(), None);
+        overdue.overdue.store(true, Ordering::Relaxed);
+        let other = Pending::new(Vec::new(), None);
+        wait(&overdue, 20_000);
+        let start = Instant::now();
+        wait(&other, 20_000);
+        assert!(start.elapsed() >= wait_budget().saturating_sub(Duration::from_millis(20)));
     }
 
     #[test]
