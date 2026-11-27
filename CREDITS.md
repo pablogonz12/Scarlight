@@ -166,6 +166,12 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
 
 - **Mesa** ([aco_opcodes.py](https://gitlab.freedesktop.org/mesa/mesa)), MIT: the reference list of
   RDNA2 instruction forms in `tools/progress/rdna2_isa_forms.txt` is generated from it.
+- **uwutaube/VIctory [217229460](https://github.com/uwutaube/VIctory/commit/217229460)** (uwutaube), GPL-3.0,
+  a port of Marvisak/VIctory [#1778](https://github.com/Marvisak/VIctory/pull/1778) by fiestorra: a sampler heap of
+  our own bound when the title binds none, because every root signature we make indexes the sampler heap directly
+  and D3D12 requires a heap of each kind before such a signature is set (the debug layer's id 1419; NVIDIA removes
+  the device). `VICTORY_SAMPLER_HEAP=0` turns it off.
+
 - **JMAN730/project-flamingo** ([#666](https://github.com/JMAN730/project-flamingo/pull/666)), GPL-3.0: page
   numbers of freed physical pages are handed out again instead of only ever growing, and allocation stops at the
   title's 21-bit `number >> 4` field (`crates/victory-hle/src/modules/xmem.rs`, `VICTORY_PAGE_RECYCLE=0`).
