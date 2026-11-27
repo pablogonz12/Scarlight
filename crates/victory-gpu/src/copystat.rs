@@ -1224,7 +1224,7 @@ pub(crate) fn log(frames: f64) {
          {:.2} MB unmapped, {:.1} MB of a copy's destination gone; {:.0} copies as bytes {:.1} MB; \
          {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.0} guarded askings {:.2} ms over {:.1} MB, {:.0} pages missed; {:.1} fallbacks; \
-         {:.0} guard faults; textures {:.1} MB watched and \
+         {:.0} guard faults; {} guard refusals, {} shadows marked not watched (total); textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed, {:.0} written behind the guard; \
          presented textures from title memory {:.0}, of them a submission old {:.0}; \
          put up at the present {:.0}; shown out of order {:.0}, their copy's source \
@@ -1256,6 +1256,8 @@ pub(crate) fn log(frames: f64) {
         c[C::GuardMissed as usize],
         c[C::Fallbacks as usize],
         c[C::GuardFaults as usize],
+        crate::watch::guard_refusals(),
+        crate::shadow::MARKED_NOT_WATCHED.load(Relaxed),
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
