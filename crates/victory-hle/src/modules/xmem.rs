@@ -154,6 +154,11 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if placeholder && base.is_null() && !at.is_null() {
+        // The GPU side answers its placeholder questions from this table
+        // (`victory_gpu::inplace`): nothing else maps or unmaps inside one.
+        victory_gpu::title_memory_placeholder(at as usize, size);
+    }
     if !at.is_null() && kind & MEM_COMMIT != 0 && protect == PAGE_READWRITE {
         // Committed private memory the GPU may use: the arena's registry
         // (`VICTORY_ARENA=1`, off by default; a no-op when off).

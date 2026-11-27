@@ -2172,7 +2172,10 @@ impl Shadow {
                 .collect()
         };
         for done in jobs {
-            done.wait();
+            let _ = done.wait_for(
+                "a submission's snapshot of a range a write-back job holds",
+                crate::writeback::MERGE_DEADLINE,
+            );
         }
     }
 
