@@ -47,6 +47,8 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
 
 ## Design notes
 
+- **Belobug/VIctory-Belobug-AMD `84eae352a`** (local) — identified an indirect
+  dispatch requesting 67,440 groups that lost its tail under the 65,535-group clamp.
 - **fuzeofficial** ([Marvisak/VIctory #2608](https://github.com/Marvisak/VIctory/pull/2608)), GPL-3.0: the
   idea of cutting a command list at its texture read-backs and running the part after one in a submission
   of its own, so a copy or draw recorded behind a read-back is prepared after its bytes are in title
