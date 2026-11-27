@@ -396,6 +396,11 @@ struct Physical {
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// Secondary index by `(section_ptr, start_page, base)` -> view length in
+    /// bytes, so `title_ranges` is O(log N + k) instead of scanning all views.
+    by_section: BTreeMap<(usize, usize, usize), usize>,
+    /// Largest view length in pages ever inserted for each section.
+    max_pages: HashMap<usize, usize>,
 }
 
 /// Whether freed page numbers are handed out again (`VICTORY_PAGE_RECYCLE=0`
@@ -470,6 +475,56 @@ impl Physical {
         if self.pages.remove(&number).is_some() {
             self.free_pages.push(number);
         }
+    }
+
+    fn insert_view(&mut self, base: usize, len: usize, slice: Slice) {
+        let sec = Arc::as_ptr(&slice.section) as usize;
+        let idx = slice.index;
+        if let Some((_, old)) = self.views.insert(base, (len, slice)) {
+            let old_sec = Arc::as_ptr(&old.section) as usize;
+            self.by_section.remove(&(old_sec, old.index, base));
+        }
+        self.by_section.insert((sec, idx, base), len);
+        let pages = len.div_ceil(PAGE);
+        let max = self.max_pages.entry(sec).or_insert(0);
+        if pages > *max {
+            *max = pages;
+        }
+    }
+
+    fn remove_view(&mut self, at: usize) -> Option<(usize, Slice)> {
+        let (size, slice) = self.views.remove(&at)?;
+        let sec = Arc::as_ptr(&slice.section) as usize;
+        self.by_section.remove(&(sec, slice.index, at));
+        Some((size, slice))
+    }
+
+    /// Title-address ranges showing bytes `[within, within + len)` of the
+    /// `n`-page run starting at `slice`, via the O(log N + k) section index.
+    fn ranges_for(&self, slice: &Slice, n: usize, within: usize, len: usize) -> Vec<(usize, usize)> {
+        let sec = Arc::as_ptr(&slice.section) as usize;
+        let Some(&max_pages) = self.max_pages.get(&sec) else {
+            return Vec::new();
+        };
+        let end = within.saturating_add(len);
+        let run_end_page = slice.index.saturating_add(n);
+        let lo_page = slice.index.saturating_sub(max_pages);
+        let mut out = Vec::new();
+        for (&(_, view_index, at), &view_len) in
+            self.by_section.range((sec, lo_page, 0)..(sec, run_end_page, 0))
+        {
+            let head = (view_index as i64 - slice.index as i64).saturating_mul(PAGE as i64);
+            let lo = head.max(within as i64);
+            let hi = head
+                .saturating_add(view_len as i64)
+                .min(end as i64)
+                .min((n as i64).saturating_mul(PAGE as i64));
+            if hi <= lo {
+                continue;
+            }
+            out.push((at + (lo - head) as usize, (hi - lo) as usize));
+        }
+        out
     }
 }
 
@@ -687,29 +742,8 @@ fn mark_written(slice: &Slice, n: usize, within: usize, len: usize) {
 /// pages from `slice`, as addresses and lengths: the guards a write through
 /// our own view must open first.
 fn title_ranges(slice: &Slice, n: usize, within: usize, len: usize) -> Vec<(usize, usize)> {
-    let end = within.saturating_add(len);
     let physical = physical();
-    let mut out = Vec::new();
-    for (at, (view_len, view)) in &physical.views {
-        if !Arc::ptr_eq(&view.section, &slice.section) {
-            continue;
-        }
-        // Where this view sits in the run's own bytes, which may start
-        // before the run (a view holding several pages of one section).
-        // Signed and saturating: a section's page indexes are large
-        // numbers, and a view may start before the run.
-        let head = (view.index as i64 - slice.index as i64).saturating_mul(PAGE as i64);
-        let lo = head.max(within as i64);
-        let hi = head
-            .saturating_add(*view_len as i64)
-            .min(end as i64)
-            .min((n as i64).saturating_mul(PAGE as i64));
-        if hi <= lo {
-            continue;
-        }
-        out.push((*at + (lo - head) as usize, (hi - lo) as usize));
-    }
-    out
+    physical.ranges_for(slice, n, within, len)
 }
 
 /// Views a worker keeps for its next page destination: a load sends
@@ -1098,7 +1132,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
-    physical.views.insert(base, (len, slice));
+    physical.insert_view(base, len, slice);
     true
 }
 
@@ -1173,7 +1207,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
         .collect();
     for at in hit {
-        let Some((size, slice)) = physical.views.remove(&at) else {
+        let Some((size, slice)) = physical.remove_view(at) else {
             continue;
         };
         victory_gpu::title_memory_remapped(at, size);
@@ -1913,6 +1947,33 @@ mod tests {
         assert!(
             !physical.allocate(&section, &mut numbers),
             "one round past the field must be refused"
+        );
+    }
+
+    #[test]
+    fn section_view_index_matches_linear_overlap() {
+        let s1 = empty_section();
+        let s2 = empty_section();
+        let mut p = owned_physical(FIRST_PAGE_NUMBER);
+        p.insert_view(0x1000_0000, 4 * PAGE, Slice { section: Arc::clone(&s1), index: 2 });
+        p.insert_view(0x2000_0000, 2 * PAGE, Slice { section: Arc::clone(&s1), index: 4 });
+        p.insert_view(0x3000_0000, 2 * PAGE, Slice { section: Arc::clone(&s2), index: 2 });
+
+        let query = Slice { section: Arc::clone(&s1), index: 3 };
+        let mut got = p.ranges_for(&query, 3, PAGE / 2, 2 * PAGE);
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![
+                (0x1000_0000 + PAGE + PAGE / 2, 2 * PAGE),
+                (0x2000_0000, PAGE + PAGE / 2),
+            ]
+        );
+        // Removing a view updates the secondary index too.
+        assert!(p.remove_view(0x2000_0000).is_some());
+        assert_eq!(
+            p.ranges_for(&query, 3, PAGE / 2, 2 * PAGE),
+            vec![(0x1000_0000 + PAGE + PAGE / 2, 2 * PAGE)]
         );
     }
 }
