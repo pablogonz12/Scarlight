@@ -10,6 +10,7 @@ mod shader;
 #[cfg(windows)]
 mod translate;
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -89,7 +90,7 @@ enum Command {
         #[arg(long)]
         list: bool,
         /// Worker threads (default: every logical core).
-        #[arg(long)]
+        #[arg(long, value_parser = parse_jobs)]
         jobs: Option<usize>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
@@ -195,6 +196,13 @@ fn title_id(exe: &std::path::Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn parse_jobs(value: &str) -> Result<usize, &'static str> {
+    value
+        .parse::<NonZeroUsize>()
+        .map(NonZeroUsize::get)
+        .map_err(|_| "expected a worker count of 1 or more")
 }
 
 fn main() -> Result<()> {

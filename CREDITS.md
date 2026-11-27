@@ -1,5 +1,8 @@
 # Credits
 
+- **Marvis [da82e444](https://github.com/Marvisak/VIctory/commit/da82e444)**, GPL-3.0:
+  correctly rounded normalized buffer format conversion.
+
 - **GrapeJuice429 [#29](https://github.com/pablogonz12/Scarlight/pull/29)**, GPL-3.0:
   diagnostics for previewing a selected render target.
 - **Duff [c430b1de](https://github.com/Marvisak/VIctory/commit/c430b1de)**, GPL-3.0:
@@ -407,6 +410,8 @@ D
 - **Senchsus**, [VIctory #682](https://github.com/Marvisak/VIctory/pull/682): legacy multiply treats denormal operands as zero.
 - **Marvis**, [shader UAV flags](https://github.com/Marvisak/VIctory/commit/a1a2077a3d9ab6bf51d457c1a3f86db166554446): declare UAV usage outside pixel and compute stages.
 - **CaravelaLabs**, [shader decoder change](https://github.com/Belobug/VIctory-Belobug-AMD/commit/3d71ad1a6547836ac1dbd19bfab2d759c965d307): decode the ATC probe immediate, resource width, and cache flags.
+
+- **Luiz Otavio Mello de Campos**, [scalar quadmask lowering](https://github.com/Marvisak/VIctory/commit/c3a04e2e4164523f38ffceec23509a0ba4316856): scalar quad-mask instruction lowering and tests.
 - **SpaghettiMaster545**, [fxceless/victory-fork #907](https://github.com/fxceless/victory-fork/pull/907), GPL-3.0: preserve early depth and stencil testing for eligible pixel shaders.
 - **beamdotdev**, [fxceless/victory-fork #1146](https://github.com/fxceless/victory-fork/pull/1146), GPL-3.0: reset settled submission lists on an optional background thread.
 - **Key**, [fxceless/victory-fork #1044](https://github.com/fxceless/victory-fork/pull/1044), GPL-3.0: size DirectStorage workers to physical cores and allow an override.
@@ -414,3 +419,5 @@ D
 - **Rareuncommon**, [vector sum of absolute differences](https://github.com/Marvisak/VIctory/commit/5d6889e8b): lower vector SAD variants.
 - **AnoHunted**, [signed nibble conversion](https://github.com/Marvisak/VIctory/commit/78c12677e): lower `v_cvt_off_f32_i4` and test its conversion.
 - **gomeaw**, Belobug/VIctory-Belobug-AMD commit 7348b80aa, GPL-3.0: include implicit lane inputs in wave uniformity proofs.
+- **loyodea**, Belobug/VIctory-Belobug-AMD `a31fa6cbf`, GPL-3.0: reject zero translation worker counts and test CLI validation.
+- **sawetco**, Belobug/VIctory-Belobug-AMD commit 4fd34fdd6, GPL-3.0: follow unchanged scalar joins when removing wave64 early-out skips.
