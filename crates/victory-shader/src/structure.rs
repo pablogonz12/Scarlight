@@ -570,6 +570,16 @@ struct SopMasks {
 
 const MAX_ROUNDS: usize = 256;
 
+/// Whether a wave64 lane mask split into two scalar moves is recognised as
+/// the mask it was copied from. `VICTORY_DX_LANE_MASK_MOVES=0` turns the
+/// recovery off, leaving the split pair as an opaque atom.
+fn wave64_mask_from_moves() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var_os("VICTORY_DX_LANE_MASK_MOVES").is_some_and(|v| v == "0")
+    })
+}
+
 impl<'a> Lanes<'a> {
     fn new(p: &'a Program) -> Result<Self, ShaderError> {
         let blocks = &p.blocks;
@@ -901,12 +911,12 @@ impl<'a> Lanes<'a> {
         // dword at a time. The spill pass turns these into scalar moves.
         // Recover the original lane predicate only when the two words
         // still come from the same known mask, in their original order.
-        if self.p.wave64 {
-            let source = (self.move_source(k.0), self.move_source(k.1));
-            if source != k && let Some(&m) = self.masks.get(&source) {
-                self.masks.insert(k, m);
-                return (m, true);
-            }
+        if self.p.wave64
+            && wave64_mask_from_moves()
+            && let Some(m) = self.moved_mask(k)
+        {
+            self.masks.insert(k, m);
+            return (m, true);
         }
         let p = self.p;
         let (m, derived) = match self.join(k) {
@@ -948,6 +958,16 @@ impl<'a> Lanes<'a> {
         };
         cache.insert(k, m);
         (m, derived)
+    }
+
+    /// The mask `k` was copied from, through scalar moves only, when both of
+    /// its dwords still trace back to the same known mask of the same pair.
+    fn moved_mask(&self, k: Key) -> Option<Bool> {
+        let source = (self.move_source(k.0), self.move_source(k.1));
+        if source == k {
+            return None;
+        }
+        self.masks.get(&source).copied()
     }
 
     fn move_source(&self, mut value: Value) -> Value {
@@ -1353,16 +1373,17 @@ impl<'a> Lanes<'a> {
         match inst.name() {
             "s_cbranch_execz" => self.b.not(exec),
             "s_cbranch_execnz" => exec,
+            // Hardware tests raw VCC, not VCC & EXEC; inactive lanes can
+            // leave bits in VCC and masking would flip the branch.
             n @ ("s_cbranch_vccz" | "s_cbranch_vccnz") => {
                 let vcc = match self.key(|r| inst.read(r), VCC) {
                     Some(k) => self.mask(k).0,
                     None => Bool::FALSE,
                 };
-                let any = self.b.and(vcc, exec);
                 if n.ends_with("nz") {
-                    any
+                    vcc
                 } else {
-                    self.b.not(any)
+                    self.b.not(vcc)
                 }
             }
             n => {
@@ -1821,6 +1842,38 @@ mod tests {
                 .any(|&e| matches!(s.bools.support(e)[..], [Atom::Lane(_)])),
             "{edges:?}"
         );
+    }
+
+    /// `s_cbranch_vccz/nz` tests raw VCC, without EXEC masking (Belobug #83,
+    /// upstream #2406).
+    #[test]
+    fn cbranch_vcc_tests_raw_vcc_without_exec_masking() {
+        for (branch_word, invert) in [(0xBF87_0001_u32, false), (0xBF86_0001_u32, true)] {
+            // v_cmp_eq_u32 vcc, 0, v0; v_cmpx_eq_u32 exec, 0, v1;
+            // s_cbranch_vccnz / s_cbranch_vccz -> target; v_mov; S_ENDPGM.
+            let p = build(
+                &[
+                    0x7D84_0080,
+                    0x7DA4_0280,
+                    branch_word,
+                    0x7E04_0280,
+                    S_ENDPGM,
+                ],
+                false,
+            );
+            let s = structure(&p).unwrap();
+            let LaneExit::Branch { when, .. } = s.exits[0] else {
+                panic!("expected branch exit");
+            };
+            let cmp = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+            let (lo, hi) = if invert {
+                (Bool::TRUE, Bool::FALSE)
+            } else {
+                (Bool::FALSE, Bool::TRUE)
+            };
+            assert_eq!(s.bools.node(when), Some((Atom::Lane(cmp), lo, hi)));
+            assert_eq!(s.bools.support(when), vec![Atom::Lane(cmp)]);
+        }
     }
 
     #[test]

@@ -620,6 +620,9 @@ fn ask_page(rig: &mut Rig, device: &ID3D12Device, base: *mut u8) -> (Health, Str
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
+    // A reservation released whole is no placeholder any more: an address
+    // used again must not be answered from its old table.
+    placeholders_gone(at, len);
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -841,6 +844,152 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     for base in gone {
         v.views.remove(&base);
     }
+}
+
+/// The runtime's placeholder reservations (`MEM_RESERVE_PLACEHOLDER`, made by
+/// `xmem::XMemVirtualAlloc`) for its 64 KiB pages, as `base -> bytes`.
+///
+/// Inside one, pages can only become mapped or unmapped through `xmem::map`,
+/// which tells the GPU side ([`title_memory_view`] and
+/// [`crate::title_memory_remapped`]), and can never be write-watched. So the
+/// guards and the copies answer "is this a view", "how much of it is there"
+/// and "which of its blocks are unmapped holes" from this table and [`VIEWS`],
+/// instead of `GetWriteWatch`/`VirtualQuery`/`VirtualProtect` calls a frame
+/// ([`PLACEHOLDER_HITS`] counts them). Mechanism from fxceless/victory-fork
+/// #1097 (Azemed).
+static PLACEHOLDERS: RwLock<BTreeMap<usize, usize>> = RwLock::new(BTreeMap::new());
+
+/// Placeholder fast-path skips since the last reading: [0] view checks never
+/// asked, [1] absent-block `VirtualQuery` walks cut short, [2] the copies'
+/// `QueryWorkingSetEx`/`VirtualQuery` passes skipped.
+pub(crate) static PLACEHOLDER_HITS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// `VICTORY_PLACEHOLDER_FAST`: on; `=0` answers every placeholder question the
+/// old way, with the kernel calls (read once, so an A/B takes a restart).
+pub(crate) fn placeholder_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACEHOLDER_FAST").is_none_or(|v| v != "0"))
+}
+
+/// The runtime reserved the placeholder region `[at, at + len)` for its 64 KiB
+/// pages (`XMemVirtualAlloc` with `MEM_RESERVE_PLACEHOLDER`).
+pub fn title_memory_placeholder(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    PLACEHOLDERS
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(at, len);
+}
+
+fn placeholders_read() -> RwLockReadGuard<'static, BTreeMap<usize, usize>> {
+    PLACEHOLDERS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether all of `[start, end)` lies inside one placeholder reservation.
+pub(crate) fn placeholder_range(start: usize, end: usize) -> bool {
+    if !placeholder_fast() || start >= end {
+        return false;
+    }
+    let map = placeholders_read();
+    map.range(..=start)
+        .next_back()
+        .is_some_and(|(&base, &len)| end <= base.saturating_add(len))
+}
+
+/// The bytes of `[start, start + len)` that are there, from [`VIEWS`] alone
+/// (no kernel call), for a range inside a placeholder; `None` outside one.
+pub(crate) fn placeholder_mapped_bytes(start: usize, len: usize) -> Option<u64> {
+    if len == 0 || !placeholder_range(start, start.saturating_add(len)) {
+        return None;
+    }
+    PLACEHOLDER_HITS[2].fetch_add(1, Ordering::Relaxed);
+    Some(mapped_bytes_in(
+        &views_read(),
+        start,
+        start.saturating_add(len),
+    ))
+}
+
+/// The merged runs `(from, to)` of blocks of `[from_block, to_block)` that are
+/// mapped, for a block range inside a placeholder; `None` outside one. The
+/// blocks between the runs are unmapped holes, without asking.
+pub(crate) fn placeholder_mapped_blocks(
+    from_block: usize,
+    to_block: usize,
+) -> Option<Vec<(usize, usize)>> {
+    if from_block >= to_block {
+        return None;
+    }
+    let (start, end) = (from_block.checked_mul(K64)?, to_block.checked_mul(K64)?);
+    if !placeholder_range(start, end) {
+        return None;
+    }
+    let v = views_read();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut push = |lo: usize, hi: usize| {
+        let (lo, hi) = ((lo / K64).max(from_block), hi.div_ceil(K64).min(to_block));
+        if lo >= hi {
+            return;
+        }
+        match runs.last_mut() {
+            Some((_, last)) if lo <= *last => *last = (*last).max(hi),
+            _ => runs.push((lo, hi)),
+        }
+    };
+    if let Some((&base, &(bytes, _, _))) = v.views.range(..=start).next_back()
+        && base.saturating_add(bytes) > start
+    {
+        push(start, base.saturating_add(bytes).min(end));
+    }
+    for (&base, &(bytes, _, _)) in v.views.range(start.saturating_add(1)..end) {
+        push(base, base.saturating_add(bytes).min(end));
+    }
+    Some(runs)
+}
+
+/// The bytes of `[start, end)` that the views hold, off [`VIEWS`] alone.
+fn mapped_bytes_in(v: &Views, start: usize, end: usize) -> u64 {
+    let mut there = 0u64;
+    if let Some((&base, &(bytes, _, _))) = v.views.range(..=start).next_back()
+        && base.saturating_add(bytes) > start
+    {
+        there += (base.saturating_add(bytes).min(end) - start) as u64;
+    }
+    for (&base, &(bytes, _, _)) in v.views.range(start.saturating_add(1)..end) {
+        let hi = base.saturating_add(bytes).min(end);
+        if hi > base {
+            there += (hi - base) as u64;
+        }
+    }
+    there
+}
+
+/// Drops the registrations a release of `[at, at + len)` covers whole: an
+/// address used again is not taken for a placeholder. A range of a
+/// reservation being mapped or unmapped (part of it) leaves it registered.
+pub(crate) fn placeholders_gone(at: usize, len: usize) {
+    let end = at.saturating_add(len);
+    let mut map = PLACEHOLDERS.write().unwrap_or_else(|e| e.into_inner());
+    let gone: Vec<usize> = map
+        .range(at..end)
+        .filter(|&(_, &bytes)| (at + bytes) <= end)
+        .map(|(&base, _)| base)
+        .collect();
+    for base in gone {
+        map.remove(&base);
+    }
+}
+
+/// Drops a region's placeholder note and its views (the tests' cleanup).
+#[cfg(test)]
+pub(crate) fn placeholder_forget(at: usize, len: usize) {
+    PLACEHOLDERS
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&at);
+    views_gone(at, len);
 }
 
 /// How the views cover `[at, at + len)`.
@@ -1624,6 +1773,81 @@ mod tests {
         assert_eq!(cover_in(&views, at + 6 * K64, 3 * K64), Cover::Holes);
         assert_eq!(cover_in(&views, at + 7 * K64, K64), Cover::None);
         assert_eq!(cover_in(&views, at - K64, 2 * K64), Cover::None);
+    }
+
+    /// A run whose start lies inside a runtime placeholder and whose end does
+    /// not belongs to no placeholder: the guards ask Windows about it as
+    /// before, instead of taking its holes for known ones.
+    #[test]
+    fn a_run_from_inside_a_placeholder_to_outside_is_not_one() {
+        let base = 0x7_0abc_0000usize;
+        let len = 8 * K64;
+        title_memory_placeholder(base, len);
+        // Blocks 2..5 of it are a view (a section shown in place).
+        title_memory_view(base + 2 * K64, 3 * K64, 0x5ec7, 0);
+        let (first, last) = (base / K64, (base + len) / K64);
+        assert!(placeholder_range(base + K64, base + 5 * K64), "inside it");
+        // Starts inside, ends outside: not a placeholder range.
+        assert!(!placeholder_range(base + 6 * K64, base + len + K64));
+        // Starts outside, ends inside.
+        assert!(!placeholder_range(base.saturating_sub(K64), base + K64));
+        // Inside, the runs of mapped blocks, the holes between them known.
+        assert_eq!(
+            placeholder_mapped_blocks(first, last),
+            Some(vec![(first + 2, first + 5)])
+        );
+        assert_eq!(placeholder_mapped_bytes(base, len), Some((3 * K64) as u64));
+        // The run to outside is nobody's: no table answers for it.
+        assert_eq!(placeholder_mapped_blocks(last - 1, last + 1), None);
+        placeholder_forget(base, len);
+    }
+
+    /// Two placeholders side by side with a gap between them are two rooms: a
+    /// run over the gap belongs to neither, and each one's holes are its own.
+    #[test]
+    fn two_placeholders_beside_each_other_keep_their_gap() {
+        let (first_at, second_at) = (0x7_0b00_0000usize, 0x7_0b00_0000usize + 10 * K64);
+        let len = 8 * K64;
+        title_memory_placeholder(first_at, len);
+        title_memory_placeholder(second_at, len);
+        // One mapped run in each, at different offsets.
+        title_memory_view(first_at + K64, 2 * K64, 0x5ec8, 0);
+        title_memory_view(second_at + 3 * K64, 2 * K64, 0x5ec9, 0);
+        let (a, b) = (first_at / K64, second_at / K64);
+        // A run over both, through the gap: inside neither.
+        assert!(!placeholder_range(first_at + 6 * K64, second_at + 4 * K64));
+        assert_eq!(placeholder_mapped_blocks(a, b), None);
+        // The gap itself: two blocks no reservation holds.
+        assert!(!placeholder_range(first_at + len, second_at));
+        // Each one's runs and holes, from its own table alone.
+        assert_eq!(
+            placeholder_mapped_blocks(a, a + 8),
+            Some(vec![(a + 1, a + 3)])
+        );
+        assert_eq!(
+            placeholder_mapped_blocks(b, b + 8),
+            Some(vec![(b + 3, b + 5)])
+        );
+        assert_eq!(placeholder_mapped_bytes(first_at, len), Some((2 * K64) as u64));
+        assert_eq!(placeholder_mapped_bytes(second_at, len), Some((2 * K64) as u64));
+        placeholder_forget(first_at, len);
+        placeholder_forget(second_at, len);
+    }
+
+    /// A reservation released whole is forgotten; a part of one being mapped
+    /// or unmapped is not.
+    #[test]
+    fn a_released_placeholder_is_forgotten() {
+        let base = 0x7_0c00_0000usize;
+        let len = 8 * K64;
+        title_memory_placeholder(base, len);
+        assert!(placeholder_range(base, base + len));
+        // Part of it, as the runtime maps and unmaps a block: it stays.
+        placeholders_gone(base, 2 * K64);
+        assert!(placeholder_range(base, base + len));
+        // Whole: an address used again is not answered from the old table.
+        placeholders_gone(base, len);
+        assert!(!placeholder_range(base, base + len));
     }
 
     /// What the runtime forgets when memory is mapped anew.

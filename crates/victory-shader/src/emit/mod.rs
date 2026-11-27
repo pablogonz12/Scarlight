@@ -255,6 +255,28 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
     parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
 }
 
+/// `VICTORY_SHADER_SWIZZLE_ZERO`:
+/// - unset: a `ds_swizzle_b32` read whose source lane is inactive in the
+///   compute program (absent, or masked out by EXEC) reads zero, as the
+///   console's does: that lane never wrote the register.
+/// - `0`: the plain read of the source lane, whatever its EXEC bit, as
+///   before (the value of a register no lane wrote is undefined).
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+pub fn shader_swizzle_zero() -> bool {
+    static ZERO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ZERO.get_or_init(|| {
+        parse_swizzle_zero(std::env::var("VICTORY_SHADER_SWIZZLE_ZERO").ok().as_deref())
+    })
+}
+
+/// `VICTORY_SHADER_SWIZZLE_ZERO`'s value; on unless it is `0`. Pure, for
+/// testing.
+fn parse_swizzle_zero(value: Option<&str>) -> bool {
+    !matches!(value.map(str::trim), Some("0"))
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
@@ -271,13 +293,18 @@ pub const SWITCHES: &[&str] = &[
     "VICTORY_BRANCH_SAME_ARMS",
     "VICTORY_CODE_READS",
     "VICTORY_DX_LANE_MASK_MOVES",
+    "VICTORY_DX_PIXEL_QUAD",
     "VICTORY_DX_STATIC_SAMPLER_PHI",
     "VICTORY_ANISO_POINT_MIP",
+    "VICTORY_BITWISE_MODS",
+    "VICTORY_F16_FMA_ONCE",
     "VICTORY_INTERP_F16_OMOD_CLAMP",
     "VICTORY_F16_NEAREST",
     "VICTORY_F16_SUM_WIDE",
+    "VICTORY_FIELD_DWORD",
     "VICTORY_FIRSTLANE_OWN",
     "VICTORY_FIRST_HALF",
+    "VICTORY_FSPX",
     "VICTORY_GROUP_SPLIT",
     "VICTORY_GROUP_SYNC",
     "VICTORY_INT_CLAMP",
@@ -286,6 +313,7 @@ pub const SWITCHES: &[&str] = &[
     "VICTORY_SHADER_LOOP_LIMIT",
     "VICTORY_SHADER_LOOP_LIMIT_CS",
     "VICTORY_SHADER_OPT",
+    "VICTORY_SHADER_SWIZZLE_ZERO",
     "VICTORY_STRICT_JOINS",
     "VICTORY_TITLE_VIEW_CLAMP",
     "VICTORY_WAVE_DEEP_SKIPS",
@@ -423,10 +451,8 @@ pub struct UserData {
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let part = crate::program_part(&c).ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let native = crate::native_programs(part)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -942,6 +968,16 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::{parse_compute_loop_limit, parse_loop_limit};
+
+    #[test]
+    fn the_swizzle_zero_switch_is_off_only_for_zero() {
+        let on = super::parse_swizzle_zero;
+        assert!(on(None));
+        assert!(!on(Some("0")));
+        assert!(!on(Some(" 0 ")));
+        assert!(on(Some("1")));
+        assert!(on(Some("on")));
+    }
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
@@ -1950,6 +1986,46 @@ mod barycentric_tests {
         let rw: Vec<u8> = (0..2).map(|k| isg1[8 + 32 * k + 25]).collect();
         assert!(rw.contains(&0b110), "{rw:?}");
         validate(&shader);
+    }
+
+    /// A pixel shader's quad permutations read through quad operations (the
+    /// host quads are the console's, and helpers across a triangle edge have
+    /// values to give); a DPP8 whose lanes cross quads cannot.
+    #[test]
+    fn pixel_quad_swizzles_validate_and_dpp8_cannot_cross_quads() {
+        let [e0, e1] = exp_mrt0(3);
+        let swizzle = |instruction: [u32; 2]| {
+            let words = [
+                0xc808_0000, 0xc809_0001, // interpolate attr0.x into v2
+                instruction[0], instruction[1], e0, e1, 0xbf81_0000,
+            ];
+            pixel(&words, PERSP_CENTER)
+        };
+        for permutation in [0x00, 0x55, 0xaa, 0xff, 0xb1, 0x4e, 0x1b, 0xe4, 0x27] {
+            // ds_swizzle_b32 v3,v2 and v_mov_b32 v3,v2 quad_perm.
+            validate(&swizzle([0xd8d4_8000 | permutation, 0x0300_0002]).unwrap());
+            validate(&swizzle([0x7e06_02fa, 0xff00_0002 | permutation << 8]).unwrap());
+        }
+        // DPP8: different permutations in the two quads of an octet.
+        let selections = [3u32, 0, 2, 1, 4, 6, 5, 7];
+        let sel = selections.into_iter().enumerate().fold(0, |s, (i, n)| s | n << (3 * i));
+        let mov_dpp8 = |sel: u32| [0x7e06_02e9, (sel << 8) | 2];
+        validate(&swizzle(mov_dpp8(sel)).unwrap());
+        assert!(swizzle(mov_dpp8(sel ^ 4)).is_err(), "lane 0 now reads lane 7");
+    }
+
+    /// An exchange permutation (lane ^ 1, ^ 2, ^ 3) already names the lane
+    /// it reads: each two-bit group of the pattern is that lane (0xb1 lane 0
+    /// reads 1 and lane 2 reads 3; 0x4e is ^ 2; 0x1b is ^ 3), which is why
+    /// `quad_pick` reads the source as it finds it and must not XOR it again.
+    #[test]
+    fn an_exchange_pattern_names_its_lane() {
+        for p in [0xb1u8, 0x4e, 0x1b] {
+            for lane in 0..4u32 {
+                let read = u32::from(p >> (2 * lane)) & 3;
+                assert_eq!(read, lane ^ u32::from(p & 3), "{p:#04x}, lane {lane}");
+            }
+        }
     }
 
     /// Two kinds of barycentrics read directly: one element per mode.

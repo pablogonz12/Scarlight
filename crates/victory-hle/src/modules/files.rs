@@ -270,6 +270,7 @@ pub extern "system" fn CreateFileW(
     flags: u32,
     template: Handle,
 ) -> Handle {
+    let _stall = victory_gpu::stall_site!("files::CreateFileW").enter(format_args!("access={access:#x} disposition={disposition} flags={flags:#x}"));
     let p = wide(path);
     host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
@@ -318,6 +319,7 @@ pub extern "system" fn CreateFileA(
     flags: u32,
     template: Handle,
 ) -> Handle {
+    let _stall = victory_gpu::stall_site!("files::CreateFileA").enter(format_args!(""));
     match narrow(path) {
         Some(p) => {
             host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
@@ -352,6 +354,7 @@ pub extern "system" fn CreateFile2(
     disposition: u32,
     params: *const c_void,
 ) -> Handle {
+    let _stall = victory_gpu::stall_site!("files::CreateFile2").enter(format_args!(""));
     let p = wide(path);
     host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
         p.ptr(),
@@ -363,6 +366,7 @@ pub extern "system" fn CreateFile2(
 }
 
 pub extern "system" fn DeleteFileA(path: *const c_char) -> i32 {
+    let _stall = victory_gpu::stall_site!("files::DeleteFileA").enter(format_args!(""));
     match narrow(path) {
         Some(p) => {
             host!("kernel32.dll", "DeleteFileW": extern "system" fn(*const u16) -> i32)(p.as_ptr())
@@ -374,16 +378,19 @@ pub extern "system" fn DeleteFileA(path: *const c_char) -> i32 {
 }
 
 pub extern "system" fn DeleteFileW(path: *const u16) -> i32 {
+    let _stall = victory_gpu::stall_site!("files::DeleteFileW").enter(format_args!(""));
     let p = wide(path);
     host!("kernel32.dll", "DeleteFileW": extern "system" fn(*const u16) -> i32)(p.ptr())
 }
 
 pub extern "system" fn RemoveDirectoryW(path: *const u16) -> i32 {
+    let _stall = victory_gpu::stall_site!("files::RemoveDirectoryW").enter(format_args!(""));
     let p = wide(path);
     host!("kernel32.dll", "RemoveDirectoryW": extern "system" fn(*const u16) -> i32)(p.ptr())
 }
 
 pub extern "system" fn SetFileAttributesW(path: *const u16, attributes: u32) -> i32 {
+    let _stall = victory_gpu::stall_site!("files::SetFileAttributesW").enter(format_args!(""));
     let p = wide(path);
     host!("kernel32.dll", "SetFileAttributesW": extern "system" fn(*const u16, u32) -> i32)(
         p.ptr(),
@@ -392,6 +399,7 @@ pub extern "system" fn SetFileAttributesW(path: *const u16, attributes: u32) -> 
 }
 
 pub extern "system" fn GetFileAttributesA(path: *const c_char) -> u32 {
+    let _stall = victory_gpu::stall_site!("files::GetFileAttributesA").enter(format_args!(""));
     match narrow(path) {
         Some(p) => {
             host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(
@@ -407,6 +415,7 @@ pub extern "system" fn GetFileAttributesA(path: *const c_char) -> u32 {
 }
 
 pub extern "system" fn CreateDirectoryW(path: *const u16, security: *const c_void) -> i32 {
+    let _stall = victory_gpu::stall_site!("files::CreateDirectoryW").enter(format_args!(""));
     let p = wide(path);
     host!("kernel32.dll", "CreateDirectoryW": extern "system" fn(*const u16, *const c_void) -> i32)(
         p.ptr(),
@@ -419,6 +428,7 @@ pub extern "system" fn GetFileAttributesExW(
     level: i32,
     info: *mut c_void,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("files::GetFileAttributesExW").enter(format_args!(""));
     let p = wide(path);
     host!("kernel32.dll", "GetFileAttributesExW": extern "system" fn(*const u16, i32, *mut c_void) -> i32)(
         p.ptr(),
@@ -428,6 +438,7 @@ pub extern "system" fn GetFileAttributesExW(
 }
 
 pub extern "system" fn GetFileAttributesW(path: *const u16) -> u32 {
+    let _stall = victory_gpu::stall_site!("files::GetFileAttributesW").enter(format_args!(""));
     let p = wide(path);
     host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(p.ptr())
 }
@@ -438,6 +449,7 @@ pub extern "system" fn GetDiskFreeSpaceExW(
     total: *mut u64,
     free: *mut u64,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("files::GetDiskFreeSpaceExW").enter(format_args!(""));
     let p = wide(path);
     host!("kernel32.dll", "GetDiskFreeSpaceExW": extern "system" fn(*const u16, *mut u64, *mut u64, *mut u64) -> i32)(
         p.ptr(),
@@ -456,6 +468,7 @@ pub extern "system" fn GetDiskFreeSpaceW(
     free_clusters: *mut u32,
     clusters: *mut u32,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("files::GetDiskFreeSpaceW").enter(format_args!(""));
     let mut p = wide(root);
     if let Some(host) = &mut p.1
         && let [letter, colon, sep, ..] = host[..]
@@ -474,6 +487,7 @@ pub extern "system" fn GetDiskFreeSpaceW(
 }
 
 pub extern "system" fn FindFirstFileW(path: *const u16, data: *mut c_void) -> Handle {
+    let _stall = victory_gpu::stall_site!("files::FindFirstFileW").enter(format_args!(""));
     let p = wide(path);
     host!("kernel32.dll", "FindFirstFileW": extern "system" fn(*const u16, *mut c_void) -> Handle)(
         p.ptr(),
@@ -489,6 +503,7 @@ pub extern "system" fn FindFirstFileExW(
     filter: *mut c_void,
     flags: u32,
 ) -> Handle {
+    let _stall = victory_gpu::stall_site!("files::FindFirstFileExW").enter(format_args!(""));
     let p = wide(path);
     host!("kernel32.dll", "FindFirstFileExW": extern "system" fn(*const u16, i32, *mut c_void, i32, *mut c_void, u32) -> Handle)(
         p.ptr(),
@@ -501,6 +516,7 @@ pub extern "system" fn FindFirstFileExW(
 }
 
 pub extern "system" fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32 {
+    let _stall = victory_gpu::stall_site!("files::MoveFileExW").enter(format_args!(""));
     let (from, to) = (wide(from), wide(to));
     host!("kernel32.dll", "MoveFileExW": extern "system" fn(*const u16, *const u16, u32) -> i32)(
         from.ptr(),
@@ -510,6 +526,7 @@ pub extern "system" fn MoveFileExW(from: *const u16, to: *const u16, flags: u32)
 }
 
 pub extern "system" fn SetCurrentDirectoryA(path: *const c_char) -> i32 {
+    let _stall = victory_gpu::stall_site!("files::SetCurrentDirectoryA").enter(format_args!(""));
     match narrow(path) {
         Some(p) => {
             host!("kernel32.dll", "SetCurrentDirectoryW": extern "system" fn(*const u16) -> i32)(
@@ -563,6 +580,7 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("files::ReadFile").enter(format_args!("file={file:p} len={len}"));
     victory_gpu::kernel_will_write(buffer as usize, len as usize);
     host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
