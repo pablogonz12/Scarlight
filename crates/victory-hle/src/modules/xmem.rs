@@ -797,6 +797,13 @@ struct View {
 impl View {
     /// Maps `n` slices from `slice` on.
     fn map(slice: &Slice, n: usize) -> Option<View> {
+        let mark = super::dstorage::Mark::begin();
+        let result = Self::map_inner(slice, n);
+        mark.end(super::dstorage::Stage::DestMap);
+        result
+    }
+
+    fn map_inner(slice: &Slice, n: usize) -> Option<View> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
         // SAFETY: slices of a section we own; the view is ours until dropped.
@@ -840,7 +847,9 @@ impl Drop for View {
 fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)>> {
     let end = offset.checked_add(len)?;
     let pages = pages.get(offset / PAGE..end.div_ceil(PAGE))?;
+    let mark = super::dstorage::Mark::begin();
     let physical = physical();
+    mark.end(super::dstorage::Stage::DestLock);
     let mut runs: Vec<(Slice, usize)> = Vec::new();
     for page in pages {
         let slice = physical.pages.get(page)?;
@@ -887,7 +896,9 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
             return false;
         };
         let k = (n * PAGE - within).min(data.len() - done);
+        let mark = super::dstorage::Mark::begin();
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        mark.end(super::dstorage::Stage::DestCopy);
         (within, done) = (0, done + k);
     }
     true
@@ -901,9 +912,11 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
 /// `copy_back_marked` then puts its stale copy back over them (streamed
 /// textures lost after a DirectStorage burst; Marvisak/VIctory #2503).
 fn mark_written(slice: &Slice, n: usize, within: usize, len: usize) {
+    let mark = super::dstorage::Mark::begin();
     for (at, bytes) in title_ranges(slice, n, within, len) {
         victory_gpu::kernel_will_write(at, bytes);
     }
+    mark.end(super::dstorage::Stage::DestGuard);
 }
 
 /// The title's own views over bytes `[within, within + len)` of a run of `n`
