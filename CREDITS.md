@@ -408,4 +408,5 @@ D
 - **beamdotdev**, [fxceless/victory-fork #1146](https://github.com/fxceless/victory-fork/pull/1146), GPL-3.0: reset settled submission lists on an optional background thread.
 - **Key**, [fxceless/victory-fork #1044](https://github.com/fxceless/victory-fork/pull/1044), GPL-3.0: size DirectStorage workers to physical cores and allow an override.
 
+- **Rareuncommon**, [vector sum of absolute differences](https://github.com/Marvisak/VIctory/commit/5d6889e8b): lower vector SAD variants.
 - **AnoHunted**, [signed nibble conversion](https://github.com/Marvisak/VIctory/commit/78c12677e): lower `v_cvt_off_f32_i4` and test its conversion.

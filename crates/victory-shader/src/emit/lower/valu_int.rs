@@ -262,6 +262,40 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.bin(c, Bin::Mul, a, b);
                 self.s.m.bin(c, Bin::Add, m, d)
             }
+            "v_sad_u8" | "v_sad_hi_u8" | "v_sad_u16" | "v_sad_u32" | "v_msad_u8" => {
+                let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let (width, parts) = match name {
+                    "v_sad_u16" => (16, 2),
+                    "v_sad_u32" => (32, 1),
+                    _ => (8, 4),
+                };
+                let zero = k(self, 0);
+                let mut sum = zero;
+                for i in 0..parts {
+                    let (mut x, mut y) = (a, b);
+                    if width < 32 {
+                        let (sh, mask) = (k(self, width * i), k(self, (1 << width) - 1));
+                        x = self.s.m.bin(c, Bin::LShr, x, sh);
+                        x = self.s.m.bin(c, Bin::And, x, mask);
+                        y = self.s.m.bin(c, Bin::LShr, y, sh);
+                        y = self.s.m.bin(c, Bin::And, y, mask);
+                    }
+                    let above = self.s.m.cmp(c, pred::IUGT, x, y);
+                    let hi = self.s.m.select(c, above, x, y);
+                    let lo = self.s.m.select(c, above, y, x);
+                    let mut diff = self.s.m.bin(c, Bin::Sub, hi, lo);
+                    if name == "v_msad_u8" {
+                        let masked = self.s.m.cmp(c, pred::NE, y, zero);
+                        diff = self.s.m.select(c, masked, diff, zero);
+                    }
+                    sum = self.s.m.bin(c, Bin::Add, sum, diff);
+                }
+                if name == "v_sad_hi_u8" {
+                    let k16 = k(self, 16);
+                    sum = self.s.m.bin(c, Bin::Shl, sum, k16);
+                }
+                self.s.m.bin(c, Bin::Add, sum, d)
+            }
             "v_min3_i32" | "v_max3_i32" | "v_min3_u32" | "v_max3_u32" | "v_med3_i32"
             | "v_med3_u32" => {
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
