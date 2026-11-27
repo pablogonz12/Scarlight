@@ -173,13 +173,11 @@ fn profile_dirs(env: &impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<PathBu
 /// `dir`, plus how a Windows build reaches it under Wine: the same absolute
 /// POSIX path through the `Z:` drive, tried first.
 fn dir_aliases(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
     #[cfg(windows)]
     if let Some(rest) = dir.to_string_lossy().strip_prefix('/') {
-        out.push(PathBuf::from(format!("Z:\\{}", rest.replace('/', "\\"))));
+        return vec![PathBuf::from(format!("Z:\\{}", rest.replace('/', "\\"))), dir.to_owned()];
     }
-    out.push(dir.to_owned());
-    out
+    vec![dir.to_owned()]
 }
 
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {

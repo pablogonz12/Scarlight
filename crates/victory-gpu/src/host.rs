@@ -2263,10 +2263,11 @@ pub(crate) fn late() -> bool {
 
 /// `VICTORY_LATE_WAIT`: 0 (off), 1, or 2 ([`late_exact`]).
 fn late_stage() -> u8 {
-    static STAGE: OnceLock<u8> = OnceLock::new();
-    if std::env::var_os("VICTORY_GPU_TIMING").is_some() {
+    static TIMING: OnceLock<bool> = OnceLock::new();
+    if *TIMING.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some()) {
         return 0;
     }
+    static STAGE: OnceLock<u8> = OnceLock::new();
     let start = *STAGE.get_or_init(|| match std::env::var("VICTORY_LATE_WAIT").as_deref() {
         Ok("1") => 1,
         Ok("2") => 2,
@@ -7705,9 +7706,12 @@ impl Host {
         let texture = &source.texture;
         let state = D3D12_RESOURCE_STATES(source.state.load(Ordering::Relaxed) as i32);
         // What decides against composing also settles the extent: the base
-        // plane's, so the copy below and the back buffer agree.
+        // plane's, so the copy below and the back buffer agree. The compositor
+        // forces the synchronous `p.copy` path (`composition.is_some()` sets
+        // `slot = None` below), so two-plane composition works even when
+        // `late_free_present()` (`VICTORY_RELAY=1`) is enabled.
         let mut overlay = overlay
-            .filter(|_| fill.is_none() && !late_free_present())
+            .filter(|_| fill.is_none())
             .and_then(|(overlay, state)| {
                 let extent = crate::present_compositor::extent(texture, overlay)?;
                 Some((overlay, D3D12_RESOURCE_STATES(state as i32), extent))
@@ -7792,8 +7796,12 @@ impl Host {
             // list of its own, one whose last flight has finished or a new
             // one.
             #[cfg(feature = "diagnostics")]
-            let read_now =
-                cfg!(test) || crate::capture::wanted(frame) || crate::capture::listed(frame);
+            let shot = crate::capture::take_request();
+            #[cfg(feature = "diagnostics")]
+            let read_now = cfg!(test)
+                || crate::capture::wanted(frame)
+                || crate::capture::listed(frame)
+                || shot.is_some();
             #[cfg(not(feature = "diagnostics"))]
             let read_now = cfg!(test);
             let slot = if late_free_present() && !read_now && composition.is_none() {
@@ -7900,8 +7908,6 @@ impl Host {
                 list.CopyResource(&back, texture);
                 texture
             };
-            #[cfg(feature = "diagnostics")]
-            let shot = crate::capture::take_request();
             #[cfg(feature = "diagnostics")]
             let capture = (cfg!(test) || crate::capture::wanted(frame) || shot.is_some())
                 .then(|| crate::capture::read_back(&self.device, list, capture_source))
