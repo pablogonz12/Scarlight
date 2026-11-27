@@ -1211,6 +1211,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn disabled_coalescing_executes_copy_and_fill_and_tracks_title_write() {
+        let source = [11u8, 22, 33, 44];
+        let mut title = [0u8; 4];
+        let mut fill = [0u8; 4];
+        let steps = [
+            super::Step::Copy(title.as_mut_ptr() as usize, source.as_ptr() as usize, source.len()),
+            super::Step::Fill(fill.as_mut_ptr() as usize, title.as_ptr() as usize, title.len()),
+        ];
+        let mut batch = super::Batch::default();
+        let texture = std::sync::Arc::new(());
+        assert!(batch.texture_due(&texture));
+        assert!(!batch.texture_due(&texture));
+        super::run_deferred_steps(&steps, &mut batch, false, |_, _| panic!("copy treated as other step"));
+        assert_eq!(title, source);
+        assert_eq!(fill, source);
+        assert!(batch.texture_due(&texture), "title write invalidates texture tracking");
+    }
+
     /// The submission's pieces close together in title memory go in one kernel
     /// read (`VICTORY_RPM_COALESCE`), and every piece still gets the bytes its
     /// own read would have given it. A piece whose union covers a page the
@@ -6658,31 +6677,9 @@ impl HostList {
     /// lists of a submission, through many ranges).
     fn run_deferred(&self, batch: &mut Batch) {
         let deferred = self.deferred();
-        let steps = &deferred.copies;
-        let mut i = 0;
-        while i < steps.len() {
-            // The submission's own copies, the pieces that lie close together
-            // in title memory read in one go (`VICTORY_RPM_COALESCE=0` reads
-            // them one by one).
-            let mut run: Vec<Piece> = Vec::new();
-            if coalesce_reads() {
-                while let Some(piece) = copy_step(&steps[i + run.len()..]) {
-                    run.push(piece);
-                }
-            }
-            if run.is_empty() {
-                self.run_step(&steps[i], batch);
-                i += 1;
-                continue;
-            }
-            let mut at = 0;
-            while at < run.len() {
-                let end = coalesced_end(&run, at);
-                run_copies(&run[at..end], batch);
-                at = end;
-            }
-            i += run.len();
-        }
+        run_deferred_steps(&deferred.copies, batch, coalesce_reads(), |step, batch| {
+            self.run_step(step, batch)
+        });
     }
 
     /// Runs one step of the submission that is not one of its copies.
@@ -6739,6 +6736,31 @@ impl HostList {
                 }
             }
         }
+    }
+}
+
+fn run_deferred_steps(steps: &[Step], batch: &mut Batch, coalesce: bool, mut other: impl FnMut(&Step, &mut Batch)) {
+    let mut i = 0;
+    while i < steps.len() {
+        let mut run = Vec::new();
+        while let Some(piece) = copy_step(&steps[i + run.len()..]) {
+            run.push(piece);
+            if !coalesce {
+                break;
+            }
+        }
+        if run.is_empty() {
+            other(&steps[i], batch);
+            i += 1;
+            continue;
+        }
+        let mut at = 0;
+        while at < run.len() {
+            let end = coalesced_end(&run, at);
+            run_copies(&run[at..end], batch);
+            at = end;
+        }
+        i += run.len();
     }
 }
 
