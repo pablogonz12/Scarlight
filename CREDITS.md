@@ -417,3 +417,4 @@ D
 - **Rareuncommon**, [vector sum of absolute differences](https://github.com/Marvisak/VIctory/commit/5d6889e8b): lower vector SAD variants.
 - **AnoHunted**, [signed nibble conversion](https://github.com/Marvisak/VIctory/commit/78c12677e): lower `v_cvt_off_f32_i4` and test its conversion.
 - **sawetco**, Belobug/VIctory-Belobug-AMD commit 4fd34fdd6, GPL-3.0: follow unchanged scalar joins when removing wave64 early-out skips.
+- **Venom**, [VIctory #3503](https://github.com/Marvisak/VIctory/pull/3503), GPL-3.0: reuse the matching shadow buffer entry during lookup.
