@@ -176,7 +176,30 @@ pub(crate) fn forget(start: usize, len: usize) {
 /// Returns `None` for the guard path, conservatively forgetting overlaps first.
 pub(crate) fn ask(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut lock = state().lock().unwrap_or_else(|e| e.into_inner());
-    let s = lock.as_mut()?;
+    let Some(s) = lock.as_mut() else {
+        if std::env::var_os("VICTORY_LINUX_DIRTY").is_some_and(|v| v == "1") {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!("Linux dirty initialization failed; using guards"));
+            static FAILED: OnceLock<Mutex<(Instant, u64)>> = OnceLock::new();
+            let mut failed = FAILED
+                .get_or_init(|| Mutex::new((Instant::now(), 0)))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            failed.1 += 1;
+            if failed.0.elapsed() >= Duration::from_secs(10) {
+                tracing::info!(
+                    registered_mib = 0,
+                    scans = 0,
+                    us = 0,
+                    pages = 0,
+                    initialization = failed.1,
+                    "linux dirty"
+                );
+                *failed = (Instant::now(), 0);
+            }
+        }
+        return None;
+    };
     s.log();
     if start >= end || !start.is_multiple_of(BLOCK) || !end.is_multiple_of(BLOCK) {
         s.fallbacks[1] += 1;
@@ -216,6 +239,10 @@ pub(crate) fn ask(start: usize, end: usize) -> Option<Vec<usize>> {
             )
         };
         if rc != 0 {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(error = rc, "Linux dirty registration failed; using guards")
+            });
             s.fallbacks[2] += 1;
             return None;
         }
@@ -394,6 +421,107 @@ mod tests {
             UnmapViewOfFile2(GetCurrentProcess(), b, 0);
             crate::watch::title_memory_remapped(a0, BLOCK);
             crate::watch::title_memory_remapped(b0, BLOCK);
+            CloseHandle(section);
+        }
+    }
+
+    #[test]
+    fn linux_dirty_busy_falls_back() {
+        if std::env::var_os("VICTORY_LINUX_DIRTY").is_none_or(|v| v != "1") {
+            return;
+        }
+        unsafe {
+            let g = gadget().unwrap();
+            let fd = syscall(g, 323, 1, 0, 0);
+            assert!(fd >= 0);
+            let mut api = [0xaa_u64, (1 << 15) | (1 << 12), 0];
+            assert_eq!(
+                syscall(g, 16, fd as usize, 0xc018aa3f, api.as_mut_ptr() as usize),
+                0
+            );
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            );
+            let view = MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                std::ptr::null(),
+                0,
+                BLOCK,
+                0,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert!(!view.Value.is_null());
+            let a = view.Value as usize;
+            let mut reg = [a as u64, BLOCK as u64, 2, 0];
+            assert_eq!(
+                syscall(g, 16, fd as usize, 0xc020aa00, reg.as_mut_ptr() as usize),
+                0
+            );
+            assert_eq!(ask(a, a + BLOCK), None);
+            let answer = crate::watch::writes(a, a + BLOCK, true);
+            assert!(answer.is_some());
+            syscall(g, 3, fd as usize, 0, 0);
+            UnmapViewOfFile2(GetCurrentProcess(), view, 0);
+            crate::watch::title_memory_remapped(a, BLOCK);
+            CloseHandle(section);
+        }
+    }
+
+    #[test]
+    fn linux_dirty_racing_writes() {
+        if std::env::var_os("VICTORY_LINUX_DIRTY").is_none_or(|v| v != "1") {
+            return;
+        }
+        unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            );
+            let view = MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                std::ptr::null(),
+                0,
+                BLOCK,
+                0,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert!(!view.Value.is_null());
+            let a = view.Value as usize;
+            assert!(ask(a, a + BLOCK).is_some());
+            for _ in 0..1000 {
+                let barrier = std::sync::Barrier::new(2);
+                let race = std::thread::scope(|scope| {
+                    let join = scope.spawn(|| {
+                        barrier.wait();
+                        ask(a, a + BLOCK)
+                    });
+                    barrier.wait();
+                    ((a + BLOCK - PAGE) as *mut u8).write_volatile(1);
+                    join.join().unwrap()
+                });
+                let drain = ask(a, a + BLOCK);
+                assert!(
+                    race.as_ref().is_none_or(|v| v.contains(&(a / BLOCK)))
+                        || drain.as_ref().is_none_or(|v| v.contains(&(a / BLOCK)))
+                );
+            }
+            forget(a, BLOCK);
+            UnmapViewOfFile2(GetCurrentProcess(), view, 0);
             CloseHandle(section);
         }
     }
