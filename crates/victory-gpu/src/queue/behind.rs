@@ -283,16 +283,19 @@ pub(crate) fn log(frames: f64) {
 mod tests {
     use super::*;
 
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
     /// Keeps the line's own thread out of a test's jobs: with the switches on
     /// it takes them as they are pushed, and the test then reads another
     /// thread's work. (With no line of ours there is nothing to keep out.)
     struct Parked {
         parked: bool,
+        _guard: std::sync::MutexGuard<'static, ()>,
     }
 
     fn park_the_line() -> Parked {
+        let guard = held(&TEST_LOCK);
         if !on() {
-            return Parked { parked: false };
+            return Parked { parked: false, _guard: guard };
         }
         *held(&PARKED) = true;
         // A job for it to wake on: it takes none, and says so.
@@ -307,7 +310,7 @@ mod tests {
         }
         // That one is ours to run: it does nothing.
         assert!(run_one(), "the job the line was woken with");
-        Parked { parked: true }
+        Parked { parked: true, _guard: guard }
     }
 
     impl Drop for Parked {
@@ -338,6 +341,7 @@ mod tests {
         let written = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = written.clone();
         push(Job::Work(Box::new(move || flag.store(true, Release))));
+        crate::object::add_ref(fence);
         push(Job::Signal {
             queue: std::ptr::null(),
             fence,
@@ -352,6 +356,7 @@ mod tests {
         // (Ours, not the title's: the title's read takes the line in.)
         assert_eq!(crate::fence::value(fence), 1, "the value is set last");
         assert_eq!(queued(), base);
+        crate::fence::release(fence);
     }
 
     /// A drain waits for what the line took before it was called, not for what
@@ -398,6 +403,8 @@ mod tests {
         let fence = fence();
         // The queue is told to wait for a value nothing has reached.
         assert_eq!(crate::queue::wait(queue, fence, 2), S_OK);
+        crate::object::add_ref(queue);
+        crate::object::add_ref(fence);
         push(Job::Signal {
             queue,
             fence,
@@ -409,6 +416,8 @@ mod tests {
             0,
             "the value was seen though the queue still waited for one before it"
         );
+        crate::queue::release(queue);
+        crate::fence::release(fence);
     }
 
     /// A signal in the line is not a submission the card will be given: an
@@ -423,6 +432,7 @@ mod tests {
             }
         }
         let fence = fence();
+        crate::object::add_ref(fence);
         push(Job::Signal {
             queue: std::ptr::null(),
             fence,
@@ -436,5 +446,6 @@ mod tests {
             "an object was kept for a submission that is only a signal"
         );
         assert!(run_one());
+        crate::fence::release(fence);
     }
 }
