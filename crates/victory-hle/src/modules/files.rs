@@ -839,6 +839,20 @@ mod tests {
         (ok != 0).then(|| out[..usize::try_from(n).unwrap()].to_vec())
     }
 
+    /// Wine does not enforce the Windows unbuffered alignment failure used
+    /// as the oracle by these tests, even when the flag reaches the host.
+    fn wine_lacks_unbuffered_alignment_oracle() -> bool {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        let wine = unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        };
+        if wine {
+            eprintln!("skipped: Wine does not enforce this unbuffered alignment failure");
+        }
+        wine
+    }
+
     #[test]
     fn a_read_only_unbuffered_open_accepts_an_unaligned_read() {
         if !file_cache() {
@@ -851,6 +865,7 @@ mod tests {
 
     #[test]
     fn an_unbuffered_open_by_a_narrow_path_stays_unbuffered() {
+        if wine_lacks_unbuffered_alignment_oracle() { return; }
         if !file_cache() {
             return; // VICTORY_FILE_CACHE=0 keeps the title's own flags
         }
@@ -874,6 +889,7 @@ mod tests {
 
     #[test]
     fn an_overlapped_unbuffered_open_stays_unbuffered() {
+        if wine_lacks_unbuffered_alignment_oracle() { return; }
         use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_IO_PENDING};
         use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, OPEN_EXISTING};
         use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
@@ -907,6 +923,7 @@ mod tests {
 
     #[test]
     fn an_unbuffered_open_for_writing_stays_unbuffered() {
+        if wine_lacks_unbuffered_alignment_oracle() { return; }
         use windows_sys::Win32::Foundation::GENERIC_WRITE;
 
         let read = unaligned_read_of_an_unbuffered_open(GENERIC_READ | GENERIC_WRITE);

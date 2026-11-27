@@ -38,6 +38,7 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
 Code reimplemented here from a fork's pull request, because the fork's tree had diverged from ours;
 the design and the author are credited in the commit's `Co-authored-by:` and here.
 
+- **Marvisak/VIctory #1273** (Fuzeofficial) — the design for mirroring placed texture unordered-access views.
 - **Marvisak/VIctory #2401** (Mumogg) — the Wine `ExitProcess` hook that makes a host driver
   compiler crash cost one pipeline instead of the run ([`pipeline/wine.rs`](crates/victory-gpu/src/pipeline/wine.rs)),
   adapted to our pipeline workers and library.
@@ -244,6 +245,12 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   console's sampler (`crates/victory-shader/src/emit/lower.rs`); this is what recovered the archive's refused
   windshield and wiper pixel and mesh variants.
 
+- **avatarmanz/VIctory-7900XTX** (GPL-3.0), commit [b1da72814](https://github.com/avatarmanz/VIctory-7900XTX/commit/b1da72814):
+  the scheme of `VICTORY_PICKED_WRITES`: a declared range is not compared whole, only the pages its shaders wrote,
+  learned from the compares themselves, with one page in 64 looked at in turn so that nothing stays missed, and
+  what is found late still landed (`crates/victory-gpu/src/picked.rs`; 69 -> 6 ms of page compares a frame on
+  his machine). Reimplemented for this tree's compares, which keep the snapshot per copy rather than the card's
+  hashes, and so need `VICTORY_KEEP_SNAPSHOTS=1`.
 - **avatarmanz/VIctory-7900XTX** (GPL-3.0), commit [b6202840a](https://github.com/avatarmanz/VIctory-7900XTX/commit/b6202840a):
   the idea of comparing title bytes under shader writes with AVX2 rather than eight bytes at a time: the copy-back's
   piece walk, its first and last difference and the differing runs take thirty-two bytes a compare where the CPU has
@@ -392,8 +399,13 @@ D
   after the copy, behind `VICTORY_TEXTURE_BACK_UNION=1` (off by default) (`crates/victory-gpu/src/texback.rs`,
   `crates/victory-gpu/src/host.rs`, `crates/victory-gpu/src/draw.rs`, `crates/victory-gpu/src/descriptor/host.rs`).
 
+- **Belobug**, [e70e031c](https://github.com/Belobug/VIctory-Belobug-AMD/commit/e70e031cf): native shader support, and [1162d38f](https://github.com/Belobug/VIctory-Belobug-AMD/commit/1162d38f9) for the translator cache version idea.
 - **Belobug**, [e70e031c](https://github.com/Belobug/VIctory-Belobug-AMD/commit/e70e031cf): accept native shader code stored without its wrapper.
 - **Manuel Pérez**, [VIctory #114](https://github.com/Marvisak/VIctory/pull/114): run failed asynchronous call cleanup outside the completion lock.
 - **Senchsus**, [VIctory #682](https://github.com/Marvisak/VIctory/pull/682): legacy multiply treats denormal operands as zero.
+- **Marvis**, [shader UAV flags](https://github.com/Marvisak/VIctory/commit/a1a2077a3d9ab6bf51d457c1a3f86db166554446): declare UAV usage outside pixel and compute stages.
 - **CaravelaLabs**, [shader decoder change](https://github.com/Belobug/VIctory-Belobug-AMD/commit/3d71ad1a6547836ac1dbd19bfab2d759c965d307): decode the ATC probe immediate, resource width, and cache flags.
 - **SpaghettiMaster545**, [fxceless/victory-fork #907](https://github.com/fxceless/victory-fork/pull/907), GPL-3.0: preserve early depth and stencil testing for eligible pixel shaders.
+- **Key**, [fxceless/victory-fork #1044](https://github.com/fxceless/victory-fork/pull/1044), GPL-3.0: size DirectStorage workers to physical cores and allow an override.
+
+- **AnoHunted**, [signed nibble conversion](https://github.com/Marvisak/VIctory/commit/78c12677e): lower `v_cvt_off_f32_i4` and test its conversion.
