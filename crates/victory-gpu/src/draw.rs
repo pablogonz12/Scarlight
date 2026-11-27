@@ -3032,6 +3032,12 @@ impl State {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    // A placed UAV can gain a host texture without its title
+                    // descriptor changing. Keep old slots intact for earlier
+                    // draws and allocate a new table only when that changes.
+                    crate::descriptor::view(at)
+                        .and_then(|view| crate::descriptor::host::placed_uav_identity(&view))
+                        .hash(&mut h);
                 }
                 table_aliases.hash(&mut h);
                 (table, n, h.finish())

@@ -2784,6 +2784,22 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     })
 }
 
+/// Identity of a placed UAV's existing host texture, without creating one.
+/// Dynamic tables include this in their cache key so that a null entry gets a
+/// new table when the texture appears, without modifying an in-flight table.
+pub(crate) fn placed_uav_identity(view: &View) -> Option<usize> {
+    use windows::core::Interface;
+    let View::Placed(true, resource, desc) = view else {
+        return None;
+    };
+    if resource[0] == 1 {
+        return None;
+    }
+    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    let texture = crate::resource::placed_known(address, resource)?;
+    Some(crate::resource::host_made(texture)?.as_raw() as usize)
+}
+
 /// A null view of the kind `view` is, for a slot whose view the host
 /// cannot make: unordered access (to a buffer or a 2D texture) or a shader
 /// view. Writes to it are dropped, reads give zeros.
@@ -2970,11 +2986,19 @@ mod tests {
         desc[11] = (address >> 32) as u32;
         let view = View::Placed(true, resource, desc);
 
+        let before = placed_uav_identity(&view);
+        let mut tables = std::collections::HashMap::new();
+        tables.insert(before, 0);
         assert!(placed_texture(&view).is_none());
         assert!(make(&view, heap.cpu(0)).is_none());
         let placed = crate::resource::texture_at(address, &resource).unwrap();
         assert!(placed_texture(&view).is_none());
         let texture = crate::resource::host_resource(placed).unwrap();
+        let after = placed_uav_identity(&view);
+        assert_ne!(before, after);
+        assert!(!tables.contains_key(&after));
+        tables.insert(after, 1);
+        assert_eq!(tables.get(&placed_uav_identity(&view)), Some(&1));
         let resolved = placed_texture(&view).unwrap();
         assert!(matches!(resolved, View::Unordered(r, 0, Some(_)) if r == placed as usize));
         let mut format = DXGI_FORMAT(crate::resource::view_format(placed).unwrap() as i32);
