@@ -41,7 +41,7 @@ struct Queue {
     /// What the queue was given after a wait for a fence that had not been
     /// reached, in order; it runs when the fence gets there.
     #[cfg(windows)]
-    held: std::sync::Mutex<Vec<Held>>,
+    held: std::sync::Mutex<HeldQueue>,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
@@ -57,6 +57,36 @@ enum Held {
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A signal of the queue's, due after what it holds before it.
     Signal(usize, u64),
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct HeldQueue {
+    items: Vec<Held>,
+    busy: bool,
+}
+
+#[cfg(windows)]
+impl HeldQueue {
+    fn is_empty(&self) -> bool {
+        !self.busy && self.items.is_empty()
+    }
+}
+
+#[cfg(windows)]
+impl std::ops::Deref for HeldQueue {
+    type Target = Vec<Held>;
+    fn deref(&self) -> &Self::Target { &self.items }
+}
+
+#[cfg(windows)]
+impl std::ops::DerefMut for HeldQueue {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.items }
+}
+
+#[cfg(windows)]
+fn wait_after_steps(item: &Held, has_steps: bool) -> bool {
+    has_steps && matches!(item, Held::Wait(..) | Held::Value(..))
 }
 
 /// The queues that hold something (their addresses).
@@ -366,6 +396,9 @@ pub(crate) fn release_held(all: bool) {
                 let held = unsafe { &(*(q as *const Queue)).held };
                 let mut held = lock(held);
                 loop {
+                    if held.first().is_some_and(|item| wait_after_steps(item, !steps.is_empty())) {
+                        break;
+                    }
                     match held.first() {
                         None => break,
                         // (Ours, not the title's: a read that takes the line in
@@ -424,9 +457,7 @@ pub(crate) fn release_held(all: bool) {
                     }
                     moved = true;
                 }
-                if held.is_empty() {
-                    lock(&WAITING).retain(|&w| w != q);
-                }
+                held.busy = !steps.is_empty();
             }
             // The queue's lock is let go: run what was taken out, in the
             // order it was given.
@@ -473,6 +504,13 @@ pub(crate) fn release_held(all: bool) {
                         }
                     }
                 }
+            }
+            // A producer must append until every extracted step has finished.
+            let held = unsafe { &(*(q as *const Queue)).held };
+            let mut held = lock(held);
+            held.busy = false;
+            if held.is_empty() {
+                lock(&WAITING).retain(|&w| w != q);
             }
         }
         if !moved {
@@ -1243,6 +1281,34 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn busy_queue_holds_new_work_until_extracted_work_finishes() {
+        let desc = QueueDesc { kind: 0, priority: 0, flags: 0, nodes: 0 };
+        let mut q = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        lock(&queue(q).held).busy = true;
+        assert!(hold(q, || Held::Signal(1, 2)));
+        let mut state = lock(&queue(q).held);
+        assert_eq!(state.items.len(), 1);
+        assert!(!state.is_empty());
+        state.items.clear();
+        assert!(!state.is_empty());
+        state.busy = false;
+        assert!(state.is_empty());
+        drop(state);
+        release(q);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wait_after_extracted_work_is_a_boundary_even_when_met() {
+        let wait = Held::Wait(0, 0);
+        assert!(!wait_after_steps(&wait, false));
+        assert!(wait_after_steps(&wait, true));
+        assert!(!wait_after_steps(&Held::Signal(0, 0), true));
+    }
 
     /// Where a queue's signal is: newer layouts have it two slots later.
     /// Another test may switch layouts while this one runs, so the queue's
