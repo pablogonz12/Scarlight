@@ -7587,8 +7587,10 @@ impl Meter {
             }
             #[cfg(feature = "diagnostics")]
             tracing::info!(
-                "write-watch kernel calls: {:.1} a frame, invalidations: {:.1} a frame; askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms",
-                watch_counts.0 as f64 / frames,
+                "write-watch kernel calls: {:.1} answered, {:.1} failed, {:.1} skipped a frame, invalidations: {:.1} a frame; askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms",
+                watch_counts.0[0] as f64 / frames,
+                watch_counts.0[1] as f64 / frames,
+                watch_counts.0[2] as f64 / frames,
                 watch_counts.1 as f64 / frames,
                 slow[0] as f64 / frames,
                 slow[1] as f64 / 1e3 / frames,

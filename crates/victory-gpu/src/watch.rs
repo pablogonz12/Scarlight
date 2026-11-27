@@ -49,6 +49,42 @@ static ASKED: AtomicU64 = AtomicU64::new(0);
 static RESET_ORDER: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 static RESET_READY: std::sync::Condvar = std::sync::Condvar::new();
 
+// Only cache a failure when the first block is a section view. A failure of
+// an arbitrary range does not prove its private pages cannot be watched, and
+// allocations outside xmem can reuse addresses without notifying us.
+static FAILED_ASKS: Mutex<std::collections::BTreeSet<(usize, usize)>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+fn mapped_view(first: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    (unsafe { VirtualQuery((first * PAGE) as *const _, &mut info, size_of_val(&info)) != 0 })
+        && info.Type == MEM_MAPPED
+}
+
+fn ask_cached(first: usize, last: usize) -> Option<crate::journal::Answer> {
+    let key = (first, last);
+    let cached = FAILED_ASKS.lock().unwrap_or_else(|e| e.into_inner()).contains(&key);
+    // Recheck the mapping type: even an allocation outside our hooks cannot
+    // turn this into write-watched private memory while the hit stands.
+    if cached && mapped_view(first) {
+        #[cfg(feature = "diagnostics")]
+        crate::journal::skipped_kernel_call();
+        return None;
+    }
+    let answer = crate::journal::ask(first, last);
+    if answer.is_none() && mapped_view(first) {
+        let mut failed = FAILED_ASKS.lock().unwrap_or_else(|e| e.into_inner());
+        if failed.len() >= 65_536 {
+            failed.clear();
+        }
+        failed.insert(key);
+    } else if cached {
+        FAILED_ASKS.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+    }
+    answer
+}
+
 #[cfg(feature = "diagnostics")]
 static INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
 
@@ -337,7 +373,7 @@ fn ask_kernel(a: &mut Ahead, first: usize, last: usize) -> bool {
     }
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    let Some(answer) = crate::journal::ask(first, last) else {
+    let Some(answer) = ask_cached(first, last) else {
         return false;
     };
     answer.record(a.asked);
@@ -490,7 +526,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let now = next_asking();
-    let answer = crate::journal::ask(first, last);
+    let answer = ask_cached(first, last);
     let guarded = if answer.is_some() {
         Vec::new()
     } else {
@@ -1405,6 +1441,7 @@ pub fn title_memory_reading_within(limit: std::time::Duration) -> Option<Reading
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    FAILED_ASKS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     crate::texback::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
@@ -2137,6 +2174,42 @@ mod tests {
 
     /// A kernel read into a guarded view block fails; opened first, it
     /// lands and the block counts as written.
+    #[test]
+    fn failed_view_asks_are_cached_until_remapped() {
+        let _journal = journal_test_lock();
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        let section = unsafe {
+            CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, PAGE as u32, std::ptr::null())
+        };
+        assert!(!section.is_null());
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
+        assert!(!view.Value.is_null());
+        let first = view.Value as usize / PAGE;
+        let before = crate::journal::kernel_asks();
+        assert!(ask_cached(first, first + 1).is_none());
+        assert!(ask_cached(first, first + 1).is_none());
+        assert_eq!(crate::journal::kernel_asks(), before + 1);
+        title_memory_remapped(view.Value as usize, PAGE);
+        assert!(ask_cached(first, first + 1).is_none());
+        assert_eq!(crate::journal::kernel_asks(), before + 2);
+        unsafe { UnmapViewOfFile(view); CloseHandle(section); }
+        title_memory_remapped(first * PAGE, PAGE);
+        let p = unsafe {
+            VirtualAlloc((first * PAGE) as _, PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        };
+        assert_eq!(p as usize, first * PAGE);
+        unsafe { p.cast::<u8>().write(1) };
+        let answer = ask_cached(first, first + 1).expect("write watched");
+        assert!(!answer.pages().is_empty());
+        drop(answer);
+        assert!(ask_cached(first, first + 1).is_some());
+        assert_eq!(crate::journal::kernel_asks(), before + 4);
+        unsafe { VirtualFree(p, 0, MEM_RELEASE); }
+    }
+
     #[test]
     fn kernel_reads_into_guarded_blocks_after_opening() {
         let _journal = journal_test_lock();

@@ -26,11 +26,17 @@ const PAGE: usize = crate::watch::PAGE;
 const KERNEL_PAGE: usize = 4096;
 
 #[cfg(feature = "diagnostics")]
-static KERNEL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static KERNEL_CALLS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 #[cfg(feature = "diagnostics")]
-pub(crate) fn take_kernel_calls() -> u64 {
-    KERNEL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed)
+pub(crate) fn take_kernel_calls() -> [u64; 3] {
+    std::array::from_fn(|i| KERNEL_CALLS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn skipped_kernel_call() {
+    KERNEL_CALLS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Pages of one shard in a row: 1 MiB, so a range meets few shards.
@@ -203,8 +209,6 @@ pub(crate) fn ask(first: usize, last: usize) -> Option<Answer> {
     let mut granularity = 0;
     #[cfg(test)]
     note_kernel_ask();
-    #[cfg(feature = "diagnostics")]
-    KERNEL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: the answer buffer holds `count` entries.
     #[cfg(test)]
     let started = std::time::Instant::now();
@@ -218,6 +222,8 @@ pub(crate) fn ask(first: usize, last: usize) -> Option<Answer> {
             &mut granularity,
         )
     } != 0;
+    #[cfg(feature = "diagnostics")]
+    KERNEL_CALLS[usize::from(failed)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     #[cfg(test)]
     BENCH_KERNEL.with(|v| v.set(v.get() + started.elapsed().as_nanos()));
     if failed {
