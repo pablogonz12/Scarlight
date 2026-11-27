@@ -10029,7 +10029,9 @@ impl<'a> Lower<'a> {
             if kind == 5 && *unorm {
                 return Err("a cube sample with texel coordinates");
             }
-            for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+            // CalculateLOD consumes only spatial coordinates, not an array slice.
+            let read = if op == 81 { spatial } else { coords };
+            for (k, slot) in cs.iter_mut().enumerate().take(read) {
                 let x = addr_packed(self, coord_base, k)?;
                 *slot = to_float(self, x);
             }
