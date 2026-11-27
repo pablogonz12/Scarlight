@@ -912,14 +912,23 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let _stall = victory_gpu::stall_site!("xmem::XMemMapPhysicalPages").enter(format_args!(""));
-    let base = address as usize;
     let mut physical = physical();
+    map_physical_pages(&mut physical, address, n, pages)
+}
+
+fn map_physical_pages(
+    physical: &mut Physical,
+    address: *mut c_void,
+    n: usize,
+    pages: *const usize,
+) -> *mut c_void {
+    let base = address as usize;
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
     let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, base, n * PAGE);
+    unmap(physical, base, n * PAGE);
     if pages.is_null() {
         return address;
     }
@@ -971,7 +980,7 @@ pub extern "system" fn XMemMapPhysicalPages(
                 );
             }
         }
-        if !map(&mut physical, at, run * PAGE, first) {
+        if !map(physical, at, run * PAGE, first) {
             return std::ptr::null_mut();
         }
         i += run;
@@ -990,7 +999,8 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
-    for i in 0..n {
+    let mut i = 0;
+    while i < n {
         // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
         let (address, page) = unsafe {
             (
@@ -1002,9 +1012,41 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
                 },
             )
         };
-        if XMemMapPhysicalPages(address, 1, page).is_null() {
+        let mut physical = physical();
+        let mut run = 1;
+        if !address.is_null() {
+            // Do not include an unknown page: the original loop unmaps only
+            // through the first failing entry.
+            let first = if page.is_null() {
+                None
+            } else {
+                // SAFETY: `page` points into the caller's array.
+                physical.pages.get(unsafe { &*page }).cloned()
+            };
+            while i + run < n {
+                // SAFETY: both arrays contain `n` entries.
+                let next_address = unsafe { *addresses.add(i + run) } as usize;
+                if (address as usize).checked_add(run * PAGE) != Some(next_address) {
+                    break;
+                }
+                let next_page = if pages.is_null() { 0 } else { unsafe { *pages.add(i + run) } };
+                let same_run = if page.is_null() {
+                    next_page == 0
+                } else if let (Some(first), Some(next)) = (&first, physical.pages.get(&next_page)) {
+                    Arc::ptr_eq(&first.section, &next.section) && next.index == first.index + run
+                } else {
+                    false
+                };
+                if !same_run {
+                    break;
+                }
+                run += 1;
+            }
+        }
+        if map_physical_pages(&mut physical, address, run, page).is_null() {
             return 0;
         }
+        i += run;
     }
     1
 }
@@ -1588,11 +1630,6 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
-    /// A scatter of pages at consecutive addresses maps them in one call:
-    /// each address shows its own page, pages asked for in a different order
-    /// still land where they are asked for, a zero page in the middle unmaps
-    /// only its own address, and an unmap run goes in one call
-    /// (idea from ivall/xcl#254).
     #[test]
     fn scatter_mapping_microbench() {
         const N: usize = 4096;
@@ -1624,6 +1661,41 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
     }
 
+    #[test]
+    fn scatter_coalesces_views_and_preserves_aliases() {
+        let pages = allocate(4);
+        let pool = XMemVirtualAlloc(
+            std::ptr::null_mut(), 6 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE,
+        );
+        assert!(!pool.is_null());
+        let at = |i: usize| pool.wrapping_byte_add(i * PAGE);
+        let addresses = [at(0), at(1), at(2), at(4), at(5)];
+        let mapped = [pages[0], pages[1], pages[2], pages[3], pages[0]];
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 5, mapped.as_ptr()), 1);
+        {
+            let physical = physical();
+            assert_eq!(physical.views.get(&(at(0) as usize)).unwrap().0, 3 * PAGE);
+            assert_eq!(physical.views.get(&(at(4) as usize)).unwrap().0, PAGE);
+            assert_eq!(physical.views.get(&(at(5) as usize)).unwrap().0, PAGE);
+        }
+        // SAFETY: the two views alias the same mapped physical page.
+        unsafe {
+            at(0).cast::<u8>().write(42);
+            assert_eq!(at(5).cast::<u8>().read(), 42);
+        }
+        assert_eq!(XMemMapPhysicalPagesScatter([at(1)].as_ptr(), 1, std::ptr::null()), 1);
+        assert_eq!(query(at(1)).host.State, MEM_RESERVE);
+        // SAFETY: the remaining parts of the view are still mapped.
+        unsafe {
+            assert_eq!(at(0).cast::<u8>().read(), 42);
+            assert_eq!(at(5).cast::<u8>().read(), 42);
+            at(2).cast::<u8>().write(7);
+        }
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 5, std::ptr::null()), 1);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    /// Consecutive and reordered scatter mappings, including unmapping.
     #[test]
     fn scatter_maps_runs_of_consecutive_addresses() {
         let pages = allocate(3);
