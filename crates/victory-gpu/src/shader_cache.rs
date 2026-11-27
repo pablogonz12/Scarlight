@@ -1,16 +1,5 @@
-//! Translated shaders kept on disk (decision 0003): under the configured
-//! cache folder, keyed by the container's content, by the VIctory build
-//! that translated it (the BLAKE3 of our executable), by every translation
-//! switch that build runs with and by what it learned about the host GPU
-//! (see [`build`] and [`entry_key`]), so neither a rebuilt translator nor
-//! one run with other switches nor another card is served an old
-//! translation. Entries go through `victory-pipeline`'s content-addressed
-//! cache, which writes them atomically; an entry that does not read back is
-//! translated again.
-//!
-//! The entry is our own encoding of [`HostShader`]: a field added to it
-//! must be added to `encode` and `decode` too (entries of older builds
-//! are ignored anyway).
+//! Translated shaders cached by container, translator source fingerprint, encoding format,
+//! translation settings and host inputs.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -40,44 +29,13 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// A name for this build, 16 hex digits of its BLAKE3: the same executable
-/// the shader cache keys its translations on, shortened for a directory
-/// name. A pipeline library is keyed on it, so a rebuilt VIctory never
-/// reads pipelines another build made (its entries are named after
-/// translated shaders, which a rebuild changes). `None` when our executable
-/// cannot be read: nothing about this run may be trusted to a name, so
-/// nothing is pruned either.
+/// Pipeline directory shared by builds with the same translation identity.
 pub(crate) fn build_name() -> Option<String> {
-    static NAME: OnceLock<Option<String>> = OnceLock::new();
-    NAME.get_or_init(|| {
-        // The executable's bytes alone: this is asked before the host GPU
-        // exists (the pipeline library is opened first), so nothing here
-        // may probe it as `build()` does.
-        match std::env::current_exe().and_then(std::fs::read) {
-            Ok(bytes) => Some(blake3::hash(&bytes).to_hex()[..16].to_owned()),
-            Err(e) => {
-                tracing::warn!(error = %e, "cannot read our executable; no other run's pipeline library is read");
-                None
-            }
-        }
-    })
-    .clone()
+    Some(blake3::Hash::from(*build()).to_hex()[..16].to_owned())
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (every switch `victory-shader`'s
-/// [`translate`] reads, its loop limits, its barrier mode, its clean-up
-/// passes: `victory_shader::emit::settings_bytes`). One place lists them, so
-/// a switch that picks the form of a program cannot be left out of the key
-/// again: a run with `VICTORY_WAVE_LOCAL=0` or `VICTORY_F16_SUM_WIDE=0` was
-/// served the translations an earlier run of the same executable had cached
-/// with them unset, and the water it drew was flat.
-///
-/// The inputs the host GPU provides (the null slot view indices are clamped
-/// to, the widest wave it runs) are *not* here: they are known only once the
-/// device exists, which is after this is first asked for (the pipeline
-/// library and `shader-meta.bin` are opened before it). [`entry_key`] adds
-/// them when a translation is looked up.
+/// Translation identity, including source fingerprint, encoding format and settings.
+/// Host-specific inputs are included separately in each shader entry key.
 pub(crate) fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -97,21 +55,11 @@ pub(crate) fn build() -> &'static [u8; 32] {
             );
         }
         let settings = victory_shader::emit::settings_bytes();
-        match std::env::current_exe().and_then(std::fs::read) {
-            Ok(exe) => build_key(&exe, &settings),
-            Err(e) => {
-                // Without it no entry can be trusted: a fresh key per run.
-                tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                *blake3::hash(&now.as_nanos().to_le_bytes()).as_bytes()
-            }
-        }
+        build_key(env!("VICTORY_TRANSLATOR_KEY").as_bytes(), &settings)
     })
 }
 
-/// The key of one translation: the build (executable and switches) and the
+/// The key of one translation: the translator fingerprint and switches and the
 /// inputs the host GPU supplies ([`victory_shader::emit::device_bytes`]).
 /// Read at translation time, never cached: the device's limits are probed
 /// after the caches are opened, and a translation made on one host must
@@ -123,11 +71,12 @@ fn entry_key() -> [u8; 32] {
     *blake3::hash(&bytes).as_bytes()
 }
 
-/// The key for `exe`'s translation with `settings` (see [`build`]): pure, so
+/// The key for a translator fingerprint with `settings` (see [`build`]): pure, so
 /// a test can ask what a switch set would key without touching the process's
-/// executable or environment.
-fn build_key(exe: &[u8], settings: &[u8]) -> [u8; 32] {
-    let mut bytes = exe.to_vec();
+/// environment.
+fn build_key(version: &[u8], settings: &[u8]) -> [u8; 32] {
+    let mut bytes = b"shader-cache-format-1\0".to_vec();
+    bytes.extend_from_slice(version);
     bytes.extend_from_slice(settings);
     *blake3::hash(&bytes).as_bytes()
 }
@@ -403,6 +352,51 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_fingerprint_reuses_disk_cache_and_changed_fingerprint_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let container = b"a console container";
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        let before = build_key(b"translator fingerprint one", b"settings");
+        let rebuilt = build_key(b"translator fingerprint one", b"settings");
+        let bumped = build_key(b"translator fingerprint two", b"settings");
+        assert_eq!(before, rebuilt);
+        assert_ne!(before, bumped);
+        assert_eq!(
+            cached(
+                &Cache::open(dir.path()).unwrap(),
+                &before,
+                container,
+                translate
+            ),
+            Ok(shader())
+        );
+        assert_eq!(
+            cached(
+                &Cache::open(dir.path()).unwrap(),
+                &rebuilt,
+                container,
+                translate
+            ),
+            Ok(shader())
+        );
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            cached(
+                &Cache::open(dir.path()).unwrap(),
+                &bumped,
+                container,
+                translate
+            ),
+            Ok(shader())
+        );
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
     fn translations_come_back_from_the_cache() {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(dir.path()).unwrap();
@@ -517,7 +511,10 @@ mod tests {
             Ok(shader())
         };
         fn keyed(switches: impl Fn(&str) -> Option<OsString>) -> [u8; 32] {
-            build_key(b"our executable", &victory_shader::emit::settings_bytes_of(switches))
+            build_key(
+                b"our executable",
+                &victory_shader::emit::settings_bytes_of(switches),
+            )
         }
         let unset = keyed(|_| None);
         assert_eq!(cached(&cache, &unset, container, translate), Ok(shader()));
