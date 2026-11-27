@@ -13,11 +13,14 @@ use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, USER_GROUP_BASE, flags};
 use crate::ShaderError;
-use crate::gfx10::{Dpp, Fields, NULL, Operand};
+use crate::gfx10::{Dpp, Fields, NULL, Operand, Valu};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
+
+mod fused;
+mod switches;
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 /// The ray-tracing node test (`image_bvh_intersect_ray`), a child module so
@@ -168,6 +171,25 @@ enum Numeric {
     Uint,
     Sint,
     Float,
+}
+
+/// The dword a byte or half at a constant byte `off` sits in, and the shift
+/// from its low end to the field (loads are dword-aligned).
+const fn field_in_dword(off: u32) -> (u32, u32) {
+    (off & !3, (off & 3) * 8)
+}
+
+/// Whether a source's `abs`/`neg` modifiers (and, for a move, its `clamp` and
+/// `omod`) are taken as host floats again, as main did: `VICTORY_BITWISE_MODS=0`.
+fn host_mods(v: &Valu, clamp_too: bool) -> bool {
+    !switches::mods() && (v.abs != 0 || v.neg != 0 || (clamp_too && (v.clamp || v.omod != 0)))
+}
+
+/// Where a byte or half load at the constant byte `off` lands: the word
+/// [`field_in_dword`] names and the shift, or `None` for the run-time
+/// alignment in main's instruction order (`VICTORY_FIELD_DWORD=0`).
+fn field_at(off: u32) -> Option<(u32, u32)> {
+    switches::field().then(|| field_in_dword(off))
 }
 
 /// A GFX10 buffer format (the unified format of typed buffer loads): the
@@ -3496,20 +3518,40 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let op = *v.src.get(k).ok_or("a missing operand")?;
         if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 {
             return Err("integer operand modifiers");
         }
-        match self.src0 {
-            Some(x) if k == 0 => Ok(x),
+        self.src_bits(inst, k)
+    }
+
+    /// Source `k` as bits, with any SDWA selection and bitwise `abs`/`neg`
+    /// modifiers: sign-bit moves that keep denormals and NaN payloads (a
+    /// float `fabs`/`fneg` may flush or quiet them).
+    fn src_bits(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let mut x = match self.src0 {
+            Some(x) if k == 0 => x,
             _ => {
                 let x = self.operand(inst, &op)?;
-                Ok(match Self::sdwa_src(inst, k) {
+                match Self::sdwa_src(inst, k) {
                     Some((sel, sext)) => self.select_bits(x, sel, sext),
                     None => x,
-                })
+                }
             }
+        };
+        let c = self.cur;
+        if v.abs >> k & 1 != 0 {
+            let m = self.s.m.i32(0x7FFF_FFFF);
+            x = self.s.m.bin(c, Bin::And, x, m);
         }
+        if v.neg >> k & 1 != 0 {
+            let m = self.s.m.i32(0x8000_0000);
+            x = self.s.m.bin(c, Bin::Xor, x, m);
+        }
+        Ok(x)
     }
 
     fn unary(&mut self, op: u32, f: V) -> V {
@@ -6531,13 +6573,28 @@ impl<'a> Lower<'a> {
                 .collect()
         };
         let words = if total < 32 {
-            // A byte or half inside the dword that holds it.
-            let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
-            let at = self.s.m.bin(c, Bin::And, off, not3);
-            let w = load(self, at, 1)[0];
-            let byte = self.s.m.bin(c, Bin::And, off, three);
-            let sh = self.s.m.bin(c, Bin::Shl, byte, three);
-            vec![self.s.m.bin(c, Bin::LShr, w, sh)]
+            // A byte or half inside the dword that holds it. A constant offset
+            // is aligned here, and the load takes the same access as the
+            // buffer's others: vkd3d-proton reads a load at a computed offset
+            // through a per-component raw access, which on NVIDIA misses a
+            // dword the same invocation has just stored.
+            match self.s.m.int_value(off).and_then(|o| field_at(o as u32)) {
+                Some((at, sh)) => {
+                    let (at, sh) = (self.s.m.i32(at), self.s.m.i32(sh));
+                    let w = load(self, at, 1)[0];
+                    vec![self.s.m.bin(c, Bin::LShr, w, sh)]
+                }
+                // `VICTORY_FIELD_DWORD=0`: the run-time alignment, in main's
+                // instruction order.
+                _ => {
+                    let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
+                    let at = self.s.m.bin(c, Bin::And, off, not3);
+                    let w = load(self, at, 1)[0];
+                    let byte = self.s.m.bin(c, Bin::And, off, three);
+                    let sh = self.s.m.bin(c, Bin::Shl, byte, three);
+                    vec![self.s.m.bin(c, Bin::LShr, w, sh)]
+                }
+            }
         } else {
             load(self, off, total / 32)
         };
@@ -7483,11 +7540,19 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_mov_b32" => {
-                if v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 {
+                if host_mods(v, true) {
                     let a = f(self, 0)?;
                     return float(self, a);
                 }
-                let a = s(self, 0)?;
+                let a = if switches::mods() {
+                    self.src_bits(inst, 0)?
+                } else {
+                    self.src(inst, 0)?
+                };
+                if v.clamp || v.omod != 0 {
+                    let a = self.as_float(a);
+                    return float(self, a);
+                }
                 int(self, a)
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
@@ -7934,13 +7999,25 @@ impl<'a> Lower<'a> {
                         }
                     }
                 };
-                if v.abs != 0 || v.neg != 0 {
+                // Sign-bit moves on the bits the select passes (a host
+                // `fabs`/`fneg` may flush a denormal), whatever the mask's use.
+                if host_mods(v, false) {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
                     let r = self.s.m.select(c, cond, bb, a);
                     return float(self, r);
                 }
-                let (a, bb) = (s(self, 0)?, s(self, 1)?);
+                let (a, bb) = if switches::mods() {
+                    (self.src_bits(inst, 0)?, self.src_bits(inst, 1)?)
+                } else {
+                    (self.src(inst, 0)?, self.src(inst, 1)?)
+                };
                 let r = self.s.m.select(c, cond, bb, a);
+                if v.clamp || v.omod != 0 {
+                    // Output modifiers are float ones, on the bits the
+                    // select passed: the select itself stays bitwise.
+                    let f = self.as_float(r);
+                    return float(self, f);
+                }
                 int(self, r)
             }
             "v_add_co_u32" | "v_sub_co_u32" | "v_subrev_co_u32" | "v_add_co_ci_u32"
@@ -8604,7 +8681,8 @@ impl<'a> Lower<'a> {
             // (NVIDIA's does), one step of the last place lower where the two differ.
             // shortcut: the host's conversion unless `VICTORY_F16_NEAREST=1`
             // ([`f16_nearest_on`]), which costs a dozen instructions per result.
-            let h = if f16_nearest_on() {
+            let fused_half = matches!(name, "v_fma_f16" | "v_fmac_f16") && switches::fma_once();
+            let h = if fused_half || f16_nearest_on() {
                 l.f16_nearest(f)
             } else {
                 l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
@@ -8649,8 +8727,10 @@ impl<'a> Lower<'a> {
                 self.half_fsrc(inst, 2)?
             };
             let r = match name {
-                // shortcut: fused f16 multiply-adds as FMad in f32 (the
-                // product is exact; the sum rounds twice).
+                // A fused multiply-add rounds once; a multiply-add (v_mad_f16,
+                // v_mac_f16) may round the product first.
+                "v_fma_f16" | "v_fmac_f16" if switches::fma_once() => self.fmad_half(a, b, acc),
+                // `VICTORY_F16_FMA_ONCE=0`: the fused ones too, in f32.
                 "v_fma_f16" | "v_fmac_f16" | "v_mad_f16" | "v_mac_f16" => self.fmad(a, b, acc),
                 "v_max3_f16" => {
                     let t = self.max_min(true, a, b);
