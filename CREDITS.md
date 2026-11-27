@@ -404,3 +404,5 @@ D
 - **Senchsus**, [VIctory #682](https://github.com/Marvisak/VIctory/pull/682): legacy multiply treats denormal operands as zero.
 - **CaravelaLabs**, [shader decoder change](https://github.com/Belobug/VIctory-Belobug-AMD/commit/3d71ad1a6547836ac1dbd19bfab2d759c965d307): decode the ATC probe immediate, resource width, and cache flags.
 - **Key**, [fxceless/victory-fork #1044](https://github.com/fxceless/victory-fork/pull/1044), GPL-3.0: size DirectStorage workers to physical cores and allow an override.
+
+- **Rareuncommon**, [vector sum of absolute differences](https://github.com/Marvisak/VIctory/commit/5d6889e8b): lower vector SAD variants.

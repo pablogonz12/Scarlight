@@ -258,6 +258,37 @@ fn run_cases_on(
     assert!(ran > 0, "no SM 6.6 device available ({devices:?})");
 }
 
+#[test]
+fn vector_sad_variants_accumulate_unsigned_differences() {
+    let inputs = [
+        [0x0403_0201, 0x0100_0204, 0xffff_fff0, 0],
+        [0xffff_ffff, 0, 7, 0],
+        [0, 0xffff_ffff, 0xffff_fffe, 0],
+    ];
+    for (op, width, high, masked) in [
+        (0x15a, 8, false, false),
+        (0x15b, 8, true, false),
+        (0x15c, 16, false, false),
+        (0x15d, 32, false, false),
+        (0x171, 8, false, true),
+    ] {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        run_cases(&shader, &inputs, |backend, _, input, got| {
+            let mask = u32::MAX >> (32 - width);
+            let mut sum = 0u32;
+            for i in 0..(32 / width) {
+                let a = (input[0] >> (i * width)) & mask;
+                let b = (input[1] >> (i * width)) & mask;
+                if !masked || b != 0 {
+                    sum = sum.wrapping_add(a.abs_diff(b));
+                }
+            }
+            let want = input[2].wrapping_add(if high { sum << 16 } else { sum });
+            assert_eq!(got, want, "{backend}: opcode {op:#x} {input:x?}");
+        });
+    }
+}
+
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }
