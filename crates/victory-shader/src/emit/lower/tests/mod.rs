@@ -49,16 +49,20 @@ fn wave_uniform_running_sum_is_proved_inside_a_loop() {
         0xBF8C_C07F, 0x4A10_1011, 0xBE94_047E, 0x7DA4_0E12, 0x8A86_7E06,
         0xBF85_FFF3, 0xBEFE_0400, 0x3402_0082, 0xE070_1000, 0x8002_0801,
     ];
-    let mut code: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
-    code.extend_from_slice(&S_ENDPGM.to_le_bytes());
-    let p = ir::build(&code, true, 64).unwrap();
-    let st = structure::structure(&p).unwrap();
-    let tid = p.inputs.iter().find(|x| x.0 == ir::Reg::V(0)).unwrap().1;
-    let first = p.blocks.iter().flat_map(|b| &b.insts)
-        .find(|i| i.name() == "v_readfirstlane_b32").unwrap();
-    let value = first.read(ir::Reg::V(8)).unwrap();
-    let all = vec![true; p.blocks.len()];
-    assert!(super::lane_uniform(&p, &st, &all, Some(tid)).contains(&value));
+    for (address, expected) in [(words[22], true), (0x3410_0082, false)] {
+        let mut body = words;
+        body[22] = address;
+        let mut code: Vec<_> = body.into_iter().flat_map(u32::to_le_bytes).collect();
+        code.extend_from_slice(&S_ENDPGM.to_le_bytes());
+        let p = ir::build(&code, true, 64).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let tid = p.inputs.iter().find(|x| x.0 == ir::Reg::V(0)).unwrap().1;
+        let first = p.blocks.iter().flat_map(|b| &b.insts)
+            .find(|i| i.name() == "v_readfirstlane_b32").unwrap();
+        let value = first.read(ir::Reg::V(8)).unwrap();
+        let all = super::all_lane_blocks(&st).unwrap();
+        assert_eq!(super::lane_uniform(&p, &st, &all, Some(tid)).contains(&value), expected);
+    }
 }
 
 #[test]

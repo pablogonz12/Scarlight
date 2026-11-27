@@ -415,3 +415,4 @@ D
 - **AnoHunted**, [signed nibble conversion](https://github.com/Marvisak/VIctory/commit/78c12677e): lower `v_cvt_off_f32_i4` and test its conversion.
 - **gomeaw**, Belobug/VIctory-Belobug-AMD commit 7348b80aa, GPL-3.0: include implicit lane inputs in wave uniformity proofs.
 - **justrealyme**, Belobug/VIctory-Belobug-AMD commit 431cab5d9, GPL-3.0: prove first-lane reads under wave-uniform conditions.
+- **gomeaw**, Belobug/VIctory-Belobug-AMD commit 7bf91de4c, GPL-3.0: bound uniformity proofs to explicit operands.

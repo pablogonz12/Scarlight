@@ -558,7 +558,8 @@ fn lane_uniform(
                     gds: false,
                     ..
                 } = &inst.fields
-                    && name == "ds_read_b32"
+                    && name.starts_with("ds_read")
+                    && !name.contains("_d16")
                     && data.is_empty()
                 {
                     if inst.read(Reg::V(*reg)).is_some_and(|a| known(&next, &a)) {
@@ -601,20 +602,21 @@ fn lane_uniform(
                     continue;
                 }
                 let alike = ops.iter().all(|op| match *op {
-                    Operand::Vector { reg, .. } => {
-                        // every dword of the operand the instruction reads from that register on
-                        let read: Vec<Value> = inst
-                            .reads
-                            .iter()
-                            .filter(|r| matches!(r.0, Reg::V(x) if x >= reg))
-                            .map(|r| r.1)
-                            .collect();
-                        !read.is_empty() && read.iter().all(|x| known(&next, x))
+                    Operand::Vector { reg, dwords } => {
+                        (0..dwords).all(|i| {
+                            reg.checked_add(i)
+                                .and_then(|r| inst.read(Reg::V(r)))
+                                .is_some_and(|v| known(&next, &v))
+                        })
                     }
-                    // a scalar is one value; a lane mask is not, unless a compare of such values made it
-                    Operand::Scalar { code, .. } if code != NULL => inst
-                        .read(Reg::S(code))
-                        .is_none_or(|x| !is_mask(x) || known(&next, &x)),
+                    Operand::Scalar { code, dwords } if code != NULL => {
+                        (0..dwords).all(|i| {
+                            code.checked_add(i)
+                                .and_then(|r| inst.read(Reg::S(r)))
+                                .is_some_and(|v| !is_mask(v) || known(&next, &v))
+                        })
+                    }
+                    Operand::Const(251..=254) | Operand::Attr { .. } => false,
                     _ => true,
                 });
                 let implicit_alike = inst.reads.iter().all(|(reg, value)| {
