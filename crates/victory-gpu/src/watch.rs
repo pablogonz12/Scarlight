@@ -536,7 +536,8 @@ fn guarded_answer(first: usize, last: usize, written: &[usize]) -> (u64, Vec<(us
 /// written: the first asking reports every block (the whole range once, as
 /// before), and after it only the blocks the title wrote, 8-9 us a block.
 ///
-/// `VICTORY_GUARD_COPY_POOLS=0` puts the whole-range copy back. The kernel
+/// `VICTORY_GUARD_POOLS=0` or `VICTORY_GUARD_COPY_POOLS=0` puts the
+/// whole-range copy back. The kernel
 /// cannot verify this class (that is why it cannot answer), so a write that
 /// makes no fault (the card's into host memory, one through another view of
 /// the same section) is not seen: `crate::guards` never guards an aliased
@@ -547,7 +548,10 @@ pub(crate) fn guard_copy_pools() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_COPY_POOLS").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_GUARD_POOLS").is_none_or(|v| v != "0")
+            && std::env::var_os("VICTORY_GUARD_COPY_POOLS").is_none_or(|v| v != "0")
+    })
 }
 
 /// Whether a range the kernel will not answer for is guarded as a pool: for
