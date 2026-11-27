@@ -1139,6 +1139,18 @@ impl State {
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != Some(self.heaps) {
+            if self.heaps[0] == 0 || crate::descriptor::heap(self.heaps[0] as This).host().is_none() {
+                once!("no view heap to bind");
+                return false;
+            }
+            if self.heaps[1] != 0 && crate::descriptor::heap(self.heaps[1] as This).host().is_none() {
+                once!("no host sampler heap to bind");
+                return false;
+            }
+            if self.heaps[1] == 0 && !fallback_samplers_on() {
+                once!("no sampler heap to bind");
+                return false;
+            }
             let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
                 .heaps
                 .iter()
@@ -1156,7 +1168,10 @@ impl State {
                         tracing::debug!("the title binds no sampler heap: binding ours");
                         heaps.push(Some(h.heap.clone()));
                     }
-                    None => once!("no sampler heap of ours to bind"),
+                    None => {
+                        once!("no sampler heap of ours to bind");
+                        return false;
+                    }
                 }
             }
             heaps.iter().flatten().for_each(|h| list.keep(h));
