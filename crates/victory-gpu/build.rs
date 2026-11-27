@@ -1,5 +1,14 @@
 use std::path::{Path, PathBuf};
 
+const EXTRA_SOURCES: &[&str] = &[
+    "crates/victory-shader/Cargo.toml",
+    "crates/victory-gpu/src/shader_cache.rs",
+    "crates/victory-gpu/src/shader_meta.rs",
+    "crates/victory-gpu/src/pipeline.rs",
+    "crates/victory-gpu/src/pipeline/host.rs",
+    "crates/victory-gpu/build.rs",
+];
+
 fn collect(dir: &Path, files: &mut Vec<PathBuf>) {
     println!("cargo:rerun-if-changed={}", dir.display());
     for entry in std::fs::read_dir(dir).expect("read shader source directory") {
@@ -16,13 +25,7 @@ fn main() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut files = Vec::new();
     collect(&root.join("crates/victory-shader/src"), &mut files);
-    for path in [
-        "crates/victory-shader/Cargo.toml",
-        "crates/victory-gpu/src/shader_cache.rs",
-        "crates/victory-gpu/src/shader_meta.rs",
-        "crates/victory-gpu/src/pipeline/host.rs",
-        "crates/victory-gpu/build.rs",
-    ] {
+    for path in EXTRA_SOURCES {
         files.push(root.join(path));
     }
     files.sort();
@@ -51,4 +54,12 @@ fn main() {
         "cargo:rustc-env=VICTORY_TRANSLATOR_KEY={}",
         hash.finalize().to_hex()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn metadata_computation_is_fingerprinted() {
+        assert!(super::EXTRA_SOURCES.contains(&"crates/victory-gpu/src/pipeline.rs"));
+    }
 }
