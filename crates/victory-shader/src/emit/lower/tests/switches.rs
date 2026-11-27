@@ -53,6 +53,23 @@ fn a_fused_half_multiply_add_rounds_once_only_with_its_switch() {
 }
 
 #[test]
+fn fused_half_always_uses_nearest_conversion() {
+    let _held = exclusive();
+    force("VICTORY_F16_FMA_ONCE", Some(true));
+    let lower_with = |opcode, nearest| {
+        super::super::TEST_F16_NEAREST.set(Some(nearest));
+        let words: Vec<u32> = vop3(opcode, 0, 256, 257, 258)
+            .into_iter()
+            .chain(std::iter::once(S_ENDPGM))
+            .collect();
+        lowers_cs(&words, 1 << 15, false, [1, 1, 1]).unwrap().dxil
+    };
+    assert_eq!(lower_with(0x34b, false), lower_with(0x34b, true));
+    super::super::TEST_F16_NEAREST.set(None);
+    force("VICTORY_F16_FMA_ONCE", None);
+}
+
+#[test]
 fn a_bitwise_modifier_reads_bits_only_with_its_switch() {
     let _held = exclusive();
     let abs = Valu {

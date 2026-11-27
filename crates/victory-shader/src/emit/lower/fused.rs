@@ -6,8 +6,8 @@ use crate::emit::bitcode::{Bin, V, pred};
 impl<'a> Lower<'a> {
     /// Both binary16 factors have an exact product in binary32, so the fused
     /// sum's error is only the final rounding: an error-free residual of the
-    /// sum rounds the inexact result to odd and the bits to nearest even
-    /// (Boldo and Melquiond, 2008).
+    /// sum rounds the inexact binary32 result to odd (Boldo and Melquiond,
+    /// 2008). The caller must convert it to binary16 with nearest-even rounding.
     pub(super) fn fmad_half(&mut self, a: V, b: V, addend: V) -> V {
         let c = self.cur;
         let product = self.s.m.bin(c, Bin::Mul, a, b);

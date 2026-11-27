@@ -8579,7 +8579,8 @@ impl<'a> Lower<'a> {
             // (NVIDIA's does), one step of the last place lower where the two differ.
             // shortcut: the host's conversion unless `VICTORY_F16_NEAREST=1`
             // ([`f16_nearest_on`]), which costs a dozen instructions per result.
-            let h = if f16_nearest_on() {
+            let fused_half = matches!(name, "v_fma_f16" | "v_fmac_f16") && switches::fma_once();
+            let h = if fused_half || f16_nearest_on() {
                 l.f16_nearest(f)
             } else {
                 l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
