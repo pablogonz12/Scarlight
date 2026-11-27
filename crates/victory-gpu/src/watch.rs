@@ -906,13 +906,22 @@ fn guarded_range(start: usize, end: usize, pools: bool) -> Option<Vec<usize>> {
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
-        && crate::guards::block_known(start);
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // A range inside a runtime placeholder reservation is view memory (the
+    // runtime maps its pages through `xmem::map`, which tells us), and its
+    // holes are in the views: no question to Windows either way.
+    let in_placeholder = crate::inplace::placeholder_range(first * BLOCK, last * BLOCK);
+    if in_placeholder {
+        crate::inplace::PLACEHOLDER_HITS[0]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let known = in_placeholder
+        || (!*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
+            && crate::guards::block_known(start));
     if !known && !is_view(start, end) && !(pools && is_pool(start)) {
         return None;
     }
     install();
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     Some(crate::guards::reguard(first, last))
 }
 
@@ -1043,6 +1052,14 @@ pub(crate) fn back_begin(done: &std::sync::Arc<Done>, from: usize, to: usize) ->
     install();
     let mut held = Vec::new();
     let take = |a: usize, b: usize, held: &mut Vec<usize>| {
+        // The map is taken *before* the pages are made inaccessible: a title
+        // thread that faults in between would find no job for the block
+        // (`back_pending`), so the handler could not wait for the merge and
+        // would pass the fault on. With the map held across the protect, that
+        // fault waits here and then finds the job. Nothing inside this block
+        // touches title memory, so the handler cannot be entered on this
+        // thread while it holds the map.
+        let mut map = back();
         let mut old = 0;
         // SAFETY: title memory; only its protection changes.
         if unsafe {
@@ -1054,7 +1071,6 @@ pub(crate) fn back_begin(done: &std::sync::Arc<Done>, from: usize, to: usize) ->
             )
         } != 0
         {
-            let mut map = back();
             for block in a..b {
                 // A block an earlier job holds keeps the protection it had
                 // before the first job took it: `back_release` gives that
@@ -1105,14 +1121,60 @@ pub(crate) fn back_wait(from: usize, to: usize) {
             .collect()
     };
     for done in jobs {
-        done.wait();
+        let _ = done.wait_for(
+            "a fence signal behind a write-back job",
+            crate::writeback::MERGE_DEADLINE,
+        );
+    }
+}
+
+/// Waits for the job that holds `at`, if one does; on the deadline the job's
+/// hold is given up (`back_open_now`: the merge is lost, and said so by
+/// `Done::wait_for`) so the title's access can go through instead of the run
+/// stopping on a job that will never finish. The worker never waits for its
+/// own job: it opens the block and goes on.
+pub(crate) fn wait_held(at: usize) {
+    let Some(done) = back_pending(at) else {
+        return;
+    };
+    if crate::writeback::this_is_worker() {
+        back_open_now(at, 1);
+        return;
+    }
+    if !done.wait_for(
+        "a title access to a block a write-back job holds",
+        crate::writeback::MERGE_DEADLINE,
+    ) {
+        back_open_now(at, 1);
     }
 }
 
 /// Before a kernel write into title memory `[at, at + len)`: the blocks are
-/// given back writable, as [`open`] does for the guarded ones (the write is
-/// the title's, or the job's own, so nothing waits for the job there).
+/// given back writable, as [`open`] does for the guarded ones. A job that
+/// holds one is waited for first (bounded: [`wait_held`] and the deadline):
+/// opening the block under it would let the job's merge put the GPU's older
+/// bytes over the title's write afterwards, i.e. lose the merge *and* the
+/// title's bytes.
 pub(crate) fn back_open(at: usize, len: usize) {
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    if !crate::writeback::this_is_worker() {
+        let jobs: Vec<std::sync::Arc<Done>> = {
+            let map = back();
+            map.range(first..last).map(|(_, (done, _))| done.clone()).collect()
+        };
+        for done in jobs {
+            let _ = done.wait_for(
+                "a write into a block a write-back job holds",
+                crate::writeback::MERGE_DEADLINE,
+            );
+        }
+    }
+    back_open_now(at, len);
+}
+
+/// [`back_open`] without waiting for the job: the worker's own write into its
+/// blocks, and the repair after a wait gave up.
+pub(crate) fn back_open_now(at: usize, len: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut opened = Vec::new();
@@ -1291,17 +1353,13 @@ fn install() {
         let at = r.ExceptionInformation[1];
         // A write-back job has this block (inaccessible to reads and writes
         // alike): wait for the GPU's bytes to be put back before the
-        // instruction reads or writes them.
-        if let Some(done) = back_pending(at) {
-            // The worker itself must never wait for its own job: the block
-            // is opened and the instruction goes on.
-            if crate::writeback::this_is_worker() {
-                back_open(at, 1);
-                return EXCEPTION_CONTINUE_EXECUTION;
-            }
+        // instruction reads or writes them, but never past the deadline with
+        // no word said: `wait_held` gives the block up, names the job it
+        // waited for, and this instruction goes on with the title's range.
+        if back_pending(at).is_some() {
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
-            done.wait();
+            wait_held(at);
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::add(crate::copystat::C::AsyncWaits, 1);
@@ -2391,6 +2449,90 @@ mod mapping_tests {
         remapped_taken(crate::watch::remap_generation(), at, BLOCK);
         assert!(!remapped_any(at, BLOCK), "a copy that read it clears it");
         *remapped() = saved;
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+}
+#[cfg(test)]
+mod back_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    /// A kernel write of ours into a block a job holds waits for the job
+    /// before it opens it: opening first would let the job's merge write the
+    /// GPU's older bytes over the title's, and lose the merge.
+    #[test]
+    fn back_open_waits_for_the_job_that_holds_the_block() {
+        use std::sync::mpsc;
+        // SAFETY: one block of private memory, freed at the end.
+        let at = unsafe {
+            VirtualAlloc(std::ptr::null(), BLOCK, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(at, 0);
+        let done = std::sync::Arc::new(Done::default());
+        let blocks = back_begin(&done, at, at + BLOCK);
+        assert_eq!(blocks, [at / BLOCK]);
+        let (opened, when) = mpsc::channel();
+        let opener = std::thread::spawn(move || {
+            back_open(at, 1);
+            opened.send(()).unwrap();
+        });
+        assert!(
+            when.recv_timeout(std::time::Duration::from_millis(50)).is_err(),
+            "back_open opened a block a job still holds (the job's merge is lost)"
+        );
+        assert!(!writable_now(at));
+        done.finish();
+        assert!(
+            when.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            "back_open goes on once the job is done"
+        );
+        assert!(writable_now(at), "the title's write has the block");
+        assert!(back_pending(at).is_none());
+        opener.join().unwrap();
+        back_release(&blocks, &done);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A read of a block a job holds returns within the deadline and names
+    /// the job it waited for; on the deadline the block is the title's again,
+    /// so the instruction that faulted goes through instead of the title's
+    /// thread never running again.
+    #[test]
+    fn a_read_of_a_held_block_returns_within_the_deadline_and_names_the_job() {
+        use std::sync::mpsc;
+        // SAFETY: one block of private memory, freed at the end.
+        let at = unsafe {
+            VirtualAlloc(std::ptr::null(), BLOCK, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(at, 0);
+        let done = std::sync::Arc::new(Done::default());
+        let id = done.id();
+        let blocks = back_begin(&done, at, at + BLOCK);
+        assert_eq!(blocks, [at / BLOCK]);
+        let (back, when) = mpsc::channel();
+        let waited = done.clone();
+        let reader = std::thread::spawn(move || {
+            wait_held(at);
+            back.send((waited.id(), waited.finished())).unwrap();
+        });
+        assert!(
+            when.recv_timeout(std::time::Duration::from_millis(50)).is_err(),
+            "the read waits while the job is outstanding"
+        );
+        let (named, finished) = when
+            .recv_timeout(crate::writeback::MERGE_DEADLINE + std::time::Duration::from_secs(2))
+            .expect("the read returns within the deadline");
+        assert_eq!(named, id, "the wait names the job it waited for");
+        assert!(!finished, "the job never finished: only the deadline returned it");
+        assert!(writable_now(at), "the block is given back to the title");
+        assert!(back_pending(at).is_none(), "and no job holds it any more");
+        reader.join().unwrap();
+        back_release(&blocks, &done);
         // SAFETY: our allocation.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
