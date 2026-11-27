@@ -347,6 +347,13 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
     (size / PIECE as u64 + 2) * 16
 }
 
+/// The floor of the card's copies in KiB (`VICTORY_CARD_BUFFERS_MIN_KB` /
+/// `VICTORY_CARD_BUFFERS_MIN_MB`: the one env var back to the old floor), for
+/// the frame line.
+pub(crate) fn card_floor_kb() -> u64 {
+    card_limits().0 >> 10
+}
+
 /// A buffer of `size` bytes in the card's memory for a title buffer's
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the

@@ -59,6 +59,8 @@ pub mod fence;
 pub mod frame;
 #[cfg(any(windows, test))]
 mod frame_budget;
+// The ranges a submission's copies took: pure, so its tests run everywhere.
+mod refresh_runs;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
