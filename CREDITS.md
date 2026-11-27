@@ -1,5 +1,7 @@
 # Credits
 
+- **Duff [c430b1de](https://github.com/Marvisak/VIctory/commit/c430b1de)**, GPL-3.0:
+  pack typed buffer d16 loads two channels per register, retaining integer bits.
 - **Marvisak/VIctory [13091f6e](https://github.com/Marvisak/VIctory/commit/13091f6e)**, GPL-3.0:
   array level queries use spatial coordinates only.
 
