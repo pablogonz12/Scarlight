@@ -37,6 +37,7 @@ pub(crate) mod ahead;
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
+    texture: ID3D12Resource,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
     size: u64,
@@ -242,6 +243,10 @@ pub(crate) fn order_on() -> bool {
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
+    /// Per-subresource generations, cleared only by a submission that
+    /// recorded that same generation. Zero means no pending upload.
+    upload_generations: Vec<u64>,
+    next_generation: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
     /// The guard said "not written" and this check hashed anyway (the
@@ -255,6 +260,27 @@ struct Last {
 }
 
 impl Last {
+    fn mark_uploads(&mut self, indices: impl IntoIterator<Item = usize>) {
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        for i in indices {
+            if let Some(generation) = self.upload_generations.get_mut(i) {
+                *generation = self.next_generation;
+            }
+        }
+    }
+
+    fn mark_all_uploads(&mut self) {
+        self.mark_uploads(0..self.upload_generations.len());
+    }
+
+    fn acknowledge_uploads(&mut self, recorded: &[u64]) {
+        for (current, &generation) in self.upload_generations.iter_mut().zip(recorded) {
+            if *current == generation {
+                *current = 0;
+            }
+        }
+    }
+
     /// `hash` is not the hash of the last read: what the guard let pass
     /// as unwritten was written.
     fn changed(&mut self, hash: blake3::Hash) {
@@ -717,12 +743,23 @@ fn dirty_runs(
     runs
 }
 
+fn touched_subresources(ranges: &[(u64, u64)], runs: &[(u64, usize)]) -> Vec<usize> {
+    ranges.iter().enumerate().filter_map(|(i, &(a, b))| {
+        runs.iter().any(|&(at, len)| at < b && a < at.saturating_add(len as u64)).then_some(i)
+    }).collect()
+}
+
 /// Whether a changed texture is detiled only where it changed, the 64 KiB
 /// pages the title wrote since the last asking (`VICTORY_DETILE_DIRTY=0`
 /// detiles the whole texture at every change, as before).
 fn detile_dirty() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_DETILE_DIRTY").is_none_or(|v| v != "0"))
+}
+
+fn upload_dirty_mips() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_DIRTY_MIPS").is_none_or(|v| v != "0"))
 }
 
 /// Frames between two looks at a texture at most (`VICTORY_TEXTURE_REFRESH_EVERY`,
@@ -1178,14 +1215,16 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             let ran = staging.clone();
             job.then(move |copied: bool| {
                 use std::sync::atomic::Ordering::Relaxed;
-                ran.ahead
-                    .store(if copied { ahead::DONE } else { ahead::NONE }, Relaxed);
                 if copied {
+                    let mut last = ran.last.lock().unwrap_or_else(|e| e.into_inner());
+                    last.upload_generations.fill(0);
                     ran.uploaded.store(true, Relaxed);
                     ran.dirty.store(false, Relaxed);
                     #[cfg(feature = "diagnostics")]
                     ran.present.queued();
                 }
+                ran.ahead
+                    .store(if copied { ahead::DONE } else { ahead::NONE }, Relaxed);
             });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexUploads, 1);
@@ -1208,6 +1247,11 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         list.defer_texture(staging);
         return false;
     }
+    let generations = {
+        let last = staging.last.lock().unwrap_or_else(|e| e.into_inner());
+        last.upload_generations.clone()
+    };
+    let all_uploads = !upload_dirty_mips() || !staging.uploaded.load(Relaxed);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
     if ahead::on() {
@@ -1221,6 +1265,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {
+        if !all_uploads && generations.get(i).copied().unwrap_or(1) == 0 {
+            continue;
+        }
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
@@ -1273,8 +1320,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     {
         let staging = staging.clone();
         list.defer_host(move || {
+            let mut last = staging.last.lock().unwrap_or_else(|e| e.into_inner());
+            last.acknowledge_uploads(&generations);
             staging.uploaded.store(true, Relaxed);
-            staging.dirty.store(false, Relaxed);
+            staging.dirty.store(last.upload_generations.iter().any(|&g| g != 0), Relaxed);
             if ahead::on() {
                 staging.ahead.store(ahead::DONE, Relaxed);
             }
@@ -1356,7 +1405,8 @@ impl Staging {
             // to pay (`VICTORY_DETILE_DIRTY=0`: the whole texture, as
             // before).
             if previous != 0
-                && let Some(read) = self.refresh_pages(&written, previous)
+                && !last.missed
+                && let Some(read) = self.refresh_pages(&written, previous, last)
             {
                 return read;
             }
@@ -1364,7 +1414,7 @@ impl Staging {
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                self.detile(read);
+                self.detile(read, last);
             });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
@@ -1476,7 +1526,7 @@ impl Staging {
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
-                self.detile(read);
+                self.detile(read, last);
                 true
             });
             #[cfg(feature = "diagnostics")]
@@ -1501,7 +1551,7 @@ impl Staging {
                     return size;
                 }
                 last.changed(hash);
-                self.detile(tiled);
+                self.detile(tiled, last);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
@@ -1526,7 +1576,7 @@ impl Staging {
                     last.hash = Some(hash);
                     // SAFETY: as above.
                     let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-                    self.detile(tiled);
+                    self.detile(tiled, last);
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                     drop(_mapped);
@@ -1561,7 +1611,7 @@ impl Staging {
             }
             // Learnt from a write the guard missed (`intro-fix`), and counted.
             last.changed(hash);
-            self.detile(tiled);
+            self.detile(tiled, last);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
             true
@@ -1585,7 +1635,7 @@ impl Staging {
             let hash = blake3::hash(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
-                self.detile(read);
+                self.detile(read, last);
             }
             true
         });
@@ -1610,7 +1660,7 @@ impl Staging {
     /// whole at each of its refreshes; the write watch already knows which
     /// 64 KiB pages changed, so only those runs are read, and only the
     /// elements of them each subresource covers are detiled.
-    fn refresh_pages(&self, written: &[(usize, u64)], previous: u64) -> Option<usize> {
+    fn refresh_pages(&self, written: &[(usize, u64)], previous: u64, last: &mut Last) -> Option<usize> {
         use std::sync::atomic::Ordering::Relaxed;
         if !detile_dirty() || previous == 0 {
             return None;
@@ -1623,6 +1673,16 @@ impl Staging {
         let runs = dirty_runs(written, previous, start, end);
         if runs.is_empty() {
             return Some(0);
+        }
+        if ranges.len() != self.footprints.len() {
+            return None;
+        }
+        if !committed(self.memory, self.layout.size as usize)
+            || runs.iter().any(|run| touched_subresources(ranges, std::slice::from_ref(run)).is_empty())
+        {
+            last.mark_all_uploads();
+        } else {
+            last.mark_uploads(touched_subresources(ranges, &runs));
         }
         let mut read = 0usize;
         for &(run_at, run_len) in &runs {
@@ -1676,7 +1736,8 @@ impl Staging {
         Some(read)
     }
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
+    fn detile(&self, tiled: &[u8], last: &mut Last) {
+        last.mark_all_uploads();
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         self.present.detiled(tiled);
@@ -2287,7 +2348,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let skipped = crate::resource::dropped_mips(resource);
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize)) {
+    if let Some(s) = map.get(&(resource as usize)).filter(|s| s.texture == *texture) {
         return Some(s.clone());
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
@@ -2393,10 +2454,12 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let ranges = {
         let (mips, slices) = (u32::from(d.MipLevels), u32::from(d.DepthOrArraySize));
         let per_plane = mips.saturating_mul(slices);
-        (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D
+        (skipped == 0
+            && d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D
             && per_plane != 0
             && per_plane == subresources_per_plane
-            && layout.planes.len() as u32 * per_plane == count)
+            && layout.planes.len() as u32 * per_plane == count
+            && layout.planes.iter().all(|p| p.layout.mips.len() == mips as usize))
             .then(|| {
                 let mut r = Vec::with_capacity(count as usize);
                 for plane in &layout.planes {
@@ -2422,6 +2485,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
         buffer,
+        texture: texture.clone(),
         #[cfg(feature = "diagnostics")]
         size: total,
         data,
@@ -2436,7 +2500,11 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         memory,
         resource,
         released: std::sync::atomic::AtomicBool::new(false),
-        last: Mutex::default(),
+        last: Mutex::new(Last {
+            upload_generations: vec![1; count as usize],
+            next_generation: 1,
+            ..Last::default()
+        }),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         ahead: std::sync::atomic::AtomicU8::new(0),
@@ -2446,6 +2514,40 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod dirty_upload_tests {
+    use super::{Last, touched_subresources};
+
+    fn selected(last: &Last) -> Vec<usize> {
+        last.upload_generations.iter().enumerate()
+            .filter_map(|(i, &generation)| (generation != 0).then_some(i)).collect()
+    }
+
+    #[test]
+    fn changed_windows_and_submission_generations() {
+        let ranges = [(0, 100), (100, 200), (200, 300)];
+        let mut last = Last { upload_generations: vec![0; 3], ..Last::default() };
+        last.mark_uploads(touched_subresources(&ranges, &[(110, 2)]));
+        assert_eq!(selected(&last), [1]);
+        let first = last.upload_generations.clone();
+        last.acknowledge_uploads(&first);
+        assert!(selected(&last).is_empty());
+        last.mark_uploads(touched_subresources(&ranges, &[(110, 2), (250, 1)]));
+        assert_eq!(selected(&last), [1, 2]);
+        let two = last.upload_generations.clone();
+        last.acknowledge_uploads(&two);
+        assert!(selected(&last).is_empty());
+        last.mark_uploads(touched_subresources(&ranges, &[(99, 2), (250, 1)]));
+        assert_eq!(selected(&last), [0, 1, 2]);
+        let recorded = last.upload_generations.clone();
+        last.mark_uploads([1]);
+        last.acknowledge_uploads(&recorded);
+        assert_eq!(selected(&last), [1], "a later write must remain pending");
+        last.mark_all_uploads();
+        assert_eq!(selected(&last), [0, 1, 2]);
+    }
 }
 
 #[cfg(test)]

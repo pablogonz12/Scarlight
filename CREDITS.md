@@ -47,6 +47,8 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
 
 ## Design notes
 
+- **Marvis** (Marvisak/VIctory `cc5f96125`), GPL-3.0: the idea of updating only the
+  texture subresources affected by changed memory, adapted to this tree's staging path.
 - **fuzeofficial** ([Marvisak/VIctory #2608](https://github.com/Marvisak/VIctory/pull/2608)), GPL-3.0: the
   idea of cutting a command list at its texture read-backs and running the part after one in a submission
   of its own, so a copy or draw recorded behind a read-back is prepared after its bytes are in title
