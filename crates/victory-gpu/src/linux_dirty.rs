@@ -351,7 +351,7 @@ mod tests {
             let a = view.Value as usize;
             assert_eq!(ask(a, a + BLOCK), Some(vec![a / BLOCK]));
             assert_eq!(ask(a, a + BLOCK), Some(vec![]));
-            ((a + BLOCK - PAGE) as *mut u8).write_volatile(1);
+            (a as *mut u8).write_volatile(1);
             assert_eq!(ask(a, a + BLOCK), Some(vec![a / BLOCK]));
             assert_eq!(ask(a, a + BLOCK), Some(vec![]));
             assert_ne!(UnmapViewOfFile2(GetCurrentProcess(), view, 0), 0);
