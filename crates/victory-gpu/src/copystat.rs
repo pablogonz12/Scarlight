@@ -175,6 +175,58 @@ pub(crate) enum C {
     /// Shader resource views narrowed to their texture's resident mips.
     ViewNarrowed,
 }
+
+/// Creation calls by buffer kind and whether the calling thread has submitted.
+/// CreateCommittedResource includes any synchronous residency work it performs.
+struct ThreadCounters([AtomicU64; 4]);
+
+impl ThreadCounters {
+    const fn new() -> Self {
+        Self([const { AtomicU64::new(0) }; 4])
+    }
+
+    fn record(&self, submitting: bool, ns: u64) {
+        let i = if submitting { 0 } else { 2 };
+        self.0[i].fetch_add(1, Relaxed);
+        self.0[i + 1].fetch_add(ns, Relaxed);
+    }
+
+    fn take(&self) -> [u64; 4] {
+        std::array::from_fn(|i| self.0[i].swap(0, Relaxed))
+    }
+
+    fn record_current(&self, ns: u64) {
+        self.record(SUBMITTING_THREAD.with(|marked| marked.get()), ns);
+    }
+}
+
+static BUFFER_CREATES: [ThreadCounters; 3] = [const { ThreadCounters::new() }; 3];
+
+pub(crate) fn buffer_created(kind: usize, started: std::time::Instant) {
+    BUFFER_CREATES[kind].record_current(started.elapsed().as_nanos() as u64);
+}
+
+#[cfg(test)]
+mod thread_counter_tests {
+    use super::*;
+
+    #[test]
+    fn counts_and_time_follow_marked_threads() {
+        let counts = std::sync::Arc::new(ThreadCounters::new());
+        let other = counts.clone();
+        std::thread::spawn(move || {
+            SUBMITTING_THREAD.with(|marked| marked.set(true));
+            other.record_current(30);
+            other.record_current(40);
+        }).join().unwrap();
+        std::thread::spawn({
+            let counts = counts.clone();
+            move || counts.record_current(20)
+        }).join().unwrap();
+        assert_eq!(counts.take(), [2, 70, 1, 20]);
+        assert_eq!(counts.take(), [0; 4]);
+    }
+}
 /// One past the last counter: derived, so a variant added by either side
 /// (this branch's `DestGone`) cannot leave the array short.
 const COUNTERS: usize = C::ViewNarrowed as usize + 1;
@@ -948,6 +1000,8 @@ static SUBMITTERS: Mutex<Vec<(u32, Submitter)>> = Mutex::new(Vec::new());
 static RECORDERS: Mutex<Vec<(u32, u64, u64)>> = Mutex::new(Vec::new());
 
 thread_local! {
+    /// Once this thread has submitted, also attribute work between submissions.
+    static SUBMITTING_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// This thread's last submission: when it returned ([`now_us`]) and the
     /// thread's processor time then (user, kernel).
     static LEFT: std::cell::Cell<Option<(u64, u64, u64)>> = const { std::cell::Cell::new(None) };
@@ -1030,6 +1084,7 @@ pub(crate) fn recorded(started: std::time::Instant) {
 /// A submission is called on this thread (before it waits for the
 /// submission lock).
 pub(crate) fn submission_begins() {
+    SUBMITTING_THREAD.with(|marked| marked.set(true));
     let now = now_us();
     if !SUBMITTED_SINCE.load(Relaxed) && !SUBMITTED_SINCE.swap(true, Relaxed) {
         add(C::UntilSubmitUs, now.saturating_sub(PRESENTED_AT.load(Relaxed)));
@@ -1097,6 +1152,14 @@ fn page_faults() -> u64 {
 /// second or more: a 4 s frame after an unlogged 4 s frame showed two
 /// frames' counts as one's).
 pub(crate) fn log(frames: f64) {
+    for (name, counters) in ["readback", "upload", "shared"].into_iter().zip(&BUFFER_CREATES) {
+        let [submit, submit_ns, other, other_ns] = counters.take();
+        tracing::info!(
+            "buffer create {name} per frame: submit {:.1} {:.3} ms; other {:.1} {:.3} ms (committed creation including implicit residency)",
+            submit as f64 / frames, submit_ns as f64 / 1e6 / frames,
+            other as f64 / frames, other_ns as f64 / 1e6 / frames
+        );
+    }
     let counted = COUNT[C::Frames as usize].swap(0, Relaxed);
     let frames = if counted > 0 { counted as f64 } else { frames };
     static FAULTS: AtomicU64 = AtomicU64::new(0);

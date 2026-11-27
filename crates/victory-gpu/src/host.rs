@@ -7111,6 +7111,8 @@ impl Host {
         };
         let mut buffer: Option<ID3D12Resource> = None;
         // SAFETY: plain creation of a read-back buffer.
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         let made = unsafe {
             self.device.CreateCommittedResource(
                 &heap,
@@ -7121,6 +7123,10 @@ impl Host {
                 &mut buffer,
             )
         };
+        #[cfg(feature = "diagnostics")]
+        if made.is_ok() {
+            crate::copystat::buffer_created(0, started);
+        }
         match made {
             Ok(()) => buffer,
             Err(e) => {
@@ -7153,6 +7159,8 @@ impl Host {
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
         // SAFETY: plain creation and mapping of an upload buffer.
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         let made = unsafe {
             self.device
                 .CreateCommittedResource(
@@ -7164,6 +7172,8 @@ impl Host {
                     &mut buffer,
                 )
                 .and_then(|()| {
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::buffer_created(1, started);
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
                     b.Map(0, None, Some(&mut data))
                 })
@@ -8168,6 +8178,8 @@ impl Host {
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
         // SAFETY: plain creation and mapping of a CPU-visible buffer.
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         let made = unsafe {
             self.device
                 .CreateCommittedResource(
@@ -8179,6 +8191,8 @@ impl Host {
                     &mut buffer,
                 )
                 .and_then(|()| {
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::buffer_created(2, started);
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
                     b.Map(0, None, Some(&mut data))
                 })
