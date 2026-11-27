@@ -17,6 +17,7 @@ extern "system" fn create_device(
     iid: *const Iid,
     out: *mut *const Object,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("d3d12x::create_device").enter(format_args!(""));
     // The title's allocator, the page mapper and the failure hook all drive
     // the host's D3D12: Windows only (the crate is built off Windows for the
     // unit tests and rustdoc).

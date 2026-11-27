@@ -221,6 +221,7 @@ fn name_info_flags(sa: *const u8, len: i32, host_wanted: bool, flags: i32) -> Op
 // Connects.
 
 pub extern "system" fn connect(s: Socket, name: *const u8, len: i32) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::connect").enter(format_args!(""));
     if !reachable("network connect blocked", name, len) {
         return SOCKET_ERROR;
     }
@@ -236,6 +237,7 @@ pub extern "system" fn WSAConnect(
     sqos: *const c_void,
     gqos: *const c_void,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::WSAConnect").enter(format_args!(""));
     if !reachable("network connect blocked", name, len) {
         return SOCKET_ERROR;
     }
@@ -261,6 +263,7 @@ pub extern "system" fn WSAConnectByNameA(
     timeout: *const c_void,
     reserved: *mut c_void,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::WSAConnectByNameA").enter(format_args!(""));
     if !reachable_name(narrow(node)) {
         return 0;
     }
@@ -280,6 +283,7 @@ pub extern "system" fn WSAConnectByNameW(
     timeout: *const c_void,
     reserved: *mut c_void,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::WSAConnectByNameW").enter(format_args!(""));
     if !reachable_name(wide(node)) {
         return 0;
     }
@@ -307,6 +311,7 @@ pub extern "system" fn WSAConnectByList(
     timeout: *const c_void,
     reserved: *mut c_void,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::WSAConnectByList").enter(format_args!(""));
     if !list.is_null() {
         // SAFETY: the title passes a `SOCKET_ADDRESS_LIST`.
         let entries = unsafe {
@@ -335,6 +340,7 @@ pub extern "system" fn WSAJoinLeaf(
     gqos: *const c_void,
     flags: u32,
 ) -> Socket {
+    let _stall = victory_gpu::stall_site!("net::WSAJoinLeaf").enter(format_args!(""));
     if !reachable("network connect blocked", name, len) {
         return INVALID_SOCKET;
     }
@@ -360,6 +366,7 @@ extern "system" fn connect_ex(
     sent: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::connect_ex").enter(format_args!(""));
     if !reachable("network connect blocked", name, len) {
         return 0;
     }
@@ -412,6 +419,7 @@ pub extern "system" fn WSAIoctl(
     overlapped: *mut c_void,
     completion: *const c_void,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::WSAIoctl").enter(format_args!(""));
     if code == SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER {
         wsa_error(WSAEINVAL);
         return SOCKET_ERROR;
@@ -445,6 +453,7 @@ pub extern "system" fn sendto(
     to: *const u8,
     to_len: i32,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::sendto").enter(format_args!(""));
     if !to.is_null() && !stream(s) && !reachable("network datagram blocked", to, to_len) {
         return SOCKET_ERROR;
     }
@@ -464,6 +473,7 @@ pub extern "system" fn WSASendTo(
     overlapped: *mut c_void,
     completion: *const c_void,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::WSASendTo").enter(format_args!(""));
     if !to.is_null() && !stream(s) && !reachable("network datagram blocked", to, to_len) {
         return SOCKET_ERROR;
     }
@@ -497,6 +507,7 @@ pub extern "system" fn WSASendMsg(
     overlapped: *mut c_void,
     completion: *const c_void,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::WSASendMsg").enter(format_args!(""));
     // SAFETY: the title passes a `WSAMSG` or null.
     if let Some(m) = unsafe { message.cast::<MessageName>().as_ref() }
         && !m.name.is_null()
@@ -514,6 +525,7 @@ pub extern "system" fn WSASendMsg(
 // shortcut: `[::]` becomes `[::1]`, so a dual-stack listener no longer hears
 // 127.0.0.1; bind both families if a title relies on that.
 pub extern "system" fn bind(s: Socket, name: *const u8, len: i32) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::bind").enter(format_args!(""));
     let host_bind = host!("ws2_32.dll", "bind": extern "system" fn(Socket, *const u8, i32) -> i32);
     match socket_addr(name, len) {
         Some(a) if loopback(a.ip()) => host_bind(s, name, len),
@@ -543,6 +555,7 @@ pub extern "system" fn getaddrinfo(
     hints: *const c_void,
     result: *mut *mut c_void,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::getaddrinfo").enter(format_args!(""));
     if !resolvable(narrow(node)) {
         return WSAHOST_NOT_FOUND;
     }
@@ -557,6 +570,7 @@ pub extern "system" fn GetAddrInfoW(
     hints: *const c_void,
     result: *mut *mut c_void,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::GetAddrInfoW").enter(format_args!(""));
     if !resolvable(wide(node)) {
         return WSAHOST_NOT_FOUND;
     }
@@ -577,6 +591,7 @@ pub extern "system" fn GetAddrInfoExA(
     completion: *const c_void,
     handle: *mut Handle,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::GetAddrInfoExA").enter(format_args!(""));
     if !resolvable(narrow(name)) {
         return WSAHOST_NOT_FOUND;
     }
@@ -597,6 +612,7 @@ pub extern "system" fn GetAddrInfoExW(
     completion: *const c_void,
     handle: *mut Handle,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::GetAddrInfoExW").enter(format_args!(""));
     if !resolvable(wide(name)) {
         return WSAHOST_NOT_FOUND;
     }
@@ -606,6 +622,7 @@ pub extern "system" fn GetAddrInfoExW(
 }
 
 pub extern "system" fn gethostbyname(name: *const c_char) -> *mut c_void {
+    let _stall = victory_gpu::stall_site!("net::gethostbyname").enter(format_args!(""));
     if !resolvable(narrow(name)) {
         return std::ptr::null_mut();
     }
@@ -619,6 +636,7 @@ pub extern "system" fn WSAAsyncGetHostByName(
     buf: *mut c_char,
     buf_len: i32,
 ) -> Handle {
+    let _stall = victory_gpu::stall_site!("net::WSAAsyncGetHostByName").enter(format_args!(""));
     if !resolvable(narrow(name)) {
         return std::ptr::null_mut();
     }
@@ -636,6 +654,7 @@ pub extern "system" fn WSALookupServiceBeginA(
     _flags: u32,
     _lookup: *mut Handle,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::WSALookupServiceBeginA").enter(format_args!(""));
     once("network name-space query blocked", "any".into());
     wsa_error(WSASERVICE_NOT_FOUND);
     SOCKET_ERROR
@@ -647,12 +666,14 @@ pub extern "system" fn WSALookupServiceBeginW(
     flags: u32,
     lookup: *mut Handle,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::WSALookupServiceBeginW").enter(format_args!(""));
     WSALookupServiceBeginA(restrictions, flags, lookup)
 }
 
 // Reverse lookups.
 
 pub extern "system" fn gethostbyaddr(addr: *const c_char, len: i32, kind: i32) -> *mut c_void {
+    let _stall = victory_gpu::stall_site!("net::gethostbyaddr").enter(format_args!(""));
     if !reverse_resolvable(raw_ip(addr, len, kind)) {
         wsa_error(WSAHOST_NOT_FOUND);
         return std::ptr::null_mut();
@@ -671,6 +692,7 @@ pub extern "system" fn WSAAsyncGetHostByAddr(
     buf: *mut c_char,
     buf_len: i32,
 ) -> Handle {
+    let _stall = victory_gpu::stall_site!("net::WSAAsyncGetHostByAddr").enter(format_args!(""));
     if !reverse_resolvable(raw_ip(addr, len, kind)) {
         wsa_error(WSAHOST_NOT_FOUND);
         return std::ptr::null_mut();
@@ -689,6 +711,7 @@ pub extern "system" fn getnameinfo(
     serv_len: u32,
     flags: i32,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::getnameinfo").enter(format_args!(""));
     let Some(flags) = name_info_flags(sa, sa_len, !host.is_null(), flags) else {
         return WSAHOST_NOT_FOUND;
     };
@@ -706,6 +729,7 @@ pub extern "system" fn GetNameInfoW(
     serv_len: u32,
     flags: i32,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::GetNameInfoW").enter(format_args!(""));
     let Some(flags) = name_info_flags(sa, sa_len, !host.is_null(), flags) else {
         return WSAHOST_NOT_FOUND;
     };
@@ -724,6 +748,7 @@ pub extern "system" fn WinHttpConnect(
     port: u16,
     reserved: u32,
 ) -> Handle {
+    let _stall = victory_gpu::stall_site!("net::WinHttpConnect").enter(format_args!(""));
     if let Some(name) = wide(server)
         && !loopback_name(&name)
     {
@@ -746,6 +771,7 @@ pub extern "system" fn WinHttpOpen(
     _bypass: *const u16,
     flags: u32,
 ) -> Handle {
+    let _stall = victory_gpu::stall_site!("net::WinHttpOpen").enter(format_args!(""));
     if access != WINHTTP_ACCESS_TYPE_NO_PROXY {
         once("HTTP proxy ignored", format!("access type {access}"));
     }
@@ -765,6 +791,7 @@ pub extern "system" fn WinHttpSetOption(
     buffer: *const c_void,
     len: u32,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::WinHttpSetOption").enter(format_args!(""));
     if option == WINHTTP_OPTION_PROXY {
         once("HTTP proxy ignored", "WINHTTP_OPTION_PROXY".into());
         return 1;
@@ -781,6 +808,7 @@ fn no_auto_proxy() -> u32 {
 }
 
 pub extern "system" fn WinHttpDetectAutoProxyConfigUrl(_flags: u32, _url: *mut *mut u16) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::WinHttpDetectAutoProxyConfigUrl").enter(format_args!(""));
     // SAFETY: no pointers.
     unsafe { SetLastError(no_auto_proxy()) };
     0
@@ -792,6 +820,7 @@ pub extern "system" fn WinHttpGetProxyForUrl(
     _options: *const c_void,
     _info: *mut c_void,
 ) -> i32 {
+    let _stall = victory_gpu::stall_site!("net::WinHttpGetProxyForUrl").enter(format_args!(""));
     // SAFETY: no pointers.
     unsafe { SetLastError(no_auto_proxy()) };
     0
@@ -803,6 +832,7 @@ pub extern "system" fn WinHttpGetProxyForUrlEx(
     _options: *const c_void,
     _context: usize,
 ) -> u32 {
+    let _stall = victory_gpu::stall_site!("net::WinHttpGetProxyForUrlEx").enter(format_args!(""));
     no_auto_proxy()
 }
 
@@ -814,6 +844,7 @@ pub extern "system" fn WinHttpGetProxyForUrlEx2(
     _selection: *const u8,
     _context: usize,
 ) -> u32 {
+    let _stall = victory_gpu::stall_site!("net::WinHttpGetProxyForUrlEx2").enter(format_args!(""));
     no_auto_proxy()
 }
 
@@ -823,6 +854,7 @@ pub extern "system" fn WinHttpGetProxySettingsEx(
     _params: *const c_void,
     _context: usize,
 ) -> u32 {
+    let _stall = victory_gpu::stall_site!("net::WinHttpGetProxySettingsEx").enter(format_args!(""));
     no_auto_proxy()
 }
 

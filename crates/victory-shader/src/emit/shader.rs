@@ -39,8 +39,9 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 ///   address space: the number of the host copy holding that page (0: none
 ///   yet) and the page's byte offset in that copy;
 /// - copy `n` is the raw buffer view at view-heap slot `base + n`, `base`
-///   the user-data dword of kind [`USER_MEMORY_BASE`]; slot `base` itself
-///   reads zeros and drops writes;
+///   the user-data dword of kind [`USER_MEMORY_BASE`]. Dword 1 of that kind
+///   is the last copy number prepared for the recorded bind: later numbers
+///   (and slot `base` itself) read zeros and drop writes;
 /// - the root UAV `u<SLOT_FAULTS>` takes the page numbers of accesses that
 ///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 a sink), which the
 ///   host reads afterwards to make those copies for the frames to come.
@@ -69,6 +70,13 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host computes: the index
+/// of the first thread group a dispatch runs, in `x`. The console allows more
+/// groups in a dimension than the host runs in one dispatch (65,535), so the
+/// host runs such a dispatch as several, one after another, and tells each
+/// where its groups start. 0 for every dispatch that fits. Read only by a
+/// program that reads its group id, which adds it to `x`.
+pub const USER_GROUP_BASE: u32 = 0x104;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -130,10 +138,38 @@ pub fn view_heap_limit() -> u32 {
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether shaders clamp the view slots the title made itself below the
+/// host's dynamic slots ([`title_view_limit`]). `VICTORY_TITLE_VIEW_CLAMP=0`
+/// turns it off, and `victory-gpu` then keeps its dynamic slots right after
+/// the title's, as before.
+pub fn title_view_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TITLE_VIEW_CLAMP").is_none_or(|v| v != "0"))
+}
+
+/// The slots a view index the title made itself may name: the host's view
+/// heap less its dynamic slots ([`super::DYNAMIC_VIEWS`]), which follow the
+/// title's. 0: no separate limit (no host heap probed, a heap with no room
+/// for both, or the clamp is off).
+pub fn title_view_limit() -> u32 {
+    if !title_view_clamp() {
+        return 0;
+    }
+    title_view_limit_of(view_heap_limit())
+}
+
+/// [`title_view_limit`] for a heap whose last slot is `limit`.
+fn title_view_limit_of(limit: u32) -> u32 {
+    if limit > super::DYNAMIC_VIEWS + 1 { limit - super::DYNAMIC_VIEWS } else { 0 }
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
     pub pixel: bool,
+    /// The last slot of the host's view heap when this shader is translated
+    /// ([`view_heap_limit`]; 0: none), which its view indices are clamped to.
+    pub view_limit: u32,
     pub inputs: Vec<SigElement>,
     pub outputs: Vec<SigElement>,
     /// A mesh shader's per-primitive outputs.
@@ -146,8 +182,8 @@ pub(crate) struct Shader {
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
     pub samplers: u32,
-    /// Bit n: immediate sampler n is a comparison sampler.
-    pub cmp_samplers: u64,
+    /// Per-slot flag: immediate sampler `n` is a comparison sampler.
+    pub cmp_samplers: Vec<bool>,
     /// Root CBVs read, by root parameter index, with their handles.
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
@@ -200,6 +236,7 @@ impl Shader {
                 res_ret,
             },
             pixel,
+            view_limit: VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed),
             inputs: Vec::new(),
             outputs: Vec::new(),
             prims: Vec::new(),
@@ -207,7 +244,7 @@ impl Shader {
             geometry: None,
             user_data: 0,
             samplers: 0,
-            cmp_samplers: 0,
+            cmp_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
@@ -352,8 +389,8 @@ impl Shader {
         h
     }
 
-    /// The handle of immediate sampler `n` (a comparison sampler when its
-    /// bit in `cmp_samplers` is set).
+    /// The handle of immediate sampler `n` (a comparison sampler when
+    /// `cmp_samplers[n]` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
         let bind = [
             self.m.i32(n),
@@ -371,7 +408,7 @@ impl Shader {
             217,
             &[bind, i, f],
         );
-        let cmp = if self.cmp_samplers >> n & 1 != 0 {
+        let cmp = if self.cmp_samplers.get(n as usize).copied().unwrap_or(false) {
             0x8000
         } else {
             0
@@ -392,6 +429,25 @@ impl Shader {
         )
     }
 
+    /// A view index the title made itself (every path to the descriptor is the
+    /// resource heap itself, not a table): on a host whose dynamic slots
+    /// follow the title's ([`title_view_limit`]), an index past the title's
+    /// slots reads the heap's null slot instead of naming one of the host's
+    /// tables. A table's index may name a dynamic slot and is not clamped
+    /// here, only at the heap's end ([`Self::heap_handle`]).
+    pub fn clamp_title_heap_index(&mut self, block: usize, index: V) -> V {
+        let limit = if title_view_clamp() { title_view_limit_of(self.view_limit) } else { 0 };
+        if limit == 0 {
+            return index;
+        }
+        let last = self.m.i32(limit - 1);
+        let over = self.m.cmp(block, super::bitcode::pred::IUGT, index, last);
+        let null = self.m.i32(self.view_limit);
+        let v = self.m.select(block, over, null, index);
+        self.m.tag(v, super::bitcode::Tag::Clamp);
+        v
+    }
+
     /// A descriptor heap handle, annotated with `props`; `nonuniform` when
     /// the index may differ between lanes (`NonUniformResourceIndex`).
     pub fn heap_handle(
@@ -401,9 +457,12 @@ impl Shader {
         sampler: bool,
         nonuniform: bool,
         props: (u32, u32),
+        from_heap: bool,
     ) -> V {
+        // An index the title made itself (not a table's) may not name a host slot.
+        let index = if from_heap && !sampler { self.clamp_title_heap_index(block, index) } else { index };
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
-        let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+        let limit = self.view_limit;
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
         let index = if !sampler && limit != 0 {
             let null = self.m.i32(limit);
@@ -605,7 +664,8 @@ impl Shader {
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
                 for n in 0..self.samplers {
-                    let kind = (self.cmp_samplers >> n & 1) as u32;
+                    let kind =
+                        u32::from(self.cmp_samplers.get(n as usize).copied().unwrap_or(false));
                     let ops = vec![
                         Some(i32c(&mut self, n)),
                         Some(self.m.md_value(u)),

@@ -14,6 +14,7 @@ use crate::{HleModule, HostPolicy, hle_export, registry, runtime};
 /// `GetModuleHandleW(NULL)` must return the title's image, not our exe;
 /// title images and our console modules are found by name.
 pub extern "system" fn GetModuleHandleW(name: *const u16) -> *mut c_void {
+    let _stall = victory_gpu::stall_site!("kernel::GetModuleHandleW").enter(format_args!(""));
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
@@ -22,6 +23,7 @@ pub extern "system" fn GetModuleHandleW(name: *const u16) -> *mut c_void {
 
 /// See [`GetModuleHandleW`].
 pub extern "system" fn GetModuleHandleA(name: *const u8) -> *mut c_void {
+    let _stall = victory_gpu::stall_site!("kernel::GetModuleHandleA").enter(format_args!(""));
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
@@ -48,6 +50,7 @@ fn wide(text: *const u16) -> String {
 /// A title image's path is its original file, not our cache copy;
 /// `NULL` means the title's exe.
 pub extern "system" fn GetModuleFileNameW(module: *mut c_void, out: *mut u16, size: u32) -> u32 {
+    let _stall = victory_gpu::stall_site!("kernel::GetModuleFileNameW").enter(format_args!(""));
     let Some(path) = title_path(module) else {
         return host::get_module_file_name_w(module, out, size);
     };
@@ -60,6 +63,7 @@ pub extern "system" fn GetModuleFileNameW(module: *mut c_void, out: *mut u16, si
 
 /// See [`GetModuleFileNameW`].
 pub extern "system" fn GetModuleFileNameA(module: *mut c_void, out: *mut u8, size: u32) -> u32 {
+    let _stall = victory_gpu::stall_site!("kernel::GetModuleFileNameA").enter(format_args!(""));
     let Some(path) = title_path(module) else {
         return host::get_module_file_name_a(module, out, size);
     };
@@ -106,6 +110,7 @@ pub extern "system" fn LoadLibraryExA(
     file: *mut c_void,
     flags: u32,
 ) -> *mut c_void {
+    let _stall = victory_gpu::stall_site!("kernel::LoadLibraryExA").enter(format_args!(""));
     if !name.is_null()
         && let Some(handle) = find_module(&narrow(name), runs_code(flags))
     {
@@ -120,6 +125,7 @@ pub extern "system" fn LoadLibraryExW(
     file: *mut c_void,
     flags: u32,
 ) -> *mut c_void {
+    let _stall = victory_gpu::stall_site!("kernel::LoadLibraryExW").enter(format_args!(""));
     if !name.is_null()
         && let Some(handle) = find_module(&wide(name), runs_code(flags))
     {
@@ -136,16 +142,19 @@ fn runs_code(flags: u32) -> bool {
 }
 
 pub extern "system" fn LoadLibraryA(name: *const u8) -> *mut c_void {
+    let _stall = victory_gpu::stall_site!("kernel::LoadLibraryA").enter(format_args!(""));
     LoadLibraryExA(name, std::ptr::null_mut(), 0)
 }
 
 pub extern "system" fn LoadLibraryW(name: *const u16) -> *mut c_void {
+    let _stall = victory_gpu::stall_site!("kernel::LoadLibraryW").enter(format_args!(""));
     LoadLibraryExW(name, std::ptr::null_mut(), 0)
 }
 
 /// Looks up our implementations behind a pseudo handle; real modules go to
 /// the host.
 pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void {
+    let _stall = victory_gpu::stall_site!("kernel::GetProcAddress").enter(format_args!(""));
     // `NULL` is the process's exe, which for the title is its own image.
     let module = if module.is_null() {
         runtime::main_image().unwrap_or(0) as *mut c_void
@@ -197,6 +206,7 @@ fn host_override(module: *mut c_void, name: *const u8) -> Option<*mut c_void> {
 /// Our pseudo modules and the title's images stay loaded: `LoadLibrary`
 /// took no reference on them, so the host's count must not drop.
 pub extern "system" fn FreeLibrary(module: *mut c_void) -> i32 {
+    let _stall = victory_gpu::stall_site!("kernel::FreeLibrary").enter(format_args!(""));
     if registry().iter().any(|m| handle(m) == module)
         || runtime::image_path(module as usize).is_some()
     {
@@ -208,11 +218,13 @@ pub extern "system" fn FreeLibrary(module: *mut c_void) -> i32 {
 /// Title images hear of thread starts and ends from us, not from the
 /// Windows loader (`victory_loader::disable_thread_calls`).
 pub extern "system" fn DisableThreadLibraryCalls(module: *mut c_void) -> i32 {
+    let _stall = victory_gpu::stall_site!("kernel::DisableThreadLibraryCalls").enter(format_args!(""));
     host::disable_thread_library_calls(module)
 }
 
 /// Title debug output goes to our log (no debugger needs to be attached).
 pub extern "system" fn OutputDebugStringA(text: *const u8) {
+    let _stall = victory_gpu::stall_site!("kernel::OutputDebugStringA").enter(format_args!(""));
     if !text.is_null() {
         let text = narrow(text);
         host::note_title_output(text.trim());
@@ -222,6 +234,7 @@ pub extern "system" fn OutputDebugStringA(text: *const u8) {
 
 /// See [`OutputDebugStringA`].
 pub extern "system" fn OutputDebugStringW(text: *const u16) {
+    let _stall = victory_gpu::stall_site!("kernel::OutputDebugStringW").enter(format_args!(""));
     if !text.is_null() {
         let text = wide(text);
         host::note_title_output(text.trim());
@@ -260,11 +273,13 @@ pub extern "C" fn _invalid_parameter_noinfo_noreturn() -> ! {
 static TITLE_FILTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub extern "system" fn SetUnhandledExceptionFilter(filter: usize) -> usize {
+    let _stall = victory_gpu::stall_site!("kernel::SetUnhandledExceptionFilter").enter(format_args!(""));
     host::set_unhandled_exception_filter(report_unhandled);
     TITLE_FILTER.swap(filter, std::sync::atomic::Ordering::AcqRel)
 }
 
 extern "system" fn report_unhandled(info: *const c_void) -> i32 {
+    let _stall = victory_gpu::stall_site!("kernel::report_unhandled").enter(format_args!(""));
     host::report_unhandled(info);
     match TITLE_FILTER.load(std::sync::atomic::Ordering::Acquire) {
         0 => 0, // EXCEPTION_CONTINUE_SEARCH
@@ -279,6 +294,7 @@ extern "system" fn report_unhandled(info: *const c_void) -> i32 {
 
 /// See [`exit`]; only the current process is logged.
 pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 {
+    let _stall = victory_gpu::stall_site!("kernel::TerminateProcess").enter(format_args!(""));
     if process as isize == -1 {
         tracing::warn!(code, from = %host::callers(), "title terminates the process");
     }
@@ -350,6 +366,55 @@ fn refuse(file: &str) {
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 
+/// The title's thread priorities, but for the lowest two, which become
+/// "below normal", when `remapped`. Six of the title's threads run at "idle",
+/// the streaming pager's among them; on the console they have what the rest of
+/// the title leaves of its cores. A PC's processors are also wanted by other
+/// programs and by our own workers (sixteen when pipelines are made): with
+/// every one of them busy such a thread ran once in four seconds or so, when
+/// the host's scheduler took pity, and the loading that waits for it with it
+/// (stream-3: loads done 1.1 s late on average, 4.8 s at worst, fever308).
+/// Unset (or `0`): every thread keeps the priority the title asks for.
+fn title_priority(asked: i32, remapped: bool) -> i32 {
+    const IDLE: i32 = -15;
+    const LOWEST: i32 = -2;
+    const BELOW_NORMAL: i32 = -1;
+    if !remapped {
+        return asked;
+    }
+    match asked {
+        IDLE..=LOWEST => BELOW_NORMAL,
+        other => other,
+    }
+}
+
+/// [`title_priority`]'s `remapped`: `VICTORY_TITLE_PRIORITIES` is set and not
+/// `0`. Read once, as the title sets a priority on every thread it starts.
+fn remap_priorities() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_TITLE_PRIORITIES") {
+        None => false,
+        Some(v) => !v.is_empty() && v != "0",
+    })
+}
+
+/// The title sets its threads' priorities; the lowest two run below normal
+/// instead when `VICTORY_TITLE_PRIORITIES` is set (see [`title_priority`]).
+pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32 {
+    let _stall = victory_gpu::stall_site!("kernel::SetThreadPriority").enter(format_args!(""));
+    static NOTED: std::sync::Once = std::sync::Once::new();
+    let priority = title_priority(priority, remap_priorities());
+    if remap_priorities() {
+        NOTED.call_once(|| {
+            tracing::info!(
+                "the title's idle and lowest threads run below normal \
+                 (VICTORY_TITLE_PRIORITIES=0: as it sets them)"
+            );
+        });
+    }
+    host::set_thread_priority(thread, priority)
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -382,6 +447,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            hle_export!(SetThreadPriority),
         ],
     }
 }
@@ -503,6 +569,11 @@ mod host {
         unsafe { victory_loader::report_unhandled(info.cast()) };
     }
 
+    pub(super) fn set_thread_priority(thread: *mut c_void, priority: i32) -> i32 {
+        // SAFETY: the title passes a thread handle.
+        unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
+    }
+
     pub(super) fn note_title_output(line: &str) {
         victory_loader::note_title_output(line);
     }
@@ -583,6 +654,10 @@ mod host {
 
     pub(super) fn set_unhandled_exception_filter(_: extern "system" fn(*const c_void) -> i32) {}
 
+    pub(super) fn set_thread_priority(_: *mut c_void, _: i32) -> i32 {
+        1
+    }
+
     pub(super) fn report_unhandled(_: *const c_void) {}
 
     pub(super) fn note_title_output(_: &str) {}
@@ -597,6 +672,38 @@ mod tests {
     // Two tests use Windows path rules and run there only.
     #![cfg_attr(not(windows), allow(unused_imports, dead_code))]
     use super::*;
+
+    /// As the title sets them unless asked: the lowest two become "below
+    /// normal" only with `VICTORY_TITLE_PRIORITIES`, and no other priority
+    /// moves either way.
+    #[test]
+    fn the_lowest_two_priorities_run_below_normal_only_when_asked() {
+        let asked = [-15, -2, -1, 0, 1, 2, 15];
+        let as_set: Vec<i32> = asked.iter().map(|&p| title_priority(p, false)).collect();
+        assert_eq!(as_set, asked);
+        let remapped: Vec<i32> = asked.iter().map(|&p| title_priority(p, true)).collect();
+        assert_eq!(remapped, [-1, -1, -1, 0, 1, 2, 15]);
+        // Everything the title does not lower is left alone, a thread at
+        // "time critical" included.
+        for p in [3, 4, 6, 10, 15] {
+            assert_eq!(title_priority(p, true), p);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn the_host_takes_the_priority_it_is_given() {
+        std::thread::spawn(|| {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+            // SAFETY: plain calls on this thread.
+            let thread = unsafe { GetCurrentThread() };
+            assert_eq!(host::set_thread_priority(thread, title_priority(-15, true)), 1);
+            // SAFETY: as above.
+            assert_eq!(unsafe { GetThreadPriority(thread) }, -1);
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     #[cfg(windows)] // Windows path rules (`C:\\..`)
