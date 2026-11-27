@@ -2934,6 +2934,8 @@ fn late_threads() {
 /// as waiting for the card. The caller may hold the submission lock: the
 /// thread that lands flights never takes it.
 fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
+    #[cfg(feature = "diagnostics")]
+    let _trace = crate::trace::span("relay wait");
     let mut line = line();
     if done(&line) {
         return;
@@ -3992,6 +3994,8 @@ impl Host {
     /// bytes, which that flight's landing then finds merged already; and
     /// nothing is sent back up.
     fn relay_card_back(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>) {
+        #[cfg(feature = "diagnostics")]
+        let _trace = crate::trace::span("relay fetch");
         let differs = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
@@ -4113,6 +4117,8 @@ impl Host {
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+        #[cfg(feature = "diagnostics")]
+        let _trace = crate::trace::span("relay landing");
         let landing = std::time::Instant::now();
         {
             let flights: Vec<&Flight> = items
@@ -4478,6 +4484,8 @@ impl Host {
     /// the merge writes the copies' CPU side, which a flight still on the
     /// card may be writing too.
     fn settle(&self, submitted: &mut u64, why: usize) {
+        #[cfg(feature = "diagnostics")]
+        let _trace = crate::trace::span("settle");
         if !late() {
             return;
         }
@@ -4669,12 +4677,20 @@ impl Host {
     /// still held.
     fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         #[cfg(feature = "diagnostics")]
+        let _trace = crate::trace::span("submission");
+        #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        #[cfg(feature = "diagnostics")]
+        let lock_wait = crate::trace::span("queue lock wait");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        drop(lock_wait);
+        #[cfg(feature = "diagnostics")]
+        let _lock_hold = crate::trace::span("queue lock hold (submit)");
         let was_working = working(true);
         submitting(1, runs.len());
         // Flights in the air ([`late`]): a submission that is waited for
@@ -6457,6 +6473,8 @@ impl HostList {
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
     fn run_deferred(&self, batch: &mut Batch) {
+        #[cfg(feature = "diagnostics")]
+        let _trace = crate::trace::span("list recording");
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {

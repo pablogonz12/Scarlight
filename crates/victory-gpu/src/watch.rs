@@ -408,6 +408,8 @@ fn covers(pieces: &[(usize, usize)], first: usize, last: usize) -> bool {
 /// with `guarded`, view memory, which is then guarded, nor a pool the guards
 /// hold, [`guard_pools`]).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    #[cfg(feature = "diagnostics")]
+    let _trace = crate::trace::span("watch writes");
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // Asked ahead with the submission's other ranges: the journal has it.
     // The asking's lock is held while its pages are read, so a range that

@@ -2963,6 +2963,8 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let _trace = crate::trace::span("shadow update");
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             if self.resident {
