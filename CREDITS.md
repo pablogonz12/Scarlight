@@ -13,7 +13,7 @@ in `Co-authored-by:` trailers, read from `git log main`.
 ## Authors
 
 9hvn9yt2vk-netizen, A6thGraderFr, Abdellah K., acleofe, adamfx, Advait Palve, AlanQiang0418,
-alessiodeia, Andrea Casale, artor410, BaggyALPHA, bartikele, BastienRdz, Brazlucas, CaravelaLabs,
+alessiodeia, Andrea Casale, artor410, AscilCH, BaggyALPHA, bartikele, BastienRdz, Brazlucas, CaravelaLabs,
 Carlos Sant'Anna, dadou000, Dathinel, desp, Duartt - Ryu Garage, Duff, EatCodeSleep2,
 Enzo Souza Duarte, ESAT, Exorion, fever308, FIocker, franticfrostin, fuzeofficial, Gabriel Cruz,
 gingertonik, Halfect, Henrique Bueno, hophaver, ifBars, ismailchaka1, itsRevela, Jeremy Goldberg,
@@ -40,6 +40,10 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   buffers that a list copies title memory through: a buffer a list let go of is kept by its size class and reused by
   the next copy, and only after every submission in the air has finished
   ([`upload_pool.rs`](crates/victory-gpu/src/upload_pool.rs), `VICTORY_UPLOAD_POOL=0` off).
+- **fxceless/victory-fork [#1097](https://github.com/fxceless/victory-fork/pull/1097)** (Azemed), GPL-3.0 — a
+  runtime placeholder reservation's mapped runs come off the views the GPU side already keeps, so the guards note its
+  holes absent instead of a failing `VirtualProtect` and a `VirtualQuery` a block, and the copies' committed-byte
+  counts skip the kernel too (`crates/victory-gpu/src/inplace.rs`, `guards.rs`, `VICTORY_PLACEHOLDER_FAST=0` off).
 
 ## Design notes
 
@@ -151,6 +155,10 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
 - **AnyPS5** ([boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5)): the format of the
   source-counted progress page (reference instruction forms, history chart). No code taken.
 - **HUMAN** ([HumanlyDev/HUMAN](https://github.com/HumanlyDev/HUMAN)) by HumanlyDev and bdycounter-sudo,
+  GPL-3.0-or-later: a placed view aliased to a texture the host writes may cover a leading prefix of that
+  texture's mip chain (and its format may be block-compressed as well as texel-wise as wide), found by address
+  in the host-written table as well as by the placed table (`crates/victory-gpu/src/resource.rs` `alias_of`,
+  `texture.rs` `alias`/`with_host_written_at`); `VICTORY_ALIAS_WIDE=0` restores the narrower match.
   GPL-3.0-or-later: the pass that draws a depth plane's twin into the plane runs inline, in the list that
   wrote the twin (and that list replays the title's state after it), so a depth test in the same list sees
   what the shaders wrote (`crates/victory-gpu/src/host.rs` `twin_use`/`pass_plane`, `draw.rs` `replay`);
@@ -258,6 +266,13 @@ D
   the stride was already ours (`queue::second_plane_resource`, 0x48).
 - **avatarmanz/VIctory-7900XTX [350c68648](https://github.com/avatarmanz/VIctory-7900XTX/commit/350c68648)** (avatarmanz), GPL-3.0: a texture's first upload started ahead on a copy queue of its own (`texture/ahead.rs`) and a slot shown only once that upload ran (`descriptor/host.rs::show_after`, 3bab23c06), which there ended a device loss every ~16 minutes. Reimplemented on this tree's texture path: `crates/victory-gpu/src/texture/ahead.rs`, the copy queue made at device creation and a submission's wait on its fence in `crates/victory-gpu/src/host.rs`, `VICTORY_UPLOAD_AHEAD=1` and `VICTORY_SHOW_AFTER`.
 
+- **DexNom/VIctory [921d8d3b4](https://github.com/DexNom/VIctory/commit/921d8d3b43b44f3a6ca4b44095edd3c4baf10a87)**,
+  GPL-3.0: a pixel shader's quad permutations (`ds_swizzle_b32` quad_perm and DPP) read through quad operations,
+  whose values include a helper lane's, as the console's do at a triangle's edge; common broadcasts and exchanges
+  take one read, and a DPP8 that selects across quads falls back to a wave-lane read (`VICTORY_DX_PIXEL_QUAD=0`
+  turns it off). Its other two parts: each view heap's run of raw page views grows with the copies that need one
+  (the 1,023-copy cap is gone, `crates/victory-gpu/src/memory.rs`), and a texture whose interior mips alone have
+  arrived is staged instead of treated as away (`crates/victory-gpu/src/texture.rs`).
 - **codec-d/cool_fox [`18bdf7932`](https://github.com/codec-d/cool_fox/commit/18bdf7932)**, GPL-3.0: the
   buffer-view pass keeps its slot table, its once-a-frame gate and the refresh interval of unwatched host
   copies on the heap that owns them rather than in process-wide tables keyed by the heap's address, and an
@@ -280,6 +295,18 @@ D
   is clipped rather than refused after its range was unmapped (`crates/victory-hle/src/modules/xmem.rs`,
   `VICTORY_MAP_CLIP=0` turns it off).
 
+- **codec-d/CGBJ (codec-d/cool_fox [`ab75ac3e0`](https://github.com/codec-d/cool_fox/commit/ab75ac3e0),
+  [`18bdf7932`](https://github.com/codec-d/cool_fox/commit/18bdf7932),
+  [`8cc31ab37`](https://github.com/codec-d/cool_fox/commit/8cc31ab37))**, GPL-3.0-or-later: a host-memory guard for
+  speculative uploads — a free-RAM and commit sample with hysteresis, a floor left free after an upload and a larger
+  one before a new block of upload storage is committed, a backoff after a refused allocation instead of one attempt
+  per small upload, and idle upload storage given back at once under pressure. Reimplemented for our 16 GiB PC and
+  16 GiB RADV card, where a refused import falls back silently, so only pool growth waits and no texture an
+  on-demand upload needs is ever deferred (`crates/victory-gpu/src/residency.rs`, `VICTORY_RESIDENCY=0`).
+- **codec-d/cool_fox [`e05d4633a`](https://github.com/codec-d/cool_fox/commit/e05d4633a)**, GPL-3.0: a
+  `SetEventOnCompletion` with no event blocks the guest thread on the fence's value with `WaitOnAddress`, and
+  `Signal`/`Set` wakes it with `WakeByAddressAll` (`crates/victory-gpu/src/fence.rs`; the wait here is bounded
+  by `VICTORY_FENCE_BLOCK_MS` and lets the queue run what it holds between slices).
 - **codec-d/cool_fox [`8cc31ab37`](https://github.com/codec-d/cool_fox/commit/8cc31ab37)**, GPL-3.0: an XMA
   voice whose input the title publishes again while the context stays enabled decodes on instead of staying
   ended, and the decode pass publishes only whole blocks (a short one only as the flushed tail), trying a few
