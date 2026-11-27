@@ -992,6 +992,9 @@ fn guarded_range(start: usize, end: usize, pools: bool) -> Option<Vec<usize>> {
     if !known && !is_view(start, end) && !(pools && is_pool(start)) {
         return None;
     }
+    if let Some(written) = crate::linux_dirty::ask(first * BLOCK, last * BLOCK) {
+        return Some(written);
+    }
     install();
     Some(crate::guards::reguard(first, last))
 }
@@ -1053,6 +1056,9 @@ fn is_view(start: usize, end: usize) -> bool {
 /// it, so the guard of such a page covers nothing and the copies through it
 /// must go to the kernel (after avatarmanz 2be0515c).
 pub fn opened_beside(views: &[(usize, usize)]) {
+    for &(at, len) in views {
+        crate::linux_dirty::forget(at, len);
+    }
     if views.is_empty() || !crate::guards::aliases() {
         return;
     }
@@ -1305,6 +1311,7 @@ pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
     // A block a write-back job holds is this write's now.
     back_open(at, len);
+    crate::linux_dirty::forget(at, len);
     crate::guards::open(at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
@@ -1388,6 +1395,7 @@ pub fn title_memory_reading_within(limit: std::time::Duration) -> Option<Reading
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::linux_dirty::forget(at, len);
     crate::texback::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
