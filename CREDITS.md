@@ -395,3 +395,4 @@ D
 - **Belobug**, [e70e031c](https://github.com/Belobug/VIctory-Belobug-AMD/commit/e70e031cf): accept native shader code stored without its wrapper.
 - **Manuel Pérez**, [VIctory #114](https://github.com/Marvisak/VIctory/pull/114): run failed asynchronous call cleanup outside the completion lock.
 - **Senchsus**, [VIctory #682](https://github.com/Marvisak/VIctory/pull/682): legacy multiply treats denormal operands as zero.
+- **Marvis**, [typed integer buffer access](https://github.com/Marvisak/VIctory/commit/4243a96a7): preserve 16-bit data through integer buffer views.
