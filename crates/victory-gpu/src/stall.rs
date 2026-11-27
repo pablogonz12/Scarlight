@@ -107,7 +107,7 @@ impl Site {
     /// Times a call until the returned [`Call`] is dropped. `args` is
     /// formatted only into a fixed stack buffer, so a fast call pays two
     /// clock reads and a copy of at most [`ARGS`] bytes.
-    pub fn enter(self: &'static Self, args: fmt::Arguments<'_>) -> Call {
+    pub fn enter(&'static self, args: fmt::Arguments<'_>) -> Call {
         Call::new(self, args)
     }
 }
@@ -277,7 +277,7 @@ fn since_epoch(at: Instant) -> u64 {
 
 fn publish(site: &'static Site, at: Instant, args: &Args) -> usize {
     let tid = thread_id();
-    let mut mine = MINE.lock().unwrap_or_else(|e| e.into_inner());
+    let mine = MINE.lock().unwrap_or_else(|e| e.into_inner());
     let cached = mine.iter().position(|&(t, _)| t == tid);
     let index = match cached {
         Some(i) => mine[i].1,
