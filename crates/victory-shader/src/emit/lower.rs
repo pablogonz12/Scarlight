@@ -1311,6 +1311,17 @@ fn code_table_start(
     if fixed_below { lowest } else { lowest.max(code_end & !3) }
 }
 
+/// Preserve the console's early depth/stencil test unless the pixel shader
+/// exports depth, coverage or stencil, which cannot be tested beforehand.
+fn early_depth(io: &StageIo, outputs: &[SigElement]) -> bool {
+    let StageIo::Ps { db_shader_control, .. } = io else {
+        return false;
+    };
+    db_shader_control & (1 << 12) != 0
+        && db_shader_control & (0b111 | 1 << 8) == 0
+        && !outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20))
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -1323,6 +1334,9 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if early_depth(&x.native.io, &x.outputs) {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
