@@ -50,6 +50,8 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// Whether what it is made from went to the warm-up list.
     warmed: AtomicBool,
+    first_wait: OnceLock<Instant>,
+    overdue: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -76,6 +78,8 @@ impl Pending {
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
             warmed: AtomicBool::new(false),
+            first_wait: OnceLock::new(),
+            overdue: AtomicBool::new(false),
         }
     }
 
@@ -292,7 +296,15 @@ impl Spent {
 /// Waits for `p` while frame `frame` has budget of its kind left.
 fn wait(p: &Pending, frame: u64) {
     let budget = wait_budget();
-    if budget.is_zero() {
+    if budget.is_zero() || p.overdue.load(Ordering::Relaxed) {
+        return;
+    }
+    let first = *p.first_wait.get_or_init(Instant::now);
+    let remaining = budget.saturating_sub(first.elapsed());
+    if remaining.is_zero() {
+        if !p.overdue.swap(true, Ordering::Relaxed) {
+            tracing::warn!(key = %p.key, "pipeline overdue: making for {} ms", first.elapsed().as_millis());
+        }
         return;
     }
     // Each kind (a world's pipelines, a pass over the screen) counts its own
@@ -300,10 +312,13 @@ fn wait(p: &Pending, frame: u64) {
     static SPENT: [Mutex<Spent>; 2] = [const { Mutex::new(Spent::new()) }; 2];
     let shared = shared_budget();
     let spent = &SPENT[usize::from(p.screen)];
-    let left = spent
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take(frame, budget, shared);
+    let left = {
+        let mut spent = spent.lock().unwrap_or_else(|e| e.into_inner());
+        let reserved = spent.take(frame, budget, shared);
+        let left = reserved.min(remaining);
+        spent.give_back(frame, reserved, left, shared);
+        left
+    };
     if left.is_zero() {
         return;
     }
@@ -562,6 +577,41 @@ mod tests {
         assert!(ready(&p).is_none());
         assert!(started.elapsed() < Duration::from_secs(1), "a lost pipeline was waited for");
         assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED, "a lost pipeline was queued");
+    }
+
+    #[test]
+    fn pending_pipeline_waits_at_most_one_budget_across_frames() {
+        let p = Pending::new(Vec::new(), None);
+        let start = Instant::now();
+        wait(&p, 10_000);
+        assert!(start.elapsed() >= wait_budget().saturating_sub(Duration::from_millis(20)));
+        let repeat = Instant::now();
+        for frame in 10_001..10_010 {
+            wait(&p, frame);
+        }
+        assert!(p.overdue.load(Ordering::Relaxed));
+        assert!(repeat.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn an_overdue_pipeline_does_not_spend_another_pipelines_wait() {
+        let overdue = Pending::new(Vec::new(), None);
+        overdue.overdue.store(true, Ordering::Relaxed);
+        let other = Pending::new(Vec::new(), None);
+        wait(&overdue, 20_000);
+        let start = Instant::now();
+        wait(&other, 20_000);
+        assert!(start.elapsed() >= wait_budget().saturating_sub(Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn lost_worker_marks_its_pipeline_lost() {
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        WAITING.fetch_add(1, Ordering::Relaxed);
+        MAKING_NOW.set(Some(p.clone()));
+        assert!(worker_lost());
+        assert!(p.lost.load(Ordering::Relaxed));
+        assert!(!worker_lost());
     }
 
     #[test]
