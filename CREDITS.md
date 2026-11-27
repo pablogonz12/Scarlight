@@ -1,5 +1,8 @@
 # Credits
 
+- **Marvisak/VIctory [13091f6e](https://github.com/Marvisak/VIctory/commit/13091f6e)**, GPL-3.0:
+  array level queries use spatial coordinates only.
+
 Scarlight is a port of **VIctory** ([Marvisak/VIctory](https://github.com/Marvisak/VIctory)),
 GPL-3.0. Its history, authorship and commit dates are kept.
 
@@ -16,7 +19,7 @@ in `Co-authored-by:` trailers, read from `git log main`.
 alessiodeia, Andrea Casale, artor410, AscilCH, BaggyALPHA, bartikele, BastienRdz, Brazlucas, CaravelaLabs,
 Carlos Sant'Anna, dadou000, Dathinel, desp, Duartt - Ryu Garage, Duff, EatCodeSleep2,
 Enzo Souza Duarte, ESAT, Exorion, fever308, FIocker, franticfrostin, fuzeofficial, Gabriel Cruz,
-gingertonik, Halfect, Henrique Bueno, hophaver, ifBars, ismailchaka1, itsRevela, Jeremy Goldberg,
+gingertonik, GrapeJuice429, Halfect, Henrique Bueno, hophaver, ifBars, ismailchaka1, itsRevela, Jeremy Goldberg,
 JMAN730, julio, KaiserBloo, KoLolX3, lameloball2813-ui, LaunchDoesntCode, LF2000 Builder,
 localshotgun, lordon1a, Louis Faust, LUIS LARIOS, Luiz Neves, Lyrnc, Manuel Pérez, Maraco91,
 marquezini, Marvis, Matheus, meower, nathanbzrr, Nikita Romanovich, Noname0202, Nostyxx, Ortomanic,
@@ -47,6 +50,8 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
 
 ## Design notes
 
+- **Belobug/VIctory-Belobug-AMD `84eae352a`** (local) — identified an indirect
+  dispatch requesting 67,440 groups that lost its tail under the 65,535-group clamp.
 - **fuzeofficial** ([Marvisak/VIctory #2608](https://github.com/Marvisak/VIctory/pull/2608)), GPL-3.0: the
   idea of cutting a command list at its texture read-backs and running the part after one in a submission
   of its own, so a copy or draw recorded behind a read-back is prepared after its bytes are in title
@@ -371,6 +376,9 @@ D
   source field, so a marker byte there is not an extra dword and no longer swallows the next instruction, and the
   VOP3 encoding of `v_cmpx*` writes EXEC rather than its VDST, for both wave sizes
   (`crates/victory-shader/src/gfx10/{mod.rs,fields.rs}`).
+- **jaschinski97-ops**, Belobug/VIctory-Belobug-AMD [15cc76c39](https://github.com/Belobug/VIctory-Belobug-AMD/commit/15cc76c39):
+  regression tests for interpolation first halves read through a phi and standalone half-precision first halves
+  (`crates/victory-shader/src/io.rs`).
 - **Yoshi-233 [coolfox/main PR #7](https://github.com/Yoshi-233), from fxceless/victory-fork [9bf4a0f](https://github.com/fxceless/victory-fork/commit/9bf4a0f)**,
   GPL-3.0: the RGB dump decodes the packed 16-bit BGR targets (B5G6R5, B5G5R5A1, B4G4R4A4, host formats 85, 86,
   115) and keeps padded rows aligned (diagnostics only) (`crates/victory-gpu/src/capture.rs`).
@@ -383,3 +391,5 @@ D
   `crates/victory-gpu/src/host.rs`, `crates/victory-gpu/src/draw.rs`, `crates/victory-gpu/src/descriptor/host.rs`).
 
 - **Belobug**, [e70e031c](https://github.com/Belobug/VIctory-Belobug-AMD/commit/e70e031cf): native shader support, and [1162d38f](https://github.com/Belobug/VIctory-Belobug-AMD/commit/1162d38f9) for the translator cache version idea.
+- **Manuel Pérez**, [VIctory #114](https://github.com/Marvisak/VIctory/pull/114): run failed asynchronous call cleanup outside the completion lock.
+- **Senchsus**, [VIctory #682](https://github.com/Marvisak/VIctory/pull/682): legacy multiply treats denormal operands as zero.
