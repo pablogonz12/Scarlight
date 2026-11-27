@@ -10,8 +10,9 @@
 //! never wait on each other. How many we use is a switch,
 //! `VICTORY_GUARD_SHARDS` (`1`: the single lock of before).
 //!
-//! Lock order: `watch`'s `JOURNAL`, then a shard, then `watch`'s
-//! `DESTINATIONS` and `BACK` (taken by [`protect`] and [`open`] under it).
+//! Lock order: `watch`'s asking ranges, then a journal page shard, then a
+//! shard here, then `watch`'s `DESTINATIONS` and `BACK` (taken by [`protect`]
+//! and [`open`] under it).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -130,11 +131,11 @@ static SLOTS: [Slot; MAX_SHARDS] = [const {
 }; MAX_SHARDS];
 
 fn slot(s: usize) -> RwLockWriteGuard<'static, Guards> {
-    SLOTS[s].0.write().unwrap_or_else(|e| e.into_inner())
+    crate::stall::write(crate::stall::Lock::Guards, &SLOTS[s].0)
 }
 
 fn reading(s: usize) -> RwLockReadGuard<'static, Guards> {
-    SLOTS[s].0.read().unwrap_or_else(|e| e.into_inner())
+    crate::stall::read(crate::stall::Lock::Guards, &SLOTS[s].0)
 }
 
 /// Shards `0..` as a bitset, set bits taken in ascending order (fever308's
@@ -344,6 +345,10 @@ pub(crate) fn opened(blocks: &[usize]) {
 /// `watch::guard` has checked that the range is view memory.
 pub(crate) fn reguard(first: usize, last: usize) -> Vec<usize> {
     let alias = aliases();
+    // Inside a runtime placeholder the mapped runs are known from its views,
+    // so a hole there needs no kernel question. Asked before any shard is
+    // held: the views are a table of their own, walked in its own lock.
+    let placeholder = crate::inplace::placeholder_mapped_blocks(first, last).is_some();
     let mut written = Vec::new();
     // One answer covers a whole uncommitted region, across stripes.
     let mut uncommitted_until = first;
@@ -355,14 +360,22 @@ pub(crate) fn reguard(first: usize, last: usize) -> Vec<usize> {
             for block in from..to {
                 let mut open = true;
                 if g.absent.contains(&block) {
-                    // Ordinary commits need no runtime mapping notification. Reuse
-                    // this asking's query for the following blocks in the same region.
-                    if block >= uncommitted_until {
-                        uncommitted_until = uncommitted_end(block);
-                    }
-                    open = block >= uncommitted_until;
-                    if open {
-                        g.absent.remove(&block);
+                    if placeholder {
+                        // A hole the runtime has not mapped since (a mapping
+                        // clears the note): no `VirtualQuery` to find out again.
+                        crate::inplace::PLACEHOLDER_HITS[1]
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        open = false;
+                    } else {
+                        // Ordinary commits need no runtime mapping notification. Reuse
+                        // this asking's query for the following blocks in the same region.
+                        if block >= uncommitted_until {
+                            uncommitted_until = uncommitted_end(block);
+                        }
+                        open = block >= uncommitted_until;
+                        if open {
+                            g.absent.remove(&block);
+                        }
                     }
                 }
                 if open && alias && crate::inplace::aliased(block * BLOCK) {
@@ -420,6 +433,46 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     crate::watch::forget(from * BLOCK, (to - from) * BLOCK);
     if set(from, to) {
         note(g, from, to);
+        return;
+    }
+    // Inside a runtime placeholder the unmapped parts are known — they are
+    // the blocks between the mapped runs — so they are noted absent here
+    // instead of a failing `VirtualProtect` and a `VirtualQuery` a block: the
+    // title's 64 KiB reservations are mostly holes (`PLACEHOLDER_HITS[1]`).
+    if let Some(runs) = crate::inplace::placeholder_mapped_blocks(from, to) {
+        let mut cursor = from;
+        let holes = |g: &mut Guards, from: usize, to: usize| {
+            if from >= to {
+                return;
+            }
+            g.absent.extend(from..to);
+            // Only the blocks of this hole: the set can hold a title's whole
+            // address space, and a scan of it a block at a time is what a
+            // guard round cannot afford ([`remapped`]).
+            let stale: Vec<usize> = g.mapped.range(from..to).copied().collect();
+            for block in stale {
+                g.mapped.remove(&block);
+            }
+            crate::inplace::PLACEHOLDER_HITS[1]
+                .fetch_add((to - from) as u64, std::sync::atomic::Ordering::Relaxed);
+        };
+        for (lo, hi) in runs {
+            holes(g, cursor, lo);
+            if set(lo, hi) {
+                note(g, lo, hi);
+            } else {
+                for block in lo..hi {
+                    if set(block, block + 1) {
+                        note(g, block, block + 1);
+                    } else if block < uncommitted_end(block) {
+                        g.absent.insert(block);
+                        g.mapped.remove(&block);
+                    }
+                }
+            }
+            cursor = hi;
+        }
+        holes(g, cursor, to);
         return;
     }
     for block in from..to {
@@ -645,6 +698,105 @@ mod tests {
         runs.insert(11, 16);
         blocks.extend(11..16);
         check(&runs, &blocks);
+    }
+
+    /// A runtime placeholder's holes are noted absent without a `VirtualQuery`
+    /// a block: the mapped runs come off the views, and the guard round counts
+    /// the questions it did not ask (`PLACEHOLDER_HITS[1]`).
+    #[test]
+    fn placeholder_holes_are_noted_without_asking_the_kernel() {
+        use std::sync::atomic::Ordering;
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, PAGE_READWRITE,
+            UnmapViewOfFile2, VirtualAlloc2, VirtualFree,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let (blocks, mapped) = (4usize, 2usize);
+        // SAFETY (the whole test): a reservation and a section of our own, and
+        // a view of it in the reservation's first half; all released or
+        // closed below.
+        let (at, view, section) = unsafe {
+            let at = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                blocks * BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert!(!at.is_null(), "a placeholder: {:?}", std::io::Error::last_os_error());
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (mapped * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null(), "a section: {:?}", std::io::Error::last_os_error());
+            assert_ne!(
+                VirtualFree(at, mapped * BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER),
+                0,
+                "split: {:?}",
+                std::io::Error::last_os_error()
+            );
+            let view = MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                at,
+                0,
+                mapped * BLOCK,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert_eq!(
+                view.Value,
+                at,
+                "the view into the placeholder: {:?}",
+                std::io::Error::last_os_error()
+            );
+            (at as usize, view, section)
+        };
+        let (first, last) = (at / BLOCK, (at + blocks * BLOCK) / BLOCK);
+        crate::inplace::title_memory_placeholder(at, blocks * BLOCK);
+        crate::inplace::title_memory_view(at, mapped * BLOCK, section as usize, 0);
+        let before = crate::inplace::PLACEHOLDER_HITS[1].load(Ordering::Relaxed);
+        let written = reguard(first, last);
+        let skipped = crate::inplace::PLACEHOLDER_HITS[1].load(Ordering::Relaxed) - before;
+        assert_eq!(written.len(), blocks * PAGES, "every block of it is asked about");
+        assert_eq!(holds(at), (true, false), "the mapped blocks are read-only by our hand");
+        assert_eq!(
+            holds(at + (blocks - 1) * BLOCK),
+            (false, true),
+            "the holes are known uncommitted, from the views"
+        );
+        assert!(
+            skipped >= (blocks - mapped) as u64,
+            "the holes asked the kernel: {skipped} skipped"
+        );
+        // SAFETY: the view, the placeholder's two parts and the section we
+        // made.
+        unsafe {
+            assert_ne!(
+                UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER),
+                0,
+                "back to a placeholder: {:?}",
+                std::io::Error::last_os_error()
+            );
+            for part in [at, at + mapped * BLOCK] {
+                VirtualFree(part as *mut _, 0, MEM_RELEASE);
+            }
+            CloseHandle(section);
+        }
+        // The guards' notes of the range go too: the address is the
+        // kernel's again, and another test's allocation is not this one's.
+        remapped(at, blocks * BLOCK);
+        crate::inplace::placeholder_forget(at, blocks * BLOCK);
     }
 
     /// What a guard costs: the read path a copy takes ([`all_mapped`], one

@@ -59,6 +59,7 @@ fn folder() -> Option<String> {
 }
 
 extern "system" fn path_size(_: This, out: *mut usize) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("storage::path_size").enter(format_args!(""));
     match folder() {
         Some(path) => put(out, path.len() + 1),
         None => NOT_SUPPORTED,
@@ -68,6 +69,7 @@ extern "system" fn path_size(_: This, out: *mut usize) -> HRESULT {
 /// A buffer too small for the path fails with `E_FAIL`, the documented
 /// Xbox result (a PC gets `ERROR_INSUFFICIENT_BUFFER`).
 extern "system" fn path(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("storage::path").enter(format_args!(""));
     match folder() {
         Some(path) if size <= path.len() => E_FAIL,
         Some(path) => put_string(&path, size, buffer, used),
@@ -140,6 +142,7 @@ fn space() -> SpaceInfo {
 }
 
 extern "system" fn space_info(_: This, out: *mut SpaceInfo) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("storage::space_info").enter(format_args!(""));
     put(out, space())
 }
 
@@ -148,6 +151,7 @@ static PROMPT: u8 = 0;
 
 /// There is nobody to ask: granted when the quota has room, else declined.
 extern "system" fn prompt_for_space(_: This, bytes: u64, block: *mut AsyncBlock) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("storage::prompt_for_space").enter(format_args!(""));
     let hr = if bytes <= space().total_free {
         S_OK
     } else {
@@ -157,6 +161,7 @@ extern "system" fn prompt_for_space(_: This, bytes: u64, block: *mut AsyncBlock)
 }
 
 extern "system" fn prompt_result(_: This, block: *mut AsyncBlock) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("storage::prompt_result").enter(format_args!(""));
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const PROMPT).cast(), 0, none, none.cast())
 }

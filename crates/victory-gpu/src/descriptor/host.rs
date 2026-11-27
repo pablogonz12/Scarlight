@@ -79,6 +79,9 @@ fn say_slot_past(
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
+    /// The pass over this heap's buffer views, kept here rather than in a
+    /// table keyed by the heap's address (`crate::buffersweep`).
+    sweep: std::sync::Mutex<crate::buffersweep::Sweep>,
     cpu: usize,
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
@@ -801,6 +804,7 @@ impl HostHeap {
             .flatten();
         let h = HostHeap {
             heap,
+            sweep: Mutex::default(),
             cpu,
             step,
             count,
@@ -897,6 +901,33 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// A sampler heap of our own, for the lists that set a root signature whose
+/// sampler heap is indexed directly (`SAMPLER_HEAP_DIRECTLY_INDEXED`) while
+/// the title binds no sampler heap: D3D12 requires one to be bound first (the
+/// debug layer's id 1419), and breaking that rule removes the device on
+/// NVIDIA. Slot 0 holds a point sampler, so an indexed read of it returns
+/// something defined rather than whatever the memory held.
+pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
+    static HEAP: std::sync::OnceLock<Option<Fallback>> = std::sync::OnceLock::new();
+    HEAP.get_or_init(|| {
+        let heap = HostHeap::new(true, 1)?;
+        null_sampler(heap.cpu(0));
+        Some(Fallback(heap))
+    })
+    .as_ref()
+    .map(|f| &f.0)
+}
+
+/// The one sampler heap of ours, held for the device's life as the host is.
+struct Fallback(HostHeap);
+
+// SAFETY: a descriptor heap is created once on the device, then only bound
+// and written through its CPU handles, as the title's heaps are; its slots
+// are guarded by the `made` lock. There is one of these for the device's
+// life, as there is one `Host`.
+unsafe impl Send for Fallback {}
+unsafe impl Sync for Fallback {}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -956,6 +987,11 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// This heap's pass over its buffer views (`crate::buffersweep`).
+    pub(crate) fn buffer_sweep(&self) -> std::sync::MutexGuard<'_, crate::buffersweep::Sweep> {
+        self.sweep.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The GPU address of the table of element strides by title slot (view
@@ -1823,7 +1859,7 @@ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     }
 }
 
-fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+pub(crate) fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_format(words[0]);
     // SAFETY: 40 bytes in the host's layout.

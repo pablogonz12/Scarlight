@@ -16,11 +16,14 @@
 //! (swap chain).
 
 #[cfg(windows)]
+mod ambient_floor;
 mod ambient;
 #[cfg(any(windows, test))]
 mod bindcache;
 #[cfg(any(windows, test))]
 mod bound;
+#[cfg(any(windows, test))]
+mod buffersweep;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
@@ -37,6 +40,10 @@ mod declareonce;
 #[allow(dead_code)]
 #[cfg(windows)]
 mod arena;
+// Residents: title memory the card only reads, placed from an arena. Windows
+// only, as the arena and the in-place API it stands on (`notes/resident-on-arena.md`).
+#[cfg(windows)]
+mod resident;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -52,12 +59,18 @@ pub mod fence;
 pub mod frame;
 #[cfg(any(windows, test))]
 mod frame_budget;
+// The ranges a submission's copies took: pure, so its tests run everywhere.
+mod refresh_runs;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+// `watch`'s journal of written pages, sharded so records and copies do not
+// queue on one lock (`VICTORY_JOURNAL_SHARDS=1` for one lock, as before).
+#[cfg(windows)]
+mod journal;
 pub mod list;
 pub mod object;
 pub mod pipeline;
@@ -66,12 +79,17 @@ pub mod pipeline;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) mod picked;
 #[cfg(windows)]
-#[cfg(windows)]
 mod placed;
+#[cfg(windows)]
+mod present_compositor;
 mod primitive;
 pub mod query;
 pub mod queue;
 mod reflection;
+// Host memory is read like the rest of `host` (`GlobalMemoryStatusEx`); the
+// Linux build tests other modules.
+#[cfg(windows)]
+mod residency;
 pub mod resource;
 #[cfg(any(windows, test))]
 mod scratchfill;
@@ -88,6 +106,7 @@ mod shader_meta;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+pub mod stall;
 #[cfg(all(windows, test))]
 mod test_device;
 #[cfg(windows)]
@@ -108,7 +127,7 @@ pub use host::on_failure;
 #[cfg(windows)]
 pub use arena::{title_memory_committed, title_memory_released};
 #[cfg(windows)]
-pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+pub use inplace::{title_memory_freeing, title_memory_placeholder, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
     title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,

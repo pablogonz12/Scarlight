@@ -17,7 +17,7 @@
 //! garbage records cannot run for seconds either.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
-//! groups per dimension and 2^20 per dispatch, one-dimensional mesh
+//! groups per dimension except split compute X, 2^20 per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
@@ -46,6 +46,10 @@ RWByteAddressBuffer dst_args : register(u0);
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
+// Whether a record that does not fit takes the rest (`VICTORY_INDIRECT_REST`).
+#ifndef REST
+#define REST 1
+#endif
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
 [RootSignature(RS)]
@@ -53,10 +57,22 @@ static const uint GROUPS = 1u << 20;
 void main(uint3 id : SV_DispatchThreadID) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
+    bool wide = (has_count & 4u) != 0;
+    bool base_constant = (has_count & 8u) != 0;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
-    if (id.x >= eff_count) return;
+    if (id.x >= eff_count) {
+        if (wide && id.x < records) {
+            for (uint i = 0; i < 16; ++i) {
+                if (base_constant)
+                    dst_args.Store4((id.x * 16 + i) * 16, uint4(0, 0, 0, 0));
+                else
+                    dst_args.Store3((id.x * 16 + i) * 12, uint3(0, 0, 0));
+            }
+        }
+        return;
+    }
     uint src_at = args_offset + id.x * stride;
     uint dst_at = id.x * stride;
     // A tight buffer's last record ends at its argument payload (the title
@@ -80,14 +96,14 @@ void main(uint3 id : SV_DispatchThreadID) {
         draw_counts = uint2(count, instances);
     } else if (kind == 2) {
         uint3 want = src_args.Load3(src_at);
-        uint3 g = min(want, uint3(65535u, 65535u, 65535u));
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+        uint3 g = min(want, uint3(wide ? 1048560u : 65535u, 65535u, 65535u));
+        // Check each multiplication before performing it.
+        if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
             g = uint3(0, 0, 0);
         }
         // Diagnostics, in the budget buffer's words 12 and 16 (beside the
         // mesh notes at 4 and 8): what the record asked, before the clamp
-        // that keeps the first 65,535 groups only.
+        // that bounds each dimension.
         uint was;
         budget.InterlockedMax(12, want.x, was);
         budget.InterlockedAdd(16, min(want.x, 1u << 24), was);
@@ -117,13 +133,29 @@ void main(uint3 id : SV_DispatchThreadID) {
         budget.InterlockedOr(0, 0, before);
         [allow_uav_condition]
         while (before < BUDGET) {
-            uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
+            // A record that does not fit whole takes the rest of the
+            // budget (`REST`) or nothing at all: a title whose records vary
+            // in cost loses every later draw of a list when one garbage
+            // record empties it, and which one that is may differ from
+            // frame to frame.
+            uint next = (BUDGET - before < cost) ? (REST ? BUDGET : before) : (before + cost);
             uint prev;
             budget.InterlockedCompareExchange(0, before, next, prev);
             if (prev == before) break;
             before = prev;
         }
         over = before >= BUDGET || BUDGET - before < cost;
+    }
+    // Diagnostics, in the budget buffer's words after the dispatch notes
+    // (bytes 20 and 24; the frame line tells them): the records that ran
+    // empty for want of the budget, and the largest cost one of them had
+    // (below 2^22 the cost is not told).
+    if (over) {
+        uint was;
+        budget.InterlockedAdd(20, 1, was);
+        if (cost >= (1u << 22)) {
+            budget.InterlockedMax(24, cost, was);
+        }
     }
     if (kind <= 1) {
         if (over) {
@@ -137,6 +169,17 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (over) {
             groups = uint3(0, 0, 0);
         }
+        if (wide) {
+            for (uint i = 0; i < 16; ++i) {
+                uint base = i * 65535u;
+                uint n = groups.x > base ? min(groups.x - base, 65535u) : 0;
+                if (base_constant)
+                    dst_args.Store4((id.x * 16 + i) * 16, uint4(base, n, groups.y, groups.z));
+                else
+                    dst_args.Store3((id.x * 16 + i) * 12, uint3(n, groups.y, groups.z));
+            }
+            return;
+        }
         dst_args.Store3(dst_at, groups);
         for (uint off = 12; off < copy_end; off += 4) {
             dst_args.Store(dst_at + off, src_args.Load(src_at + off));
@@ -145,6 +188,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+#[derive(Clone)]
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
@@ -174,11 +218,23 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
-    let bytes = compile(SOURCE, "main", "cs_5_1")?;
+    let source = format!("#define REST {}\n{SOURCE}", rest());
+    let bytes = compile(&source, "main", "cs_5_1")?;
     make_clamp(device, &bytes)
 }
 
 /// The clamp's root signature and pipeline over compiled `bytes`.
+/// Whether a record that does not fit in what is left of its list's budget
+/// takes the rest, so that every record after it runs empty too
+/// (`VICTORY_INDIRECT_REST=0`: it takes nothing, and the next one that fits
+/// runs). A list whose budget one garbage record empties loses all its later
+/// draws, and which record that is may differ from frame to frame. The frame
+/// line says how many records a frame a list refuses.
+fn rest() -> u32 {
+    static ON: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| u32::from(std::env::var("VICTORY_INDIRECT_REST").ok().as_deref() != Some("0")))
+}
+
 fn make_clamp(device: &ID3D12Device, bytes: &[u8]) -> windows::core::Result<Clamp> {
     // SAFETY: the root signature is inside the shader; the description
     // points at live bytes and never releases its pointer.
@@ -259,6 +315,24 @@ pub(crate) fn bound(
     record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
 }
 
+/// Expands each compute record into sixteen dispatches, with root constants
+/// when the shader reads the X group ID.
+pub(crate) fn bound_wide(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    base_constant: bool,
+) -> Option<ID3D12Resource> {
+    validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    let bytes = u64::from(spec.2).checked_mul(if base_constant { 256 } else { 192 })?;
+    if bytes > u64::from(u32::MAX) {
+        return None;
+    }
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    record_clamp_mode(c, &list.list, &dst, budget, src, count, spec, false, Some(base_constant)).then_some(dst)
+}
+
 /// [`bound`] for a window of records clamped ahead of the draws that will
 /// read them (`crate::draw`'s windows; no count buffer). The records past
 /// the ones the title filled are whatever the buffer holds, and each
@@ -304,6 +378,21 @@ fn record_clamp_as(
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
 ) -> bool {
+    record_clamp_mode(c, l, dst, budget, (src, src_offset), count, (kind, stride, records), ahead, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_mode(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    dst: &ID3D12Resource,
+    budget: u64,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, records): (u32, u32, u32),
+    ahead: bool,
+    wide: Option<bool>,
+) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
         src_offset,
@@ -347,7 +436,7 @@ fn record_clamp_as(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1) | (u32::from(wide.is_some()) << 2) | (u32::from(wide == Some(true)) << 3), count_offset];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -617,74 +706,142 @@ void main() {
     }
 
     /// The compare of copies in the card's memory (`crate::host`), on the
-    /// software adapter. Told 1 it flags the pieces whose bytes are not
-    /// what was hashed last and leaves the hashes: a piece a shader changed
-    /// and a later one changed back then looks untouched, which is right
-    /// only if the piece was fetched after both. Told 2 (submissions sent
-    /// ahead with the relay, whose pieces are fetched flight by flight) it
-    /// stores the hash it made: each compare flags what changed since the
-    /// compare before it, also a change back.
+    /// software adapter, in both forms of its hash: a thread to a piece
+    /// ([`crate::host::CARD_COMPARE`]) and a group of 64 to a piece
+    /// ([`crate::host::CARD_COMPARE_WIDE`], `VICTORY_CARD_HASH_WIDE`). Told 1
+    /// it flags the pieces whose bytes are not what was hashed last and
+    /// leaves the hashes: a piece a shader changed and a later one changed
+    /// back then looks untouched, which is right only if the piece was
+    /// fetched after both. Told 2 (submissions sent ahead with the relay,
+    /// whose pieces are fetched flight by flight) it stores the hash it
+    /// made: each compare flags what changed since the compare before it,
+    /// also a change back.
     #[test]
     fn card_compare_stores_the_hash_it_made_when_told() {
         let _once = crate::warptest::lock();
-        let Some(mut harness) = Harness::new() else {
+        for (source, wide) in [(crate::host::CARD_COMPARE, false), (crate::host::CARD_COMPARE_WIDE, true)] {
+            card_compare_modes(source, wide);
+        }
+    }
 
+    /// Both forms of the compare compile for the host (`cs_5_1`, with the
+    /// root signature they ask for): the software adapter's test below runs
+    /// the bytes, and this catches a source that no host would take before
+    /// any of it is needed (a host without a software adapter on Wine has
+    /// no test of the bytes themselves).
+    #[test]
+    fn card_compare_sources_compile() {
+        for source in [crate::host::CARD_COMPARE, crate::host::CARD_COMPARE_WIDE] {
+            let bytes = compile(source, "main", "cs_5_1").expect("the card compare must compile");
+            assert!(bytes.len() > 4);
+            // The host creates the root signature the container holds: bytes
+            // without it would pass a length check and still be refused.
+            assert!(
+                crate::dxc::carries_root_signature(&bytes),
+                "the card compare's container must carry its root signature"
+            );
+        }
+    }
+
+    /// A compare pass is one group to a piece when a piece has a group of
+    /// its own, and the pieces a group of 64 threads covers when not.
+    #[test]
+    fn card_compare_dispatches_one_group_a_piece_when_wide() {
+        for pieces in [0u32, 1, 2, 63, 64, 65, 1000, 16_385] {
+            assert_eq!(crate::host::card_compare_groups(pieces, true), pieces);
+            assert_eq!(crate::host::card_compare_groups(pieces, false), pieces.div_ceil(64));
+        }
+    }
+
+    /// `card_compare_stores_the_hash_it_made_when_told` for one form of the
+    /// hash.
+    fn card_compare_modes(source: &str, wide: bool) {
+        let Some(mut warp) = Harness::new() else {
             return;
         };
-        let compare = compile_cs(&harness.device, crate::host::CARD_COMPARE).expect("the card compare must compile on the test device");
+        let compare = compile_cs(&warp.device, source).expect("the card compare must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
-        let (_now, now_ptr, now_gpu) = harness.shared_buffer(size as u64);
-        let (_hashes, _, hashes_gpu) = harness.shared_buffer(16 * u64::from(PIECES));
-        let (_differs, differs_ptr, differs_gpu) = harness.shared_buffer(64);
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
         let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
         // SAFETY: the mapping holds `size` bytes.
         unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
-        // One pass over the three pieces; what it left in `differs` (7s
-        // where it stored nothing).
-        let run = |harness: &mut Harness, mode: u32| -> [u32; 3] {
+        // One pass over `pieces` pieces from the `first` one, the copy
+        // starting `skew` bytes into its piece 0; what it left in `differs`
+        // (7s where it stored nothing).
+        let run_with = |warp: &mut Harness, mode: u32, (first, skew, pieces): (u32, u32, u32)| -> [u32; 3] {
             // SAFETY: our open list, live buffers, the compare's own root
             // signature; the mappings hold what is read and written.
             unsafe {
                 for piece in 0..PIECES as usize {
                     differs_ptr.cast::<u32>().add(piece).write_volatile(7);
                 }
-                harness.list.SetComputeRootSignature(&compare.root);
-                harness.list.SetPipelineState(&compare.pso);
-                let constants = [0u32, 0, size as u32, PIECES, 0, mode];
-                harness.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                harness.list.SetComputeRootShaderResourceView(1, now_gpu);
-                harness.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
-                harness.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                harness.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [first, skew, size as u32, pieces, 0, mode];
+                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.Dispatch(crate::host::card_compare_groups(pieces, wide), 1, 1);
             }
-            harness.submit_and_wait();
+            warp.submit_and_wait();
             // SAFETY: as above.
             [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
         };
+        let run = |warp: &mut Harness, mode: u32| run_with(warp, mode, (0, 0, PIECES));
         let at = PIECE + 1234;
         // SAFETY (each): inside the mapping.
         let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
         // 0: the hashes are stored, nothing is flagged.
-        assert_eq!(run(&mut harness, 0), [7, 7, 7]);
-        assert_eq!(run(&mut harness, 1), [0, 0, 0]);
+        assert_eq!(run(&mut warp, 0), [7, 7, 7]);
+        assert_eq!(run(&mut warp, 1), [0, 0, 0]);
         // A change in the second piece: flagged, and with 1 flagged again
         // (the hash stays the old one).
         set(content[at] ^ 0x40);
-        assert_eq!(run(&mut harness, 1), [0, 1, 0]);
-        assert_eq!(run(&mut harness, 1), [0, 1, 0]);
+        assert_eq!(run(&mut warp, 1), [0, 1, 0]);
+        assert_eq!(run(&mut warp, 1), [0, 1, 0]);
         // Changed back: with 1 the piece looks untouched.
         set(content[at]);
-        assert_eq!(run(&mut harness, 1), [0, 0, 0]);
+        assert_eq!(run(&mut warp, 1), [0, 0, 0]);
         // With 2 the change is flagged once, and the hash is the new one.
         set(content[at] ^ 0x40);
-        assert_eq!(run(&mut harness, 2), [0, 1, 0]);
-        assert_eq!(run(&mut harness, 2), [0, 0, 0]);
+        assert_eq!(run(&mut warp, 2), [0, 1, 0]);
+        assert_eq!(run(&mut warp, 2), [0, 0, 0]);
         // Changed back: flagged, where 1 saw nothing.
         set(content[at]);
-        assert_eq!(run(&mut harness, 2), [0, 1, 0]);
-        assert_eq!(run(&mut harness, 2), [0, 0, 0]);
+        assert_eq!(run(&mut warp, 2), [0, 1, 0]);
+        assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        // A byte anywhere in the piece, the first and the last ones
+        // included: flagged in this piece alone, in both forms (a group of
+        // 64 threads hashes steps t, t + 64... and folds them in order; a
+        // step nobody hashed is a byte nobody saw).
+        for offset in [0usize, 15, 16, 4096, PIECE - 1] {
+            let at = PIECE + offset;
+            let old = content[at];
+            // SAFETY: inside the mapping.
+            unsafe { now_ptr.add(at).write_volatile(old ^ 0x40) };
+            assert_eq!(run(&mut warp, 2), [0, 1, 0], "offset {offset}");
+            unsafe { now_ptr.add(at).write_volatile(old) };
+            assert_eq!(run(&mut warp, 2), [0, 1, 0], "offset {offset}, changed back");
+        }
+        // A copy that does not start on a piece boundary, hashed from a span
+        // that does not start at its piece 0: the two pieces of the span have
+        // a result each, and the piece after them is not touched (7).
+        const SKEW: u32 = 1000;
+        let run_skewed = |warp: &mut Harness, mode: u32| run_with(warp, mode, (1, SKEW, 2));
+        assert_eq!(run_skewed(&mut warp, 0), [7, 7, 7]);
+        assert_eq!(run_skewed(&mut warp, 1), [0, 0, 7]);
+        let skewed = 2 * PIECE + 5000;
+        // SAFETY: inside the mapping.
+        unsafe { now_ptr.add(skewed).write_volatile(content[skewed] ^ 0x10) };
+        assert_eq!(run_skewed(&mut warp, 2), [0, 1, 7]);
+        assert_eq!(run_skewed(&mut warp, 2), [0, 0, 7]);
+        unsafe { now_ptr.add(skewed).write_volatile(content[skewed]) };
+        assert_eq!(run_skewed(&mut warp, 2), [0, 1, 7]);
     }
 
     /// The last record's span is its payload: a tight title buffer asks for
@@ -701,6 +858,124 @@ void main() {
         }
         // A layout whose last payload overflows 32 bits is refused, not clamped.
         assert_eq!(required_bytes((2, 12, u32::MAX)), None);
+    }
+
+    #[test]
+    fn wide_clamp_covers_each_group_once_and_clears_inactive_records() {
+        let Some(mut gpu) = Harness::new() else { return };
+        let (src, src_ptr, _) = gpu.shared_buffer(48);
+        let (count, count_ptr, _) = gpu.shared_buffer(4);
+        let (_budget, budget_ptr, budget_gpu) = gpu.shared_buffer(256);
+        let (readback, readback_ptr, _) = gpu.shared_buffer(1024);
+        let dst = gpu.default_uav(1024);
+        // SAFETY: the mapped buffers have the sizes given above.
+        unsafe {
+            for (i, x) in [65_535u32, 65_536, 67_440, 42].into_iter().enumerate() {
+                for (j, value) in [x, 1, 1].into_iter().enumerate() {
+                    src_ptr.cast::<u32>().add(i * 3 + j).write_volatile(value);
+                }
+            }
+            count_ptr.cast::<u32>().write_volatile(3);
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+        }
+        assert!(record_clamp_mode(
+            &gpu.clamp, &gpu.list, &dst, budget_gpu, (&src, 0), Some((&count, 0)),
+            (2, 12, 4), false, Some(true),
+        ));
+        // SAFETY: the clamp left dst in INDIRECT_ARGUMENT; the copy has sufficient space.
+        unsafe {
+            gpu.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            gpu.list.CopyBufferRegion(&readback, 0, &dst, 0, 1024);
+        }
+        gpu.submit_and_wait();
+        // SAFETY: the copy completed and the mapped readback has 1024 bytes.
+        let words = unsafe { std::slice::from_raw_parts(readback_ptr.cast::<u32>(), 256) };
+        for (record, total) in [65_535usize, 65_536, 67_440].into_iter().enumerate() {
+            let mut hits = vec![0u8; total];
+            for piece in words[record * 64..(record + 1) * 64].chunks_exact(4) {
+                let (base, size) = (piece[0] as usize, piece[1] as usize);
+                assert!(size <= 65_535);
+                if size > 0 {
+                    assert_eq!(&piece[2..], &[1, 1]);
+                    for hit in &mut hits[base..base + size] { *hit += 1; }
+                }
+            }
+            assert!(hits.iter().all(|&n| n == 1), "record {record}");
+        }
+        assert!(words[192..].iter().all(|&word| word == 0));
+    }
+
+    #[test]
+    fn wide_commands_set_group_base_before_dispatch() {
+        const WORKER: &str = r#"
+#define RS "RootConstants(num32BitConstants=1, b0), UAV(u0)"
+cbuffer Base : register(b0) { uint base; };
+RWByteAddressBuffer hits : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 group : SV_GroupID) {
+    uint old;
+    hits.InterlockedAdd((base + group.x) * 4, 1, old);
+}
+"#;
+        let Some(mut gpu) = Harness::new() else { return };
+        let worker = compile_cs(&gpu.device, WORKER).expect("wide worker");
+        let signature = crate::draw::make_wide_signature(&gpu.device, &worker.root, (0, 0))
+            .expect("wide signature");
+        let (src, src_ptr, _) = gpu.shared_buffer(12);
+        let (_budget, budget_ptr, budget_gpu) = gpu.shared_buffer(256);
+        let (_hits, hits_ptr, hits_gpu) = gpu.shared_buffer(67_441 * 4);
+        let dst = gpu.default_uav(256);
+        // SAFETY: the buffers are mapped and have the stated lengths.
+        unsafe {
+            for (i, v) in [67_440u32, 1, 1].into_iter().enumerate() {
+                src_ptr.cast::<u32>().add(i).write_volatile(v);
+            }
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(hits_ptr, 0, 67_441 * 4);
+        }
+        assert!(record_clamp_mode(&gpu.clamp, &gpu.list, &dst, budget_gpu, (&src, 0), None, (2, 12, 1), false, Some(true)));
+        // SAFETY: the scratch and signature match, and the worker's UAV is live.
+        unsafe {
+            gpu.list.SetComputeRootSignature(&worker.root);
+            gpu.list.SetPipelineState(&worker.pso);
+            gpu.list.SetComputeRootUnorderedAccessView(1, hits_gpu);
+            gpu.list.ExecuteIndirect(&signature, 16, &dst, 0, None, 0);
+        }
+        gpu.submit_and_wait();
+        // SAFETY: the GPU is finished and the buffer is mapped.
+        let hits = unsafe { std::slice::from_raw_parts(hits_ptr.cast::<u32>(), 67_441) };
+        assert!(hits[..67_440].iter().all(|&v| v == 1));
+        assert_eq!(hits[67_440], 0);
+    }
+
+    #[test]
+    fn wide_commands_without_group_id_use_dispatch_only_layout() {
+        let Some(mut gpu) = Harness::new() else { return };
+        let (src, src_ptr, _) = gpu.shared_buffer(12);
+        let (_budget, budget_ptr, budget_gpu) = gpu.shared_buffer(256);
+        let (_hits, hits_ptr, hits_gpu) = gpu.shared_buffer(4);
+        let dst = gpu.default_uav(192);
+        // SAFETY: the buffers are mapped and have the stated lengths.
+        unsafe {
+            for (i, v) in [65_536u32, 1, 1].into_iter().enumerate() {
+                src_ptr.cast::<u32>().add(i).write_volatile(v);
+            }
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            hits_ptr.cast::<u32>().write_volatile(0);
+        }
+        assert!(record_clamp_mode(&gpu.clamp, &gpu.list, &dst, budget_gpu, (&src, 0), None, (2, 12, 1), false, Some(false)));
+        let signature = gpu.signature(2, 12);
+        // SAFETY: the scratch and signature match, and the worker's UAV is live.
+        unsafe {
+            gpu.list.SetComputeRootSignature(&gpu.worker.root);
+            gpu.list.SetPipelineState(&gpu.worker.pso);
+            gpu.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            gpu.list.ExecuteIndirect(&signature, 16, &dst, 0, None, 0);
+        }
+        gpu.submit_and_wait();
+        // SAFETY: the GPU is finished and the buffer is mapped.
+        assert_eq!(unsafe { hits_ptr.cast::<u32>().read_volatile() }, 65_536);
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
@@ -1161,6 +1436,107 @@ void main() {
             }
         }
         assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+    }
+
+    /// Two records that cost 200 and 100 with 250 left of the budget: one
+    /// fits either way, and what the other did with the rest is
+    /// `VICTORY_INDIRECT_REST`. Taking it (`REST` 1, the default) saturates
+    /// the budget, so every record after it runs empty; taking nothing
+    /// leaves the 50 that no record of this pair wants, and the next record
+    /// of the list that fits runs. Either way one record is refused, and the
+    /// clamp says so in the budget's words after the dispatch notes (word 5:
+    /// the records refused, word 6: the largest cost of one, 0 under 2^22).
+    #[test]
+    fn a_record_that_does_not_fit_takes_the_rest_or_nothing() {
+        let _once = crate::warptest::lock();
+        let Some(mut harness) = Harness::new() else {
+
+            return;
+        };
+        const KIND_DRAW: u32 = 0;
+        const STRIDE: u32 = 16;
+        const RECORDS: u32 = 2;
+        const BUDGET_CAP: u32 = 1 << 27;
+        const LEFT: u32 = 250;
+        let total = (STRIDE * RECORDS) as usize;
+        // One run of the clamp: what the budget holds after it, which
+        // records were kept, and the two words of notes.
+        // Compiled explicitly, as REST 0 is below: `Harness::new`'s own clamp
+        // takes whatever `VICTORY_INDIRECT_REST` the runner has (CodeRabbit,
+        // PR #233).
+        let rest1 = compile_cs(&harness.device, &format!("#define REST 1\n{SOURCE}")).expect("the clamp must compile");
+        let rest0 = compile_cs(&harness.device, &format!("#define REST 0\n{SOURCE}")).expect("the clamp must compile");
+        let run = |harness: &mut Harness, clamp: &Clamp| -> (u32, Vec<u32>, u32, u32) {
+            let (src_buf, src_ptr, _) = harness.shared_buffer(total as u64);
+            let (_budget_buf, budget_ptr, budget_gpu) = harness.shared_buffer(256);
+            let (readback_buf, readback_ptr, _) = harness.shared_buffer(total as u64);
+        let dst_buf = harness.default_uav(total as u64);
+            // SAFETY: mapped buffers hold these bytes.
+            unsafe {
+                let words = src_ptr.cast::<u32>();
+                for (i, (count, instances)) in [(200u32, 1u32), (100, 1)].into_iter().enumerate() {
+                    words.add(i * 4).write_volatile(count);
+                    words.add(i * 4 + 1).write_volatile(instances);
+                }
+                (budget_ptr as *mut u32).write_volatile(BUDGET_CAP - LEFT);
+                for i in 1..5 {
+                    (budget_ptr as *mut u32).add(i).write_volatile(0);
+                }
+                std::ptr::write_bytes(readback_ptr, 0, total);
+            }
+            assert!(record_clamp(
+                clamp,
+                &harness.list,
+                &dst_buf,
+                budget_gpu,
+                (&src_buf, 0),
+                None,
+                (KIND_DRAW, STRIDE, RECORDS),
+            ));
+            done_on(&harness.list, &dst_buf);
+            // SAFETY: open list; live buffers.
+            unsafe {
+                harness.list.ResourceBarrier(&[transition(
+                    &dst_buf,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                harness
+                    .list
+                    .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total as u64);
+                harness.list.ResourceBarrier(&[transition(
+                    &dst_buf,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+            done_on(&harness.list, &readback_buf);
+            harness.submit_and_wait();
+            // SAFETY: the GPU work is done; the mappings are ours.
+            unsafe {
+                let notes = budget_ptr.cast::<u32>();
+                (
+                    notes.read_volatile(),
+                    std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), total / 4).to_vec(),
+                    notes.add(5).read_volatile(),
+                    notes.add(6).read_volatile(),
+                )
+            }
+        };
+        let (spent, out, refused, biggest) = run(&mut harness, &rest1);
+        assert_eq!(spent, BUDGET_CAP, "the record that did not fit took the rest");
+        assert_eq!((refused, biggest), (1, 0), "one refused, its cost under 2^22");
+        let kept = (0..RECORDS as usize).filter(|&i| out[i * 4] > 0).count();
+        assert_eq!(kept, 1, "one of the two fits either way");
+        let (spent, out, refused, biggest) = run(&mut harness, &rest0);
+        // Which record reserves first is the compare-exchange loop's order,
+        // not the record order: the 200-cost one leaves 50, the 100-cost one
+        // 150. The kept record says which (CodeRabbit, PR #233).
+        let expected = if out[0] > 0 { BUDGET_CAP - 50 } else { BUDGET_CAP - 150 };
+        assert_eq!(spent, expected, "it took nothing: what it left is the rest of its size");
+        assert_eq!((refused, biggest), (1, 0));
+        let kept = (0..RECORDS as usize).filter(|&i| out[i * 4] > 0).count();
+        assert_eq!(kept, 1);
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, `done`, `Host::execute`,
