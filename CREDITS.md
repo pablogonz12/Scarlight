@@ -371,6 +371,9 @@ D
   source field, so a marker byte there is not an extra dword and no longer swallows the next instruction, and the
   VOP3 encoding of `v_cmpx*` writes EXEC rather than its VDST, for both wave sizes
   (`crates/victory-shader/src/gfx10/{mod.rs,fields.rs}`).
+- **jaschinski97-ops**, Belobug/VIctory-Belobug-AMD [15cc76c39](https://github.com/Belobug/VIctory-Belobug-AMD/commit/15cc76c39):
+  regression tests for interpolation first halves read through a phi and standalone half-precision first halves
+  (`crates/victory-shader/src/io.rs`).
 - **Yoshi-233 [coolfox/main PR #7](https://github.com/Yoshi-233), from fxceless/victory-fork [9bf4a0f](https://github.com/fxceless/victory-fork/commit/9bf4a0f)**,
   GPL-3.0: the RGB dump decodes the packed 16-bit BGR targets (B5G6R5, B5G5R5A1, B4G4R4A4, host formats 85, 86,
   115) and keeps padded rows aligned (diagnostics only) (`crates/victory-gpu/src/capture.rs`).
