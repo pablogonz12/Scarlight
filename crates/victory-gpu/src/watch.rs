@@ -837,7 +837,7 @@ static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 
 /// How many askings were answered without a guard because the range was not
 /// whole blocks (asked by a copy whose destination is not ours to guard).
-#[cfg(test)]
+#[cfg(any(test, feature = "diagnostics"))]
 pub(crate) fn guard_refusals() -> u64 {
     REFUSED.load(std::sync::atomic::Ordering::Relaxed)
 }
