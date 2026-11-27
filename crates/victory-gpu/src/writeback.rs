@@ -263,6 +263,7 @@ mod tests {
     /// of its own inaccessible for the rest of the run (issue #32).
     #[test]
     fn a_job_dropped_without_running_gives_its_pages_back() {
+        let _journal = crate::watch::journal_test_lock();
         use windows_sys::Win32::System::Memory::{
             MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS,
             PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualQuery,
@@ -301,6 +302,7 @@ mod tests {
     /// waiting for a job that will never finish (issue #32).
     #[test]
     fn a_panicking_job_finishes_and_lets_its_waiters_go() {
+        let _journal = crate::watch::journal_test_lock();
         let done = Arc::new(Done::default());
         let waiter = done.clone();
         let thread = std::thread::spawn(move || {
@@ -322,6 +324,7 @@ mod tests {
     /// A wait returns only once the job finished, on another thread.
     #[test]
     fn done_waits_for_the_finish() {
+        let _journal = crate::watch::journal_test_lock();
         let done = Arc::new(Done::default());
         assert!(!done.finished());
         let flag = done.clone();
@@ -340,6 +343,7 @@ mod tests {
     /// through, and no one may be left waiting for a job that has no work.
     #[test]
     fn an_empty_job_gives_its_pages_back_and_lets_a_read_through() {
+        let _journal = crate::watch::journal_test_lock();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
             VirtualFree, VirtualQuery,
@@ -398,6 +402,7 @@ mod tests {
     /// faults on the block would never run again).
     #[test]
     fn a_wait_gives_up_at_the_deadline_and_names_the_job() {
+        let _journal = crate::watch::journal_test_lock();
         let done = Done::default();
         assert_ne!(done.id(), 0, "a job has an id to name it");
         let limit = std::time::Duration::from_millis(50);

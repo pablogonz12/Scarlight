@@ -2466,6 +2466,7 @@ mod back_tests {
     /// GPU's older bytes over the title's, and lose the merge.
     #[test]
     fn back_open_waits_for_the_job_that_holds_the_block() {
+        let _journal = super::journal_test_lock();
         use std::sync::mpsc;
         // SAFETY: one block of private memory, freed at the end.
         let at = unsafe {
@@ -2504,6 +2505,7 @@ mod back_tests {
     /// thread never running again.
     #[test]
     fn a_read_of_a_held_block_returns_within_the_deadline_and_names_the_job() {
+        let _journal = super::journal_test_lock();
         use std::sync::mpsc;
         // SAFETY: one block of private memory, freed at the end.
         let at = unsafe {
