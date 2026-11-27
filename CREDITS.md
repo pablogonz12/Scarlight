@@ -414,3 +414,4 @@ D
 - **Rareuncommon**, [vector sum of absolute differences](https://github.com/Marvisak/VIctory/commit/5d6889e8b): lower vector SAD variants.
 - **AnoHunted**, [signed nibble conversion](https://github.com/Marvisak/VIctory/commit/78c12677e): lower `v_cvt_off_f32_i4` and test its conversion.
 - **gomeaw**, Belobug/VIctory-Belobug-AMD commit 7348b80aa, GPL-3.0: include implicit lane inputs in wave uniformity proofs.
+- **justrealyme**, Belobug/VIctory-Belobug-AMD commit 431cab5d9, GPL-3.0: prove first-lane reads under wave-uniform conditions.
