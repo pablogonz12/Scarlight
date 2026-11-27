@@ -477,7 +477,8 @@ fn dump_on() -> bool {
 /// target (8-bit, 10-bit or 16-bit float colour, 16:9, at least 1280 wide) the
 /// most draws wrote, which in a world frame is a G-buffer layer. A debugging
 /// view: it shows a buffer as it is (a G-buffer layer unlit, say), not a
-/// finished picture.
+/// finished picture. `VICTORY_SHOW_TARGET=last:<width>x<height>` shows the
+/// last matching single-sample, single-mip 8-bit RGBA/BGRA colour target.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum Show {
     Index(usize),
