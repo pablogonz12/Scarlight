@@ -2658,6 +2658,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 }
             }
             let mut desc = desc.as_ref().map(uav_desc);
+            if let Some(desc) = desc.as_mut()
+                && desc.Format.0 == 0
+                && let Some(format) = crate::resource::view_format(resource)
+            {
+                desc.Format = DXGI_FORMAT(format as i32);
+            }
             // A depth texture's unordered access is its colour twin's: the
             // host gives a depth texture none.
             let twin = crate::resource::twin_resource(resource)
@@ -2712,10 +2718,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
-                // shortcut: unordered access to a texture the title placed
-                // itself is not mirrored; give it a resource as shader
-                // views of such textures get when a dispatch writes one.
-                once!(dimension = resource[0], "placed unordered texture view not mirrored");
+                // No known host texture: keep the null view.
                 return None;
             }
             // The resource description's width, after the alignment.
@@ -2755,19 +2758,46 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// A placed texture view resolved to its resource. UAVs only use an
+/// already-existing host texture; SRVs retain their lazy creation path.
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let View::Placed(unordered, resource, desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let texture = if *unordered {
+        let texture = crate::resource::placed_known(address, resource)?;
+        crate::resource::host_made(texture)?;
+        texture
+    } else {
+        crate::resource::texture_at(address, resource)?
+    };
+    let desc = desc[..10].try_into().ok();
+    Some(if *unordered {
+        View::Unordered(texture as usize, 0, desc)
+    } else {
+        View::Shader(texture as usize, desc)
+    })
+}
+
+/// Identity of a placed UAV's existing host texture, without creating one.
+/// Dynamic tables include this in their cache key so that a null entry gets a
+/// new table when the texture appears, without modifying an in-flight table.
+pub(crate) fn placed_uav_identity(view: &View) -> Option<usize> {
+    use windows::core::Interface;
+    let View::Placed(true, resource, desc) = view else {
+        return None;
+    };
+    if resource[0] == 1 {
+        return None;
+    }
+    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    let texture = crate::resource::placed_known(address, resource)?;
+    Some(crate::resource::host_made(texture)?.as_raw() as usize)
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
@@ -2941,6 +2971,44 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static PLACED_UAV_MEMORY: [u8; 131072] = [0; 131072];
+
+    #[test]
+    fn placed_uav_uses_only_a_known_host_texture() {
+        let Some(host) = host() else { return };
+        let Some(heap) = HostHeap::new(false, 2) else { return };
+        let address = (PLACED_UAV_MEMORY.as_ptr() as u64 + 65535) & !65535;
+        let resource = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 29, 1, 0, 0, 4, 0];
+        let mut desc = [0; 16];
+        desc[1] = 4; // TEXTURE2D
+        desc[10] = address as u32;
+        desc[11] = (address >> 32) as u32;
+        let view = View::Placed(true, resource, desc);
+
+        let before = placed_uav_identity(&view);
+        let mut tables = std::collections::HashMap::new();
+        tables.insert(before, 0);
+        assert!(placed_texture(&view).is_none());
+        assert!(make(&view, heap.cpu(0)).is_none());
+        let placed = crate::resource::texture_at(address, &resource).unwrap();
+        assert!(placed_texture(&view).is_none());
+        let texture = crate::resource::host_resource(placed).unwrap();
+        let after = placed_uav_identity(&view);
+        assert_ne!(before, after);
+        assert!(!tables.contains_key(&after));
+        tables.insert(after, 1);
+        assert_eq!(tables.get(&placed_uav_identity(&view)), Some(&1));
+        let resolved = placed_texture(&view).unwrap();
+        assert!(matches!(resolved, View::Unordered(r, 0, Some(_)) if r == placed as usize));
+        let mut format = DXGI_FORMAT(crate::resource::view_format(placed).unwrap() as i32);
+        assert!(fits(texture, Some(&mut format), true));
+        assert_eq!(format, DXGI_FORMAT_R8G8B8A8_UNORM);
+        let kept = make(&view, heap.cpu(1)).expect("a valid UAV").expect("a texture");
+        assert_eq!(windows::core::Interface::as_raw(&kept), windows::core::Interface::as_raw(texture));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
 
     /// The host's dynamic slots sit below the null slot that shaders clamp
     /// view indices to, never right after the title's, so an index the title
