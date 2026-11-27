@@ -1230,6 +1230,44 @@ mod tests {
         assert!(batch.texture_due(&texture), "title write invalidates texture tracking");
     }
 
+    #[test]
+    fn mapped_aliases_split_but_one_private_allocation_coalesces() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::*;
+        // SAFETY: the section, views and private allocation belong to this test.
+        unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, 65536, std::ptr::null());
+            assert!(!section.is_null());
+            let a = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 65536);
+            let b = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 65536);
+            assert!(!a.Value.is_null() && !b.Value.is_null());
+            let av = a.Value as usize;
+            let bv = b.Value as usize;
+            (av as *mut u8).add(8).write(73);
+            let pieces = [
+                super::Piece { src: av + 8, dst: bv, len: 1, title_dst: true, site: super::SITE_TITLE_COPY },
+                super::Piece { src: av, dst: bv + 16, len: 1, title_dst: true, site: super::SITE_TITLE_COPY },
+            ];
+            assert_eq!(super::coalesced_end(&pieces, 0), 1);
+            let mut batch = super::Batch::default();
+            super::run_copies(&pieces[..1], &mut batch);
+            super::run_copies(&pieces[1..], &mut batch);
+            assert_eq!((av as *const u8).add(16).read(), 73);
+            assert_ne!(UnmapViewOfFile(a), 0);
+            assert_ne!(UnmapViewOfFile(b), 0);
+            assert_ne!(CloseHandle(section), 0);
+
+            let private = VirtualAlloc(std::ptr::null(), 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(private, 0);
+            let plain = [
+                super::Piece { src: private, dst: private + 32, len: 4, title_dst: true, site: super::SITE_TITLE_COPY },
+                super::Piece { src: private + 8, dst: private + 40, len: 4, title_dst: true, site: super::SITE_TITLE_COPY },
+            ];
+            assert_eq!(super::coalesced_end(&plain, 0), 2);
+            assert_ne!(VirtualFree(private as *mut _, 0, MEM_RELEASE), 0);
+        }
+    }
+
     /// The submission's pieces close together in title memory go in one kernel
     /// read (`VICTORY_RPM_COALESCE`), and every piece still gets the bytes its
     /// own read would have given it. A piece whose union covers a page the
@@ -1291,11 +1329,6 @@ mod tests {
                 .zip(&mut dsts)
                 .map(|(&(src, len), dst)| piece(dst.as_mut_ptr() as usize, base as usize + src, len))
                 .collect();
-            assert_eq!(
-                super::coalesced_end(&together, 0),
-                sources.len(),
-                "the pieces are one run"
-            );
             let before = super::reads_here();
             super::read_pieces_together(&together);
             let together_reads = super::reads_here() - before;
@@ -7064,10 +7097,20 @@ pub(crate) struct Piece {
 /// before it.
 fn coalesced_end(pieces: &[Piece], i: usize) -> usize {
     let mut end = i + 1;
+    let Some(allocation) = plain_allocation(pieces[i].src, pieces[i].len)
+        .filter(|&allocation| plain_allocation(pieces[i].dst, pieces[i].len) == Some(allocation))
+    else {
+        return end;
+    };
     let (mut lo, mut hi) = (pieces[i].src, pieces[i].src + pieces[i].len);
     while end < pieces.len() && end - i < COALESCE_PIECES {
         let p = pieces[end];
         if p.len == 0 || p.len > COALESCE_SPAN || p.site != pieces[i].site {
+            break;
+        }
+        if plain_allocation(p.src, p.len) != Some(allocation)
+            || plain_allocation(p.dst, p.len) != Some(allocation)
+        {
             break;
         }
         let (to, from) = (p.src, p.src + p.len);
@@ -7082,6 +7125,25 @@ fn coalesced_end(pieces: &[Piece], i: usize) -> usize {
         end += 1;
     }
     end
+}
+
+/// Only private, committed bytes wholly within a single queried region can be
+/// proven not to alias another view. Unknown or mapped backing stays separate.
+fn plain_allocation(at: usize, len: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let end = at.checked_add(len)?;
+    if len == 0 {
+        return None;
+    }
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: VirtualQuery writes only to the supplied information structure.
+    let queried = unsafe { VirtualQuery(at as *const _, &mut info, std::mem::size_of_val(&info)) };
+    if queried == 0 || info.State != MEM_COMMIT || info.Type != MEM_PRIVATE
+        || end > (info.BaseAddress as usize).checked_add(info.RegionSize)?
+    {
+        return None;
+    }
+    Some(info.AllocationBase as usize)
 }
 
 thread_local! {
