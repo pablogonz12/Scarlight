@@ -47,7 +47,12 @@ valid_version "$version" || { echo 'Invalid or unavailable release version.' >&2
 major=${version%%.*}; rest=${version#*.}; ge_release=${rest%%.*}
 base="GE-Proton${major}-${ge_release}"
 tmp=$(mktemp -d)
-trap 'rm -rf -- "$tmp"' EXIT
+stage=''
+cleanup() {
+  [[ -z $stage ]] || rm -rf -- "$stage"
+  rm -rf -- "$tmp"
+}
+trap cleanup EXIT
 archive="Scarlight-$version.tar.gz"
 url="https://github.com/pablogonz12/Scarlight/releases/download/v$version"
 curl -fsSL "$url/$archive" -o "$tmp/$archive"
@@ -73,7 +78,12 @@ for dir in "${steam_dirs[@]}"; do
   mkdir -p "$dir"
   if ((need_proton && with_proton)) && [[ ! -x $dir/$base-x86_64/files/bin/wine && ! -x $dir/$base/files/bin/wine ]]; then
     [[ ! -e $dir/$ge ]] || { echo "Cannot overwrite $dir/$ge" >&2; exit 1; }
-    cp -a "$tmp/$ge" "$dir/"
+    stage=$(mktemp -d "$dir/.scarlight-stage.XXXXXXXX")
+    cp -a "$tmp/$ge" "$stage/item"
+    mv -T --no-clobber "$stage/item" "$dir/$ge"
+    [[ ! -e $stage/item ]] || { echo "Cannot overwrite $dir/$ge" >&2; exit 1; }
+    rmdir "$stage"
+    stage=''
     echo "Installed $ge in $dir"
   fi
   if [[ -e $dir/Scarlight-$version ]]; then
@@ -87,12 +97,17 @@ for dir in "${steam_dirs[@]}"; do
     valid_version "$candidate" || continue
     if [[ -z $previous ]] || [[ $(printf '%s\n%s\n' "$previous" "$candidate" | sort -V | tail -n 1) == "$candidate" ]]; then previous=$candidate; fi
   done
-  cp -a "$tmp/Scarlight-$version" "$dir/"
+  stage=$(mktemp -d "$dir/.scarlight-stage.XXXXXXXX")
+  cp -a "$tmp/Scarlight-$version" "$stage/item"
   if [[ -n $previous ]]; then
-    cp -- "$dir/Scarlight-$previous/scarlight.conf" "$dir/Scarlight-$version/scarlight.conf"
+    cp -- "$dir/Scarlight-$previous/scarlight.conf" "$stage/item/scarlight.conf"
   else
-    printf 'BUILD=default\nPROTON=%s-x86_64\nEXTRA_ENV=VICTORY_LOG=info\n' "$base" > "$dir/Scarlight-$version/scarlight.conf"
+    printf 'BUILD=default\nPROTON=\nEXTRA_ENV=VICTORY_LOG=info\n' > "$stage/item/scarlight.conf"
   fi
+  mv -T --no-clobber "$stage/item" "$dir/Scarlight-$version"
+  [[ ! -e $stage/item ]] || { echo "Cannot overwrite $dir/Scarlight-$version" >&2; exit 1; }
+  rmdir "$stage"
+  stage=''
   echo "Installed Scarlight $version in $dir"
 done
 if ((need_proton && !with_proton)); then
