@@ -2,9 +2,8 @@ use std::process::Command;
 
 #[test]
 fn worker_count_is_validated_before_dispatch() {
-    let dir = tempfile::tempdir().unwrap();
     // Accepted arguments reach the config error without reading game files or probing the GPU.
-    let missing_config = dir.path().join("missing.toml");
+    let missing_config = std::env::temp_dir().join(format!("victory-missing-config-{}.toml", std::process::id()));
     let modes: &[&[&str]] = &[&["translate"]];
 
     for args in modes {
