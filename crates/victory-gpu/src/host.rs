@@ -3739,6 +3739,8 @@ impl Host {
             // SAFETY: the list's last run finished (it ran ahead of a
             // submission that was waited for, and came back after that);
             // live buffers, and the ranges lie in them.
+            #[cfg(feature = "diagnostics")]
+            let list_started = std::time::Instant::now();
             let recorded = unsafe {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
@@ -3806,6 +3808,8 @@ impl Host {
                     Ok(())
                 })()
             };
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::card_list(0, list_started);
             if let Err(e) = recorded {
                 fail(format_args!("host copies in the card's memory could not be brought up to date ({e})"));
             }
@@ -3858,6 +3862,8 @@ impl Host {
             // SAFETY: the list's last run finished (its submission was
             // waited for, and it came back after that); live buffers; the
             // compare's own root signature.
+            #[cfg(feature = "diagnostics")]
+            let list_started = std::time::Instant::now();
             let recorded = unsafe {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
@@ -3894,6 +3900,8 @@ impl Host {
                     list.cast()
                 })()
             };
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::card_list(1, list_started);
             match recorded {
                 Ok(list) => plan.check = Some(list),
                 Err(e) => fail(format_args!("the compare of host copies in the card's memory could not be recorded ({e})")),

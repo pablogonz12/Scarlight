@@ -202,6 +202,7 @@ impl ThreadCounters {
 
 static BUFFER_CREATES: [ThreadCounters; 3] = [const { ThreadCounters::new() }; 3];
 static CARD_RECORDING: [ThreadCounters; 2] = [const { ThreadCounters::new() }; 2];
+static CARD_LIST_RECORDING: [ThreadCounters; 2] = [const { ThreadCounters::new() }; 2];
 static CARD_PIECES: [[AtomicU64; 2]; 2] = [const { [const { AtomicU64::new(0) }; 2] }; 2];
 static FETCH_BYTES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
@@ -225,6 +226,11 @@ pub(crate) fn card_pass(kind: usize, pieces: u32, started: std::time::Instant) {
     let submitting = SUBMITTING_THREAD.with(|marked| marked.get());
     CARD_RECORDING[kind].record(submitting, started.elapsed().as_nanos() as u64);
     CARD_PIECES[kind][usize::from(!submitting)].fetch_add(u64::from(pieces), Relaxed);
+}
+
+/// Time for an entire card hash/compare list, including its setup.
+pub(crate) fn card_list(kind: usize, started: std::time::Instant) {
+    CARD_LIST_RECORDING[kind].record_current(started.elapsed().as_nanos() as u64);
 }
 
 #[cfg(test)]
@@ -1193,6 +1199,12 @@ pub(crate) fn log(frames: f64) {
             "card {name} dispatch recording per frame: submit {:.1} passes {:.1} pieces {:.3} ms; other {:.1} passes {:.1} pieces {:.3} ms",
             submit as f64 / frames, pieces[0], submit_ns as f64 / 1e6 / frames,
             other as f64 / frames, pieces[1], other_ns as f64 / 1e6 / frames
+        );
+        let [submit, submit_ns, other, other_ns] = CARD_LIST_RECORDING[kind].take();
+        tracing::info!(
+            "card {name} list recording per frame: submit {:.1} lists {:.3} ms; other {:.1} lists {:.3} ms",
+            submit as f64 / frames, submit_ns as f64 / 1e6 / frames,
+            other as f64 / frames, other_ns as f64 / 1e6 / frames
         );
     }
     let counted = COUNT[C::Frames as usize].swap(0, Relaxed);
