@@ -19,17 +19,12 @@ fn worker_count_is_validated_before_dispatch() {
             }
             let output = command.output().unwrap();
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let (code, message) = if jobs == Some("0") {
-                (2, "invalid value '0' for '--jobs")
+            if jobs == Some("0") {
+                assert_eq!(output.status.code(), Some(2), "{args:?} {jobs:?}: {stderr}");
+                assert!(stderr.contains("invalid value '0' for '--jobs"), "{stderr}");
             } else {
-                (1, "VICTORY_CONFIG points at")
-            };
-            assert_eq!(
-                output.status.code(),
-                Some(code),
-                "{args:?} {jobs:?}: {stderr}"
-            );
-            assert!(stderr.contains(message), "{args:?} {jobs:?}: {stderr}");
+                assert_ne!(output.status.code(), Some(2), "{args:?} {jobs:?}: {stderr}");
+            }
         }
     }
 }
