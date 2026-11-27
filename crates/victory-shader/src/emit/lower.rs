@@ -4586,7 +4586,7 @@ impl<'a> Lower<'a> {
     /// lane must be a constant. A quad read keeps a helper lane's value,
     /// which a pixel shader needs across a triangle edge; `pattern` is the
     /// instruction's quad permutation, when it has one (common broadcasts
-    /// and exchanges then take one read instead of four and a select).
+    /// then take one read instead of four and a select).
     fn quad_pick(&mut self, x: V, src: V, pattern: Option<u8>) -> V {
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
@@ -4604,14 +4604,6 @@ impl<'a> Lower<'a> {
             Some(0xe4) => return x,
             Some(p @ (0x00 | 0x55 | 0xaa | 0xff)) => {
                 let lane = self.s.m.i32(u32::from(p & 3));
-                return broadcast(self, lane);
-            }
-            Some(0xb1 | 0x4e | 0x1b) => {
-                // These three permutations are lane ^ 1, ^ 2 and ^ 3, which
-                // is what `src` already picks (the callers decode the
-                // pattern into it), so no XOR here: one read, not four.
-                let three = self.s.m.i32(3);
-                let lane = self.s.m.bin(c, Bin::And, src, three);
                 return broadcast(self, lane);
             }
             _ => {}
