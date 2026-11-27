@@ -765,6 +765,10 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(feature = "diagnostics")]
+    let _frame_end = crate::trace::FrameEnd(FRAMES.load(Ordering::Relaxed) + 1);
+    #[cfg(feature = "diagnostics")]
+    let _trace = crate::trace::span("present");
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
     // Submissions sent to the card and not waited for are settled first,

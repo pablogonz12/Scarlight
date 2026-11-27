@@ -99,6 +99,8 @@ mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 mod switches;
+#[cfg(feature = "diagnostics")]
+mod trace;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
