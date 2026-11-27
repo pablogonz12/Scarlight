@@ -3065,11 +3065,11 @@ impl Shadow {
             }
             let start = self.start as usize;
             let end = start + self.len as usize;
-            if ask_from == start && ask_to == end && start.is_multiple_of(PAGE) && end.is_multiple_of(PAGE) {
-                if self.watched.swap(NOT_WATCHED, Ordering::Relaxed) != NOT_WATCHED {
-                    #[cfg(feature = "diagnostics")]
-                    MARKED_NOT_WATCHED.fetch_add(1, Ordering::Relaxed);
-                }
+            if ask_from == start && ask_to == end && start.is_multiple_of(PAGE) && end.is_multiple_of(PAGE)
+                && self.watched.swap(NOT_WATCHED, Ordering::Relaxed) != NOT_WATCHED
+            {
+                #[cfg(feature = "diagnostics")]
+                MARKED_NOT_WATCHED.fetch_add(1, Ordering::Relaxed);
             }
         }
         #[cfg(feature = "diagnostics")]
