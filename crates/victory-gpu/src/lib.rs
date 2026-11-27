@@ -63,6 +63,8 @@ mod frame_budget;
 mod refresh_runs;
 #[cfg(windows)]
 mod host;
+#[cfg(all(feature = "diagnostics", any(windows, test)))]
+mod hangdog;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
