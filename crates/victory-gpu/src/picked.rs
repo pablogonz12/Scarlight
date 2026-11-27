@@ -86,16 +86,19 @@ pub(crate) fn log(frames: f64) {
 /// copy compares on every other submission of two still walks every one of
 /// its pages (`turn % slice` would otherwise only ever be the parity of its
 /// own turns, and half its pages never look).
-pub(crate) fn next_turn(id: u64) -> u64 {
-    // Keyed by slot, so the map cannot grow: it never has to clear what it
-    // holds, and a full map does not give every copy turn 0 again (the pages
-    // off its first then never look). Two copies that share a slot walk the
-    // same page of the slice, and each still walks all of them.
+pub(crate) fn next_turn(id: u64) -> Option<u64> {
     let mut turns = TURNS.lock().unwrap_or_else(|e| e.into_inner());
-    let t = turns.entry(id % KEPT as u64).or_insert(0);
+    next_turn_in(&mut turns, id)
+}
+
+fn next_turn_in(turns: &mut BTreeMap<u64, u64>, id: u64) -> Option<u64> {
+    if !turns.contains_key(&id) && turns.len() >= KEPT {
+        return None;
+    }
+    let t = turns.entry(id).or_insert(0);
     let now = *t;
-    *t += 1;
-    now
+    *t = t.wrapping_add(1);
+    Some(now)
 }
 
 /// Each copy's count of compares so far, its turn ([`next_turn`]).
@@ -177,6 +180,17 @@ pub(crate) fn spans(
     out
 }
 
+/// Without a retained turn, comparing the whole range prevents starvation.
+pub(crate) fn spans_for_turn(
+    turn: Option<u64>, id: u64, start: usize, from: usize, to: usize, baseline: Option<&[bool]>,
+) -> Vec<(usize, usize)> {
+    match turn {
+        Some(turn) => spans(turn, id, start, from, to, baseline),
+        None if from < to => vec![(from, to)],
+        None => Vec::new(),
+    }
+}
+
 /// The pages of the copy from `start` that the pieces `[at, at + n)` of
 /// `found` hold are learned: they are compared every time from now on.
 pub(crate) fn found(id: u64, start: usize, found: &[(usize, usize)]) {
@@ -203,9 +217,7 @@ pub(crate) fn found(id: u64, start: usize, found: &[(usize, usize)]) {
 /// number does not inherit its pages.
 pub(crate) fn forget(id: u64) {
     SETS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-    // Its slot may be one another copy shares: that copy's count carries on
-    // from where it was, nothing of its sweep restarts.
-    TURNS.lock().unwrap_or_else(|e| e.into_inner()).remove(&(id % KEPT as u64));
+    TURNS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
 }
 
 #[cfg(test)]
@@ -330,18 +342,25 @@ mod tests {
     #[test]
     fn a_full_map_does_not_restart_a_copys_sweep() {
         let id = 0x00fa_0000_0000_00d1u64;
-        let slot = id % super::KEPT as u64;
+        let mut turns = std::collections::BTreeMap::new();
         // A few of its own turns first, so a restart cannot hide behind 0.
-        let first = (0..4).map(|_| super::next_turn(id)).last().unwrap_or(0);
+        let mut first = None;
+        for _ in 0..4 {
+            first = super::next_turn_in(&mut turns, id);
+        }
+        assert_eq!(first, Some(3));
         // More copies than the map keeps, each asking once: a whole-range
         // scan of a big title does this, and so does a small one that learns.
         for i in 0..(super::KEPT as u64 * 2) {
             let other = 0x0100_0000_0000_0000u64 | i.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-            if other % super::KEPT as u64 != slot {
-                super::next_turn(other);
-            }
+            super::next_turn_in(&mut turns, other);
         }
-        assert!(super::next_turn(id) > first, "its sweep went on, it did not start again");
+        assert_eq!(super::next_turn_in(&mut turns, id), Some(4));
+        assert_eq!(super::next_turn_in(&mut turns, u64::MAX), None);
+        assert_eq!(super::spans_for_turn(None, u64::MAX, 0, 0, 8 * PAGE, Some(&[true; 8])), vec![(0, 8 * PAGE)]);
+        assert!(super::spans_for_turn(None, u64::MAX, 0, 0, 0, None).is_empty());
+        turns.remove(&id);
+        assert_eq!(super::next_turn_in(&mut turns, u64::MAX), Some(0));
     }
 
     /// The spans are of the range, in order, never overlapping; over a

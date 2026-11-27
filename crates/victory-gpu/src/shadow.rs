@@ -1573,7 +1573,8 @@ fn find_pieces(scans: Vec<Scan>) -> Vec<Vec<(usize, usize)>> {
         // The spans of the range this look examines (`crate::picked`), or
         // the range whole.
         let mut place = 0;
-        for (from, to) in crate::picked::spans(turn, scan.id, start, scan.from, scan.to, scan.baseline.as_deref()) {
+        let ranges = crate::picked::spans_for_turn(turn, scan.id, start, scan.from, scan.to, scan.baseline.as_deref());
+        for (from, to) in ranges {
             let mut at = from;
             while at < to {
                 // Cut where pieces end, so that every job sees whole pieces.
