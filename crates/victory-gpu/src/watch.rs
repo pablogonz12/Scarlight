@@ -49,6 +49,19 @@ static ASKED: AtomicU64 = AtomicU64::new(0);
 static RESET_ORDER: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 static RESET_READY: std::sync::Condvar = std::sync::Condvar::new();
 
+#[cfg(feature = "diagnostics")]
+static INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn invalidated() {
+    #[cfg(feature = "diagnostics")]
+    INVALIDATIONS.fetch_add(1, Relaxed);
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_invalidations() -> u64 {
+    INVALIDATIONS.swap(0, Relaxed)
+}
+
 struct ResetRange(usize, usize);
 
 impl Drop for ResetRange {
@@ -121,9 +134,12 @@ fn next_asking() -> u64 {
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
 /// range).
-const AHEAD_GAP: usize = (8 << 20) / PAGE;
-/// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
-const AHEAD_MAX: usize = (1 << 30) / PAGE;
+fn allocation(page: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
+    (n != 0 && !info.AllocationBase.is_null()).then_some(info.AllocationBase as usize)
+}
 
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
@@ -142,7 +158,7 @@ fn ask_ahead_locked(ranges: &[(usize, usize)]) {
         .filter(|r| r.0 < r.1)
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
-    if pieces.len() < 2 {
+    if pieces.is_empty() {
         return;
     }
     pieces.sort_unstable();
@@ -160,10 +176,8 @@ fn ask_ahead_locked(ranges: &[(usize, usize)]) {
         let first = pieces[i].0;
         let mut last = pieces[i].1;
         let mut k = i + 1;
-        while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
-            && last.max(pieces[k].1) - first <= AHEAD_MAX
-        {
+        let base = allocation(first);
+        while k < pieces.len() && base.is_some() && allocation(pieces[k].0) == base {
             last = last.max(pieces[k].1);
             k += 1;
         }
@@ -292,13 +306,16 @@ pub(crate) fn wrote(at: usize, len: usize) {
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`].
 fn ask_run(a: &mut Ahead, pieces: &[(usize, usize)]) {
-    if pieces.len() < 2 {
+    if pieces.is_empty() {
         return;
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
     if ask_kernel(a, first, last) {
         a.ranges.push((first, last));
+        return;
+    }
+    if pieces.len() == 1 {
         return;
     }
     let (left, right) = pieces.split_at(pieces.len() / 2);
@@ -2005,6 +2022,45 @@ mod tests {
     /// Askings of one submission that meet or overlap are one range each
     /// run, so a page range lying in any of them is covered: the journal
     /// answers for it instead of the kernel being asked again.
+    #[test]
+    fn batched_segments_keep_gap_writes_and_share_answers() {
+        let _journal = journal_test_lock();
+        tests::POOLS.with(|v| v.set(Some(false)));
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 400 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let ranges = [(p, p + PAGE), (p + 300 * PAGE, p + 301 * PAGE)];
+        unsafe { ((p + 150 * PAGE) as *mut u8).write_volatile(1) };
+        let before = crate::journal::kernel_asks();
+        ask_once(&ranges);
+        assert_eq!(crate::journal::kernel_asks() - before, 1);
+        let (first, _) = writes(ranges[0].0, ranges[0].1, true).unwrap();
+        let (_, gap) = writes(p + 150 * PAGE, p + 151 * PAGE, true).unwrap();
+        assert!(gap.iter().any(|&(page, _)| page == p / PAGE + 150));
+        std::thread::scope(|scope| {
+            for _ in 0..7 {
+                scope.spawn(|| {
+                    let before = crate::journal::kernel_asks();
+                    for _ in 0..20 {
+                        assert!(writes(ranges[1].0, ranges[1].1, true).is_some());
+                    }
+                    assert_eq!(crate::journal::kernel_asks(), before);
+                });
+            }
+        });
+        unsafe { ((p + 300 * PAGE) as *mut u8).write_volatile(2) };
+        ask_once_end();
+        let before = crate::journal::kernel_asks();
+        ask_once(&ranges);
+        assert_eq!(crate::journal::kernel_asks() - before, 1);
+        assert_eq!(written_since(ranges[1].0, ranges[1].1, first), Some(true));
+        ask_once_end();
+        forget_askings();
+        tests::POOLS.with(|v| v.set(None));
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
     #[test]
     fn overlapping_askings_are_merged_so_a_range_inside_any_is_covered() {
         let _journal = journal_test_lock();

@@ -25,6 +25,14 @@ const PAGE: usize = crate::watch::PAGE;
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
 
+#[cfg(feature = "diagnostics")]
+static KERNEL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_kernel_calls() -> u64 {
+    KERNEL_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Pages of one shard in a row: 1 MiB, so a range meets few shards.
 const STRIPE: usize = 16;
 
@@ -195,6 +203,8 @@ pub(crate) fn ask(first: usize, last: usize) -> Option<Answer> {
     let mut granularity = 0;
     #[cfg(test)]
     note_kernel_ask();
+    #[cfg(feature = "diagnostics")]
+    KERNEL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: the answer buffer holds `count` entries.
     #[cfg(test)]
     let started = std::time::Instant::now();
