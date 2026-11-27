@@ -12,7 +12,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+#[cfg(feature = "diagnostics")]
+use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
@@ -690,16 +692,20 @@ impl Physical {
     }
 }
 
-static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
-    Mutex::new(Physical {
+static PHYSICAL: LazyLock<RwLock<Physical>> = LazyLock::new(|| {
+    RwLock::new(Physical {
         // Page numbers are opaque to titles; 0 stays unused.
         next_page: FIRST_PAGE_NUMBER,
         ..Default::default()
     })
 });
 
-fn physical() -> MutexGuard<'static, Physical> {
-    PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
+fn physical() -> RwLockWriteGuard<'static, Physical> {
+    PHYSICAL.write().unwrap_or_else(|e| e.into_inner())
+}
+
+fn physical_read() -> RwLockReadGuard<'static, Physical> {
+    PHYSICAL.read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
@@ -848,7 +854,7 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
     let end = offset.checked_add(len)?;
     let pages = pages.get(offset / PAGE..end.div_ceil(PAGE))?;
     let mark = super::dstorage::Mark::begin();
-    let physical = physical();
+    let physical = physical_read();
     mark.end(super::dstorage::Stage::DestLock);
     let mut runs: Vec<(Slice, usize)> = Vec::new();
     for page in pages {
@@ -923,7 +929,7 @@ fn mark_written(slice: &Slice, n: usize, within: usize, len: usize) {
 /// pages from `slice`, as addresses and lengths: the guards a write through
 /// our own view must open first.
 fn title_ranges(slice: &Slice, n: usize, within: usize, len: usize) -> Vec<(usize, usize)> {
-    let physical = physical();
+    let physical = physical_read();
     physical.ranges_for(slice, n, within, len)
 }
 
@@ -1781,6 +1787,52 @@ mod tests {
         assert!(reader.join().expect("the reader never faulted") > 0);
         assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn concurrent_page_writers_and_scatter_preserve_data() {
+        use std::sync::{Arc, Barrier};
+        let pages = allocate(12);
+        let base = XMemVirtualAlloc(
+            std::ptr::null_mut(), 12 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE,
+        ) as usize;
+        assert_ne!(base, 0);
+        let addresses: Vec<_> = (0..12).map(|i| (base + i * PAGE) as *mut c_void).collect();
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 12, pages.as_ptr()), 1);
+        let start = Arc::new(Barrier::new(14));
+        std::thread::scope(|scope| {
+            for (i, &page) in pages.iter().enumerate() {
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..100 {
+                        let mut window = page_window(&[page], 0, 1).expect("page window");
+                        window.bytes()[0] = (i + 1) as u8;
+                    }
+                });
+            }
+            let reader_start = Arc::clone(&start);
+            scope.spawn(move || {
+                reader_start.wait();
+                for _ in 0..1000 {
+                    let _reading = victory_gpu::title_memory_reading();
+                    for i in 0..12 {
+                        // SAFETY: the read lock excludes remapping.
+                        assert_eq!(unsafe { ((base + i * PAGE + PAGE - 1) as *const u8).read_volatile() }, 0);
+                    }
+                }
+            });
+            start.wait();
+            for _ in 0..100 {
+                assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 12, pages.as_ptr()), 1);
+            }
+        });
+        for (i, &address) in addresses.iter().enumerate() {
+            // SAFETY: all threads joined and the final scatter mapped every page.
+            assert_eq!(unsafe { address.cast::<u8>().read() }, (i + 1) as u8);
+        }
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 12, std::ptr::null()), 1);
+        assert_eq!(XMemFreePhysicalPages(12, pages.as_ptr()), 1);
     }
 
     /// A scatter of pages at consecutive addresses maps them in one call:
