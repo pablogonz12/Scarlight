@@ -439,7 +439,21 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         // every refresh ([`guard_copy_pools`], `VICTORY_GUARD_COPY_POOLS=0`
         // for the old way).
         let pools = !guarded || !verified.is_empty() || guard_copy_pools();
-        let written = match guarded_range(first * PAGE, last * PAGE, pools) {
+        // A range that is not whole blocks is not one we own: the block it
+        // rounds into holds memory somebody else writes (our own heap, the
+        // title's private allocations), and making that read-only faults in
+        // its writer. Our own allocator writes there, so the fault came back
+        // into this thread's own guard locks and the run hung
+        // (`watch::tests`: a guarded page of the CRT heap). Refused and
+        // counted; the copy takes its range whole, as it did before the pool
+        // guard existed.
+        let ours = start.is_multiple_of(PAGE) && end.is_multiple_of(PAGE);
+        let written = match if pools && !ours {
+            REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            None
+        } else {
+            guarded_range(first * PAGE, last * PAGE, pools)
+        } {
             Some(written) => written,
             None if verified.is_empty() => return None,
             None => verified.clone(),
@@ -815,6 +829,17 @@ pub(crate) fn remapped_taken(generation: u64, at: usize, len: usize) {
 /// their state and protection, so one answer covers every copy inside it;
 /// it is forgotten when the range's protection changes ([`title_memory_remapped`],
 /// our own guards and write-back jobs) or a kernel write into it fails.
+/// Range askings whose guard was refused because the range is not whole
+/// blocks ([`writes`]): memory we did not allocate.
+static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many askings were answered without a guard because the range was not
+/// whole blocks (asked by a copy whose destination is not ours to guard).
+#[cfg(test)]
+pub(crate) fn guard_refusals() -> u64 {
+    REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static DESTINATIONS: Mutex<BTreeMap<usize, (usize, bool)>> = Mutex::new(BTreeMap::new());
 
 /// Forgets the destination answers that overlap `[at, at + len)`: what was
@@ -1623,8 +1648,21 @@ mod tests {
         // guarding off (the old way, `VICTORY_GUARD_COPY_POOLS=0`) its asking
         // is not answered at all, and a copy takes the whole range at every
         // refresh for the rest of the run.
-        let mut plain = vec![0u8; PAGE];
-        let (at, plane_end) = (plain.as_mut_ptr() as usize, plain.as_mut_ptr() as usize + PAGE);
+        // A private region of ours, page aligned: a copy's destination is
+        // title memory we own. The old fixture was a page of the CRT heap,
+        // unaligned, so the guard took in the block after it — our own
+        // allocator's memory. Making that read-only made our allocator fault
+        // inside the guard's own shard lock, and the run hung.
+        let plain = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(plain, 0);
+        let (at, plane_end) = (plain, plain + PAGE);
         set_guard_copy_pools(Some(false));
         assert!(writes(at, plane_end, true).is_none(), "not answered, as before");
         // With the pool guarded for a copy (the default) the range is
@@ -1646,8 +1684,31 @@ mod tests {
         assert_eq!(again.iter().filter(|&&(_, w)| w > first).count(), 0, "nothing written since");
         crate::guards::open(at, plane_end);
         tests::POOLS.with(|v| v.set(None));
-        // SAFETY: our allocation.
-        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        // SAFETY: our allocations.
+        unsafe {
+            VirtualFree(plain as *mut _, 0, MEM_RELEASE);
+            VirtualFree(p as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// A copy's destination that is not whole blocks is not ours to guard:
+    /// the guard would make the block it rounds into read-only, and that
+    /// block holds memory somebody else writes — our own heap, which faulted
+    /// back into the guard's own lock and hung the run. Refused and counted,
+    /// the copy takes its range whole.
+    #[test]
+    fn a_range_that_is_not_whole_blocks_is_not_guarded() {
+        tests::POOLS.with(|v| v.set(Some(false)));
+        set_guard_copy_pools(Some(true));
+        let mut plain = vec![0u8; PAGE];
+        plain[0] = 1;
+        let at = plain.as_mut_ptr() as usize;
+        // A page of heap is not page aligned (the fixture that hung).
+        let before = guard_refusals();
+        assert!(writes(at, at + PAGE, true).is_none(), "refused");
+        assert_eq!(guard_refusals(), before + 1, "counted");
+        set_guard_copy_pools(None);
+        tests::POOLS.with(|v| v.set(None));
     }
 
     /// A pool's asking is the guards' to answer: the kernel is not asked at
