@@ -1,0 +1,30 @@
+use std::process::Command;
+
+#[test]
+fn worker_count_is_validated_before_dispatch() {
+    // Accepted arguments reach the config error without reading game files or probing the GPU.
+    let missing_config = std::env::temp_dir().join(format!("victory-missing-config-{}.toml", std::process::id()));
+    let modes: &[&[&str]] = &[&["translate"]];
+
+    for args in modes {
+        for jobs in [Some("0"), Some("1"), Some("3"), None] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_victory"));
+            command
+                .args(*args)
+                .env("VICTORY_CONFIG", &missing_config)
+                .env_remove("VICTORY_AUDIO_CAPTURE")
+                .env_remove("VICTORY_EMIT_DUMP");
+            if let Some(jobs) = jobs {
+                command.args(["--jobs", jobs]);
+            }
+            let output = command.output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if jobs == Some("0") {
+                assert_eq!(output.status.code(), Some(2), "{args:?} {jobs:?}: {stderr}");
+                assert!(stderr.contains("invalid value '0' for '--jobs"), "{stderr}");
+            } else {
+                assert_ne!(output.status.code(), Some(2), "{args:?} {jobs:?}: {stderr}");
+            }
+        }
+    }
+}
