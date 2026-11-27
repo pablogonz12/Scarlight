@@ -7,8 +7,8 @@
 //! `XBCH` decompression (`native_programs`) on cached shader hits.
 //!
 //! The file is only served to the build that wrote it: its header carries
-//! [`build`](crate::shader_cache::build), the BLAKE3 of our executable and
-//! of the settings the parse and translation run with, so a rebuilt
+//! [`build`](crate::shader_cache::build), the translator source fingerprint and
+//! the settings the parse and translation run with, so a rebuilt
 //! translator (or one whose switches differ) starts from an empty store
 //! instead of reading metadata a different build computed. A file of
 //! another format version, another build, or a truncated one is ignored,
