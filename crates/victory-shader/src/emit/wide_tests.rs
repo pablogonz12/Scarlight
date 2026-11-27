@@ -146,6 +146,7 @@ fn want_dwords(data: &[u32], starts: [u64; 3]) -> Vec<u32> {
 
 /// The starts of the three loads for a given `s0` and `s1`: the x8 from `s0`,
 /// the x4 from the instruction's 0x8, the x16 from `s1` plus its 0x4.
+#[cfg(windows)]
 fn starts_of(s0: u32, s1: u32) -> [u64; 3] {
     [u64::from(s0), 8, u64::from(s1) + 4]
 }
@@ -153,6 +154,7 @@ fn starts_of(s0: u32, s1: u32) -> [u64; 3] {
 /// The cases: `s0` and `s1` of the three loads, inside the view and across
 /// its end (the first load's from 40 on is past it; the x16's from 44 on is
 /// 12 dwords past it).
+#[cfg(windows)]
 const CASES: [(u32, u32); 6] = [(0, 0), (16, 0), (24, 4), (40, 28), (48, 44), (8, 12)];
 
 #[test]
