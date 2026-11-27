@@ -79,6 +79,10 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// Placed in an arena as a range the card only reads (`crate::resident`):
+    /// its copies are not merely no-ops, they are never made, and its drop
+    /// and its counters are the resident class's.
+    resident: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -268,10 +272,72 @@ pub(crate) fn card_stats() -> [u64; 10] {
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
-    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
+    out[7] = crate::stall::guard(crate::stall::Lock::Shadow, &CARDED).iter().filter(|w| w.strong_count() > 0).count() as u64;
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed);
     out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
     out
+}
+
+/// Where a frame's copied bytes came from, always on (not `diagnostics`: a
+/// release run is where the volume has to be read). [0]/[1] bytes and pages
+/// a copy had never taken (its first pass over them), [2]/[3] bytes and
+/// pages the title wrote since their last copy, [4]/[5] bytes and ranges no
+/// write watch answered for (copied whole, every refresh, until something
+/// makes them watched).
+pub(crate) static COPY_SOURCES: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// The copies that took the most bytes since the last frame line, by the
+/// title address each holds: bytes, copy calls, the copy's length. Says
+/// whether one buffer is copied several times a frame: the same address
+/// with more bytes than its length is that.
+static COPY_TOP: Mutex<BTreeMap<u64, [u64; 3]>> = Mutex::new(BTreeMap::new());
+
+/// [`COPY_SOURCES`] and the five copies that took the most, taken together
+/// and once a frame; the counters start again for the next frame.
+pub(crate) fn copy_sources() -> ([u64; 6], Vec<(u64, u64, u64, u64)>) {
+    let mut counts = [0u64; 6];
+    for (i, c) in COPY_SOURCES.iter().enumerate() {
+        counts[i] = c.swap(0, Ordering::Relaxed);
+    }
+    let mut top: Vec<(u64, u64, u64, u64)> = {
+        let mut held = COPY_TOP.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *held).into_iter().map(|(start, [bytes, calls, len])| (start, bytes, calls, len)).collect()
+    };
+    top = largest(top);
+    (counts, top)
+}
+
+/// The five copies that took the most bytes, largest first.
+fn largest(mut top: Vec<(u64, u64, u64, u64)>) -> Vec<(u64, u64, u64, u64)> {
+    top.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
+    top.truncate(5);
+    top
+}
+
+/// A copy took `bytes` in `calls` copies: for the frame line's five largest.
+fn taken(start: u64, bytes: u64, calls: u64, len: u64) {
+    if bytes == 0 {
+        return;
+    }
+    let mut held = COPY_TOP.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = held.entry(start).or_insert([0, 0, len]);
+    entry[0] += bytes;
+    entry[1] += calls;
+    entry[2] = len;
+}
+
+/// The five copies that took the most, largest first, as the frame line
+/// prints them; `none` when nothing was copied.
+pub(crate) fn top_copies(top: &[(u64, u64, u64, u64)]) -> String {
+    if top.is_empty() {
+        return "none".to_string();
+    }
+    top.iter()
+        .map(|&(start, bytes, calls, len)| {
+            format!("{start:#x}+{len:#x} {:.1} MB in {} copies{}", bytes as f64 / 1e6, calls, if bytes > len { " (more than its length)" } else { "" })
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
@@ -279,6 +345,13 @@ pub(crate) fn card_stats() -> [u64; 10] {
 /// has one piece more).
 pub(crate) fn card_hash_bytes(size: u64) -> u64 {
     (size / PIECE as u64 + 2) * 16
+}
+
+/// The floor of the card's copies in KiB (`VICTORY_CARD_BUFFERS_MIN_KB` /
+/// `VICTORY_CARD_BUFFERS_MIN_MB`: the one env var back to the old floor), for
+/// the frame line.
+pub(crate) fn card_floor_kb() -> u64 {
+    card_limits().0 >> 10
 }
 
 /// A buffer of `size` bytes in the card's memory for a title buffer's
@@ -390,7 +463,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
     let mut out = Vec::new();
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut carded = crate::stall::guard(crate::stall::Lock::Shadow, &CARDED);
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
     carded.retain(|weak| {
         let Some(shadow) = weak.upgrade() else {
@@ -515,6 +588,29 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 #[cfg(test)]
 mod card_tests {
     use super::{CardSpan, PIECE, card_piece_of, card_span_of, hash_spans, joined, joined_piece_runs};
+
+    /// The frame line's five are the largest, largest first, and the line says
+    /// when a copy took more than its length (a copy taken more than once a
+    /// frame: the duplication the counters are for).
+    #[test]
+    fn the_five_largest_copies_are_named() {
+        let top = vec![
+            (0x1000, 900_000u64, 3u64, 0x400u64),
+            (0x2000, 2_000_000, 1, 0x800),
+            (0x3000, 100_000, 2, 0x100),
+            (0x4000, 5, 9, 0x10),
+            (0x5000, 1, 1, 0x10),
+            (0x6000, 40_000, 1, 0x10),
+        ];
+        let top = super::largest(top);
+        assert_eq!(top.len(), 5, "five are named");
+        assert_eq!(top[0].0, 0x2000, "the largest first");
+        let line = super::top_copies(&top);
+        assert!(line.starts_with("0x2000+0x800 2.0 MB in 1 copies"), "{line}");
+        assert!(line.contains("0x1000+0x400 0.9 MB in 3 copies (more than its length)"), "{line}");
+        assert!(line.contains("0x3000+0x100 0.1 MB in 2 copies"), "{line}");
+        assert_eq!(super::top_copies(&[]), "none");
+    }
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -1662,8 +1758,12 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {
-            // Never counted with the copies (`Shadow::placed`).
-            crate::inplace::gone(self.window, self.len);
+            if self.resident {
+                crate::resident::gone(self.start, self.len);
+            } else {
+                // Never counted with the copies (`Shadow::placed`).
+                crate::inplace::gone(self.window, self.len);
+            }
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
@@ -1777,7 +1877,7 @@ static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 #[cfg(feature = "diagnostics")]
 pub(crate) fn windows() -> [u64; 3] {
     let asked: u64 = {
-        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let loose = crate::stall::guard(crate::stall::Lock::Shadow, &LOOSE);
         loose
             .values()
             .map(|s| {
@@ -1801,7 +1901,7 @@ pub(crate) fn windows() -> [u64; 3] {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_use() -> [u64; 8] {
     let mut out = [0u64; 8];
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let loose = crate::stall::guard(crate::stall::Lock::Shadow, &LOOSE);
     for s in loose.values() {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
         let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
@@ -1842,7 +1942,7 @@ pub(crate) fn let_go_idle() {
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = crate::stall::guard(crate::stall::Lock::Shadow, &LOOSE);
         if map.is_empty() {
             return;
         }
@@ -1879,7 +1979,7 @@ pub(crate) fn let_go_idle() {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 6] {
     let (windows, window_bytes) = {
-        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let loose = crate::stall::guard(crate::stall::Lock::Shadow, &LOOSE);
         // Each copy once: a window may stand under several keys.
         let mut seen = std::collections::HashSet::new();
         let bytes: u64 = loose
@@ -1963,6 +2063,21 @@ impl Shadow {
         shadow
     }
 
+    /// Title memory `[start, start + len)` the card only reads, placed in an
+    /// arena part ([`crate::resident::place`]): not a copy at all. Its
+    /// upload and copy-back steps are gone (as a level 2 placement's), and
+    /// its own counters and drop are the resident class's.
+    fn resident(placed: crate::inplace::Placed, start: u64, len: u64) -> Shadow {
+        crate::host::name(&placed.buffer, || format!("title memory {start:#x}+{len:#x} resident (the card only reads it)"));
+        let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len);
+        LIVE[0].fetch_sub(1, Ordering::Relaxed);
+        LIVE[1].fetch_sub(len, Ordering::Relaxed);
+        *shadow.watched.get_mut() = NOT_WATCHED;
+        shadow.place = Some((placed.heap, placed.bias));
+        shadow.resident = true;
+        shadow
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
@@ -1996,6 +2111,7 @@ impl Shadow {
             },
             card: None,
             window: false,
+            resident: false,
             place: None,
         }
     }
@@ -2023,6 +2139,11 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            if self.resident {
+                // The class only admits buffers without a UAV: a declared
+                // write here is a finding (counted, and the region goes).
+                crate::resident::wrote(address, len.min(self.left(address)));
+            }
             return;
         }
         let len = len.min(self.left(address));
@@ -2051,7 +2172,10 @@ impl Shadow {
                 .collect()
         };
         for done in jobs {
-            done.wait();
+            let _ = done.wait_for(
+                "a submission's snapshot of a range a write-back job holds",
+                crate::writeback::MERGE_DEADLINE,
+            );
         }
     }
 
@@ -2206,6 +2330,11 @@ impl Shadow {
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
         if self.place.is_some() {
+            if self.resident {
+                // The card writes the title's memory itself: counted, because
+                // a resident buffer has no UAV and this should never happen.
+                crate::resident::copy_back_skipped(len as u64);
+            }
             return 0;
         }
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -2720,6 +2849,10 @@ impl Shadow {
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
         // In place: the card reads title memory itself.
         if self.place.is_some() {
+            if self.resident {
+                // The upload a copy would have paid for this step.
+                crate::resident::refreshed(len as u64);
+            }
             return 0;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -2807,6 +2940,9 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self.copy(from, to);
+        COPY_SOURCES[4].fetch_add((to - from) as u64, Ordering::Relaxed);
+        COPY_SOURCES[5].fetch_add(1, Ordering::Relaxed);
+        taken(self.start, (to - from) as u64, 1, self.len);
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
@@ -2819,7 +2955,7 @@ impl Shadow {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
+        let (mut bytes, mut run, mut calls) = (0, None, 0);
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -2834,18 +2970,30 @@ impl Shadow {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                let in_range = ((page * PAGE).max(start), ((page + 1) * PAGE).min(end));
+                let n = in_range.1.saturating_sub(in_range.0) as u64;
+                if *at == 0 {
+                    COPY_SOURCES[0].fetch_add(n, Ordering::Relaxed);
+                    COPY_SOURCES[1].fetch_add(1, Ordering::Relaxed);
+                } else {
+                    COPY_SOURCES[2].fetch_add(n, Ordering::Relaxed);
+                    COPY_SOURCES[3].fetch_add(1, Ordering::Relaxed);
+                }
+                if in_range.0 >= from && in_range.1 <= to {
                     *at = now;
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
                 bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                calls += 1;
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
             bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            calls += 1;
         }
+        taken(self.start, bytes as u64, calls, self.len);
         bytes
     }
 
@@ -3051,6 +3199,10 @@ impl Shadow {
 
 struct Entry {
     end: u64,
+    /// The buffer's resource was created without
+    /// `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS`: D3D12 gives shaders no
+    /// UAV over it, so the card can only read it (`crate::resident`).
+    read_only: bool,
     shadow: Option<Arc<Shadow>>,
 }
 
@@ -3058,15 +3210,16 @@ struct Entry {
 static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
 
 fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+    crate::stall::guard(crate::stall::Lock::Shadow, &BUFFERS)
 }
 
 /// A title buffer exists at `start` (`len` bytes).
-pub(crate) fn register(resource: usize, start: u64, len: u64) {
+pub(crate) fn register(resource: usize, start: u64, len: u64, read_only: bool) {
     buffers().insert(
         (start, resource),
         Entry {
             end: start + len,
+            read_only,
             shadow: None,
         },
     );
@@ -3094,10 +3247,13 @@ pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
 /// tables, so that the next ask makes a copy or opens the memory anew, and
 /// goes when no list and no slot holds it any more. Returns how many.
 pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
+    // Nothing resident stays over pages that show something else now, whatever
+    // its placement: the next ask proves the part again or is a copy.
+    crate::resident::changed(at, len);
     let end = at.saturating_add(len);
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = crate::stall::guard(crate::stall::Lock::Shadow, &LOOSE);
         let keys: Vec<(u64, u64)> = map
             .range((at.saturating_sub(WINDOW), 0)..(end, 0))
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
@@ -3126,7 +3282,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 /// bytes, true).
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     let mut spans: Vec<(u64, u64, bool)> = buffers().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let loose = crate::stall::guard(crate::stall::Lock::Shadow, &LOOSE);
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
 }
@@ -3191,6 +3347,15 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && size >= card_limits().0;
+        // A read-only title buffer, from an arena part: the card reads the
+        // title's own memory and nothing is copied either way
+        // (`crate::resident`, `VICTORY_RESIDENT=read`).
+        if !big
+            && let Some(placed) = crate::resident::place(key.0, len, entry.read_only)
+        {
+            entry.shadow = Some(Arc::new(Shadow::resident(placed, key.0, len)));
+            return entry.shadow.clone();
+        }
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
@@ -3237,7 +3402,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            crate::stall::guard(crate::stall::Lock::Shadow, &CARDED).push(Arc::downgrade(&shadow));
         }
         entry.shadow = Some(shadow);
     }
@@ -3346,7 +3511,7 @@ fn fine() -> bool {
 /// which is copied once for each.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_cover() -> u64 {
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let loose = crate::stall::guard(crate::stall::Lock::Shadow, &LOOSE);
     cover(loose.keys().copied())
 }
 
@@ -3380,7 +3545,7 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = crate::stall::guard(crate::stall::Lock::Shadow, &LOOSE);
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
     let (start, len) = if unsized_ask && tails() {
@@ -3446,7 +3611,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.card = card;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        crate::stall::guard(crate::stall::Lock::Shadow, &CARDED).push(Arc::downgrade(&shadow));
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());

@@ -1481,21 +1481,21 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// For `this`, a texture made for a view the title placed in memory
 /// ([`texture_at`]): the title texture the host writes that lies in the
 /// same memory, if there is one of the same size, levels and layers with
-/// texels of the same width. The console reads such a texture through the
-/// view as it is
+/// texels or blocks of the same width. The console reads such a texture
+/// through the view as it is
 /// (the title packs light as R9G9B9E5 into R32_UINT textures
 /// with compute shaders, which cannot write R9G9B9E5, and samples them
 /// through R9G9B9E5 views placed at the textures' addresses: the sky, the
-/// sky and light probes, the bounced light the lighting pass adds). On the
-/// host the two are two textures and what the shaders wrote exists in one
-/// of them only: the other was filled from title memory, which nothing
-/// writes, so everything read through such a view was black.
+/// sky and light probes, the bounced light the lighting pass adds; it also
+/// copies baked character skin and decorations into block-compressed
+/// textures that shaders then read through placed views). On the host the
+/// two are two textures and what the GPU wrote exists in one of them only:
+/// the other was filled from title memory, which nothing writes, so
+/// everything read through such a view was black.
 /// Textures of several levels or layers count too (the screen probes'
 /// light atlas has four levels, the camera's sky light cache six layers,
-/// the cloud and sky tables are volumes): only textures of one level and
-/// one layer were found at first, and the programs behind the others read
-/// the title's unwritten memory - the sky light cache's second stage wrote
-/// all zeros from a first stage that held light (run 88).
+/// the cloud and sky tables are volumes), as do placed views covering a
+/// leading prefix `1..=o_mips` of the written texture's mip chain.
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
 #[cfg(windows)]
@@ -1510,33 +1510,60 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let whole =
         *WHOLE.get_or_init(|| std::env::var_os("VICTORY_ALIAS_COPY").is_none_or(|v| v != "1"));
+    // The matching added with the mip-prefix, block and by-address rules
+    // below. `VICTORY_ALIAS_WIDE=0`: only a texture of the same level count
+    // with texels of the same width, found at the placed table's address,
+    // as before.
+    static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let wide = *WIDE.get_or_init(|| std::env::var_os("VICTORY_ALIAS_WIDE").is_none_or(|v| v != "0"));
     let r = resource(this);
-    // A level count of 0 asks for a full chain: not counted here.
     let one = |d: &ResourceDesc| {
+        let mips = mip_count(d);
         d.dimension != BUFFER
-            && d.mip_levels >= 1
+            && mips >= 1
             && d.depth_or_array_size >= 1
-            && (whole || (d.mip_levels == 1 && d.depth_or_array_size == 1))
+            && (whole || (mips == 1 && d.depth_or_array_size == 1))
             && d.sample_count <= 1
     };
     if !r.host.placed.load(Relaxed) || !fills(&r.desc) || !one(&r.desc) {
         return None;
     }
-    // Under the table's lock: a texture leaves it before it is freed.
-    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-    let other = *targets.get(&(r.data() as u64))? as This;
-    let o = resource(other);
     const DEPTH: u32 = 0x2;
-    let same = one(&o.desc)
-        && o.desc.dimension == r.desc.dimension
-        && o.desc.width == r.desc.width
-        && o.desc.height == r.desc.height
-        && o.desc.mip_levels == r.desc.mip_levels
-        && o.desc.depth_or_array_size == r.desc.depth_or_array_size
-        && o.desc.flags & DEPTH == 0
-        && target_format(o.desc.format) == o.desc.format
-        && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
-    same.then_some(other)
+    let r_mips = mip_count(&r.desc);
+    let matches_source = |other: This| -> Option<This> {
+        if other.is_null() || other == this {
+            return None;
+        }
+        let o = resource(other);
+        let o_mips = mip_count(&o.desc);
+        let same = one(&o.desc)
+            && o.desc.dimension == r.desc.dimension
+            && o.desc.width == r.desc.width
+            && o.desc.height == r.desc.height
+            && (if wide { r_mips <= o_mips } else { r_mips == o_mips })
+            && o.desc.depth_or_array_size == r.desc.depth_or_array_size
+            && o.desc.flags & DEPTH == 0
+            && target_format(o.desc.format) == o.desc.format
+            && element(o.desc.format).is_some_and(|e| {
+                if wide {
+                    Some(e) == element(r.desc.format)
+                } else {
+                    e.1 == 1 && Some(e) == element(r.desc.format)
+                }
+            });
+        same.then_some(other)
+    };
+    let at = r.data() as u64;
+    // Under each table's lock: a texture leaves it before it is freed.
+    let target = {
+        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        targets.get(&at).copied().and_then(|o| matches_source(o as This))
+    };
+    target.or_else(|| {
+        wide.then(|| crate::texture::with_host_written_at(at, matches_source))
+            .flatten()
+            .flatten()
+    })
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -2181,7 +2208,12 @@ fn hand_out_resource(
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        crate::shadow::register(at, resource.data() as u64, desc.width);
+        crate::shadow::register(
+            at,
+            resource.data() as u64,
+            desc.width,
+            desc.flags & windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32 == 0,
+        );
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -2203,6 +2235,7 @@ impl Drop for Resource {
                 }
             }
         }
+        crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         let made = self
             .host
             .made
@@ -2234,7 +2267,6 @@ impl Drop for Resource {
                 crate::host::retire(twin);
             }
         }
-        crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {
             crate::shadow::unregister(
@@ -2472,6 +2504,20 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
     footprint(&d).map(|f| f.size)
 }
 
+#[cfg(windows)]
+/// The texture [`texture_at`] made for `address` and `desc`, if it was
+/// made: with the filler words of the description left out and with them
+/// (whichever key [`texture_at`] kept).
+pub(crate) fn placed_known(address: u64, desc: &[u32; 14]) -> Option<This> {
+    let mut key = *desc;
+    key[1] = 0;
+    key[13] = 0;
+    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&(address, key))
+        .or_else(|| map.get(&(address, *desc)))
+        .map(|&r| r as This)
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
@@ -2529,6 +2575,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
+    drop(map);
     crate::texture::placed_in_host_written(address, desc);
     Some(out)
 }

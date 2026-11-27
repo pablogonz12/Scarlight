@@ -393,6 +393,7 @@ mod tests {
                     });
                 }
             });
+            drop(tx);
             let ns = started.elapsed().as_nanos() as f64 / OPS as f64;
             (ns, rx.iter().sum::<usize>())
         };

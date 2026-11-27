@@ -148,6 +148,7 @@ pub extern "system" fn XApuConnect(
     output: *mut ConnectOutput,
     handle: *mut *mut Connection,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("apu::XApuConnect").enter(format_args!(""));
     if input.is_null() || output.is_null() || handle.is_null() {
         return E_INVALIDARG;
     }
@@ -218,6 +219,7 @@ pub extern "system" fn XApuConnect(
 }
 
 pub extern "system" fn XApuDisconnect(handle: *mut Connection) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("apu::XApuDisconnect").enter(format_args!(""));
     if handle.is_null() {
         return E_INVALIDARG;
     }
@@ -237,6 +239,7 @@ pub extern "system" fn XApuEnqueueCommand(
     command: *const CommandId,
     total: *mut u32,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("apu::XApuEnqueueCommand").enter(format_args!(""));
     if handle.is_null() || command.is_null() {
         return E_INVALIDARG;
     }
@@ -354,6 +357,7 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
 }
 
 pub extern "system" fn XApuDequeueResult(handle: *mut Connection, out: *mut ApuResult) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("apu::XApuDequeueResult").enter(format_args!(""));
     if handle.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
@@ -371,6 +375,7 @@ pub extern "system" fn XApuDequeueResult(handle: *mut Connection, out: *mut ApuR
 }
 
 pub extern "system" fn XApuGetResultCount(handle: *mut Connection, total: *mut u32) -> u32 {
+    let _stall = victory_gpu::stall_site!("apu::XApuGetResultCount").enter(format_args!(""));
     if handle.is_null() {
         return 0;
     }

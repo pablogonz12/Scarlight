@@ -233,20 +233,40 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
 /// when free physical RAM is low. Never returns less than 2,000 ms.
+/// Effective idle timeout (in milliseconds) for system-RAM caches (staging
+/// buffers, loose shadows, and the mapped pipeline library), scaled down
+/// when free physical RAM is low and at once when the host-memory guard says
+/// the PC is under pressure. Never returns less than 2,000 ms.
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
+    ram_idle_for(avail_phys, crate::total_system_ram_bytes())
+}
+
+/// [`ram_idle_ms`] for a PC of `total_ram` bytes, so a test states the PC it
+/// means instead of measuring the one it runs on.
+pub(crate) fn ram_idle_for(avail_phys: Option<u64>, total_ram: Option<u64>) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
     const NORMAL_MS: u64 = 10_000;
     const MODERATE_MS: u64 = 5_000;
     const HIGH_MS: u64 = 2_000;
-    let Some(avail) = avail_phys else {
-        return NORMAL_MS;
-    };
-    if avail < 2 * GIB {
-        HIGH_MS
-    } else if avail < 4 * GIB {
-        MODERATE_MS
+    // Off, the idle timeout is the one of before: the guard's smaller budget
+    // for a small PC is part of what VICTORY_RESIDENCY=0 turns off.
+    let budget = if crate::residency::enabled() {
+        crate::residency::budgets(total_ram).idle_ms
     } else {
         NORMAL_MS
+    };
+    if crate::residency::pressured() {
+        return budget.min(crate::residency::PRESSURE_IDLE_MS);
+    }
+    let Some(avail) = avail_phys else {
+        return budget;
+    };
+    if avail < 2 * GIB {
+        budget.min(HIGH_MS)
+    } else if avail < 4 * GIB {
+        budget.min(MODERATE_MS)
+    } else {
+        budget
     }
 }
 
@@ -274,6 +294,30 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
 fn sweep() {
     // The in-place probe and census, if asked for (`VICTORY_INPLACE_PROBE`).
     crate::inplace::tick();
+    // Host-memory pressure and the refusal backoff ([`crate::residency`]).
+    crate::residency::tick();
+    if crate::residency::pressured() {
+        // A pool that already holds idle chunks gives them back now, not at the
+        // next give (`0` above only stops new ones being kept).
+        let gone = {
+            let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::replace(&mut *spare, Spare::new())
+        };
+        if gone.bytes > 0 {
+            ALIVE[3].fetch_sub(gone.kept.len() as u64, Ordering::Relaxed);
+            ALIVE[4].fetch_sub(gone.bytes, Ordering::Relaxed);
+            tracing::debug!(bytes = gone.bytes, "idle upload chunks freed under host-memory pressure");
+        }
+        drop(gone);
+    }
+    let deferred = crate::residency::take_deferred();
+    if deferred > 0 {
+        tracing::debug!(
+            deferred,
+            pressured = crate::residency::pressured(),
+            "upload growth held back by the host-memory guard"
+        );
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP").is_none_or(|v| v != "0")) {
         return;
@@ -886,6 +930,7 @@ mod tests {
 
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
+        let _journal = crate::watch::journal_test_lock();
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 5 << 16;
         // SAFETY: we reserve a private region, commit selected pages inside it,
@@ -921,6 +966,7 @@ mod tests {
 
     #[test]
     fn a_read_only_title_destination_is_written_through_the_kernel() {
+        let _journal = crate::watch::journal_test_lock();
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 2 << 16;
         // SAFETY: a private region committed whole, accessed directly.
@@ -983,6 +1029,7 @@ mod tests {
 
     #[test]
     fn a_copy_of_title_memory_the_layer_has_seen_goes_at_the_bytes() {
+        let _journal = crate::watch::journal_test_lock();
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 2 << 16;
         // SAFETY: a private region committed whole, accessed directly.
@@ -1576,6 +1623,9 @@ pub(crate) fn dred_on() -> bool {
 static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 static COMPUTE_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Indirect records that ran empty for want of their list's budget, and the
+/// largest cost of one (told from 2^22 on), likewise.
+static BUDGET_NOTES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
@@ -1664,16 +1714,9 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 /// list that did took 4 MiB of the PC's memory for it.
 const SCRATCH_FIRST: u64 = 256 << 10;
 /// The most bytes of chunks kept while no list holds them, scaled from total
-/// system RAM.
+/// system RAM ([`crate::residency::budgets`]).
 fn spare_most(total_ram_bytes: Option<u64>) -> u64 {
-    const GIB: u64 = 1 << 30;
-    match total_ram_bytes {
-        Some(ram) if ram <= 16 * GIB => 64 << 20,
-        // 32 GB Windows systems typically report ~31.7–31.9 GiB in
-        // `ullTotalPhys` after firmware/hardware reservations.
-        Some(ram) if ram >= 30 * GIB => 256 << 20,
-        _ => 128 << 20,
-    }
+    crate::residency::budgets(total_ram_bytes).spare_upload
 }
 
 /// Whether lists share their scratch chunks: a list takes a chunk when it
@@ -1733,6 +1776,21 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
+    // A refused upload buffer must not be asked for again for every small
+    // copy of the frame: the driver has said there is nothing, and each ask is
+    // a failed call ([`crate::residency`], his `pool::grow`). Chunks already
+    // kept are still handed out above.
+    if crate::residency::refused() {
+        crate::residency::note_deferred();
+        return None;
+    }
+    // A new OS block of upload storage is what the host-memory guard may hold
+    // back when the PC is close to its limit: a copy that gets no chunk is the
+    // same failure as one whose allocation would have been refused, and the
+    // title asks again next frame.
+    if !crate::residency::admit_growth(size) {
+        return None;
+    }
     let (buffer, data) = host.upload_buffer(size)?;
     name(&buffer, || "list scratch".into());
     // SAFETY: a live buffer.
@@ -1754,6 +1812,17 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         return;
     }
     let most = spare_most(crate::total_system_ram_bytes());
+    // Idle chunks are speculative storage: capped where a small PC already
+    // holds a gigabyte of staging, and none at all under pressure
+    // ([`crate::residency`], his `pool::room` dropping the spare limit to
+    // zero), rather than waiting for the next allocation to notice.
+    let most = crate::residency::prefetch_limit(
+        most,
+        false,
+        crate::residency::limited_host_ram(),
+        crate::texture::staged_bytes(),
+    );
+    let most = if crate::residency::pressured() { 0 } else { most };
     let mut freed = Vec::new();
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
@@ -5501,6 +5570,38 @@ impl HostList {
         }
     }
 
+    /// As [`HostList::transition`], but a texture this list has no record of
+    /// is taken to rest in `assumed` and moved from there, so its first read
+    /// is ordered after a write another list made.
+    ///
+    /// [`HostList::transition`]'s first use records nothing because its
+    /// prelude is meant to bring the texture there; a texture the host wrote
+    /// (a copy destination, [#218]) is not brought anywhere by the prelude,
+    /// and reading it with no barrier returns what it held before the write:
+    /// zeros, about one run of an alias test in three on RADV.
+    pub(crate) fn transition_from(
+        &self,
+        resource: crate::object::This,
+        wanted: u32,
+        assumed: u32,
+    ) -> Option<(&'static ID3D12Resource, u32)> {
+        let texture = crate::resource::host_resource(resource)?;
+        let copy = crate::resource::host_copy(resource)?;
+        let wanted = legal_state(texture, wanted);
+        let assumed = legal_state(texture, assumed);
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((assumed, wanted, copy));
+                (assumed != wanted).then_some((texture, assumed))
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                (before != wanted).then_some((texture, before))
+            }
+        }
+    }
+
     /// Moves host texture `copy` to `wanted` (a host state) in this list,
     /// as [`HostList::transition`] does a title resource's host copy, and
     /// records the barrier: for textures that are not a title resource's
@@ -6212,7 +6313,8 @@ impl HostList {
             // The words after the budget hold what the clamp noted about the
             // list's last run (dispatch records: the largest group count
             // asked for and the groups asked in all, mesh in words 1 and 2,
-            // compute in words 3 and 4): taken, then zeroed.
+            // compute in words 3 and 4; the indirect records refused, the
+            // largest cost of one, in words 5 and 6): taken, then zeroed.
             deferred.copies.push(Step::Host(Box::new(move || unsafe {
                 let words = at as *mut u32;
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
@@ -6221,7 +6323,10 @@ impl HostList {
                 let (largest, all) = (words.add(3).read_volatile(), words.add(4).read_volatile());
                 COMPUTE_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 COMPUTE_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                for k in 0..5 {
+                let (refused, biggest) = (words.add(5).read_volatile(), words.add(6).read_volatile());
+                BUDGET_NOTES[0].fetch_add(u64::from(refused), Ordering::Relaxed);
+                BUDGET_NOTES[1].fetch_max(u64::from(biggest), Ordering::Relaxed);
+                for k in 0..7 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -6449,7 +6554,13 @@ mod wide_refresh_tests {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// One entry per copy, and the runs of title memory it took this
+    /// submission: the ranges themselves, not the span that covers them.
+    /// The heap's ready list records thousands of small copies of the same
+    /// few buffers; one span per copy made every refresh ask the kernel,
+    /// and read the title, over the gaps between them (a 4 MiB window
+    /// asked for 8 KiB of vertices: [`refresh_runs`]).
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
     /// Where each copy (by address) is in `refreshes`: the list that makes
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
@@ -6465,12 +6576,16 @@ impl Batch {
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         match self.index.get(&key) {
             Some(&at) => {
-                let r = &mut self.refreshes[at];
-                (r.1, r.2) = (r.1.min(address), r.2.max(end));
+                let runs = &mut self.refreshes[at].1;
+                if crate::refresh_runs::on() {
+                    crate::refresh_runs::add(runs, address, end);
+                } else if let Some(r) = runs.first_mut() {
+                    (r.0, r.1) = (r.0.min(address), r.1.max(end));
+                }
             }
             None => {
                 self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), vec![(address, end)]));
             }
         }
     }
@@ -6481,12 +6596,14 @@ impl Batch {
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
-        let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let (shadow, runs) = self.refreshes.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
+        for (from, to) in runs {
+            Self::update(&shadow, from, to);
+        }
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
@@ -6524,7 +6641,7 @@ impl Batch {
                 .refreshes
                 .iter()
                 .filter(|r| !r.0.unwatched())
-                .map(|r| (r.1, r.2))
+                .flat_map(|r| r.1.iter().copied())
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -6534,17 +6651,21 @@ impl Batch {
         // where the check would have left them ([`crate::shadow::skip_clean`]).
         if crate::shadow::skip_clean() {
             let started = std::time::Instant::now();
-            self.refreshes.retain(|(shadow, from, to)| {
-                let clean = shadow.clean(*from, *to);
-                #[cfg(feature = "diagnostics")]
-                if clean {
-                    crate::copystat::add(crate::copystat::C::Skipped, 1);
-                    crate::copystat::add(crate::copystat::C::SkippedBytes, (to - from) as u64);
-                }
-                !clean
-            });
+            for (shadow, runs) in &mut self.refreshes {
+                runs.retain(|&(from, to)| {
+                    let clean = shadow.clean(from, to);
+                    #[cfg(feature = "diagnostics")]
+                    if clean {
+                        crate::copystat::add(crate::copystat::C::Skipped, 1);
+                        crate::copystat::add(crate::copystat::C::SkippedBytes, (to - from) as u64);
+                    }
+                    !clean
+                });
+            }
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
+        // A copy with nothing left to do is no job at all.
+        self.refreshes.retain(|r| !r.1.is_empty());
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
@@ -6554,14 +6675,22 @@ impl Batch {
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                .map(|(shadow, runs)| {
+                    Box::new(move || {
+                        for (from, to) in runs {
+                            Self::update(&shadow, from, to);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
                 .collect();
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
+            for (shadow, runs) in self.refreshes.drain(..) {
+                for (from, to) in runs {
+                    Self::update(&shadow, from, to);
+                }
             }
         }
         if ahead {
@@ -7041,6 +7170,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
             }
@@ -7226,9 +7356,10 @@ impl Meter {
         }
         self.counters = [0; 5];
         let dropped = crate::draw::take_dropped() as f64 / frames;
-        // Of those, the ones whose pipeline was refused (lost every frame)
-        // and those still being made (lost this one).
-        let [refused_per_frame, waiting_per_frame] =
+        // Of those, the ones whose pipeline was refused (lost every frame),
+        // those still being made (lost this one), and those skipped on
+        // purpose (not a pipeline gap at all).
+        let [refused_per_frame, waiting_per_frame, design_per_frame] =
             crate::pipeline::take_dropped_split().map(|count| count as f64 / frames);
         let indirect = crate::list::take_indirect() as f64 / frames;
         // What a shot's stats file says about this second of frames.
@@ -7238,7 +7369,7 @@ impl Meter {
              {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} ms on \
              the GPU; copying back {back_ms:.1} ms {back_mb:.1} MB), {draws:.0} draws/frame, \
              dropped {dropped:.0} without a host pipeline ({refused_per_frame:.0} refused, \
-             {waiting_per_frame:.0} waiting for one, {} being made), \
+             {waiting_per_frame:.0} waiting for one, {} being made, {design_per_frame:.0} by design), \
              {indirect:.0} indirect",
             crate::pipeline::making()
         ));
@@ -7246,8 +7377,10 @@ impl Meter {
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         let compute_largest = COMPUTE_GROUPS[0].swap(0, Ordering::Relaxed);
         let compute_groups = COMPUTE_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+        let refused = BUDGET_NOTES[0].swap(0, Ordering::Relaxed) as f64 / frames;
+        let biggest = BUDGET_NOTES[1].swap(0, Ordering::Relaxed);
         tracing::info!(
-            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
+            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
         );
         tracing::info!(
             "indirect compute dispatches: the largest group count asked for {compute_largest} (clamped: at most 65535), {compute_groups:.0} groups asked per frame"
@@ -7271,11 +7404,19 @@ impl Meter {
         {
             let [own, asking, still, all] =
                 [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            // Taken every interval, logged when there is a refresh to price:
+            // a counter left to accumulate would be divided by a single
+            // interval's frames when the line comes back.
+            let [ph_check, ph_holes, ph_bytes] = [0, 1, 2]
+                .map(|i| crate::inplace::PLACEHOLDER_HITS[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if all >= 1.0 {
                 tracing::info!(
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
                      is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
-                     hold still (the runtime remapping it); the rest is reading, hashing and detiling"
+                     hold still (the runtime remapping it); the rest is reading, hashing and detiling. Placeholder fast path \
+                     (VICTORY_PLACEHOLDER_FAST={}): {ph_check:.0} view checks, {ph_holes:.0} hole blocks and {ph_bytes:.0} byte \
+                     counts never asked of the kernel, per frame",
+                    u8::from(crate::inplace::placeholder_fast())
                 );
             }
             let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -7320,6 +7461,9 @@ impl Meter {
         let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
         // Copies in the card's memory (`crate::shadow::cards`).
         let card = crate::shadow::card_stats();
+        // Where the copied bytes came from, and the copies that took the
+        // most (`crate::shadow::COPY_SOURCES`, `COPY_TOP`): always on.
+        let (sources, top) = crate::shadow::copy_sources();
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::slow_asks();
         // Over the same frames as the counts above.
@@ -7380,11 +7524,28 @@ impl Meter {
                 );
             }
             tracing::info!(
+                "copies per frame, by what put the bytes there: {:.1} MB in {} pages the copy had never taken, \
+                 {:.1} MB in {} pages the title wrote since their last copy, {:.1} MB in {} ranges no write watch \
+                 answered for (copied whole), then guarded; the card's copies: {} KiB floor, {} MB in {} copies, \
+                 {:.1} MB of them sent on to the card side; the five copies that took the most: {}",
+                sources[0] as f64 / frames / 1e6,
+                sources[1] as f64 / frames,
+                sources[2] as f64 / frames / 1e6,
+                sources[3] as f64 / frames,
+                sources[4] as f64 / frames / 1e6,
+                sources[5] as f64 / frames,
+                crate::shadow::card_floor_kb(),
+                card[8] >> 20,
+                card[7],
+                card[0] as f64 / frames / 1e6,
+                crate::shadow::top_copies(&top)
+            );
+            tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({refused_per_frame:.0} refused, \
-                 {waiting_per_frame:.0} waiting for one, {making} being made) and {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
+                 {waiting_per_frame:.0} waiting for one, {making} being made, {design_per_frame:.0} by design) and {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                  {picked_waiting} waiting, {picked_away} passed over unmapped ({picked_kept} kept what they showed); depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
@@ -7417,6 +7578,12 @@ impl Meter {
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
+                        *n as f64 / frames
+                    );
+                }
+                for (why, n) in crate::pipeline::take_design().iter().take(20) {
+                    tracing::info!(
+                        "dropped {:.1}/frame by design: {why}",
                         *n as f64 / frames
                     );
                 }
@@ -8449,8 +8616,9 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
     #[test]
     fn ram_idle_ms_scales_with_pressure() {
-        use super::ram_idle_ms;
         let gib = 1024 * 1024 * 1024;
+        // Stated: a 30 GiB desktop, whatever the machine running the test has.
+        let ram_idle_ms = |avail| super::ram_idle_for(avail, Some(30 * gib));
         // Normal (>= 4 GiB)
         assert_eq!(ram_idle_ms(Some(8 * gib)), 10_000);
         assert_eq!(ram_idle_ms(Some(4 * gib)), 10_000);

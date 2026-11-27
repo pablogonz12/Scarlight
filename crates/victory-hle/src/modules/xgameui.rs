@@ -41,10 +41,12 @@ extern "system" fn profile_card_async(
     _user: *const c_void,
     xuid: u64,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgameui::profile_card_async").enter(format_args!(""));
     tracing::info!(xuid, "profile card: nothing to show");
     xasync::finished(block, (&raw const PROFILE).cast(), S_OK)
 }
 extern "system" fn profile_card_result(_: This, block: *mut AsyncBlock) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgameui::profile_card_result").enter(format_args!(""));
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const PROFILE).cast(), 0, none, none.cast())
 }
@@ -60,6 +62,7 @@ extern "system" fn text_entry_async(
     _scope: u32,
     max_length: u32,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgameui::text_entry_async").enter(format_args!(""));
     let [title, description, default] = [title, description, default].map(|t| text(t).unwrap_or_default());
     tracing::info!(title, description, max_length, "text entry");
     xasync::pending_with(block, (&raw const TEXT).cast(), move || {
@@ -79,6 +82,7 @@ extern "system" fn text_entry_async(
 }
 /// Bytes of the result, its NUL included.
 extern "system" fn text_entry_size(_: This, block: *mut AsyncBlock, out: *mut u32) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgameui::text_entry_size").enter(format_args!(""));
     let mut size = 0;
     let hr = xasync::XAsyncGetResultSize(block, &mut size);
     if hr < 0 {
@@ -93,6 +97,7 @@ extern "system" fn text_entry_result(
     buffer: *mut c_char,
     used: *mut u32,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgameui::text_entry_result").enter(format_args!(""));
     let mut written = 0;
     let identity = (&raw const TEXT).cast();
     let hr = xasync::XAsyncGetResult(block, identity, size as usize, buffer.cast(), &mut written);
@@ -207,6 +212,7 @@ mod dialog {
     }
 
     extern "system" fn procedure(dialog: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> isize {
+        let _stall = victory_gpu::stall_site!("xgameui::procedure").enter(format_args!(""));
         // SAFETY: our dialog; its user data is the `Entry` from `ask`,
         // stored at WM_INITDIALOG.
         unsafe {

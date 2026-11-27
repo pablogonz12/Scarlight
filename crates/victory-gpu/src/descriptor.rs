@@ -127,7 +127,7 @@ static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
 fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = crate::stall::guard(crate::stall::Lock::Heap, &SHADER_HEAPS);
     let &(_, _, at) = heaps
         .iter()
         .find(|&&(start, end, _)| (start..end).contains(&handle))?;
@@ -159,7 +159,7 @@ fn mirror(handle: u64) {
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = crate::stall::guard(crate::stall::Lock::Heap, &SHADER_HEAPS);
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
@@ -172,7 +172,7 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = crate::stall::guard(crate::stall::Lock::Heap, &SHADER_HEAPS);
         heaps.retain(|&(_, _, h)| h != at);
     }
 }
@@ -565,7 +565,7 @@ fn words_for(view: View) -> [u32; 2] {
             View::Placed(unordered, resource, desc) => {
                 let (shape, address) = shape_of(*unordered, resource, desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
-                    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut views = crate::stall::guard(crate::stall::Lock::Heap, &VIEWS);
                     if let Some(shape) = views.shape(shape) {
                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
                         return placed_words(shape, address);
@@ -575,7 +575,7 @@ fn words_for(view: View) -> [u32; 2] {
             _ => {}
         }
     }
-    VIEWS.lock().unwrap_or_else(|e| e.into_inner()).entry(view)
+    crate::stall::guard(crate::stall::Lock::Heap, &VIEWS).entry(view)
 }
 
 /// For the memory line: the distinct views kept ([`Views`]), those of them
@@ -589,7 +589,7 @@ fn words_for(view: View) -> [u32; 2] {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn views_kept() -> [u64; 8] {
     use std::sync::atomic::Ordering::Relaxed;
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = crate::stall::guard(crate::stall::Lock::Heap, &VIEWS);
     let each = size_of::<(View, u32)>() as u64;
     let shape = size_of::<Shape>() as u64;
     let (mut constants, mut placed) = (0, 0);
@@ -740,7 +740,7 @@ pub(crate) fn forget(resource: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&resource);
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = crate::stall::guard(crate::stall::Lock::Heap, &VIEWS);
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
@@ -765,12 +765,12 @@ pub(crate) fn forget(resource: usize) {
 fn view_at(i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
         0 => {
-            let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+            let views = crate::stall::guard(crate::stall::Lock::Heap, &VIEWS);
             let (view, current) = views.list.get(i as usize)?;
             (*current == generation).then(|| view.clone())
         }
         CONSTANT => Some(constant_of(i, generation)),
-        PLACED => VIEWS.lock().unwrap_or_else(|e| e.into_inner()).placed_of(i, generation),
+        PLACED => crate::stall::guard(crate::stall::Lock::Heap, &VIEWS).placed_of(i, generation),
         _ => None,
     }
 }
@@ -993,7 +993,7 @@ pub(crate) extern "system" fn create_heap(
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = crate::stall::guard(crate::stall::Lock::Heap, &SHADER_HEAPS);
         heaps.push((start, start + size, at));
     }
     #[cfg(not(windows))]
