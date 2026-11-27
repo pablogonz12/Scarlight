@@ -17,7 +17,7 @@
 //! garbage records cannot run for seconds either.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
-//! groups per dimension and 2^20 per dispatch, one-dimensional mesh
+//! groups per dimension except split compute X, 2^20 per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
@@ -57,10 +57,22 @@ static const uint GROUPS = 1u << 20;
 void main(uint3 id : SV_DispatchThreadID) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
+    bool wide = (has_count & 4u) != 0;
+    bool base_constant = (has_count & 8u) != 0;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
-    if (id.x >= eff_count) return;
+    if (id.x >= eff_count) {
+        if (wide && id.x < records) {
+            for (uint i = 0; i < 16; ++i) {
+                if (base_constant)
+                    dst_args.Store4((id.x * 16 + i) * 16, uint4(0, 0, 0, 0));
+                else
+                    dst_args.Store3((id.x * 16 + i) * 12, uint3(0, 0, 0));
+            }
+        }
+        return;
+    }
     uint src_at = args_offset + id.x * stride;
     uint dst_at = id.x * stride;
     // A tight buffer's last record ends at its argument payload (the title
@@ -84,14 +96,14 @@ void main(uint3 id : SV_DispatchThreadID) {
         draw_counts = uint2(count, instances);
     } else if (kind == 2) {
         uint3 want = src_args.Load3(src_at);
-        uint3 g = min(want, uint3(65535u, 65535u, 65535u));
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+        uint3 g = min(want, uint3(wide ? 1048560u : 65535u, 65535u, 65535u));
+        // Check each multiplication before performing it.
+        if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
             g = uint3(0, 0, 0);
         }
         // Diagnostics, in the budget buffer's words 12 and 16 (beside the
         // mesh notes at 4 and 8): what the record asked, before the clamp
-        // that keeps the first 65,535 groups only.
+        // that bounds each dimension.
         uint was;
         budget.InterlockedMax(12, want.x, was);
         budget.InterlockedAdd(16, min(want.x, 1u << 24), was);
@@ -156,6 +168,17 @@ void main(uint3 id : SV_DispatchThreadID) {
     } else {
         if (over) {
             groups = uint3(0, 0, 0);
+        }
+        if (wide) {
+            for (uint i = 0; i < 16; ++i) {
+                uint base = i * 65535u;
+                uint n = groups.x > base ? min(groups.x - base, 65535u) : 0;
+                if (base_constant)
+                    dst_args.Store4((id.x * 16 + i) * 16, uint4(base, n, groups.y, groups.z));
+                else
+                    dst_args.Store3((id.x * 16 + i) * 12, uint3(n, groups.y, groups.z));
+            }
+            return;
         }
         dst_args.Store3(dst_at, groups);
         for (uint off = 12; off < copy_end; off += 4) {
@@ -292,6 +315,24 @@ pub(crate) fn bound(
     record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
 }
 
+/// Expands each compute record into sixteen dispatches, with root constants
+/// when the shader reads the X group ID.
+pub(crate) fn bound_wide(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    base_constant: bool,
+) -> Option<ID3D12Resource> {
+    validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    let bytes = u64::from(spec.2).checked_mul(if base_constant { 256 } else { 192 })?;
+    if bytes > u64::from(u32::MAX) {
+        return None;
+    }
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    record_clamp_mode(c, &list.list, &dst, budget, src, count, spec, false, Some(base_constant)).then_some(dst)
+}
+
 /// [`bound`] for a window of records clamped ahead of the draws that will
 /// read them (`crate::draw`'s windows; no count buffer). The records past
 /// the ones the title filled are whatever the buffer holds, and each
@@ -337,6 +378,21 @@ fn record_clamp_as(
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
 ) -> bool {
+    record_clamp_mode(c, l, dst, budget, (src, src_offset), count, (kind, stride, records), ahead, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_mode(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    dst: &ID3D12Resource,
+    budget: u64,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, records): (u32, u32, u32),
+    ahead: bool,
+    wide: Option<bool>,
+) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
         src_offset,
@@ -380,7 +436,7 @@ fn record_clamp_as(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1) | (u32::from(wide.is_some()) << 2) | (u32::from(wide == Some(true)) << 3), count_offset];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -802,6 +858,124 @@ void main() {
         }
         // A layout whose last payload overflows 32 bits is refused, not clamped.
         assert_eq!(required_bytes((2, 12, u32::MAX)), None);
+    }
+
+    #[test]
+    fn wide_clamp_covers_each_group_once_and_clears_inactive_records() {
+        let Some(mut gpu) = Harness::new() else { return };
+        let (src, src_ptr, _) = gpu.shared_buffer(48);
+        let (count, count_ptr, _) = gpu.shared_buffer(4);
+        let (_budget, budget_ptr, budget_gpu) = gpu.shared_buffer(256);
+        let (readback, readback_ptr, _) = gpu.shared_buffer(1024);
+        let dst = gpu.default_uav(1024);
+        // SAFETY: the mapped buffers have the sizes given above.
+        unsafe {
+            for (i, x) in [65_535u32, 65_536, 67_440, 42].into_iter().enumerate() {
+                for (j, value) in [x, 1, 1].into_iter().enumerate() {
+                    src_ptr.cast::<u32>().add(i * 3 + j).write_volatile(value);
+                }
+            }
+            count_ptr.cast::<u32>().write_volatile(3);
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+        }
+        assert!(record_clamp_mode(
+            &gpu.clamp, &gpu.list, &dst, budget_gpu, (&src, 0), Some((&count, 0)),
+            (2, 12, 4), false, Some(true),
+        ));
+        // SAFETY: the clamp left dst in INDIRECT_ARGUMENT; the copy has sufficient space.
+        unsafe {
+            gpu.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            gpu.list.CopyBufferRegion(&readback, 0, &dst, 0, 1024);
+        }
+        gpu.submit_and_wait();
+        // SAFETY: the copy completed and the mapped readback has 1024 bytes.
+        let words = unsafe { std::slice::from_raw_parts(readback_ptr.cast::<u32>(), 256) };
+        for (record, total) in [65_535usize, 65_536, 67_440].into_iter().enumerate() {
+            let mut hits = vec![0u8; total];
+            for piece in words[record * 64..(record + 1) * 64].chunks_exact(4) {
+                let (base, size) = (piece[0] as usize, piece[1] as usize);
+                assert!(size <= 65_535);
+                if size > 0 {
+                    assert_eq!(&piece[2..], &[1, 1]);
+                    for hit in &mut hits[base..base + size] { *hit += 1; }
+                }
+            }
+            assert!(hits.iter().all(|&n| n == 1), "record {record}");
+        }
+        assert!(words[192..].iter().all(|&word| word == 0));
+    }
+
+    #[test]
+    fn wide_commands_set_group_base_before_dispatch() {
+        const WORKER: &str = r#"
+#define RS "RootConstants(num32BitConstants=1, b0), UAV(u0)"
+cbuffer Base : register(b0) { uint base; };
+RWByteAddressBuffer hits : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 group : SV_GroupID) {
+    uint old;
+    hits.InterlockedAdd((base + group.x) * 4, 1, old);
+}
+"#;
+        let Some(mut gpu) = Harness::new() else { return };
+        let worker = compile_cs(&gpu.device, WORKER).expect("wide worker");
+        let signature = crate::draw::make_wide_signature(&gpu.device, &worker.root, (0, 0))
+            .expect("wide signature");
+        let (src, src_ptr, _) = gpu.shared_buffer(12);
+        let (_budget, budget_ptr, budget_gpu) = gpu.shared_buffer(256);
+        let (_hits, hits_ptr, hits_gpu) = gpu.shared_buffer(67_441 * 4);
+        let dst = gpu.default_uav(256);
+        // SAFETY: the buffers are mapped and have the stated lengths.
+        unsafe {
+            for (i, v) in [67_440u32, 1, 1].into_iter().enumerate() {
+                src_ptr.cast::<u32>().add(i).write_volatile(v);
+            }
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(hits_ptr, 0, 67_441 * 4);
+        }
+        assert!(record_clamp_mode(&gpu.clamp, &gpu.list, &dst, budget_gpu, (&src, 0), None, (2, 12, 1), false, Some(true)));
+        // SAFETY: the scratch and signature match, and the worker's UAV is live.
+        unsafe {
+            gpu.list.SetComputeRootSignature(&worker.root);
+            gpu.list.SetPipelineState(&worker.pso);
+            gpu.list.SetComputeRootUnorderedAccessView(1, hits_gpu);
+            gpu.list.ExecuteIndirect(&signature, 16, &dst, 0, None, 0);
+        }
+        gpu.submit_and_wait();
+        // SAFETY: the GPU is finished and the buffer is mapped.
+        let hits = unsafe { std::slice::from_raw_parts(hits_ptr.cast::<u32>(), 67_441) };
+        assert!(hits[..67_440].iter().all(|&v| v == 1));
+        assert_eq!(hits[67_440], 0);
+    }
+
+    #[test]
+    fn wide_commands_without_group_id_use_dispatch_only_layout() {
+        let Some(mut gpu) = Harness::new() else { return };
+        let (src, src_ptr, _) = gpu.shared_buffer(12);
+        let (_budget, budget_ptr, budget_gpu) = gpu.shared_buffer(256);
+        let (_hits, hits_ptr, hits_gpu) = gpu.shared_buffer(4);
+        let dst = gpu.default_uav(192);
+        // SAFETY: the buffers are mapped and have the stated lengths.
+        unsafe {
+            for (i, v) in [65_536u32, 1, 1].into_iter().enumerate() {
+                src_ptr.cast::<u32>().add(i).write_volatile(v);
+            }
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            hits_ptr.cast::<u32>().write_volatile(0);
+        }
+        assert!(record_clamp_mode(&gpu.clamp, &gpu.list, &dst, budget_gpu, (&src, 0), None, (2, 12, 1), false, Some(false)));
+        let signature = gpu.signature(2, 12);
+        // SAFETY: the scratch and signature match, and the worker's UAV is live.
+        unsafe {
+            gpu.list.SetComputeRootSignature(&gpu.worker.root);
+            gpu.list.SetPipelineState(&gpu.worker.pso);
+            gpu.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            gpu.list.ExecuteIndirect(&signature, 16, &dst, 0, None, 0);
+        }
+        gpu.submit_and_wait();
+        // SAFETY: the GPU is finished and the buffer is mapped.
+        assert_eq!(unsafe { hits_ptr.cast::<u32>().read_volatile() }, 65_536);
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
