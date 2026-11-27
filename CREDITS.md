@@ -1,5 +1,8 @@
 # Credits
 
+- **Marvis [da82e444](https://github.com/Marvisak/VIctory/commit/da82e444)**, GPL-3.0:
+  correctly rounded normalized buffer format conversion.
+
 - **GrapeJuice429 [#29](https://github.com/pablogonz12/Scarlight/pull/29)**, GPL-3.0:
   diagnostics for previewing a selected render target.
 - **Duff [c430b1de](https://github.com/Marvisak/VIctory/commit/c430b1de)**, GPL-3.0:
