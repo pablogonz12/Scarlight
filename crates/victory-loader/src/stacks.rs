@@ -19,7 +19,7 @@ use windows_sys::Win32::System::Threading::{
     SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
-use crate::crash::{MAX_FRAMES, locate, unwind_into};
+use crate::crash::{MAX_FRAMES, locate, unwind_checks_enabled, unwind_into};
 
 /// Reads `VICTORY_STACKS` and, if set, starts a thread that prints every
 /// thread's stack at each listed time (seconds from now).
@@ -117,6 +117,7 @@ pub fn dump_stacks() {
 /// The thread's frames and its current and base scheduling priority (0-31).
 fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
     let mut frames = Vec::with_capacity(MAX_FRAMES);
+    let checks = unwind_checks_enabled();
     let mut info: BasicInfo = BasicInfo {
         exit_status: 0,
         teb: std::ptr::null(),
@@ -152,7 +153,7 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
             return (frames, (info.priority, info.base_priority));
         }
         if GetThreadContext(thread, &mut context.0) != 0 {
-            unwind_into(context.0, low, high, &mut frames);
+            unwind_into(context.0, low, high, &mut frames, checks);
         }
         ResumeThread(thread);
     }
