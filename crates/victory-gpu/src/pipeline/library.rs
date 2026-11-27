@@ -16,7 +16,7 @@
 //! from several threads ("The pipeline library is thread-safe to use, and
 //! will internally synchronize as necessary", `CreatePipelineLibrary`,
 //! Thread Safety), with one exception kept here: two loads of the same
-//! pipeline are made one after the other ([`same_name`]). Under one lock of
+//! pipeline are made one after the other ([`Names`]). Under one lock of
 //! ours for every call, the eight workers made pipelines one at a time:
 //! 87 to 96 of 110 looks at each worker found it waiting for that lock
 //! (run 49), and an earlier run's 2,300 pipelines, all in the library, were
@@ -51,19 +51,11 @@
 //! `VICTORY_LIBRARY_PRUNE=0` keeps every one): the entries are named after
 //! translated shaders, so the first run of a new build used to write its
 //! few pipelines over the library the build before it had warmed.
-//!
-//! The early list has a cap ([`EARLY_MAX`] keys). A title with more
-//! pipelines than the cap keeps the first this many keys — the ones drawn
-//! with first, which are the ones the measured scene needs — and the tail
-//! of its creation order is dropped, not put in the place of older keys,
-//! so its own workers still make them. Both [`save`] and the first read of
-//! the list say how many keys were listed, the cap, and how many requests
-//! were refused, so a run never truncates in silence.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -527,27 +519,125 @@ struct Library {
 
 // SAFETY: D3D12 objects are free-threaded, and the library synchronises
 // its own calls (see the module's notes); what it does not, two loads of
-// one name, is serialised by `same_name`.
+// one name, is serialised by `NAMES`.
 unsafe impl Send for Library {}
 // SAFETY: as above; the other fields are an atomic and a lock.
 unsafe impl Sync for Library {}
 
-/// Held by a load of the pipeline named `name`: loads of the same name
-/// wait for each other (the host's one exception to the library's thread
-/// safety: such a load may change that pipeline's entry). Names share 64
-/// locks, so two different names seldom wait.
-fn same_name(name: &str) -> MutexGuard<'static, ()> {
-    static LOADING: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
-    let at = name.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(usize::from(b)));
-    LOADING[at % LOADING.len()].lock().unwrap_or_else(|e| e.into_inner())
+/// Names one thread at a time holds: a load or a making of the same name
+/// waits for the other (the host's one exception to the library's thread
+/// safety: such a load may change that pipeline's entry). Ported from
+/// Marvisak/VIctory #2401, whose `abandon` lets a lost thread's name go.
+struct Names {
+    held: Mutex<Option<HashSet<String>>>,
+    released: Condvar,
+}
+
+/// A name held until this is dropped.
+struct Held<'a> {
+    names: &'a Names,
+    name: &'a str,
+}
+
+impl Names {
+    const fn new() -> Names {
+        Names {
+            held: Mutex::new(None),
+            released: Condvar::new(),
+        }
+    }
+
+    /// Holds `name`, once no other thread does.
+    fn hold<'a>(&'a self, name: &'a str) -> Held<'a> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        while held.as_ref().is_some_and(|h| h.contains(name)) {
+            held = self.released.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+        held.get_or_insert_default().insert(name.to_owned());
+        Held { names: self, name }
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        let mut held = self.names.held.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = held.as_mut() {
+            h.remove(self.name);
+        }
+        drop(held);
+        self.names.released.notify_all();
+    }
+}
+
+/// The names held now.
+static NAMES: Names = Names::new();
+
+/// With `VICTORY_LIBRARY_LOCK=1`: one library call at a time, as before.
+pub(super) fn serialized() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_LOCK").is_some_and(|v| v == "1"))
+}
+
+thread_local! {
+    /// Whether this thread holds [`one_call`]'s lock now: a driver crash
+    /// here loses the lock for good, so the thread exits instead of
+    /// parking (see `pipeline::wine`).
+    static CALLING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One library call at a time, held: clears the thread's mark when let go.
+struct OneCall {
+    _held: MutexGuard<'static, ()>,
+}
+
+impl Drop for OneCall {
+    fn drop(&mut self) {
+        let _ = CALLING.try_with(|c| c.set(false));
+    }
 }
 
 /// With `VICTORY_LIBRARY_LOCK=1`: held by every library call, as before.
-fn one_call() -> Option<MutexGuard<'static, ()>> {
-    static ON: OnceLock<bool> = OnceLock::new();
-    static CALLING: Mutex<()> = Mutex::new(());
-    ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_LOCK").is_some_and(|v| v == "1"))
-        .then(|| CALLING.lock().unwrap_or_else(|e| e.into_inner()))
+fn one_call() -> Option<OneCall> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    if !serialized() {
+        return None;
+    }
+    let held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = CALLING.try_with(|c| c.set(true));
+    Some(OneCall { _held: held })
+}
+
+/// Whether this thread holds [`one_call`]'s lock now.
+pub(super) fn calling() -> bool {
+    CALLING.try_with(|c| c.get()).unwrap_or(false)
+}
+
+thread_local! {
+    /// Whether this thread holds the library's store guard now: a driver
+    /// crash in `StorePipeline` would park with it, and every later `save`
+    /// would wait on the save lock for the rest of the run.
+    static STORING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The library's store guard for one store call, held: clears the thread's
+/// mark when let go.
+struct Storing(#[expect(dead_code, reason = "held for its Drop: it keeps the store alone")] std::sync::RwLockReadGuard<'static, ()>);
+
+impl Drop for Storing {
+    fn drop(&mut self) {
+        let _ = STORING.try_with(|s| s.set(false));
+    }
+}
+
+fn storing(library: &'static Library) -> Storing {
+    let held = library.saving.read().unwrap_or_else(|e| e.into_inner());
+    let _ = STORING.try_with(|s| s.set(true));
+    Storing(held)
+}
+
+/// Whether this thread holds the library's store guard now.
+pub(super) fn storing_now() -> bool {
+    STORING.try_with(|s| s.get()).unwrap_or(false)
 }
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
@@ -556,13 +646,7 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
-/// Title pipelines listed for an early start, at most. A title that asks
-/// for more keeps the first this many keys (the ones drawn with first) and
-/// loses the tail; `save` logs how many requests were refused. Our own lists are
-/// 2,238 keys and 1,785 buildable pipelines, so nothing measured is near
-/// it: the cap is a guard against a title whose keys never repeat, not a
-/// tuning value, and it moves only with a measurement of a list that
-/// needed more.
+/// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
 fn library() -> Option<&'static Library> {
@@ -672,14 +756,25 @@ pub(crate) fn pipeline(
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
+    // The name is held (and a crash in this run's name recorded) on both
+    // paths: with no library the make is still a driver compile a crash
+    // must be able to name, and same-name creations wait for it.
+    let _held = NAMES.hold(name);
+    if abandoned(name) {
+        // E_FAIL: the driver's compiler crashed on it in this run.
+        let fail = windows::core::HRESULT(0x8000_4005_u32 as i32);
+        return Err(windows::core::Error::from_hresult(fail));
+    }
+    HOLDS.set(Some(name.to_owned()));
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        let pso = create();
+        HOLDS.set(None);
+        return pso;
     };
     let began = std::time::Instant::now();
     let loaded = {
         let _all = one_call();
-        let _one = same_name(name);
         let _call = call("load", name);
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
@@ -688,6 +783,7 @@ pub(crate) fn pipeline(
     TRIMMED.store(false, Ordering::Relaxed);
     let refused = match loaded {
         Ok(pso) => {
+            HOLDS.set(None);
             LOADED.fetch_add(1, Ordering::Relaxed);
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
@@ -700,7 +796,17 @@ pub(crate) fn pipeline(
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
-        create()?
+        create()
+    };
+    // `HOLDS` stays the name until the store is done: a driver crash in
+    // `StorePipeline` loses the pipeline too, and `abandon` must be able to
+    // let the name go (the thread parks and never drops its `Held`).
+    let pso = match pso {
+        Ok(pso) => pso,
+        Err(e) => {
+            HOLDS.set(None);
+            return Err(e);
+        }
     };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
@@ -711,14 +817,43 @@ pub(crate) fn pipeline(
         )
     });
     let _all = one_call();
-    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+    let _stores = storing(library);
     let _call = call("store", name);
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
     if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
         library.added.fetch_add(1, Ordering::Relaxed);
     }
+    HOLDS.set(None);
     Ok(pso)
+}
+
+thread_local! {
+    /// The name this thread holds in [`NAMES`] while it loads or makes it.
+    static HOLDS: std::cell::Cell<Option<String>> = const { std::cell::Cell::new(None) };
+}
+
+/// Names whose making crashed the host driver's compiler in this run.
+static ABANDONED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+fn abandoned(name: &str) -> bool {
+    ABANDONED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|a| a.contains(name))
+}
+
+/// This thread will not return from the load or creation it is in (see
+/// `make::worker_lost`): the name it holds is let go, and refused to the
+/// threads waiting for it and to later ones.
+pub(super) fn abandon() {
+    let Ok(Some(name)) = HOLDS.try_with(std::cell::Cell::take) else { return };
+    let mut abandoned = ABANDONED.lock().unwrap_or_else(|e| e.into_inner());
+    abandoned.get_or_insert_default().insert(name.clone());
+    drop(abandoned);
+    let mut held = NAMES.held.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = held.as_mut() {
+        h.remove(&name);
+    }
+    drop(held);
+    NAMES.released.notify_all();
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -776,7 +911,6 @@ pub(crate) fn save(now: bool) {
         }
     };
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
-    let dropped = DROPPED.load(Ordering::Relaxed);
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
@@ -798,9 +932,6 @@ pub(crate) fn save(now: bool) {
         Ok(()) => tracing::info!(
             bytes,
             early = used.len(),
-            cap = EARLY_MAX,
-            truncated = dropped > 0,
-            refused = dropped,
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
@@ -850,10 +981,6 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
 static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
-/// Requests refused since the start because the list was at [`EARLY_MAX`].
-/// Per request, not per key: two pipelines of one refused key each reach
-/// [`note_used`] once, so the same key counts once for each of them.
-static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
@@ -863,16 +990,7 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
         let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
-        // A file at the cap may have been written truncated, but only a
-        // full one (`at_cap`) is what the file can say: the save that wrote
-        // it logged whether it actually dropped keys.
-        let at_cap = set.len() >= EARLY_MAX;
-        tracing::info!(
-            pipelines = set.len(),
-            cap = EARLY_MAX,
-            at_cap,
-            "title pipelines to start early"
-        );
+        tracing::info!(pipelines = set.len(), "title pipelines to start early");
         *used = Some(set);
     }
     used
@@ -883,38 +1001,12 @@ pub(crate) fn wanted_early(key: &str) -> bool {
     used().as_ref().is_some_and(|s| s.contains(key))
 }
 
-/// Adds `key` to `set` unless it holds `cap` keys already; says whether it
-/// was added. A refused key never evicts one that is there.
-fn insert_capped(set: &mut HashSet<String>, cap: usize, key: &str) -> bool {
-    if set.contains(key) {
-        return false;
-    }
-    if set.len() >= cap {
-        return false;
-    }
-    set.insert(key.to_owned())
-}
-
 /// A draw or dispatch requested the title pipeline with `key`.
 pub(crate) fn note_used(key: &str) {
     let mut used = used();
     let set = used.get_or_insert_with(HashSet::new);
-    if insert_capped(set, EARLY_MAX, key) {
+    if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
         USED_CHANGED.store(true, Ordering::Relaxed);
-    } else if set.len() >= EARLY_MAX && !set.contains(key) {
-        // A save must write and log the count even when the list itself did
-        // not change, so the refusal is what makes it eligible.
-        USED_CHANGED.store(true, Ordering::Relaxed);
-        // Logged once, when the cap is first reached, and counted for every
-        // key after it: a run never loses the tail without a word.
-        let dropped = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
-        if dropped == 1 {
-            tracing::warn!(
-                cap = EARLY_MAX,
-                "early pipeline list at its cap: further keys are dropped, not listed \
-                 (logged once; the refused count is in the next save, per request)"
-            );
-        }
     }
 }
 
@@ -932,34 +1024,6 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
-    }
-
-    #[test]
-    fn the_early_list_drops_keys_at_the_cap_and_counts_them() {
-        // A small cap first: the boundary rule, without a big set.
-        let mut set = HashSet::new();
-        assert!(insert_capped(&mut set, 3, "a"));
-        assert!(insert_capped(&mut set, 3, "b"));
-        assert!(insert_capped(&mut set, 3, "c"));
-        assert!(!insert_capped(&mut set, 3, "d"), "past the cap");
-        assert_eq!(set.len(), 3, "a refused key evicts nothing");
-        assert!(!set.contains("d"));
-        assert!(set.contains("a"), "the first keys stay");
-        // A key already listed is not a new one, cap or no cap.
-        assert!(!insert_capped(&mut set, 3, "a"));
-        assert_eq!(set.len(), 3);
-
-        // The real cap: one key short is listed, the last one is refused.
-        let mut full = HashSet::new();
-        for i in 0..EARLY_MAX {
-            assert!(
-                insert_capped(&mut full, EARLY_MAX, &format!("k{i}")),
-                "key {i}"
-            );
-        }
-        assert_eq!(full.len(), EARLY_MAX);
-        assert!(!insert_capped(&mut full, EARLY_MAX, "one-too-many"));
-        assert_eq!(full.len(), EARLY_MAX);
     }
 
     #[test]

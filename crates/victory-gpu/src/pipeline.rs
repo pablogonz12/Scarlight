@@ -193,11 +193,11 @@ fn with_resources(
     container: &[u8],
     host: victory_shader::emit::HostShader,
 ) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
+    use victory_shader::{Container, HwStage};
     let meta = crate::shader_meta::get_or_compute(full_hash, || {
         let c = Container::parse(container).map_err(|e| e.to_string())?;
-        let programs = match c.part(FourCC::DXIL) {
-            Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
+        let programs = match victory_shader::program_part(&c) {
+            Some(part) => victory_shader::native_programs(part).map_err(|e| e.to_string())?,
             None => Vec::new(),
         };
         let stores = programs.is_empty() || programs.iter().any(stores);
@@ -469,13 +469,6 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
-/// Pipeline requests that had to wait for their pipeline (it was not made
-/// yet), since the last call: what a frame's pipeline wait budget paid for.
-#[cfg(windows)]
-pub(crate) fn take_demanded() -> u64 {
-    make::take_demanded()
-}
-
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -534,20 +527,67 @@ pub(crate) enum Absent {
     Waiting,
 }
 
-/// Draws and dispatches recorded without a host pipeline since the last
-/// [`take_dropped_split`]: `[refused, waiting]`.
+/// Draws and dispatches recorded since the last [`take_dropped_split`]:
+/// `[refused, waiting, by design]`.
 #[cfg(windows)]
-static DROPPED_SPLIT: [std::sync::atomic::AtomicU64; 2] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static DROPPED_SPLIT: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// The draws and dispatches counted by [`note_drop`] since the last call:
-/// `[refused, waiting]`, which adds up to the draws and dispatches without a
-/// host pipeline. A refused pipeline costs its draws every frame
-/// (JMAN730/victory#589); one still being made costs them one frame.
+/// The draws and dispatches counted by [`note_drop`] and [`note_design`]
+/// since the last call: `[refused, waiting, by design]`. A refused pipeline
+/// costs its draws every frame (JMAN730/victory#589); one still being made
+/// costs them one frame; one skipped on purpose was never a pipeline gap
+/// (the ray-tracing structure builder while it is off, a shader in
+/// `VICTORY_SKIP_PIPELINES`), and is counted apart so that the three
+/// earlier causes and this one add up to the drops a frame reports.
 #[cfg(windows)]
-pub(crate) fn take_dropped_split() -> [u64; 2] {
-    [&DROPPED_SPLIT[0], &DROPPED_SPLIT[1]]
+pub(crate) fn take_dropped_split() -> [u64; 3] {
+    [&DROPPED_SPLIT[0], &DROPPED_SPLIT[1], &DROPPED_SPLIT[2]]
         .map(|count| count.swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Counts a draw or dispatch skipped on purpose: the by-design cause, which
+/// no [`Absent`] covers because the pipeline may well have a host pipeline
+/// (the ray-tracing structure builder while it is off). The reason is filed
+/// apart from the pipeline gaps by [`note_design_why`] (diagnostics).
+#[cfg(windows)]
+pub(crate) fn note_design() {
+    DROPPED_SPLIT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Reasons for drops counted by [`note_design`], most first (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+static DESIGN: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
+/// As [`note_design`], naming `why` for the by-design lines (diagnostics).
+/// Its reasons are kept out of [`take_drops`], which is the pipeline gaps.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn note_design_why(why: String) {
+    note_design();
+    crate::capture::op(0, || format!("DROPPED by design {why}"));
+    let mut design = DESIGN.lock().unwrap_or_else(|e| e.into_inner());
+    *design.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
+}
+
+/// The by-design drops counted since the last call, most first
+/// (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn take_design() -> Vec<(String, u64)> {
+    let design = DESIGN.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut design: Vec<(String, u64)> = design.into_iter().flatten().collect();
+    design.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    design
+}
+
+/// As [`note_design`], for a pipeline the title asked us to skip
+/// (`VICTORY_SKIP_PIPELINES`): the reason names the shader.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn note_skipped(this: This) {
+    if let Some(why) = reason(this) {
+        note_design_why(why);
+        return;
+    }
+    note_design();
 }
 
 /// Why pipeline `this` has no host pipeline, `None` when it has one.
@@ -622,6 +662,21 @@ pub(crate) fn drops_snapshot() -> Vec<(String, u64)> {
     drops.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     drops.truncate(20);
     drops
+}
+
+/// The by-design reasons counted since the run began, most first, without
+/// consuming them (diagnostics): what a shot's stats line says about work
+/// skipped on purpose, apart from the pipelines we do not have.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn design_snapshot() -> Vec<(String, u64)> {
+    let design = DESIGN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut design: Vec<(String, u64)> = design
+        .iter()
+        .flat_map(|m| m.iter().map(|(why, n)| (why.clone(), *n)))
+        .collect();
+    design.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    design.truncate(20);
+    design
 }
 
 /// The stage's container, if it has one.
@@ -763,6 +818,14 @@ fn subobject(kind: u32) -> Option<(usize, Option<&'static str>)> {
 
 /// Device method: a pipeline from a stream; the shaders are kept, and the
 /// graphics state for the host pipeline.
+/// Whether the guest's integer color targets bypass their blender
+/// (`VICTORY_INTEGER_BLEND_BYPASS=0` turns the fix off).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn integer_blend_bypass() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_INTEGER_BLEND_BYPASS").as_deref() != Ok("0"))
+}
+
 pub(crate) extern "system" fn create_stream(
     _: This,
     desc: *const StreamDesc,
@@ -803,6 +866,10 @@ pub(crate) extern "system" fn create_stream(
         };
         at += size;
     }
+    #[cfg(windows)]
+    if integer_blend_bypass() {
+        graphics.apply_integer_blend_bypass();
+    }
     hand_out(
         shaders,
         #[cfg(windows)]
@@ -837,6 +904,8 @@ mod library;
 mod make;
 #[cfg(windows)]
 mod warm;
+#[cfg(windows)]
+mod wine;
 
 #[cfg(windows)]
 pub use warm::{Report as WarmUpReport, report_shader_caches, warm_up};
@@ -970,7 +1039,7 @@ mod tests {
         assert_eq!(super::absent(p), Some(super::Absent::Waiting));
         let _ = super::take_dropped_split();
         super::note_drop(p);
-        assert_eq!(super::take_dropped_split(), [0, 1]);
+        assert_eq!(super::take_dropped_split(), [0, 1, 0]);
         // Its shaders are not shader containers: making it is refused.
         assert!(!make::now(&pipeline(p).host));
         assert_eq!(super::absent(p), Some(super::Absent::Refused));
@@ -978,7 +1047,74 @@ mod tests {
         // are counted on the refused side.
         super::note_drop(p);
         super::note_drop(std::ptr::null());
-        assert_eq!(super::take_dropped_split(), [2, 0]);
+        assert_eq!(super::take_dropped_split(), [2, 0, 0]);
+    }
+
+    /// A draw skipped on purpose - a stage of the ray-tracing structure
+    /// builder while it is off, a shader in `VICTORY_SKIP_PIPELINES` - has a
+    /// host pipeline, or would have one: it is not a pipeline gap, so it is
+    /// counted apart from refused and waiting, and the four causes add up to
+    /// the drops a frame reports (the reference frame read "405 without a
+    /// host pipeline (0 refused, 0 waiting for one, 0 being made)" with 390
+    /// of them the builder's stages, off by switch).
+    #[cfg(windows)]
+    #[test]
+    fn a_skip_on_purpose_is_counted_apart_from_the_pipeline_gaps() {
+        let (vs, ps) = ([1u8, 2, 3], [4u8; 5]);
+        let none = || Bytecode {
+            code: std::ptr::null(),
+            size: 0,
+        };
+        let desc = GraphicsHead {
+            root: std::ptr::null(),
+            stages: [
+                Bytecode {
+                    code: vs.as_ptr(),
+                    size: vs.len(),
+                },
+                Bytecode {
+                    code: ps.as_ptr(),
+                    size: ps.len(),
+                },
+                none(),
+                none(),
+                none(),
+            ],
+        };
+        let mut p = std::ptr::null();
+        assert_eq!(
+            create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+            S_OK
+        );
+        let _ = super::take_dropped_split();
+        // Two by-design skips (the builder's stage twice), one real gap.
+        super::note_design();
+        super::note_drop(p);
+        #[cfg(feature = "diagnostics")]
+        {
+            let _ = super::take_drops();
+            // Another, with its reason filed as the dispatch path files it.
+            super::note_design_why(
+                "a stage of the ray-tracing structure builder (VICTORY_BVH_BUILDER is not 1)".to_owned(),
+            );
+            assert!(
+                super::take_drops()
+                    .iter()
+                    .all(|(why, _)| !why.contains("ray-tracing")),
+                "a skip on purpose is not a pipeline gap"
+            );
+            assert_eq!(
+                super::design_snapshot(),
+                [(
+                    "a stage of the ray-tracing structure builder (VICTORY_BVH_BUILDER is not 1)"
+                        .to_owned(),
+                    1
+                )]
+            );
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        super::note_design();
+        assert_eq!(super::take_dropped_split(), [0, 1, 2]);
     }
 
     /// The stream layout the title builds (title+0x86f090): root

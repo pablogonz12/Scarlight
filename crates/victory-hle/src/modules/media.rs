@@ -245,6 +245,7 @@ extern "system" fn query_interface(
     iid: *const [u8; 16],
     out: *mut *mut c_void,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("media::query_interface").enter(format_args!(""));
     if iid.is_null() || out.is_null() {
         return E_POINTER;
     }
@@ -267,11 +268,13 @@ extern "system" fn query_interface(
 }
 
 extern "system" fn add_ref(this: *mut Resolver) -> u32 {
+    let _stall = victory_gpu::stall_site!("media::add_ref").enter(format_args!(""));
     // SAFETY: as in `host`.
     unsafe { (*this).refs.fetch_add(1, Ordering::Relaxed) + 1 }
 }
 
 extern "system" fn release(this: *mut Resolver) -> u32 {
+    let _stall = victory_gpu::stall_site!("media::release").enter(format_args!(""));
     // SAFETY: as in `host`.
     let left = unsafe { (*this).refs.fetch_sub(1, Ordering::AcqRel) } - 1;
     if left == 0 {
@@ -293,6 +296,7 @@ extern "system" fn create_from_url(
     kind: *mut u32,
     object: *mut Unknown,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("media::create_from_url").enter(format_args!(""));
     let url = match checked(url) {
         Ok(url) => url,
         Err(error) => {
@@ -325,6 +329,7 @@ extern "system" fn begin_from_url(
     callback: Unknown,
     state: Unknown,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("media::begin_from_url").enter(format_args!(""));
     let url = match checked(url) {
         Ok(url) => url,
         Err(error) => return error,
@@ -352,6 +357,7 @@ extern "system" fn create_from_stream(
     kind: *mut u32,
     object: *mut Unknown,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("media::create_from_stream").enter(format_args!(""));
     let host = host(this);
     // SAFETY: slot 4 is `CreateObjectFromByteStream`; the URL is only a
     // hint for picking a handler.
@@ -373,6 +379,7 @@ extern "system" fn end_from_url(
     kind: *mut u32,
     object: *mut Unknown,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("media::end_from_url").enter(format_args!(""));
     let host = host(this);
     // SAFETY: slot 6 is `EndCreateObjectFromURL`.
     let f: extern "system" fn(*mut Host, Unknown, *mut u32, *mut Unknown) -> HRESULT =
@@ -391,6 +398,7 @@ extern "system" fn begin_from_stream(
     callback: Unknown,
     state: Unknown,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("media::begin_from_stream").enter(format_args!(""));
     let host = host(this);
     // SAFETY: slot 7 is `BeginCreateObjectFromByteStream`.
     let f: extern "system" fn(
@@ -412,6 +420,7 @@ extern "system" fn end_from_stream(
     kind: *mut u32,
     object: *mut Unknown,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("media::end_from_stream").enter(format_args!(""));
     let host = host(this);
     // SAFETY: slot 8 is `EndCreateObjectFromByteStream`.
     let f: extern "system" fn(*mut Host, Unknown, *mut u32, *mut Unknown) -> HRESULT =
@@ -420,6 +429,7 @@ extern "system" fn end_from_stream(
 }
 
 extern "system" fn cancel(this: *mut Resolver, cookie: Unknown) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("media::cancel").enter(format_args!(""));
     let host = host(this);
     // SAFETY: slot 9 is `CancelObjectCreation`.
     let f: extern "system" fn(*mut Host, Unknown) -> HRESULT = unsafe { Host::method(host, 9) };
@@ -428,6 +438,7 @@ extern "system" fn cancel(this: *mut Resolver, cookie: Unknown) -> HRESULT {
 
 /// The host's resolver behind our proxy.
 pub extern "system" fn MFCreateSourceResolver(out: *mut *mut Resolver) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("media::MFCreateSourceResolver").enter(format_args!(""));
     if out.is_null() {
         return E_POINTER;
     }

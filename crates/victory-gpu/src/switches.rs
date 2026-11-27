@@ -29,6 +29,10 @@
 //!   frames apart a texture is looked at; the next refresh takes the new
 //!   value, and a texture already detiled keeps what it holds until its turn.
 //! - `VICTORY_LATE_WAITS` ([`crate::frame`]) picks how a wait sleeps.
+//! - `VICTORY_RESIDENCY` ([`crate::residency`]) turns off the host-memory
+//!   guard: the pressure state, the upload and growth floors, the refusal
+//!   backoff and the speculative upload cap. Asked per decision, so a change
+//!   takes effect at the next one.
 //! - `VICTORY_SKIP_CLEAN` ([`crate::shadow::skip_clean`]) picks whether a
 //!   copy nothing wrote since it was last brought up to date is left out of
 //!   the submission's refreshes; asked per copy at each flush.
@@ -49,12 +53,13 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 /// The switches that may be changed live, in the order they are logged.
 const NAMES: [&str; 21] = [
+
     "VICTORY_ASYNC_WRITEBACK",
+    "VICTORY_RESIDENCY",
     "VICTORY_TEXTURE_WAIT_US",
     "VICTORY_TEXTURE_IN_PLACE",
     "VICTORY_TEXTURE_INPLACE_MAX_MB",
     "VICTORY_TEXTURE_KEEP",
-    "VICTORY_GPU_COPIES",
     "VICTORY_TEXTURE_REFRESH_EVERY",
     "VICTORY_CARD_BUFFERS",
     "VICTORY_CARD_BUFFERS_MIN_MB",

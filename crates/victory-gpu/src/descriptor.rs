@@ -61,6 +61,9 @@ pub(crate) struct Heap {
     pending: std::sync::Mutex<Vec<u32>>,
 }
 
+#[cfg(windows)]
+pub(crate) use host::fallback_samplers;
+
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
     // SAFETY: called from descriptor heap methods only.
     unsafe { &*this.cast::<Heap>() }
@@ -127,7 +130,7 @@ static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
 fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = crate::stall::guard(crate::stall::Lock::Heap, &SHADER_HEAPS);
     let &(_, _, at) = heaps
         .iter()
         .find(|&&(start, end, _)| (start..end).contains(&handle))?;
@@ -159,7 +162,7 @@ fn mirror(handle: u64) {
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = crate::stall::guard(crate::stall::Lock::Heap, &SHADER_HEAPS);
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
@@ -172,7 +175,7 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = crate::stall::guard(crate::stall::Lock::Heap, &SHADER_HEAPS);
         heaps.retain(|&(_, _, h)| h != at);
     }
 }
@@ -202,6 +205,15 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
+    /// All the view it records is made from: records with equal keys have
+    /// equal views (of the same host texture).
+    #[cfg(windows)]
+    pub(crate) fn key(&self) -> (usize, [u32; 7]) {
+        let mut words = [self.described; 7];
+        words[1..].copy_from_slice(&self.desc);
+        (self.resource as usize, words)
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
@@ -209,6 +221,40 @@ impl RtvRecord {
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC> {
         const TEXTURE_2D: u32 = 4;
         self.host_desc(TEXTURE_2D)
+    }
+
+    /// The description a target keeps its output slot with when the host
+    /// cannot render to it: its own where the title spelled one out, else a
+    /// null view in a format every device renders to. The slot has to stay —
+    /// left out, the next target moves into it and the pixel shader's
+    /// outputs reach the wrong targets — and writes through the null view
+    /// are discarded. A readable format is used rather than the target's,
+    /// because a format without render-target support would be refused and
+    /// can reach the device-removal path.
+    #[cfg(windows)]
+    pub(crate) fn slot_desc(
+        &self,
+    ) -> windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC;
+        let words = self.slot_words();
+        // SAFETY: the host view description is 24 bytes in this layout.
+        unsafe {
+            (&raw const words)
+                .cast::<D3D12_RENDER_TARGET_VIEW_DESC>()
+                .read_unaligned()
+        }
+    }
+
+    /// [`Self::slot_desc`]'s words, for the targets, heaps and tests that
+    /// run where the host types are not there.
+    pub(crate) fn slot_words(&self) -> [u32; 6] {
+        /// A 2D render target view (`D3D12_RTV_DIMENSION_TEXTURE2D`).
+        const TEXTURE_2D: u32 = 4;
+        /// `DXGI_FORMAT_R8G8B8A8_UNORM`: a format every device renders to.
+        const RGBA8_UNORM: u32 = 28;
+        self.desc_words(TEXTURE_2D)
+            .filter(|w| w[0] != 0 && w[1] != 0)
+            .unwrap_or([RGBA8_UNORM, TEXTURE_2D, 0, 0, 0, 0])
     }
 
     /// The depth view description in the host's type (the same layout).
@@ -226,22 +272,22 @@ impl RtvRecord {
     #[cfg(windows)]
     fn host_desc<T>(&self, dimension: u32) -> Option<T> {
         assert!(size_of::<T>() <= size_of::<[u32; 6]>());
+        let words = self.desc_words(dimension)?;
+        // SAFETY: both host view descriptions are 24 bytes in this layout.
+        Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
+    }
+
+    /// [`Self::host_desc`]'s words: the title's own description words where
+    /// it spelled one out, else those of a view of a typeless host copy.
+    fn desc_words(&self, dimension: u32) -> Option<[u32; 6]> {
         let mut words = if self.described != 0 {
             self.desc
         } else {
-            [
-                crate::resource::view_format(self.resource)?,
-                dimension,
-                0,
-                0,
-                0,
-                0,
-            ]
+            crate::resource::slot_view_words(self.resource, dimension)?
         };
         // A target or depth view: of a target, in its stand-in format.
         words[0] = crate::resource::target_format(crate::resource::pc_format(words[0]));
-        // SAFETY: both host view descriptions are 24 bytes in this layout.
-        Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
+        Some(words)
     }
 }
 
@@ -522,7 +568,7 @@ fn words_for(view: View) -> [u32; 2] {
             View::Placed(unordered, resource, desc) => {
                 let (shape, address) = shape_of(*unordered, resource, desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
-                    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut views = crate::stall::guard(crate::stall::Lock::Heap, &VIEWS);
                     if let Some(shape) = views.shape(shape) {
                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
                         return placed_words(shape, address);
@@ -532,7 +578,7 @@ fn words_for(view: View) -> [u32; 2] {
             _ => {}
         }
     }
-    VIEWS.lock().unwrap_or_else(|e| e.into_inner()).entry(view)
+    crate::stall::guard(crate::stall::Lock::Heap, &VIEWS).entry(view)
 }
 
 /// For the memory line: the distinct views kept ([`Views`]), those of them
@@ -546,7 +592,7 @@ fn words_for(view: View) -> [u32; 2] {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn views_kept() -> [u64; 8] {
     use std::sync::atomic::Ordering::Relaxed;
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = crate::stall::guard(crate::stall::Lock::Heap, &VIEWS);
     let each = size_of::<(View, u32)>() as u64;
     let shape = size_of::<Shape>() as u64;
     let (mut constants, mut placed) = (0, 0);
@@ -697,7 +743,7 @@ pub(crate) fn forget(resource: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&resource);
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = crate::stall::guard(crate::stall::Lock::Heap, &VIEWS);
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
@@ -722,12 +768,12 @@ pub(crate) fn forget(resource: usize) {
 fn view_at(i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
         0 => {
-            let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+            let views = crate::stall::guard(crate::stall::Lock::Heap, &VIEWS);
             let (view, current) = views.list.get(i as usize)?;
             (*current == generation).then(|| view.clone())
         }
         CONSTANT => Some(constant_of(i, generation)),
-        PLACED => VIEWS.lock().unwrap_or_else(|e| e.into_inner()).placed_of(i, generation),
+        PLACED => crate::stall::guard(crate::stall::Lock::Heap, &VIEWS).placed_of(i, generation),
         _ => None,
     }
 }
@@ -950,7 +996,7 @@ pub(crate) extern "system" fn create_heap(
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = crate::stall::guard(crate::stall::Lock::Heap, &SHADER_HEAPS);
         heaps.push((start, start + size, at));
     }
     #[cfg(not(windows))]
@@ -1187,4 +1233,45 @@ mod tests {
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
     }
-}
+
+    /// A target the host cannot render to keeps its output slot: its own
+    /// description where the title gave one, else a null view in a format
+    /// every device renders to. Either way the slot is one entry, so a later
+    /// target stays where the shader's output index expects it.
+    #[test]
+    fn a_discarded_target_keeps_its_slot_with_a_description() {
+        /// `D3D12_RTV_DIMENSION_TEXTURE2D`.
+        const TEXTURE_2D: u32 = 4;
+        /// `D3D12_RTV_DIMENSION_TEXTURE2DARRAY`.
+        const TEXTURE_2D_ARRAY: u32 = 5;
+        /// `DXGI_FORMAT_R8G8B8A8_UNORM`.
+        const RGBA8_UNORM: u32 = 28;
+        // No host copy and no description (a typeless target we never made).
+        let bare = RtvRecord {
+            tag: RTV_TAG,
+            described: 0,
+            resource: std::ptr::null(),
+            desc: [0; 6],
+        };
+        assert!(
+            bare.desc_words(TEXTURE_2D).is_none(),
+            "no host copy and no description: nothing to spell out"
+        );
+        let slot = bare.slot_words();
+        assert_eq!(slot[0], RGBA8_UNORM, "a format every device renders to");
+        assert_eq!(slot[1], TEXTURE_2D);
+        // One the title described keeps the description it gave.
+        let mut described = bare;
+        described.described = 1;
+        described.desc = [10, 5, 0, 0, 0, 0];
+        assert_eq!(
+            described.slot_words()[1],
+            TEXTURE_2D_ARRAY,
+            "the title's own description, not the fallback"
+        );
+        assert_eq!(
+            described.slot_words()[0],
+            10,
+            "the title's own format, not the fallback's"
+        );
+    }}

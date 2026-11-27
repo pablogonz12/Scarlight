@@ -624,6 +624,7 @@ extern "system" fn initialize_async(
     _sync_on_demand: bool,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgamesave::initialize_async").enter(format_args!(""));
     let saves = runtime::title().saves();
     let result = if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
         Err(NO_ACCESS)
@@ -637,9 +638,11 @@ extern "system" fn initialize_result(
     block: *mut AsyncBlock,
     out: *mut *mut Provider,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgamesave::initialize_result").enter(format_args!(""));
     xasync::result(block, (&raw const INIT).cast(), out)
 }
 extern "system" fn close_provider(_: This, provider: *mut Provider) {
+    let _stall = victory_gpu::stall_site!("xgamesave::close_provider").enter(format_args!(""));
     take(provider);
 }
 
@@ -648,12 +651,14 @@ extern "system" fn quota_async(
     provider: *const Provider,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgamesave::quota_async").enter(format_args!(""));
     let result = get(provider)
         .ok_or(E_INVALIDARG)
         .map(|p| xasync::bytes(p.remaining() as i64));
     xasync::finished_with(block, (&raw const QUOTA_CALL).cast(), result)
 }
 extern "system" fn quota_result(_: This, block: *mut AsyncBlock, out: *mut i64) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgamesave::quota_result").enter(format_args!(""));
     xasync::result(block, (&raw const QUOTA_CALL).cast(), out)
 }
 
@@ -663,6 +668,7 @@ extern "system" fn delete_async(
     name: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgamesave::delete_async").enter(format_args!(""));
     let hr = match (get(provider), text(name)) {
         (Some(p), Some(name)) if valid_container(&name) => delete(&p.root, &name),
         (Some(_), Some(_)) => INVALID_CONTAINER_NAME,
@@ -671,6 +677,7 @@ extern "system" fn delete_async(
     xasync::finished(block, (&raw const DELETE).cast(), hr)
 }
 extern "system" fn delete_result(_: This, block: *mut AsyncBlock) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgamesave::delete_result").enter(format_args!(""));
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const DELETE).cast(), 0, none, none.cast())
 }
@@ -684,6 +691,7 @@ extern "system" fn container_info(
     context: *mut c_void,
     callback: Option<ContainerCallback>,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgamesave::container_info").enter(format_args!(""));
     let (Some(p), Some(name), Some(callback)) = (get(provider), text(name), callback) else {
         return E_INVALIDARG;
     };
@@ -700,6 +708,7 @@ extern "system" fn enumerate_containers(
     context: *mut c_void,
     callback: Option<ContainerCallback>,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgamesave::enumerate_containers").enter(format_args!(""));
     let (Some(p), Some(callback)) = (get(provider), callback) else {
         return E_INVALIDARG;
     };
@@ -714,6 +723,7 @@ extern "system" fn create_container(
     name: *const c_char,
     out: *mut *mut Container,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgamesave::create_container").enter(format_args!(""));
     let (Some(p), Some(name)) = (get(provider), text(name)) else {
         return E_INVALIDARG;
     };
@@ -723,6 +733,7 @@ extern "system" fn create_container(
     put(out, give(p.container(&name)))
 }
 extern "system" fn close_container(_: This, container: *mut Container) {
+    let _stall = victory_gpu::stall_site!("xgamesave::close_container").enter(format_args!(""));
     take(container);
 }
 
@@ -733,6 +744,7 @@ extern "system" fn enumerate_blobs(
     context: *mut c_void,
     callback: Option<BlobCallback>,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgamesave::enumerate_blobs").enter(format_args!(""));
     let (Some(c), Some(callback)) = (get(container), callback) else {
         return E_INVALIDARG;
     };
@@ -763,6 +775,7 @@ extern "system" fn read_blobs(
     size: usize,
     out: *mut u8,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgamesave::read_blobs").enter(format_args!(""));
     let Some(c) = get(container) else {
         return E_INVALIDARG;
     };
@@ -790,6 +803,7 @@ extern "system" fn read_async(
     count: u32,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgamesave::read_async").enter(format_args!(""));
     let result = match get(container) {
         Some(c) => read(c, names(blob_names, count)).map(|blobs| layout(&blobs, 0)),
         None => Err(E_INVALIDARG),
@@ -803,6 +817,7 @@ extern "system" fn read_result(
     out: *mut u8,
     count: *mut u32,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgamesave::read_result").enter(format_args!(""));
     let mut used = 0;
     let hr = xasync::XAsyncGetResult(block, (&raw const READ).cast(), size, out.cast(), &mut used);
     // The documented error for a small buffer; the result stays for a
@@ -838,6 +853,7 @@ extern "system" fn create_update(
     display: *const c_char,
     out: *mut *mut Update,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgamesave::create_update").enter(format_args!(""));
     let Some(c) = get(container) else {
         return E_INVALIDARG;
     };
@@ -852,6 +868,7 @@ extern "system" fn create_update(
     )
 }
 extern "system" fn close_update(_: This, update: *mut Update) {
+    let _stall = victory_gpu::stall_site!("xgamesave::close_update").enter(format_args!(""));
     take(update);
 }
 
@@ -862,6 +879,7 @@ extern "system" fn write_blob(
     data: *const u8,
     size: usize,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgamesave::write_blob").enter(format_args!(""));
     // SAFETY: a handle we gave out; the title does not use it concurrently.
     let (Some(update), Some(name)) = (unsafe { update.as_mut() }, text(name)) else {
         return E_INVALIDARG;
@@ -883,6 +901,7 @@ extern "system" fn write_blob(
 }
 
 extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgamesave::delete_blob").enter(format_args!(""));
     // SAFETY: as in `write_blob`.
     match (unsafe { update.as_mut() }, text(name)) {
         (Some(update), Some(name)) if !name.is_empty() => {
@@ -894,10 +913,12 @@ extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char
 }
 
 extern "system" fn submit_async(_: This, update: *const Update, block: *mut AsyncBlock) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgamesave::submit_async").enter(format_args!(""));
     let hr = get(update).map_or(E_INVALIDARG, Update::submit);
     xasync::finished(block, (&raw const SUBMIT).cast(), hr)
 }
 extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xgamesave::submit_result").enter(format_args!(""));
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const SUBMIT).cast(), 0, none, none.cast())
 }
@@ -1226,6 +1247,7 @@ mod tests {
         // A new provider sees the container and reads both blobs back.
         let provider = give(Provider::open(saves.path(), Some("scid")).unwrap());
         extern "system" fn seen(info: *const ContainerInfo, context: *mut c_void) -> bool {
+            let _stall = victory_gpu::stall_site!("xgamesave::seen").enter(format_args!(""));
             // SAFETY: valid during the callback; the context is the test's vector.
             let (info, out) = unsafe {
                 (

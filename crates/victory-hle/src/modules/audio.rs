@@ -140,6 +140,7 @@ fn heap_free(ptr: *mut u8) {
 // shortcut: the cached and non-cached sizes are not enforced as limits;
 // enforce them if a title relies on running out.
 pub extern "system" fn ApuCreateHeap(cached: u32, _non_cached: u32) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("audio::ApuCreateHeap").enter(format_args!(""));
     const ALREADY_ALLOCATED: HRESULT = 0x8ACA_0001_u32 as i32;
     if cached == 0 {
         return E_INVALIDARG;
@@ -155,6 +156,7 @@ pub extern "system" fn ApuCreateHeap(cached: u32, _non_cached: u32) -> HRESULT {
 
 /// The host address of a device address, null outside the heap.
 pub extern "system" fn ApuMapApuAddress(apu: u32) -> *mut c_void {
+    let _stall = victory_gpu::stall_site!("audio::ApuMapApuAddress").enter(format_args!(""));
     heap_unmap(apu).map_or(std::ptr::null_mut(), |p| p.cast())
 }
 
@@ -197,6 +199,7 @@ pub extern "system" fn ApuAlloc(
     align: u32,
     _flags: u32,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("audio::ApuAlloc").enter(format_args!(""));
     if out.is_null() || size == 0 || align < 4 || !align.is_power_of_two() {
         return E_INVALIDARG;
     }
@@ -214,14 +217,17 @@ pub extern "system" fn ApuAlloc(
 }
 
 pub extern "system" fn ApuFree(ptr: *mut c_void) {
+    let _stall = victory_gpu::stall_site!("audio::ApuFree").enter(format_args!(""));
     heap_free(ptr.cast());
 }
 
 pub extern "system" fn ApuMapVirtualAddress(ptr: *const c_void) -> u32 {
+    let _stall = victory_gpu::stall_site!("audio::ApuMapVirtualAddress").enter(format_args!(""));
     heap_map(ptr as usize)
 }
 
 pub extern "system" fn ApuIsVirtualAddressValid(ptr: *const c_void, align: u32) -> bool {
+    let _stall = victory_gpu::stall_site!("audio::ApuIsVirtualAddressValid").enter(format_args!(""));
     let apu = heap_map(ptr as usize);
     apu != 0 && (align == 0 || apu.is_multiple_of(align))
 }
@@ -244,6 +250,7 @@ const CONTEXT_BYTES: [usize; 6] = [32, 256, 256, 16, 64, 256];
 static CONTEXTS: Mutex<Option<[usize; 6]>> = Mutex::new(None);
 
 pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("audio::AcpHalAllocateShapeContexts").enter(format_args!(""));
     if contexts.is_null() {
         return E_INVALIDARG;
     }
@@ -278,6 +285,7 @@ pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts)
 }
 
 pub extern "system" fn AcpHalReleaseShapeContexts() -> HRESULT {
+    let _stall = victory_gpu::stall_site!("audio::AcpHalReleaseShapeContexts").enter(format_args!(""));
     match lock(&CONTEXTS).take() {
         Some(arrays) => {
             *XMA.write().unwrap_or_else(|e| e.into_inner()) = Xma::EMPTY;
@@ -517,7 +525,19 @@ fn pump(context: Context, voice: &mut Voice) {
         return;
     }
     while context.field(1, 31, 1) == 1 {
-        if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
+        // A skipped frame or an input boundary can advance the decoder
+        // without producing samples. Try a few times for a whole block, but
+        // no more: a looping voice that produces nothing must not hold this
+        // voice's lock (or starve the others) for the whole pass.
+        for _ in 0..8 {
+            if voice.pcm.len() >= SAMPLES_PER_BLOCK || !decode(context, voice) {
+                break;
+            }
+        }
+        // Only whole blocks are published, and a short one only where the
+        // input has ended (the flushed tail, padded with silence): a partial
+        // block taken early would move the title's read block onto silence.
+        if voice.pcm.is_empty() || (voice.pcm.len() < SAMPLES_PER_BLOCK && !voice.ended) {
             return;
         }
         let write = context.field(0, 27, 5);
@@ -540,15 +560,36 @@ fn pump(context: Context, voice: &mut Voice) {
     }
 }
 
+/// Whether a voice that ran out of input decodes again when the title
+/// publishes one (`VICTORY_XMA_REFILL=0` keeps it ended, as before).
+fn refill() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_XMA_REFILL")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true)
+    })
+}
+
 /// Decodes the next frame of the current input into `voice.pcm`; false
 /// when there is nothing left to decode.
 fn decode(context: Context, voice: &mut Voice) -> bool {
+    let valid = context.field(0, 20, 2);
     if voice.ended {
-        return false;
+        // The title can publish either input again while the context stays
+        // enabled: the voice then decodes on from there. The overlap tail was
+        // flushed when it ended, so the decoder starts a new one.
+        if valid == 0 || !refill() {
+            return false;
+        }
+        tracing::debug!("XMA voice refilled after it ended");
+        voice.ended = false;
+        if context.field(2, 26, 5) == INPUT_INVALID {
+            context.set_field(2, 26, 6, 0);
+        }
     }
     let channels = context.channels();
     let mut current = context.field(4, 31, 1);
-    let valid = context.field(0, 20, 2);
     if valid & (1 << current) == 0 {
         if valid & (1 << (1 - current)) == 0 {
             // Out of input: the overlap tail, then nothing.
@@ -791,6 +832,7 @@ fn state(this: *mut Acp) -> MutexGuard<'static, State> {
 }
 
 extern "system" fn connect(this: *mut Acp, commands: u32, messages: u32) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("audio::connect").enter(format_args!(""));
     if commands == 0 {
         return E_INVALIDARG;
     }
@@ -801,6 +843,7 @@ extern "system" fn connect(this: *mut Acp, commands: u32, messages: u32) -> HRES
 }
 
 extern "system" fn disconnect(this: *mut Acp) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("audio::disconnect").enter(format_args!(""));
     let mut state = state(this);
     if !state.connected {
         return E_FAIL;
@@ -821,6 +864,7 @@ extern "system" fn submit(
     data: *const c_void,
     notification: u32,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("audio::submit").enter(format_args!(""));
     static SEEN: Mutex<u64> = Mutex::new(0);
     if command < 64 && *lock(&SEEN) & 1 << command == 0 {
         *lock(&SEEN) |= 1 << command;
@@ -861,6 +905,7 @@ extern "system" fn submit(
 }
 
 extern "system" fn pop_message(this: *mut Acp, out: *mut Message) -> bool {
+    let _stall = victory_gpu::stall_site!("audio::pop_message").enter(format_args!(""));
     let Some(message) = state(this).messages.pop_front() else {
         return false;
     };
@@ -872,15 +917,18 @@ extern "system" fn pop_message(this: *mut Acp, out: *mut Message) -> bool {
 }
 
 extern "system" fn message_count(this: *mut Acp) -> u32 {
+    let _stall = victory_gpu::stall_site!("audio::message_count").enter(format_args!(""));
     state(this).messages.len() as u32
 }
 
 extern "system" fn release(this: *mut Acp) {
+    let _stall = victory_gpu::stall_site!("audio::release").enter(format_args!(""));
     // SAFETY: made by `AcpHalCreate` with `Box::into_raw`; released once.
     drop(unsafe { Box::from_raw(this) });
 }
 
 pub extern "system" fn AcpHalCreate(out: *mut *mut Acp) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("audio::AcpHalCreate").enter(format_args!(""));
     if out.is_null() {
         return E_INVALIDARG;
     }
@@ -1078,6 +1126,109 @@ mod tests {
         submit(DISABLE_XMA, &[1]);
         assert_eq!(produced(&xma()), None);
         (m.release)(acp);
+        ApuFree(input);
+        ApuFree(output);
+        assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    #[test]
+    fn a_voice_the_title_refills_after_it_ended_decodes_again() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let mut request = ShapeContexts {
+            counts: [0, 0, 0, 0, 4, 0],
+            arrays: [std::ptr::null_mut(); 6],
+            apu: [0; 6],
+        };
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+        let context = Context(request.arrays[4].cast::<u32>().wrapping_add(16));
+
+        let stream = silent_stream();
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        // SAFETY: two packets were allocated.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(
+            ApuAlloc(&mut output, &mut output_apu, 0x400, 0x100, 2),
+            S_OK
+        );
+
+        // As the title sets one up: two packets, input 0 valid, a ring of
+        // four blocks, writable, 48 kHz mono, reading from the first frame.
+        context.set(0, 2 | 1 << 20 | 4 << 22);
+        context.set(1, 1 << 31 | 3 << 27);
+        context.set(2, 32);
+        context.set(5, input_apu);
+        context.set(7, output_apu);
+
+        let mut acp = std::ptr::null_mut();
+        assert_eq!(AcpHalCreate(&mut acp), S_OK);
+        // SAFETY: just created.
+        let m = unsafe { (*acp).vtable };
+        assert_eq!((m.connect)(acp, 0x1000, 0x1000), S_OK);
+        let submit = |command: u32, words: &[u32]| {
+            assert_eq!(
+                (m.submit)(acp, command, 0xf1, u32::MAX, words.as_ptr().cast(), 0),
+                S_OK
+            );
+        };
+        let produced = || {
+            lock(&xma().voices[1])
+                .as_ref()
+                .map(|v| v.trace.produced)
+                .unwrap_or(0)
+        };
+        let frames = || {
+            lock(&xma().voices[1])
+                .as_ref()
+                .map(|v| v.trace.frames)
+                .unwrap_or(0)
+        };
+        submit(ENABLE_XMA, &[1]);
+        // Drain the first input: the voice ends on the flushed tail.
+        for _ in 0..40 {
+            submit(ADVANCE_XMA_READ, &[1, 4]);
+            xma().pump();
+            if context.field(2, 31, 1) == 1 && context.field(0, 20, 2) == 0 {
+                break;
+            }
+        }
+        assert_eq!(context.field(0, 20, 2), 0, "input used up");
+        assert_eq!(context.field(2, 26, 5), INPUT_INVALID, "the voice ended");
+        let (first, first_frames) = (produced(), frames());
+        assert!(first > 0, "the first input played");
+
+        // The title publishes a second input on input 1 and enables the ring
+        // again while the context stays enabled: the voice must decode it
+        // rather than stay ended for the rest of the context's life.
+        let (mut second, mut second_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut second, &mut second_apu, 0x1000, 0x800, 1), S_OK);
+        // SAFETY: as above.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), second.cast(), stream.len()) };
+        context.set(2, 32);
+        context.set(6, second_apu);
+        // Its packet count lives in word 1 (input 1), as input 0's does in
+        // word 0: without it the decoder is handed no packets.
+        context.set_field(1, 0, 12, 2);
+        context.set_field(0, 20, 2, 2);
+        context.set_field(2, 26, 5, INPUT_INVALID);
+        context.set_field(1, 31, 1, 1);
+        submit(ADVANCE_XMA_READ, &[1, 4]);
+        xma().pump();
+        assert!(
+            produced() > first,
+            "the refilled input decodes ({first} -> {})",
+            produced()
+        );
+        assert!(
+            frames() > first_frames,
+            "a frame of the second input reached the decoder ({first_frames} -> {})",
+            frames()
+        );
+
+        submit(DISABLE_XMA, &[1]);
+        (m.release)(acp);
+        ApuFree(second);
         ApuFree(input);
         ApuFree(output);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);

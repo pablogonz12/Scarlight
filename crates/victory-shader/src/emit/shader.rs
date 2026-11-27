@@ -13,18 +13,6 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
 
-/// A view handle's properties word, bit 13: the view is a rasterizer
-/// ordered view (DXC's `AnnotateROVMask`; dxil-spirv reads it as `rov`).
-/// A pixel shader that touches one runs under a pixel interlock
-/// (`SPV_EXT_fragment_shader_interlock`).
-pub const ROV: u32 = 0x2000;
-
-/// A view handle's properties word, bit 12: the view is a UAV.
-pub const UAV: u32 = 0x1000;
-
-/// `DB_SHADER_CONTROL` bit 16: primitive ordered pixel shading (POPS).
-const POPS: u32 = 1 << 16;
-
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
 /// index it computes (SM 6.6 dynamic resources): a raw buffer of
@@ -51,8 +39,9 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 ///   address space: the number of the host copy holding that page (0: none
 ///   yet) and the page's byte offset in that copy;
 /// - copy `n` is the raw buffer view at view-heap slot `base + n`, `base`
-///   the user-data dword of kind [`USER_MEMORY_BASE`]; slot `base` itself
-///   reads zeros and drops writes;
+///   the user-data dword of kind [`USER_MEMORY_BASE`]. Dword 1 of that kind
+///   is the last copy number prepared for the recorded bind: later numbers
+///   (and slot `base` itself) read zeros and drop writes;
 /// - the root UAV `u<SLOT_FAULTS>` takes the page numbers of accesses that
 ///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 a sink), which the
 ///   host reads afterwards to make those copies for the frames to come.
@@ -96,9 +85,6 @@ pub(crate) mod flags {
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
-    /// A POPS pixel shader's rasterizer ordered views (the console's
-    /// primitive ordered pixel shading): DXC's `RasterizerOrderedViews`.
-    pub const ROVS: u64 = 1 << 18;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
@@ -152,10 +138,38 @@ pub fn view_heap_limit() -> u32 {
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether shaders clamp the view slots the title made itself below the
+/// host's dynamic slots ([`title_view_limit`]). `VICTORY_TITLE_VIEW_CLAMP=0`
+/// turns it off, and `victory-gpu` then keeps its dynamic slots right after
+/// the title's, as before.
+pub fn title_view_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TITLE_VIEW_CLAMP").is_none_or(|v| v != "0"))
+}
+
+/// The slots a view index the title made itself may name: the host's view
+/// heap less its dynamic slots ([`super::DYNAMIC_VIEWS`]), which follow the
+/// title's. 0: no separate limit (no host heap probed, a heap with no room
+/// for both, or the clamp is off).
+pub fn title_view_limit() -> u32 {
+    if !title_view_clamp() {
+        return 0;
+    }
+    title_view_limit_of(view_heap_limit())
+}
+
+/// [`title_view_limit`] for a heap whose last slot is `limit`.
+fn title_view_limit_of(limit: u32) -> u32 {
+    if limit > super::DYNAMIC_VIEWS + 1 { limit - super::DYNAMIC_VIEWS } else { 0 }
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
     pub pixel: bool,
+    /// The last slot of the host's view heap when this shader is translated
+    /// ([`view_heap_limit`]; 0: none), which its view indices are clamped to.
+    pub view_limit: u32,
     pub inputs: Vec<SigElement>,
     pub outputs: Vec<SigElement>,
     /// A mesh shader's per-primitive outputs.
@@ -168,8 +182,8 @@ pub(crate) struct Shader {
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
     pub samplers: u32,
-    /// Bit n: immediate sampler n is a comparison sampler.
-    pub cmp_samplers: u64,
+    /// Per-slot flag: immediate sampler `n` is a comparison sampler.
+    pub cmp_samplers: Vec<bool>,
     /// Root CBVs read, by root parameter index, with their handles.
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
@@ -177,11 +191,6 @@ pub(crate) struct Shader {
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
-    /// A pixel shader under the console's primitive ordered pixel shading
-    /// (`DB_SHADER_CONTROL` bit 16): every UAV it reads or writes is a
-    /// rasterizer ordered view, so writes to one address from different
-    /// primitives reach it in primitive order.
-    pub rovs: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
@@ -227,6 +236,7 @@ impl Shader {
                 res_ret,
             },
             pixel,
+            view_limit: VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed),
             inputs: Vec::new(),
             outputs: Vec::new(),
             prims: Vec::new(),
@@ -234,12 +244,11 @@ impl Shader {
             geometry: None,
             user_data: 0,
             samplers: 0,
-            cmp_samplers: 0,
+            cmp_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             flags: 0,
-            rovs: false,
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
@@ -374,28 +383,14 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        let rov = if self.rovs { ROV } else { 0 };
-        if rov != 0 {
-            self.flags |= flags::ROVS;
-        }
-        let h = self.annotate(block, h, 11 | UAV | rov, 0);
+        let h = self.annotate(block, h, 11 | 0x1000, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_uavs.push((slot, h));
         h
     }
 
-    /// Whether the program is a pixel shader under the console's primitive ordered pixel
-    /// shading (`DB_SHADER_CONTROL` bit 16): its writes through UAVs are ordered against
-    /// other primitives' writes to the same address, which the host has as rasterizer
-    /// ordered views (an interlock). `VICTORY_POPS_ROV=0` keeps plain UAVs, as before.
-    pub fn pops(&mut self, db_shader_control: u32) {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let on = *ON.get_or_init(|| std::env::var_os("VICTORY_POPS_ROV").is_none_or(|v| v != "0"));
-        self.rovs = db_shader_control & POPS != 0 && on;
-    }
-
-    /// The handle of immediate sampler `n` (a comparison sampler when its
-    /// bit in `cmp_samplers` is set).
+    /// The handle of immediate sampler `n` (a comparison sampler when
+    /// `cmp_samplers[n]` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
         let bind = [
             self.m.i32(n),
@@ -413,7 +408,7 @@ impl Shader {
             217,
             &[bind, i, f],
         );
-        let cmp = if self.cmp_samplers >> n & 1 != 0 {
+        let cmp = if self.cmp_samplers.get(n as usize).copied().unwrap_or(false) {
             0x8000
         } else {
             0
@@ -434,6 +429,25 @@ impl Shader {
         )
     }
 
+    /// A view index the title made itself (every path to the descriptor is the
+    /// resource heap itself, not a table): on a host whose dynamic slots
+    /// follow the title's ([`title_view_limit`]), an index past the title's
+    /// slots reads the heap's null slot instead of naming one of the host's
+    /// tables. A table's index may name a dynamic slot and is not clamped
+    /// here, only at the heap's end ([`Self::heap_handle`]).
+    pub fn clamp_title_heap_index(&mut self, block: usize, index: V) -> V {
+        let limit = if title_view_clamp() { title_view_limit_of(self.view_limit) } else { 0 };
+        if limit == 0 {
+            return index;
+        }
+        let last = self.m.i32(limit - 1);
+        let over = self.m.cmp(block, super::bitcode::pred::IUGT, index, last);
+        let null = self.m.i32(self.view_limit);
+        let v = self.m.select(block, over, null, index);
+        self.m.tag(v, super::bitcode::Tag::Clamp);
+        v
+    }
+
     /// A descriptor heap handle, annotated with `props`; `nonuniform` when
     /// the index may differ between lanes (`NonUniformResourceIndex`).
     pub fn heap_handle(
@@ -443,9 +457,12 @@ impl Shader {
         sampler: bool,
         nonuniform: bool,
         props: (u32, u32),
+        from_heap: bool,
     ) -> V {
+        // An index the title made itself (not a table's) may not name a host slot.
+        let index = if from_heap && !sampler { self.clamp_title_heap_index(block, index) } else { index };
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
-        let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+        let limit = self.view_limit;
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
         let index = if !sampler && limit != 0 {
             let null = self.m.i32(limit);
@@ -473,13 +490,6 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
-        // A UAV in a POPS pixel shader is rasterizer ordered (see `rovs`).
-        let props = if self.rovs && props.0 & UAV != 0 {
-            self.flags |= flags::ROVS;
-            (props.0 | ROV, props.1)
-        } else {
-            props
-        };
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -619,13 +629,6 @@ impl Shader {
                 let u = self.m.undef(p);
                 let no = self.m.bool(false);
                 let no = self.m.md_value(no);
-                // A POPS pixel shader's UAVs are rasterizer ordered views.
-                let ordered = if self.rovs {
-                    let yes = self.m.bool(true);
-                    self.m.md_value(yes)
-                } else {
-                    no
-                };
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
                     // Id, variable, name, space, lower bound, range size,
@@ -641,7 +644,7 @@ impl Shader {
                         Some(i32c(&mut self, 11)),
                         Some(no),
                         Some(no),
-                        Some(ordered),
+                        Some(no),
                         None,
                     ];
                     list.push(Some(self.m.md_node(ops)));
@@ -661,7 +664,8 @@ impl Shader {
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
                 for n in 0..self.samplers {
-                    let kind = (self.cmp_samplers >> n & 1) as u32;
+                    let kind =
+                        u32::from(self.cmp_samplers.get(n as usize).copied().unwrap_or(false));
                     let ops = vec![
                         Some(i32c(&mut self, n)),
                         Some(self.m.md_value(u)),
@@ -854,11 +858,6 @@ impl Shader {
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
-        }
-        // D3D_SHADER_FEATURE_ROVS: the validator compares it with the
-        // handles' ROV property and the resources metadata's flag.
-        if self.flags & flags::ROVS != 0 {
-            features |= 0x1000;
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;

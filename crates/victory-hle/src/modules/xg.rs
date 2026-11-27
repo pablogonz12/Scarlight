@@ -74,6 +74,7 @@ pub extern "system" fn XGSuggestSwizzleMode(
     _flags: u32,
     out: *mut u32,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xg::XGSuggestSwizzleMode").enter(format_args!(""));
     // SAFETY: the title passes a description and room for the layout
     // (either may be null).
     match unsafe { (desc.as_ref(), out.as_mut()) } {
@@ -105,6 +106,7 @@ pub extern "system" fn XGCreateTextureComputer(
     desc: *const ResourceDesc,
     out: *mut This,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xg::XGCreateTextureComputer").enter(format_args!(""));
     // SAFETY: the title passes a description and room for a pointer.
     let (Some(&desc), false) = (unsafe { desc.as_ref() }, out.is_null()) else {
         return E_INVALIDARG;
@@ -147,16 +149,20 @@ fn texture(desc: &ResourceDesc) -> Option<Texture> {
         l if l & !0xff == SWIZZLED => Swizzle(l & 0xff),
         _ => return None,
     };
-    let texture = Texture::new(&TextureDesc {
-        dimension,
-        width: u32::try_from(desc.width).ok()?,
-        height: desc.height,
-        depth_or_array: u32::from(desc.depth_or_array),
-        mips: u32::from(desc.mips),
-        format: desc.format,
-        samples: desc.samples.max(1),
-        swizzle,
-    })
+    let texture = Texture::for_gpu(
+        &TextureDesc {
+            dimension,
+            width: u32::try_from(desc.width).ok()?,
+            height: desc.height,
+            depth_or_array: u32::from(desc.depth_or_array),
+            mips: u32::from(desc.mips),
+            format: desc.format,
+            samples: desc.samples.max(1),
+            swizzle,
+        },
+        victory_gpu::console::current().pipes(),
+        0,
+    )
     .ok()?;
     // The layout struct has room for 15 mips.
     (texture.planes[0].layout.mips.len() <= MIPS).then_some(texture)
@@ -276,10 +282,12 @@ fn mip_out(desc: &ResourceDesc, l: &Layout, i: usize) -> MipOut {
 }
 
 extern "system" fn add_ref(this: This) -> u32 {
+    let _stall = victory_gpu::stall_site!("xg::add_ref").enter(format_args!(""));
     computer(this).refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 extern "system" fn release(this: This) -> u32 {
+    let _stall = victory_gpu::stall_site!("xg::release").enter(format_args!(""));
     let left = computer(this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if left == 0 {
         // SAFETY: made by `Box::into_raw` in `XGCreateTextureComputer`; the
@@ -290,6 +298,7 @@ extern "system" fn release(this: This) -> u32 {
 }
 
 extern "system" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xg::layout").enter(format_args!(""));
     if out.is_null() {
         return E_INVALIDARG;
     }
@@ -381,6 +390,7 @@ extern "system" fn copy_into(
     row: u32,
     depth: u32,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xg::copy_into").enter(format_args!(""));
     let c = computer(this);
     let Some(a) = copy_args(c, plane, subresource, row, depth) else {
         return E_INVALIDARG;
@@ -418,6 +428,7 @@ extern "system" fn copy_from(
     row: u32,
     depth: u32,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xg::copy_from").enter(format_args!(""));
     let c = computer(this);
     let Some(a) = copy_args(c, plane, subresource, row, depth) else {
         return E_INVALIDARG;
@@ -476,6 +487,7 @@ extern "system" fn tiling(
     first: u32,
     out: *mut SubresourceTiling,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xg::tiling").enter(format_args!(""));
     let c = computer(this);
     let l = &c.texture.planes[0].layout;
     if l.alignment != TILE {
@@ -557,6 +569,7 @@ extern "system" fn element_offset(
     _sample: u32,
     bit: *mut u32,
 ) -> u64 {
+    let _stall = victory_gpu::stall_site!("xg::element_offset").enter(format_args!(""));
     if !bit.is_null() {
         // SAFETY: the caller passes room for the bit position or null.
         unsafe { bit.write(0) };
@@ -577,6 +590,7 @@ extern "system" fn element_offset(
 /// Slots the title does not call: size, alignment, offsets, coordinates,
 /// view descriptor, tiled-resource query.
 extern "system" fn unused(this: This) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xg::unused").enter(format_args!(""));
     tracing::warn!(desc = ?computer(this).desc, "unimplemented texture computer method");
     E_NOTIMPL
 }

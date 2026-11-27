@@ -81,6 +81,8 @@
 //!   It binds nothing.
 
 mod bitcode;
+#[cfg(test)]
+mod branch_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
@@ -95,9 +97,9 @@ mod own_bits;
 mod rect;
 mod sampler;
 mod shader;
+pub mod switches;
 #[cfg(test)]
-mod key_tests;
-mod threading;
+mod key_tests;mod threading;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -121,9 +123,15 @@ pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
-    USER_VIEW_BIAS,
-    set_view_heap_limit, view_heap_limit,
+    USER_VIEW_BIAS, set_view_heap_limit, title_view_clamp, title_view_limit, view_heap_limit,
 };
+
+/// The host's dynamic slots in a view heap (`victory-gpu`'s `DYNAMIC`): tables
+/// a draw needs made afresh are made there. They follow the title's slots, at
+/// a place shaders know before the title's heap is made, so a shader that
+/// names a view slot the title made itself is clamped below them
+/// ([`title_view_limit`]) instead of naming one of the host's tables.
+pub const DYNAMIC_VIEWS: u32 = 1 << 18;
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -247,6 +255,28 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
     parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
 }
 
+/// `VICTORY_SHADER_SWIZZLE_ZERO`:
+/// - unset: a `ds_swizzle_b32` read whose source lane is inactive in the
+///   compute program (absent, or masked out by EXEC) reads zero, as the
+///   console's does: that lane never wrote the register.
+/// - `0`: the plain read of the source lane, whatever its EXEC bit, as
+///   before (the value of a register no lane wrote is undefined).
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+pub fn shader_swizzle_zero() -> bool {
+    static ZERO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ZERO.get_or_init(|| {
+        parse_swizzle_zero(std::env::var("VICTORY_SHADER_SWIZZLE_ZERO").ok().as_deref())
+    })
+}
+
+/// `VICTORY_SHADER_SWIZZLE_ZERO`'s value; on unless it is `0`. Pure, for
+/// testing.
+fn parse_swizzle_zero(value: Option<&str>) -> bool {
+    !matches!(value.map(str::trim), Some("0"))
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
@@ -260,21 +290,32 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
 /// from then on, and the test in `key_tests` fails if the sources read one
 /// that is in none of the three lists.
 pub const SWITCHES: &[&str] = &[
+    "VICTORY_BRANCH_SAME_ARMS",
     "VICTORY_CODE_READS",
+    "VICTORY_DX_LANE_MASK_MOVES",
+    "VICTORY_DX_PIXEL_QUAD",
+    "VICTORY_DX_STATIC_SAMPLER_PHI",
     "VICTORY_ANISO_POINT_MIP",
+    "VICTORY_BITWISE_MODS",
+    "VICTORY_F16_FMA_ONCE",
     "VICTORY_INTERP_F16_OMOD_CLAMP",
     "VICTORY_F16_NEAREST",
     "VICTORY_F16_SUM_WIDE",
+    "VICTORY_FIELD_DWORD",
     "VICTORY_FIRSTLANE_OWN",
     "VICTORY_FIRST_HALF",
+    "VICTORY_FSPX",
     "VICTORY_GROUP_SPLIT",
     "VICTORY_GROUP_SYNC",
+    "VICTORY_INT_CLAMP",
     "VICTORY_MESH_OUTPUT_STRICT",
-    "VICTORY_POPS_ROV",
+    "VICTORY_SHADER_DIV_FIXUP_F16",
     "VICTORY_SHADER_LOOP_LIMIT",
     "VICTORY_SHADER_LOOP_LIMIT_CS",
     "VICTORY_SHADER_OPT",
+    "VICTORY_SHADER_SWIZZLE_ZERO",
     "VICTORY_STRICT_JOINS",
+    "VICTORY_TITLE_VIEW_CLAMP",
     "VICTORY_WAVE_DEEP_SKIPS",
     "VICTORY_WAVE_LOCAL",
     "VICTORY_WAVE_OWN_BITS",
@@ -410,10 +451,8 @@ pub struct UserData {
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let part = crate::program_part(&c).ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let native = crate::native_programs(part)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -817,7 +856,7 @@ fn emit_program(
             .enumerate()
             .map(|(n, &w)| {
                 let mut s = StaticSampler::from_words(w);
-                if l.cmp_samplers >> n & 1 != 0 {
+                if l.cmp_samplers.get(n).copied().unwrap_or(false) {
                     s.filter |= 0x80;
                 }
                 s
@@ -926,9 +965,108 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 
 #[cfg(test)]
 mod tests {
+    /// A level query (`image_get_lod`) of a 2D array passes no array slice:
+    /// DXIL's `CalculateLOD` takes the spatial coordinates only and the
+    /// validator refuses a defined third one ("out of bound coord must be
+    /// undef"), whatever the program left in that register.
+    #[test]
+    fn a_level_query_of_an_array_takes_no_slice() {
+        use crate::native::{ResourceType, RootParam, UsedResource};
+        let mut words = vec![
+            0xBE81_0380u32,
+            0xBE83_0380, // s1, s3 = 0 (upper halves of the tables)
+            0xF40C_0400,
+            0xFA00_0000, // 2D array SRV to s[16:23] from s[0:1]
+            0xF408_0601,
+            0xFA00_0000, // sampler to s[24:27] from s[2:3]
+        ];
+        for (reg, value) in [0.25f32, 0.5, 7.0].iter().enumerate() {
+            words.extend([0x7E00_02FF | ((reg as u32) << 17), value.to_bits()]);
+        }
+        words.extend([
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            // image_get_lod v[10:11], v[0:2], s[16:23], s[24:27] dmask:0x3 dim:2D_ARRAY
+            0xF000_0328 | (0x60 << 18),
+            0x00C4_0A00,
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xF800_180F,
+            0x0B0A_0B0A, // exp mrt0, v10, v11, v10, v11 done vm
+            0xBF81_0000,
+        ]);
+        let table = |slot, user_data| RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let range = |kind, words, slot, user_data| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: words,
+            user_data,
+            slot,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 12,
+            layout: vec![table(0, 0), table(1, 2)],
+            used: vec![range(ResourceType::Srv, 8, 0, 0), range(ResourceType::Sampler, 4, 1, 2)],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let osg1 = container::signature(&[target], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let _out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut _out.dxil.clone()).expect("the level query validates");
+        }
+    }
+
+    #[cfg(windows)]
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::{parse_compute_loop_limit, parse_loop_limit};
+
+    #[test]
+    fn the_swizzle_zero_switch_is_off_only_for_zero() {
+        let on = super::parse_swizzle_zero;
+        assert!(on(None));
+        assert!(!on(Some("0")));
+        assert!(!on(Some(" 0 ")));
+        assert!(on(Some("1")));
+        assert!(on(Some("on")));
+    }
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
@@ -968,6 +1106,7 @@ mod tests {
         }
     }
     use super::container::SigElement;
+    #[cfg(windows)]
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
@@ -1090,12 +1229,12 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
-        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let _out = emit(&c, &native, &p, &st, &io, &res).unwrap();
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
         ) {
-            v.validate(&mut out.dxil.clone()).unwrap();
+            v.validate(&mut _out.dxil.clone()).unwrap();
         }
     }
 
@@ -1655,7 +1794,7 @@ mod tests {
         let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
-        let l = super::lower::lower(&super::lower::Parts {
+        let _l = super::lower::lower(&super::lower::Parts {
             native: &native,
             p: &p,
             st: &st,
@@ -1667,7 +1806,8 @@ mod tests {
             mesh_stride: 0,
         })
         .unwrap();
-        let mut dxil = l.dxil;
+        #[cfg(windows)]
+        let mut dxil = _l.dxil;
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
@@ -1679,12 +1819,12 @@ mod tests {
             let cs = super::HostShader {
                 stage: super::HwStage::Cs,
                 dxil,
-                user_data: l.user_data,
+                user_data: _l.user_data,
                 samplers: Vec::new(),
                 static_samplers: Vec::new(),
-                root_cbvs: l.root_cbvs,
-                root_srvs: l.root_srvs,
-                root_uavs: l.root_uavs,
+                root_cbvs: _l.root_cbvs,
+                root_srvs: _l.root_srvs,
+                root_uavs: _l.root_uavs,
                 root_indexed_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -1937,6 +2077,46 @@ mod barycentric_tests {
         let rw: Vec<u8> = (0..2).map(|k| isg1[8 + 32 * k + 25]).collect();
         assert!(rw.contains(&0b110), "{rw:?}");
         validate(&shader);
+    }
+
+    /// A pixel shader's quad permutations read through quad operations (the
+    /// host quads are the console's, and helpers across a triangle edge have
+    /// values to give); a DPP8 whose lanes cross quads cannot.
+    #[test]
+    fn pixel_quad_swizzles_validate_and_dpp8_cannot_cross_quads() {
+        let [e0, e1] = exp_mrt0(3);
+        let swizzle = |instruction: [u32; 2]| {
+            let words = [
+                0xc808_0000, 0xc809_0001, // interpolate attr0.x into v2
+                instruction[0], instruction[1], e0, e1, 0xbf81_0000,
+            ];
+            pixel(&words, PERSP_CENTER)
+        };
+        for permutation in [0x00, 0x55, 0xaa, 0xff, 0xb1, 0x4e, 0x1b, 0xe4, 0x27] {
+            // ds_swizzle_b32 v3,v2 and v_mov_b32 v3,v2 quad_perm.
+            validate(&swizzle([0xd8d4_8000 | permutation, 0x0300_0002]).unwrap());
+            validate(&swizzle([0x7e06_02fa, 0xff00_0002 | permutation << 8]).unwrap());
+        }
+        // DPP8: different permutations in the two quads of an octet.
+        let selections = [3u32, 0, 2, 1, 4, 6, 5, 7];
+        let sel = selections.into_iter().enumerate().fold(0, |s, (i, n)| s | n << (3 * i));
+        let mov_dpp8 = |sel: u32| [0x7e06_02e9, (sel << 8) | 2];
+        validate(&swizzle(mov_dpp8(sel)).unwrap());
+        assert!(swizzle(mov_dpp8(sel ^ 4)).is_err(), "lane 0 now reads lane 7");
+    }
+
+    /// An exchange permutation (lane ^ 1, ^ 2, ^ 3) already names the lane
+    /// it reads: each two-bit group of the pattern is that lane (0xb1 lane 0
+    /// reads 1 and lane 2 reads 3; 0x4e is ^ 2; 0x1b is ^ 3), which is why
+    /// `quad_pick` reads the source as it finds it and must not XOR it again.
+    #[test]
+    fn an_exchange_pattern_names_its_lane() {
+        for p in [0xb1u8, 0x4e, 0x1b] {
+            for lane in 0..4u32 {
+                let read = u32::from(p >> (2 * lane)) & 3;
+                assert_eq!(read, lane ^ u32::from(p & 3), "{p:#04x}, lane {lane}");
+            }
+        }
     }
 
     /// Two kinds of barycentrics read directly: one element per mode.

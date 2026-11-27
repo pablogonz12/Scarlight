@@ -157,6 +157,21 @@ A gamepad works. Otherwise the keyboard acts as a pad while the title's window h
 | W A S D / I J K L | left / right stick |
 | Q / E, Z / C, F / H | shoulders, triggers, stick clicks |
 
+## Wine's shader compiler
+
+A few host passes are written in HLSL and compiled when the host starts: the indirect-argument
+clamp, the compare of copies in card memory, the depth-plane twins and the in-place probe. Wine's
+builtin `d3dcompiler_47` (vkd3d-shader) does not compile them as written: `RWByteAddressBuffer` has
+no `Load` (`E5005`), and it drops the `[RootSignature]` the shaders ask for. A failed compile costs
+that pass only, and the log says which: `no argument clamp: indirect execution dropped`, or card
+compares switched off.
+
+This build therefore compiles those shaders with DXC (`dxcompiler.dll`) and signs the container with
+`dxil.dll`; under Wine DXC is tried first. Keep `dxcompiler.dll` and `dxil.dll` next to
+`victory.exe` (the Windows SDK ships both), or name them with `VICTORY_DXC` / `VICTORY_DXIL`. With
+neither, `WINEDLLOVERRIDES=d3dcompiler_47=n,b` makes Wine use Microsoft's compiler from the prefix,
+which does compile them.
+
 ## Troubleshooting
 
 | Problem | Try |
@@ -185,6 +200,7 @@ Then point `EXE` in `play.sh` at `target/x86_64-pc-windows-msvc/diag/victory.exe
 |---|---|
 | `VICTORY_HOOKS=1` | Places the code patches the profile for this build lists (see [title profiles](title-profiles.md)). Nothing is patched without a profile, and a patch whose bytes do not match is skipped. `VICTORY_NO_WATCHDOG=1`, the old name, still works |
 | `VICTORY_ASYNC_WRITEBACK=1` | **Experimental**, off by default; has hung the title in our tests |
+| `VICTORY_WINE_EXIT=1` | Under Wine, a host driver compiler crash ends the process as Wine has it. By default it costs only the pipeline being made: its draws are dropped, the name is refused for the rest of the run, and another worker takes the lost one's place (a fault inside a Unix call never reaches a handler of ours; winevulkan's `ExitProcess` is pointed at ours) |
 | `VICTORY_LOG=info` | Normal per-frame log; `VICTORY_LOG=<target>=debug` for debug output from one area |
 | `VICTORY_LOG_FILE=<path>` | Appends the log to that file instead of stderr. A title Steam starts has no terminal, so its stderr goes nowhere; with this, `play.sh` leaves the log where you can read it (`Z:\home\you\victory.log` is the Linux path as Wine sees it). Without it the log stays on stderr |
 | `VICTORY_GPU_TIMING=1` | Diagnostics builds only: runs and waits for each command list on its own, and logs any list over 50 ms with its slowest commands. Serialising the submission changes what you measure; the per-frame copy statistics are logged without it |
@@ -206,6 +222,7 @@ detail to act on.
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | Diagnostics build only. Omits draws and dispatches, indirect ones included, whose pipeline has a listed 16-digit shader hash; the profile's `skip.shaders` is used when this is unset |
 | `VICTORY_SKIP_WAVE64=mesh,compute` | Diagnostics build only. Omits draws and dispatches whose pipeline has a 64-lane program in a listed stage (diagnostic on 32-lane hosts); the profile's `skip.stages` is used when this is unset |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | Stops translated shader loops after `n` iterations per lane instead of 2^20; a real loop longer than `n` is cut short too, so 32 is a diagnostic value and 256-1024 a safer probe |
+| `VICTORY_FSPX=0` | Leaves the console upscaler's `FSPX` images (`ACCC` parts, no `DXIL` part) refused, as when only a `DXIL` part was known; for telling a translated program from a raw one |
 | `VICTORY_SHADER_LOOP_LIMIT_CS=<n>` | Diagnostics build only. Sets that limit for compute programs alone (unset, they follow `VICTORY_SHADER_LOOP_LIMIT`); a low general limit also cuts genuine compute loops short, since a lane that reaches the limit leaves the program without its writes |
 | `VICTORY_D3D12_DEBUG=1` | Host D3D12 debug layer; `VICTORY_D3D12_GBV=1` adds GPU-based validation (slow) |
 | `VICTORY_D3D12_DRED=1` | On a GPU failure, logs the allocation hit and the commands in flight |

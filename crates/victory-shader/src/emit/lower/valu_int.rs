@@ -14,19 +14,33 @@ impl<'a> Lower<'a> {
             l.s.m.bin(c, Bin::And, x, k31)
         };
         Ok(match name {
-            "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_add_nc_u32" | "v_sub_nc_u32"
-            | "v_subrev_nc_u32" | "v_mul_lo_u32" => {
+            "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_mul_lo_u32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 let (op, a, b) = match name {
                     "v_and_b32" => (Bin::And, a, b),
                     "v_or_b32" => (Bin::Or, a, b),
                     "v_xor_b32" => (Bin::Xor, a, b),
-                    "v_add_nc_u32" => (Bin::Add, a, b),
-                    "v_sub_nc_u32" => (Bin::Sub, a, b),
-                    "v_subrev_nc_u32" => (Bin::Sub, b, a),
                     _ => (Bin::Mul, a, b),
                 };
                 self.s.m.bin(c, op, a, b)
+            }
+            "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32" => {
+                let (mut a, mut b) = (s(self, 0)?, s(self, 1)?);
+                if name == "v_subrev_nc_u32" {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                let add = name == "v_add_nc_u32";
+                let clamp = match &inst.fields {
+                    Fields::Valu(v) => v.clamp && crate::emit::switches::int_clamp(),
+                    _ => false,
+                };
+                if clamp {
+                    let (r, carry) = self.add_sub_carry(c, add, a, b, None);
+                    self.clamp_u32(c, add, r, carry)
+                } else {
+                    let op = if add { Bin::Add } else { Bin::Sub };
+                    self.s.m.bin(c, op, a, b)
+                }
             }
             "v_xnor_b32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
@@ -448,6 +462,38 @@ impl<'a> Lower<'a> {
                     .s
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 31, &[x]);
                 self.s.m.bin(c, Bin::Add, n, b)
+            }
+            "v_dot4_i32_i8" | "v_dot4_u32_u8" | "v_dot4c_i32_i8" => {
+                // The sum of the four byte products, plus an accumulator:
+                // source 2, or the destination (`c` form). It wraps unless
+                // clamped.
+                let Fields::Valu(v) = &inst.fields else {
+                    unreachable!()
+                };
+                if v.clamp || v.neg != 0 || v.neg_hi != 0 {
+                    return Err("modifiers on a dot product");
+                }
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let acc = if name == "v_dot4c_i32_i8" {
+                    let Some(Operand::Vector { reg, .. }) = v.dst else {
+                        return Err("an accumulator");
+                    };
+                    let acc = inst.read(Reg::V(reg)).ok_or("an accumulator")?;
+                    self.i32_of(acc)?
+                } else {
+                    s(self, 2)?
+                };
+                // Dot4AddI8Packed, Dot4AddU8Packed (SM 6.4).
+                let opcode = if name == "v_dot4_u32_u8" { 164 } else { 163 };
+                let i32t = self.s.t.i32;
+                self.s.op(
+                    c,
+                    "dot4AddPacked.i32",
+                    Attr::ReadNone,
+                    i32t,
+                    opcode,
+                    &[acc, a, b],
+                )
             }
             _ => return Err(name),
         })

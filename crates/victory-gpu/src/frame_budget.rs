@@ -130,7 +130,11 @@ pub(crate) fn say(
         return None;
     }
     *said = Some(now);
-    Some(line)
+    // What the same frame's calls and lock waits came to
+    // ([`crate::stall`]): the line that names a stall when the frame split
+    // only says "outside submissions". The counters are taken here, so the
+    // line says since the one before it.
+    Some(format!("{line}; {}", crate::stall::frame_summary()))
 }
 
 #[cfg(test)]
