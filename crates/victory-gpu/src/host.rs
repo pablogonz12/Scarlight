@@ -7433,6 +7433,9 @@ impl Meter {
         let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
         // Copies in the card's memory (`crate::shadow::cards`).
         let card = crate::shadow::card_stats();
+        // Where the copied bytes came from, and the copies that took the
+        // most (`crate::shadow::COPY_SOURCES`, `COPY_TOP`): always on.
+        let (sources, top) = crate::shadow::copy_sources();
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::slow_asks();
         // Over the same frames as the counts above.
@@ -7492,6 +7495,18 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            tracing::info!(
+                "copies per frame, by what put the bytes there: {:.1} MB in {} pages the copy had never taken, \
+                 {:.1} MB in {} pages the title wrote since their last copy, {:.1} MB in {} ranges no write watch \
+                 answered for (copied whole); the five copies that took the most: {}",
+                sources[0] as f64 / frames / 1e6,
+                sources[1] as f64 / frames,
+                sources[2] as f64 / frames / 1e6,
+                sources[3] as f64 / frames,
+                sources[4] as f64 / frames / 1e6,
+                sources[5] as f64 / frames,
+                crate::shadow::top_copies(&top)
+            );
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
