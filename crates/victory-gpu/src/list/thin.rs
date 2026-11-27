@@ -400,6 +400,12 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
+            if self.abandoned.load(Acquire) {
+                // A discarded list has never been submitted; releasing it
+                // also releases uploads and retained host resources.
+                drop(unsafe { Box::from_raw(inner.back as *mut List) });
+                return;
+            }
             #[cfg(test)]
             if inner.fake_back {
                 // SAFETY: the test backing was allocated above and is not pooled.
@@ -1264,6 +1270,18 @@ mod tests {
         let backs = submission.ready();
         assert_eq!(backs.len(), 1);
         assert_eq!(backs[0], good.thin.recording.as_ref().unwrap().back());
+    }
+
+    #[test]
+    fn discarded_backing_is_not_pooled_with_its_uploads() {
+        let recording = Recording::new(0);
+        let mut back = super::super::boxed(0, std::ptr::null(), true);
+        held(&back.uploads).push(vec![7; 128]);
+        let ptr = (&mut *back as *mut List) as usize;
+        held(&recording.inner).back = Box::into_raw(back) as usize;
+        recording.abandoned.store(true, Release);
+        drop(recording);
+        assert!(!held(&BACKS).contains(&ptr));
     }
 
     /// Nothing of a submission waits for a thread of ours that is not there:
