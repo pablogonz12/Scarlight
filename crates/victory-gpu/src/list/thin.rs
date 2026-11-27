@@ -174,8 +174,7 @@ impl Front {
         let schedule = {
             let mut inner = held(&recording.inner);
             if inner.failed {
-                free_uploads(&words);
-                give_back(vec![words]);
+                inner.failed_chunks.push(words);
                 return;
             }
             inner.chunks.push_back(words);
@@ -236,6 +235,8 @@ struct Inner {
     chunks: VecDeque<Vec<u64>>,
     /// Streams translated (commands may name places in them until the end).
     kept: Vec<Vec<u64>>,
+    /// Untranslated streams retain upload blocks until the recording is released.
+    failed_chunks: Vec<Vec<u64>>,
     /// It is among [`READY`] or being translated.
     scheduled: bool,
     /// A thread of ours is inside one of its streams now (what a discarded
@@ -318,7 +319,9 @@ impl Recording {
                     if !fail {
                         #[cfg(test)]
                         if inner.fake_back {
-                            inner.back = Box::into_raw(super::boxed(self.kind, std::ptr::null(), false)) as usize;
+                            // Keep test replays off a real device, even when one
+                            // has been initialized by another test.
+                            inner.back = Box::into_raw(super::boxed(self.kind, std::ptr::null(), true)) as usize;
                         } else {
                             inner.back = back_list(self.kind) as usize;
                         }
@@ -330,11 +333,10 @@ impl Recording {
                         // the device has failed, and is reported so). What
                         // was written down is not run, rather than run into
                         // a list that cannot be submitted.
-                        free_uploads(&chunk);
-                        for pending in &inner.chunks {
-                            free_uploads(pending);
+                        inner.failed_chunks.push(chunk);
+                        while let Some(pending) = inner.chunks.pop_front() {
+                            inner.failed_chunks.push(pending);
                         }
-                        inner.chunks.clear();
                         inner.failed = true;
                         inner.scheduled = false;
                         self.done.store(true, Release);
@@ -371,6 +373,10 @@ impl Recording {
 impl Drop for Recording {
     fn drop(&mut self) {
         let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
+        for chunk in &inner.failed_chunks {
+            free_uploads(chunk);
+        }
+        give_back(std::mem::take(&mut inner.failed_chunks));
         give_back(inner.chunks.drain(..).chain(std::mem::take(&mut inner.kept)).collect());
         if inner.back != 0 {
             if !inner.closed {
@@ -736,6 +742,9 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     }
     let front = front(this);
     if front.closed || front.recording.is_none() {
+        return std::ptr::null_mut();
+    }
+    if held(&front.recording.as_ref().unwrap().inner).failed {
         return std::ptr::null_mut();
     }
     let mut block = Upload(vec![0u8; len]);
@@ -1189,6 +1198,25 @@ mod tests {
         assert!(submitted(&[this]).backs().is_empty());
     }
 
+    #[test]
+    fn failed_backing_retains_uploads_until_recording_is_released() {
+        let mut list = test_list();
+        let this: This = (&mut *list as *mut List).cast();
+        let recording = list.thin.recording.clone().unwrap();
+        held(&recording.inner).fail_allocations = 1;
+        let ptr = allocate_upload(this, 128, 16);
+        assert!(!ptr.is_null());
+        list.thin.hand_over();
+        recording.run();
+        assert_eq!(held(&recording.inner).failed_chunks.len(), 1);
+        // The caller may still write until reset, even after backing failure.
+        unsafe { ptr.write(42) };
+        assert_eq!(unsafe { ptr.read() }, 42);
+        assert!(allocate_upload(this, 128, 16).is_null());
+        list.thin.leave();
+        assert_eq!(held(&recording.inner).failed_chunks.len(), 1);
+    }
+
     /// How many records a stream holds (a call each).
     fn records(stream: &[u64]) -> u64 {
         let (mut i, mut calls) = (0, 0);
@@ -1224,6 +1252,8 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("a submission waited for a translation no thread of ours would do");
         assert_eq!(backs, (1, true));
+        let backing = held(&list.thin.recording.as_ref().unwrap().inner).back as This;
+        assert!(super::super::host_list(backing).is_none(), "the test backing must not record on a device");
         assert!(held(&list.thin.recording.as_ref().unwrap().inner).replays > 0);
         let chunks = held(&list.thin.recording.as_ref().expect("a recording").inner).chunks.len();
         assert_eq!(chunks, 0, "what it wrote down was translated");
