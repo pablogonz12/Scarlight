@@ -148,6 +148,8 @@ pub(crate) struct HostHeap {
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
     /// buffers from the whole heap.
     buffers: Mutex<std::collections::BTreeSet<u32>>,
+    /// Written buffer views awaiting their first host descriptor.
+    pending_buffers: Mutex<std::collections::BTreeSet<u32>>,
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
     changed: Mutex<std::collections::HashSet<u32>>,
@@ -825,6 +827,7 @@ impl HostHeap {
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Mutex::default(),
+            pending_buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
             tabled: (0..if sampler { 0 } else { count })
@@ -1189,7 +1192,8 @@ impl HostHeap {
     /// The title slots that hold buffer views.
     pub(crate) fn buffer_slots(&self) -> Vec<u32> {
         let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        buffers.iter().copied().collect()
+        let pending = self.pending_buffers.lock().unwrap_or_else(|e| e.into_inner());
+        buffers.union(&pending).copied().collect()
     }
 
     /// The title slots whose buffer view was written, or went, since the
@@ -1211,6 +1215,7 @@ impl HostHeap {
         if self.sampler {
             return Vec::new();
         }
+        self.pending_buffers.lock().unwrap_or_else(|e| e.into_inner()).remove(&index);
         // Measured for the texture side of the same gap (textures a shader
         // picks by a computed index are neither made, if placed, nor
         // uploaded): slots written with a placed texture view, and with a
@@ -1649,6 +1654,19 @@ impl HostHeap {
                 super::wait_for(texture, handle);
             }
             let later = !for_draw && (view.is_buffer() || waiting.is_some());
+            if later {
+                // Discovery is separate from published descriptor metadata:
+                // the sweep must still find a buffer whose first view waits.
+                let mut pending = self.pending_buffers.lock().unwrap_or_else(|e| e.into_inner());
+                if view_stride(&view).is_some() {
+                    pending.insert(index);
+                    self.changed.lock().unwrap_or_else(|e| e.into_inner()).insert(index);
+                } else {
+                    pending.remove(&index);
+                }
+                drop(pending);
+                self.queue_texture(index, is_texture_view(&view), false, crate::frame::current());
+            }
             // Another view of the placed texture the slot shows already (a
             // title that streams a texture in writes its view again with
             // more mips each time some arrive): the slot goes on showing
@@ -1711,6 +1729,12 @@ impl HostHeap {
                     if !self.sampler {
                         null_for(&view, self.cpu(index));
                     }
+                    let _ = self.note_buffer(index, None, false);
+                    if view_stride(&view).is_some() {
+                        self.pending_buffers.lock().unwrap_or_else(|e| e.into_inner()).insert(index);
+                        self.changed.lock().unwrap_or_else(|e| e.into_inner()).insert(index);
+                    }
+                    self.queue_texture(index, is_texture_view(&view), false, crate::frame::current());
                     self.keep(index, None);
                 }
             }
@@ -3297,6 +3321,10 @@ mod tests {
             record[..3].copy_from_slice(&[super::super::VIEW_TAG, i, generation]);
         };
         write(&mut record, 16);
+        heap.mirror_as(0, handle, false, false, false);
+        assert_eq!(heap.made_key(0), 0);
+        assert_eq!(stride(), 0);
+        assert_eq!(heap.buffer_slots(), [0], "the sweep can discover a waiting buffer");
         heap.mirror_as(0, handle, true, true, false);
         let old = heap.made_key(0);
         assert_ne!(old, 0);
