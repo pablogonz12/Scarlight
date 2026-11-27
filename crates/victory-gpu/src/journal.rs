@@ -112,6 +112,8 @@ fn insert(pages: impl Iterator<Item = usize>, now: u64) {
     let n = shards();
     let mut held: Option<(usize, RwLockWriteGuard<'static, Pages>)> = None;
     for page in pages {
+        #[cfg(test)]
+        RECORDS.with(|n| n.set(n.get() + 1));
         let s = shard(page, n);
         if held.as_ref().map(|h| h.0) != Some(s) {
             held = Some((s, writing(s)));
@@ -222,13 +224,21 @@ pub(crate) fn kernel_asks() -> usize {
     KERNEL_ASKED.with(|n| n.get())
 }
 
-/// The pages recorded, all shards: what a test proves the bench fired with.
 #[cfg(test)]
-pub(crate) fn recorded() -> usize {
-    (0..shards()).map(|s| reading(s).written.len()).sum()
+thread_local! {
+    /// Pages this thread's records inserted: what a test proves the bench
+    /// fired with, whatever another test does to the shards meanwhile.
+    static RECORDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Forgets every page in every shard.
+/// The pages this thread's records inserted so far.
+#[cfg(test)]
+pub(crate) fn records() -> usize {
+    RECORDS.with(|n| n.get())
+}
+
+/// Forgets every page in every shard: a test of `watch` that starts from a
+/// journal of its own.
 #[cfg(test)]
 pub(crate) fn clear() {
     for s in 0..shards() {
@@ -260,7 +270,6 @@ mod tests {
         assert_eq!(pages(a, b + 1), vec![(a, 7), (b, 9)]);
         assert!(any_since(a, b + 1, 8));
         assert!(!any_since(a, a + 1, 8), "the first page was written before");
-        clear();
     }
 
     /// Two threads journaling pages of different regions do not block each
@@ -308,7 +317,6 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("released, the record of the held shard finishes");
         same.join().unwrap();
-        clear();
     }
 
     /// Threads journaling pages of regions of their own all finish, and every
@@ -322,22 +330,22 @@ mod tests {
             let tx = tx.clone();
             std::thread::spawn(move || {
                 let first = base + t * 8 * STRIPE;
+                let before = records();
                 for i in 0..500 {
                     record(first + i % (4 * STRIPE), first + i % (4 * STRIPE) + 1, 1);
                 }
-                tx.send(()).unwrap();
+                // The thread's own count: a test of `watch` clearing the
+                // journal beside this one must not read as a record lost.
+                tx.send((t, records() - before)).unwrap();
             });
         }
         drop(tx);
         for _ in 0..8 {
-            rx.recv_timeout(Duration::from_secs(60))
+            let (t, made) = rx
+                .recv_timeout(Duration::from_secs(60))
                 .expect("every thread of records finishes");
+            assert_eq!(made, 500, "thread {t} made {made} records");
         }
-        for t in 0..8 {
-            let first = base + t * 8 * STRIPE;
-            assert_eq!(pages(first, first + 4 * STRIPE).len(), 4 * STRIPE, "thread {t}'s pages");
-        }
-        clear();
     }
 
     /// What a record costs: [`record`] of one page, alone and on eight
@@ -368,29 +376,36 @@ mod tests {
             }
             started.elapsed().as_nanos() as f64 / OPS as f64
         };
+        // The records a run made: a thread's own count, so a test running
+        // beside this one cannot be counted as a record of the bench.
         let eight = |f: &(dyn Fn(usize, usize) + Sync)| {
+            let (tx, rx) = std::sync::mpsc::channel();
             let started = Instant::now();
             std::thread::scope(|s| {
                 for t in 0..8 {
+                    let tx = tx.clone();
                     s.spawn(move || {
+                        let before = records();
                         for i in 0..OPS / 8 {
                             f(t, i);
                         }
+                        tx.send(records() - before).unwrap();
                     });
                 }
             });
-            started.elapsed().as_nanos() as f64 / OPS as f64
+            let ns = started.elapsed().as_nanos() as f64 / OPS as f64;
+            (ns, rx.iter().sum::<usize>())
         };
-        let (w1, w8, r1, r8) = (alone(&bump), eight(&bump), alone(&question), eight(&question));
-        // Whether the bench fired at all: the pages it recorded are there,
-        // one per op of each run.
-        let seen = recorded();
-        assert_eq!(pages(WRITES, WRITES + 8 * (1 << 20)).len(), OPS, "nothing was recorded");
-        assert_eq!(
-            pages(WRITES + ALONE * (1 << 20), WRITES + (ALONE + 1) * (1 << 20)).len(),
-            OPS,
-            "nothing was recorded alone"
-        );
+        let before = records();
+        let w1 = alone(&bump);
+        let made_alone = records() - before;
+        let (w8, made_eight) = eight(&bump);
+        let r1 = alone(&question);
+        let (r8, _) = eight(&question);
+        let seen = made_alone + made_eight;
+        // Whether the bench fired at all: this thread's records reached the
+        // shards, one page an op, for both runs.
+        assert_eq!(seen, 2 * OPS, "the bench recorded {seen} pages, not {}", 2 * OPS);
         eprintln!(
             "journal: {n} shards, {OPS} ops — record (one page): {w1:.1} ns alone, {w8:.1} ns on 8 \
              threads; question (any_since, one page): {r1:.1} ns alone, {r8:.1} ns on 8; {seen} \
@@ -404,7 +419,7 @@ mod tests {
         // pages every frame, ten frames deep.
         const FRAME: usize = 10_000;
         const FRAMES: usize = 10;
-        clear();
+        let before = records();
         let started = Instant::now();
         for _ in 0..FRAMES {
             for i in 0..FRAME {
@@ -412,12 +427,11 @@ mod tests {
             }
         }
         let per = started.elapsed().as_micros() as f64 / FRAMES as f64;
-        let fired = pages(FRAME, 2 * FRAME).len();
-        assert_eq!(fired, FRAME, "the frame's records were not journalled");
+        let fired = records() - before;
+        assert_eq!(fired, FRAME * FRAMES, "the frame's records were not journalled");
         eprintln!(
-            "journal: a frame of {FRAME} records — {per:.1} us a frame, {fired} pages in the \
-             journal of it"
+            "journal: a frame of {FRAME} records — {per:.1} us a frame, {fired} pages journalled \
+             in {FRAMES} frames"
         );
-        clear();
     }
 }
