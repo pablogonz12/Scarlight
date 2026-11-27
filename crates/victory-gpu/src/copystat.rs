@@ -201,9 +201,18 @@ impl ThreadCounters {
 }
 
 static BUFFER_CREATES: [ThreadCounters; 3] = [const { ThreadCounters::new() }; 3];
+static CARD_RECORDING: [ThreadCounters; 2] = [const { ThreadCounters::new() }; 2];
+static CARD_PIECES: [[AtomicU64; 2]; 2] = [const { [const { AtomicU64::new(0) }; 2] }; 2];
 
 pub(crate) fn buffer_created(kind: usize, started: std::time::Instant) {
     BUFFER_CREATES[kind].record_current(started.elapsed().as_nanos() as u64);
+}
+
+/// CPU time recording each dispatch, not GPU execution time.
+pub(crate) fn card_pass(kind: usize, pieces: u32, started: std::time::Instant) {
+    let submitting = SUBMITTING_THREAD.with(|marked| marked.get());
+    CARD_RECORDING[kind].record(submitting, started.elapsed().as_nanos() as u64);
+    CARD_PIECES[kind][usize::from(!submitting)].fetch_add(u64::from(pieces), Relaxed);
 }
 
 #[cfg(test)]
@@ -1158,6 +1167,15 @@ pub(crate) fn log(frames: f64) {
             "buffer create {name} per frame: submit {:.1} {:.3} ms; other {:.1} {:.3} ms (committed creation including implicit residency)",
             submit as f64 / frames, submit_ns as f64 / 1e6 / frames,
             other as f64 / frames, other_ns as f64 / 1e6 / frames
+        );
+    }
+    for (kind, name) in ["hash", "compare"].into_iter().enumerate() {
+        let [submit, submit_ns, other, other_ns] = CARD_RECORDING[kind].take();
+        let pieces = CARD_PIECES[kind].each_ref().map(|p| p.swap(0, Relaxed) as f64 / frames);
+        tracing::info!(
+            "card {name} dispatch recording per frame: submit {:.1} passes {:.1} pieces {:.3} ms; other {:.1} passes {:.1} pieces {:.3} ms",
+            submit as f64 / frames, pieces[0], submit_ns as f64 / 1e6 / frames,
+            other as f64 / frames, pieces[1], other_ns as f64 / 1e6 / frames
         );
     }
     let counted = COUNT[C::Frames as usize].swap(0, Relaxed);

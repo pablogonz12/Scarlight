@@ -3792,9 +3792,13 @@ impl Host {
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
+                            #[cfg(feature = "diagnostics")]
+                            let started = std::time::Instant::now();
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                             list.Dispatch(card_compare_groups(run.pieces, card_hash_wide()), 1, 1);
+                            #[cfg(feature = "diagnostics")]
+                            crate::copystat::card_pass(0, run.pieces, started);
                         }
                     }
                     list.Close()?;
@@ -3875,11 +3879,15 @@ impl Host {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
+                        #[cfg(feature = "diagnostics")]
+                        let started = std::time::Instant::now();
                         let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         list.Dispatch(card_compare_groups(r.span.pieces, card_hash_wide()), 1, 1);
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::card_pass(1, r.span.pieces, started);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
