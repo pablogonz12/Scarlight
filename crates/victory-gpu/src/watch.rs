@@ -1462,6 +1462,7 @@ fn install() {
         // Both answers under the block's one shard lock: another thread
         // cannot open it and a copy guard it again between them.
         if crate::guards::open_block(at, || writable_now(at)) {
+            crate::linux_dirty::note_guard_fault();
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             EXCEPTION_CONTINUE_EXECUTION

@@ -1,5 +1,6 @@
 //! Experimental section-view dirty tracking. Unrecognized ranges retain guards.
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::System::Memory::{
@@ -8,6 +9,11 @@ use windows_sys::Win32::System::Memory::{
 
 const BLOCK: usize = crate::watch::PAGE;
 const PAGE: usize = 4096;
+static GUARD_FAULTS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn note_guard_fault() {
+    GUARD_FAULTS.fetch_add(1, Ordering::Relaxed);
+}
 
 struct State {
     gadget: usize,
@@ -17,7 +23,7 @@ struct State {
     scans: u64,
     micros: u128,
     pages: u64,
-    fallbacks: [u64; 3],
+    fallbacks: [u64; 6],
     last_log: Instant,
 }
 
@@ -111,7 +117,7 @@ fn state() -> &'static Mutex<Option<State>> {
                     scans: 0,
                     micros: 0,
                     pages: 0,
-                    fallbacks: [0; 3],
+                    fallbacks: [0; 6],
                     last_log: Instant::now(),
                 })
             }
@@ -154,15 +160,20 @@ impl State {
             scans = self.scans,
             us = self.micros as u64,
             pages = self.pages,
+            guard_faults = GUARD_FAULTS.swap(0, Ordering::Relaxed),
             alias = self.fallbacks[0],
-            range = self.fallbacks[1],
+            range = self.fallbacks[1] + self.fallbacks[3] + self.fallbacks[4] + self.fallbacks[5],
+            range_alignment = self.fallbacks[1],
+            range_guarded = self.fallbacks[3],
+            range_query = self.fallbacks[4],
+            range_crosses_region = self.fallbacks[5],
             error = self.fallbacks[2],
             "linux dirty"
         );
         self.scans = 0;
         self.micros = 0;
         self.pages = 0;
-        self.fallbacks = [0; 3];
+        self.fallbacks = [0; 6];
         self.last_log = Instant::now();
     }
 }
@@ -192,6 +203,7 @@ pub(crate) fn ask(start: usize, end: usize) -> Option<Vec<usize>> {
                     scans = 0,
                     us = 0,
                     pages = 0,
+                    guard_faults = GUARD_FAULTS.swap(0, Ordering::Relaxed),
                     initialization = failed.1,
                     "linux dirty"
                 );
@@ -214,7 +226,7 @@ pub(crate) fn ask(start: usize, end: usize) -> Option<Vec<usize>> {
     if s.ranges.get(&start).copied() != Some(end) {
         s.forget(start, end);
         if crate::guards::any_protected(start / BLOCK, end / BLOCK) {
-            s.fallbacks[1] += 1;
+            s.fallbacks[3] += 1;
             return None;
         }
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -223,9 +235,12 @@ pub(crate) fn ask(start: usize, end: usize) -> Option<Vec<usize>> {
             || info.State != MEM_COMMIT
             || info.Type != MEM_MAPPED
             || info.Protect != PAGE_READWRITE
-            || (info.BaseAddress as usize).saturating_add(info.RegionSize) < end
         {
-            s.fallbacks[1] += 1;
+            s.fallbacks[4] += 1;
+            return None;
+        }
+        if (info.BaseAddress as usize).saturating_add(info.RegionSize) < end {
+            s.fallbacks[5] += 1;
             return None;
         }
         let mut reg = [start as u64, (end - start) as u64, 2, 0];
