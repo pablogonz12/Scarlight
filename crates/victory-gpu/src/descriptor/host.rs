@@ -1640,14 +1640,6 @@ impl HostHeap {
         // though its descriptor did not change: bindless draws never write
         // the slot again, so nothing else would widen it (#672).
         if made[index as usize] != key || self.widen_due(index) {
-            // Views of other textures in the memory this one describes
-            // are stale: their host slots read nothing from here on, and
-            // let go of the host copies they held.
-            for stale in self.note_buffer(index, Some(&view), for_draw) {
-                if stale != index {
-                    self.unmake(&mut made, stale);
-                }
-            }
             // A view of a texture object that has no host copy yet waits
             // for it, as buffer views wait for a draw: the slot is made
             // when the texture is first used (`super::make_waiting`), or
@@ -1694,6 +1686,12 @@ impl HostHeap {
                     return Some(view);
                 }
                 Make::Made(kept) => {
+                    // Publish metadata only with the descriptor it describes.
+                    for stale in self.note_buffer(index, Some(&view), for_draw) {
+                        if stale != index {
+                            self.unmake(&mut made, stale);
+                        }
+                    }
                     made[index as usize] = key;
                     self.made_fast[index as usize]
                         .store(key, std::sync::atomic::Ordering::Release);
@@ -2696,6 +2694,11 @@ enum Make {
     Deferred(u64),
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_BORN_AFTER: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 /// [`make`], or [`Make::Deferred`] when `max_born` is `Some(finished)` and
 /// the host resource `view` shows was allocated after that submission.
 fn make_checked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, max_born: Option<u64>) -> Make {
@@ -2706,6 +2709,8 @@ fn make_checked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, max_born: Option<u
         prepare(view);
     }
     let born_after = view_born_after(view);
+    #[cfg(test)]
+    let born_after = TEST_BORN_AFTER.with(|value| value.get().unwrap_or(born_after));
     if must_defer(born_after, max_born) {
         return Make::Deferred(born_after);
     }
@@ -3235,7 +3240,7 @@ mod tests {
         let memory = vec![0u8; 0x1000];
         let start = memory.as_ptr() as u64;
         let address = start + (256 - start % 256) % 256 + 256;
-        crate::shadow::register(usize::MAX, start, 0x1000);
+        crate::shadow::register(usize::MAX, start, 0x1000, false);
         let Some(shadow) = crate::shadow::find(address, 16) else {
             return; // no host copy
         };
@@ -3267,6 +3272,55 @@ mod tests {
         assert_eq!(heap.flush_deferred(5), 0, "published once");
     }
 
+    #[test]
+    fn deferred_structured_replacement_publishes_its_metadata_with_the_view() {
+        let _once = crate::warptest::lock();
+        let Some(_host) = host() else { return };
+        let memory = vec![0u8; 0x1000];
+        let start = memory.as_ptr() as u64;
+        crate::shadow::register(usize::MAX, start, 0x1000, false);
+        let Some(heap) = HostHeap::new(false, 4) else { return };
+        let Some((_, _, stride_data)) = &heap.strides else { return };
+        let stride = || unsafe { (*stride_data as *const u32).read_volatile() };
+        let mut record = [0u32; 4];
+        let handle = record.as_mut_ptr() as u64;
+        let write = |record: &mut [u32; 4], width: u32| {
+            let resource = [1, 0, 0, 0, 0x1000, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            let mut desc = [0u32; 16];
+            desc[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+            desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            desc[6] = 4;
+            desc[7] = width;
+            desc[10] = start as u32;
+            desc[11] = (start >> 32) as u32;
+            let [i, generation] = super::super::words_for(View::Placed(false, resource, desc));
+            record[..3].copy_from_slice(&[super::super::VIEW_TAG, i, generation]);
+        };
+        write(&mut record, 16);
+        heap.mirror_as(0, handle, true, true, false);
+        let old = heap.made_key(0);
+        assert_ne!(old, 0);
+        assert_eq!(stride(), 16);
+        assert_eq!(heap.buffer_slots(), [0]);
+        TEST_BORN_AFTER.with(|value| value.set(Some(u64::MAX)));
+        write(&mut record, 32);
+        heap.mirror_as(0, handle, true, true, true);
+        assert_eq!(heap.made_key(0), old);
+        assert_eq!(stride(), 16);
+        assert_eq!(heap.buffer_slots(), [0]);
+        // The title replaces the queued view before it becomes ready.
+        write(&mut record, 64);
+        heap.mirror_as(0, handle, true, true, true);
+        assert_eq!(heap.made_key(0), old);
+        assert_eq!(stride(), 16);
+        assert_eq!(heap.flush_deferred(u64::MAX - 1), 0);
+        TEST_BORN_AFTER.with(|value| value.set(None));
+        assert_eq!(heap.flush_deferred(u64::MAX), 1);
+        assert_ne!(heap.made_key(0), old);
+        assert_eq!(stride(), 64);
+        assert_eq!(heap.buffer_slots(), [0]);
+    }
+
     /// A buffer view the host refuses is left null and counted, once per
     /// refusal, for the frame line: the slot is never used.
     #[test]
@@ -3277,7 +3331,7 @@ mod tests {
         };
         let memory = vec![0u8; 0x1000];
         let start = memory.as_ptr() as u64;
-        crate::shadow::register(usize::MAX, start, 0x1000);
+        crate::shadow::register(usize::MAX, start, 0x1000, false);
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };

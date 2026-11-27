@@ -943,6 +943,7 @@ mod tests {
 
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
+        let _journal = crate::watch::journal_test_lock();
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 5 << 16;
         // SAFETY: we reserve a private region, commit selected pages inside it,
@@ -978,6 +979,7 @@ mod tests {
 
     #[test]
     fn a_read_only_title_destination_is_written_through_the_kernel() {
+        let _journal = crate::watch::journal_test_lock();
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 2 << 16;
         // SAFETY: a private region committed whole, accessed directly.
@@ -1040,6 +1042,7 @@ mod tests {
 
     #[test]
     fn a_copy_of_title_memory_the_layer_has_seen_goes_at_the_bytes() {
+        let _journal = crate::watch::journal_test_lock();
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 2 << 16;
         // SAFETY: a private region committed whole, accessed directly.
@@ -6573,7 +6576,13 @@ mod wide_refresh_tests {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// One entry per copy, and the runs of title memory it took this
+    /// submission: the ranges themselves, not the span that covers them.
+    /// The heap's ready list records thousands of small copies of the same
+    /// few buffers; one span per copy made every refresh ask the kernel,
+    /// and read the title, over the gaps between them (a 4 MiB window
+    /// asked for 8 KiB of vertices: [`refresh_runs`]).
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
     /// Where each copy (by address) is in `refreshes`: the list that makes
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
@@ -6589,12 +6598,16 @@ impl Batch {
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         match self.index.get(&key) {
             Some(&at) => {
-                let r = &mut self.refreshes[at];
-                (r.1, r.2) = (r.1.min(address), r.2.max(end));
+                let runs = &mut self.refreshes[at].1;
+                if crate::refresh_runs::on() {
+                    crate::refresh_runs::add(runs, address, end);
+                } else if let Some(r) = runs.first_mut() {
+                    (r.0, r.1) = (r.0.min(address), r.1.max(end));
+                }
             }
             None => {
                 self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), vec![(address, end)]));
             }
         }
     }
@@ -6605,12 +6618,14 @@ impl Batch {
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
-        let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let (shadow, runs) = self.refreshes.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
+        for (from, to) in runs {
+            Self::update(&shadow, from, to);
+        }
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
@@ -6648,7 +6663,7 @@ impl Batch {
                 .refreshes
                 .iter()
                 .filter(|r| !r.0.unwatched())
-                .map(|r| (r.1, r.2))
+                .flat_map(|r| r.1.iter().copied())
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -6658,17 +6673,21 @@ impl Batch {
         // where the check would have left them ([`crate::shadow::skip_clean`]).
         if crate::shadow::skip_clean() {
             let started = std::time::Instant::now();
-            self.refreshes.retain(|(shadow, from, to)| {
-                let clean = shadow.clean(*from, *to);
-                #[cfg(feature = "diagnostics")]
-                if clean {
-                    crate::copystat::add(crate::copystat::C::Skipped, 1);
-                    crate::copystat::add(crate::copystat::C::SkippedBytes, (to - from) as u64);
-                }
-                !clean
-            });
+            for (shadow, runs) in &mut self.refreshes {
+                runs.retain(|&(from, to)| {
+                    let clean = shadow.clean(from, to);
+                    #[cfg(feature = "diagnostics")]
+                    if clean {
+                        crate::copystat::add(crate::copystat::C::Skipped, 1);
+                        crate::copystat::add(crate::copystat::C::SkippedBytes, (to - from) as u64);
+                    }
+                    !clean
+                });
+            }
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
+        // A copy with nothing left to do is no job at all.
+        self.refreshes.retain(|r| !r.1.is_empty());
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
@@ -6678,14 +6697,22 @@ impl Batch {
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                .map(|(shadow, runs)| {
+                    Box::new(move || {
+                        for (from, to) in runs {
+                            Self::update(&shadow, from, to);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
                 .collect();
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
+            for (shadow, runs) in self.refreshes.drain(..) {
+                for (from, to) in runs {
+                    Self::update(&shadow, from, to);
+                }
             }
         }
         if ahead {
@@ -7351,9 +7378,10 @@ impl Meter {
         }
         self.counters = [0; 5];
         let dropped = crate::draw::take_dropped() as f64 / frames;
-        // Of those, the ones whose pipeline was refused (lost every frame)
-        // and those still being made (lost this one).
-        let [refused_per_frame, waiting_per_frame] =
+        // Of those, the ones whose pipeline was refused (lost every frame),
+        // those still being made (lost this one), and those skipped on
+        // purpose (not a pipeline gap at all).
+        let [refused_per_frame, waiting_per_frame, design_per_frame] =
             crate::pipeline::take_dropped_split().map(|count| count as f64 / frames);
         let indirect = crate::list::take_indirect() as f64 / frames;
         // What a shot's stats file says about this second of frames.
@@ -7363,7 +7391,7 @@ impl Meter {
              {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} ms on \
              the GPU; copying back {back_ms:.1} ms {back_mb:.1} MB), {draws:.0} draws/frame, \
              dropped {dropped:.0} without a host pipeline ({refused_per_frame:.0} refused, \
-             {waiting_per_frame:.0} waiting for one, {} being made), \
+             {waiting_per_frame:.0} waiting for one, {} being made, {design_per_frame:.0} by design), \
              {indirect:.0} indirect",
             crate::pipeline::making()
         ));
@@ -7455,6 +7483,9 @@ impl Meter {
         let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
         // Copies in the card's memory (`crate::shadow::cards`).
         let card = crate::shadow::card_stats();
+        // Where the copied bytes came from, and the copies that took the
+        // most (`crate::shadow::COPY_SOURCES`, `COPY_TOP`): always on.
+        let (sources, top) = crate::shadow::copy_sources();
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::slow_asks();
         // Over the same frames as the counts above.
@@ -7515,11 +7546,28 @@ impl Meter {
                 );
             }
             tracing::info!(
+                "copies per frame, by what put the bytes there: {:.1} MB in {} pages the copy had never taken, \
+                 {:.1} MB in {} pages the title wrote since their last copy, {:.1} MB in {} ranges no write watch \
+                 answered for (copied whole), then guarded; the card's copies: {} KiB floor, {} MB in {} copies, \
+                 {:.1} MB of them sent on to the card side; the five copies that took the most: {}",
+                sources[0] as f64 / frames / 1e6,
+                sources[1] as f64 / frames,
+                sources[2] as f64 / frames / 1e6,
+                sources[3] as f64 / frames,
+                sources[4] as f64 / frames / 1e6,
+                sources[5] as f64 / frames,
+                crate::shadow::card_floor_kb(),
+                card[8] >> 20,
+                card[7],
+                card[0] as f64 / frames / 1e6,
+                crate::shadow::top_copies(&top)
+            );
+            tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({refused_per_frame:.0} refused, \
-                 {waiting_per_frame:.0} waiting for one, {making} being made) and {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
+                 {waiting_per_frame:.0} waiting for one, {making} being made, {design_per_frame:.0} by design) and {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                  {picked_waiting} waiting, {picked_away} passed over unmapped ({picked_kept} kept what they showed); depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
@@ -7555,6 +7603,12 @@ impl Meter {
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
+                        *n as f64 / frames
+                    );
+                }
+                for (why, n) in crate::pipeline::take_design().iter().take(20) {
+                    tracing::info!(
+                        "dropped {:.1}/frame by design: {why}",
                         *n as f64 / frames
                     );
                 }

@@ -445,6 +445,10 @@ fn a_descriptor_selected_by_scc_picks_its_heap_index() {
 
 // Descriptor words read as numbers: kept in their own file (lower.rs is at the size limit).
 mod code_table;
+mod formats;
+mod singles;
+mod switches;
+mod widened_exec;
 mod desc_data;
 mod mad_u16_lerp;
 mod vop3p_dot;

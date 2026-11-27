@@ -71,13 +71,17 @@ fn offline(block: *mut AsyncBlock, what: &str) -> HRESULT {
 }
 /// The result functions of calls that failed: their status.
 extern "system" fn status(_: This, block: *mut AsyncBlock) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::status").enter(format_args!(""));
     xasync::XAsyncGetStatus(block, false)
 }
 
 extern "system" fn create_context(_: This, _user: *const c_void, out: *mut Handle) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::create_context").enter(format_args!(""));
     put(out, handle(&CONTEXT))
 }
-extern "system" fn close(_: This, _: Handle) {}
+extern "system" fn close(_: This, _: Handle) {
+    let _stall = victory_gpu::stall_site!("xstore::close").enter(format_args!(""));
+}
 
 extern "system" fn associated_products_async(
     _: This,
@@ -86,6 +90,7 @@ extern "system" fn associated_products_async(
     _per_page: u32,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::associated_products_async").enter(format_args!(""));
     offline(block, "associated products")
 }
 
@@ -97,6 +102,7 @@ extern "system" fn entitled_products_async(
     _per_page: u32,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::entitled_products_async").enter(format_args!(""));
     xasync::finished_with(
         block,
         (&raw const QUERY_CALL).cast(),
@@ -104,6 +110,7 @@ extern "system" fn entitled_products_async(
     )
 }
 extern "system" fn query_result(_: This, block: *mut AsyncBlock, out: *mut Handle) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::query_result").enter(format_args!(""));
     xasync::result(block, (&raw const QUERY_CALL).cast(), out)
 }
 /// Empty, so the callback never runs.
@@ -113,13 +120,16 @@ extern "system" fn enumerate_products(
     _: *mut c_void,
     _: *const c_void,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::enumerate_products").enter(format_args!(""));
     S_OK
 }
 extern "system" fn has_more_pages(_: This, _: Handle) -> bool {
+    let _stall = victory_gpu::stall_site!("xstore::has_more_pages").enter(format_args!(""));
     false
 }
 /// There is no next page to ask for.
 extern "system" fn next_page_async(_: This, _: Handle, block: *mut AsyncBlock) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::next_page_async").enter(format_args!(""));
     xasync::finished(block, (&raw const QUERY_CALL).cast(), E_ILLEGAL_METHOD_CALL)
 }
 
@@ -138,6 +148,7 @@ extern "system" fn license_for_package_async(
     package: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::license_for_package_async").enter(format_args!(""));
     let ours = text(package).is_some_and(|p| p == xpackage::identifier());
     license_for(ours, block)
 }
@@ -148,6 +159,7 @@ extern "system" fn license_for_durables_async(
     store_id: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::license_for_durables_async").enter(format_args!(""));
     tracing::debug!(
         store_id = text(store_id).unwrap_or_default(),
         "durable not owned"
@@ -155,9 +167,11 @@ extern "system" fn license_for_durables_async(
     license_for(false, block)
 }
 extern "system" fn license_result(_: This, block: *mut AsyncBlock, out: *mut Handle) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::license_result").enter(format_args!(""));
     xasync::result(block, (&raw const LICENSE_CALL).cast(), out)
 }
 extern "system" fn is_license_valid(_: This, license: Handle) -> bool {
+    let _stall = victory_gpu::stall_site!("xstore::is_license_valid").enter(format_args!(""));
     license == handle(&VALID)
 }
 
@@ -195,6 +209,7 @@ fn game_license() -> GameLicense {
 }
 
 extern "system" fn game_license_async(_: This, _: Handle, block: *mut AsyncBlock) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::game_license_async").enter(format_args!(""));
     let license = xasync::bytes(game_license());
     xasync::finished_with(block, (&raw const GAME_LICENSE).cast(), Ok(license))
 }
@@ -203,6 +218,7 @@ extern "system" fn game_license_result(
     block: *mut AsyncBlock,
     out: *mut GameLicense,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::game_license_result").enter(format_args!(""));
     xasync::result(block, (&raw const GAME_LICENSE).cast(), out)
 }
 
@@ -212,6 +228,7 @@ extern "system" fn consumable_balance_async(
     _store_id: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::consumable_balance_async").enter(format_args!(""));
     offline(block, "consumable balance")
 }
 extern "system" fn report_fulfillment_async(
@@ -222,6 +239,7 @@ extern "system" fn report_fulfillment_async(
     _tracking_id: *const c_void,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::report_fulfillment_async").enter(format_args!(""));
     offline(block, "consumable fulfillment")
 }
 /// Collections and purchase ids alike.
@@ -232,9 +250,11 @@ extern "system" fn user_id_async(
     _publisher_user_id: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::user_id_async").enter(format_args!(""));
     offline(block, "user store id")
 }
 extern "system" fn size_status(_: This, block: *mut AsyncBlock, _out: *mut usize) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::size_status").enter(format_args!(""));
     xasync::XAsyncGetStatus(block, false)
 }
 extern "system" fn string_status(
@@ -243,9 +263,11 @@ extern "system" fn string_status(
     _: usize,
     _: *mut c_char,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::string_status").enter(format_args!(""));
     xasync::XAsyncGetStatus(block, false)
 }
 extern "system" fn count_status(_: This, block: *mut AsyncBlock, _out: *mut u32) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::count_status").enter(format_args!(""));
     xasync::XAsyncGetStatus(block, false)
 }
 extern "system" fn array_status(
@@ -254,6 +276,7 @@ extern "system" fn array_status(
     _: u32,
     _: *mut c_void,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::array_status").enter(format_args!(""));
     xasync::XAsyncGetStatus(block, false)
 }
 
@@ -265,6 +288,7 @@ extern "system" fn purchase_ui_async(
     _json: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::purchase_ui_async").enter(format_args!(""));
     offline(block, "purchase page")
 }
 extern "system" fn product_page_ui_async(
@@ -273,6 +297,7 @@ extern "system" fn product_page_ui_async(
     _store_id: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::product_page_ui_async").enter(format_args!(""));
     offline(block, "product page")
 }
 extern "system" fn redeem_ui_async(
@@ -284,9 +309,11 @@ extern "system" fn redeem_ui_async(
     _disallow_csv: bool,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::redeem_ui_async").enter(format_args!(""));
     offline(block, "redeem page")
 }
 extern "system" fn updates_async(_: This, _: Handle, block: *mut AsyncBlock) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::updates_async").enter(format_args!(""));
     offline(block, "update check")
 }
 /// Installing updates or packages by id alike.
@@ -297,6 +324,7 @@ extern "system" fn install_async(
     _count: usize,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::install_async").enter(format_args!(""));
     offline(block, "package download")
 }
 
@@ -308,6 +336,7 @@ extern "system" fn package_identifier(
     size: usize,
     buffer: *mut u8,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::package_identifier").enter(format_args!(""));
     let title = runtime::title();
     match text(store_id) {
         Some(id) if !title.store_id.is_empty() && id == title.store_id => {
@@ -326,9 +355,11 @@ extern "system" fn register(
     _callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xstore::register").enter(format_args!(""));
     put(out, token())
 }
 extern "system" fn unregister(_: This, _: Handle, _token: u64, _wait: bool) -> bool {
+    let _stall = victory_gpu::stall_site!("xstore::unregister").enter(format_args!(""));
     true
 }
 
