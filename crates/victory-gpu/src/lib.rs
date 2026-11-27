@@ -40,6 +40,10 @@ mod declareonce;
 #[allow(dead_code)]
 #[cfg(windows)]
 mod arena;
+// Residents: title memory the card only reads, placed from an arena. Windows
+// only, as the arena and the in-place API it stands on (`notes/resident-on-arena.md`).
+#[cfg(windows)]
+mod resident;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -72,6 +76,10 @@ mod primitive;
 pub mod query;
 pub mod queue;
 mod reflection;
+// Host memory is read like the rest of `host` (`GlobalMemoryStatusEx`); the
+// Linux build tests other modules.
+#[cfg(windows)]
+mod residency;
 pub mod resource;
 #[cfg(any(windows, test))]
 mod scratchfill;

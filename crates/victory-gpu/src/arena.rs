@@ -52,7 +52,7 @@ const SAMPLE: usize = 64;
 /// default; off, nothing is opened and the runtime's reports are dropped.
 fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| switch(std::env::var("VICTORY_ARENA").ok().as_deref()))
+    *ON.get_or_init(|| switch(std::env::var("VICTORY_ARENA").ok().as_deref()) || crate::resident::on())
 }
 
 /// [`on`]'s answer for a value of `VICTORY_ARENA`. Only the exact value `1` is
@@ -172,7 +172,7 @@ enum Slot {
 
 /// The title's committed regions and the parts opened over them.
 #[derive(Default)]
-struct State {
+pub(crate) struct State {
     /// Committed private title memory by its start: bytes.
     regions: BTreeMap<u64, u64>,
     /// Parts by (start, bytes).
@@ -598,6 +598,9 @@ pub fn title_memory_released(at: usize, len: usize) {
     if !on() {
         return;
     }
+    // Nothing resident stays over it: the next ask proves the part again or
+    // is a copy (`crate::resident`).
+    crate::resident::changed(at as u64, len as u64);
     with(|state| state.released(at as u64, len as u64));
 }
 
