@@ -33,6 +33,7 @@ andrewpozdnakov7-jpg, Bebrik229 (the `shader-meta.bin` shader metadata cache, VI
 Code reimplemented here from a fork's pull request, because the fork's tree had diverged from ours;
 the design and the author are credited in the commit's `Co-authored-by:` and here.
 
+- **Marvisak/VIctory #1273** (Fuzeofficial) — the design for mirroring placed texture unordered-access views.
 - **Marvisak/VIctory #2401** (Mumogg) — the Wine `ExitProcess` hook that makes a host driver
   compiler crash cost one pipeline instead of the run ([`pipeline/wine.rs`](crates/victory-gpu/src/pipeline/wine.rs)),
   adapted to our pipeline workers and library.
