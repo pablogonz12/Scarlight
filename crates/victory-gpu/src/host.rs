@@ -1250,8 +1250,9 @@ mod tests {
             ];
             assert_eq!(super::coalesced_end(&pieces, 0), 1);
             let mut batch = super::Batch::default();
-            super::run_copies(&pieces[..1], &mut batch);
-            super::run_copies(&pieces[1..], &mut batch);
+            // Even if the caller classified this as one run before a remap,
+            // execution must recheck and preserve sequential aliasing.
+            super::run_copies(&pieces, &mut batch);
             assert_eq!((av as *const u8).add(16).read(), 73);
             assert_ne!(UnmapViewOfFile(a), 0);
             assert_ne!(UnmapViewOfFile(b), 0);
@@ -6831,10 +6832,16 @@ fn run_copies(pieces: &[Piece], batch: &mut Batch) {
         add(C::Copies, 1);
         add(C::CopyBytes, piece.len as u64);
     }
-    if pieces.len() > 1 {
+    // The earlier grouping is only a hint: mappings may have changed since
+    // then. Recheck while holding the remapping guard through the last write.
+    let reading = (pieces.len() > 1).then(crate::watch::title_memory_reading_now).flatten();
+    if reading.is_some() && coalesced_end(pieces, 0) == pieces.len() {
         read_pieces_together(pieces);
     } else {
-        copy_piece(pieces[0]);
+        drop(reading);
+        for piece in pieces {
+            copy_piece(*piece);
+        }
     }
     // The journal learns the writes (with the submission's one asking).
     for piece in pieces.iter().filter(|p| p.title_dst) {
