@@ -869,9 +869,12 @@ impl Lanes {
     /// path, right before Submit, so until then they name no page or a page
     /// that now holds something else (a local profile names the title's
     /// addresses). A status entry behind a held read waits with it, unless
-    /// the self-submission carries the status itself: a title that enqueued
-    /// one means to poll it, so those reads run now. Off, its default, a
-    /// self-submission moves them like any other command.
+    /// the self-submission carries a status itself: a title that enqueued
+    /// one means to poll it, so the reads up to and including the last one
+    /// run now; page reads after it keep waiting for the Submit, which is
+    /// the one place their page lists are sure to be the title's to fill.
+    /// Off, its default, a self-submission moves them like any other
+    /// command.
     fn submit_as(&mut self, id: u64, explicit: bool) -> usize {
         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
             return 0;
@@ -888,28 +891,27 @@ impl Lanes {
         let Some(lane) = self.lanes.get_mut(&id) else {
             return 0;
         };
-        // A self-submission that carries a status entry is a title that will
-        // poll it, so no Submit is guaranteed: its held reads run now, or
-        // the entry stays pending for ever (the loading-screen stall).
-        let polled = !explicit
-            && lane.held_reads
-            && lane
-                .held
-                .iter()
-                .chain(lane.unsubmitted.iter())
-                .any(|c| matches!(c, Command::Status(_)));
-        let explicit = explicit || !lane.held_reads || polled;
+        let explicit = explicit || !lane.held_reads;
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
-        let mut commands = if explicit { std::mem::take(&mut lane.held) } else { Vec::new() };
+        // A status entry means a title that polls it, and no Submit is
+        // guaranteed: the reads it waits on run now, or it stays pending for
+        // ever (the loading-screen stall). Reads after the last status keep
+        // waiting: nothing polls them yet, so their page lists may still be
+        // the title's to fill before its Submit.
+        let mut commands = std::mem::take(&mut lane.held);
         commands.append(&mut lane.unsubmitted);
+        let last_status = commands.iter().rposition(|c| matches!(c, Command::Status(_)));
         let mut reads = 0;
-        for command in commands {
+        for (index, command) in commands.into_iter().enumerate() {
             let hold = !explicit
                 && match &command {
-                    Command::Read(r, _) => r.options & PAGE_DESTINATION != 0,
-                    Command::Status(_) => !lane.held.is_empty(),
+                    Command::Read(r, _) => {
+                        r.options & PAGE_DESTINATION != 0
+                            && last_status.is_none_or(|last| index > last)
+                    }
+                    Command::Status(_) => false,
                 };
             if hold {
                 lane.held.push(command);
@@ -2667,6 +2669,37 @@ mod tests {
         assert!(!l.lanes[&0].statuses.is_empty());
         let _ = l.finish(&paged, Ok(()));
         assert!(l.lanes[&0].statuses.is_empty());
+    }
+
+    /// A status releases the reads it waits on and no others: page reads
+    /// enqueued after it keep holding until the Submit, whose page lists
+    /// they were held for.
+    #[test]
+    fn a_status_releases_only_the_reads_it_waits_on() {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64));
+        l.lanes.get_mut(&0).unwrap().held_reads = true;
+        let array = status_array(1).cast::<Instance<StatusArray>>();
+        read(&mut l, 0, PAGE_DESTINATION, 16); // before the status
+        read(&mut l, 0, 0, 16);
+        add_ref_instance(array);
+        l.lanes.get_mut(&0).unwrap().unsubmitted.push(Command::Status(Status { array, index: 0 }));
+        read(&mut l, 0, PAGE_DESTINATION, 16); // after the status
+        l.submit_as(0, false);
+        // The two reads before the status run; the one after it stays held.
+        let paged = l.start().unwrap();
+        assert_eq!(paged.request.options, PAGE_DESTINATION);
+        let plain = l.start().unwrap();
+        assert_eq!(plain.request.options, 0);
+        assert!(l.start().is_none());
+        assert_eq!(l.lanes[&0].held.len(), 1);
+        assert!(!l.lanes[&0].statuses.is_empty(), "the status is not held");
+        // Its two reads done, the status completes; the held read is not
+        // waited for and has no sequence number to wait on.
+        let _ = l.finish(&paged, Ok(()));
+        let _ = l.finish(&plain, Ok(()));
+        assert!(l.lanes[&0].statuses.is_empty());
+        assert_eq!(result(array.cast(), 0), S_OK);
     }
 
     /// With held reads on, a self-submission that carries a status entry
