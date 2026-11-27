@@ -96,15 +96,21 @@ fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 fn push(job: Job) {
+    let mut line = held(&LINE);
     if matches!(job, Job::Submit { .. }) {
         *held(&SUBMISSIONS) += 1;
     }
-    // Counted before it is in the line: a drain that reads the count and then
-    // waits must not miss a job it came after.
+    // Acceptance and insertion have the same order, including for drain.
     ACCEPTED.fetch_add(1, Relaxed);
     *held(&PENDING) += 1;
-    held(&LINE).push_back(job);
+    line.push_back(job);
+    drop(line);
     WORK.notify_one();
+}
+
+fn cutoff() -> u64 {
+    let _line = held(&LINE);
+    ACCEPTED.load(Relaxed)
 }
 
 /// Runs the oldest job there is: whether there was one.
@@ -235,7 +241,7 @@ pub(crate) fn drain() {
     }
     // Only what the line took before this call: work other threads submit
     // meanwhile is not what this waits for.
-    drain_to(ACCEPTED.load(Acquire));
+    drain_to(cutoff());
 }
 
 /// Waits until the jobs accepted up to `accepted` have run.
@@ -366,7 +372,7 @@ mod tests {
     fn a_drain_waits_only_for_what_it_came_after() {
         let _parked = park_the_line();
         push(Job::Work(Box::new(|| {})));
-        let up_to = ACCEPTED.load(Acquire);
+        let up_to = cutoff();
         push(Job::Work(Box::new(|| {})));
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -381,6 +387,25 @@ mod tests {
         rx.recv_timeout(std::time::Duration::from_secs(30))
             .expect("the drain waited for a job made after it");
         assert!(run_one(), "the second job runs");
+    }
+
+    #[test]
+    fn cutoff_cannot_pass_an_uninserted_job() {
+        let _parked = park_the_line();
+        let line = held(&LINE);
+        let before = ACCEPTED.load(Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            push(Job::Work(Box::new(|| {})));
+            tx.send(()).unwrap();
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(100)).is_err());
+        assert_eq!(ACCEPTED.load(Relaxed), before);
+        drop(line);
+        rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+        producer.join().unwrap();
+        assert_eq!(cutoff(), before + 1);
+        assert!(run_one());
     }
 
     /// A signal the line makes keeps the queue's identity: a wait the queue was
