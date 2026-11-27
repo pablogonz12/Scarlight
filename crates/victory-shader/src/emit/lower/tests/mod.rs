@@ -12,6 +12,39 @@ use crate::{io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
+#[test]
+fn early_depth_only_for_eligible_pixel_shaders() {
+    use super::super::container::SigElement;
+    let ps = |db_shader_control| StageIo::Ps {
+        inputs: vec![],
+        input_addr: 0,
+        db_shader_control,
+        patches: vec![],
+    };
+    let output = |kind| SigElement {
+        name: "output".into(),
+        index: 0,
+        kind,
+        comp: 9,
+        interp: 0,
+        row: None,
+        col: 0,
+        cols: 1,
+        usage: 1,
+        half: false,
+    };
+    assert!(super::early_depth(&ps(0x1450), &[]));
+    assert!(super::early_depth(&ps(0x1010), &[output(16)]));
+    assert!(!super::early_depth(&ps(0x450), &[]));
+    for bit in [0, 1, 2, 8] {
+        assert!(!super::early_depth(&ps(0x1000 | (1 << bit)), &[]));
+    }
+    for kind in [14, 17, 18, 19, 20] {
+        assert!(!super::early_depth(&ps(0x1050), &[output(kind)]));
+    }
+    assert!(!super::early_depth(&StageIo::None, &[]));
+}
+
 /// A same-target branch that closes a loop can be cut short exactly as a
 /// plain jump can (`VICTORY_BRANCH_SAME_ARMS`), so a barrier after it
 /// must not wait for the group.
