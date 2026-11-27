@@ -2825,6 +2825,27 @@ fn land() {
     }
 }
 
+/// Move settled-list resets off the submitting thread when requested.
+fn land_after_submission() {
+    static ASIDE: OnceLock<Option<std::sync::mpsc::Sender<()>>> = OnceLock::new();
+    let aside = ASIDE.get_or_init(|| {
+        if !std::env::var_os("VICTORY_LAND_ASIDE").is_some_and(|v| v == "1") {
+            return None;
+        }
+        let (send, asked) = std::sync::mpsc::channel::<()>();
+        std::thread::Builder::new().name("victory-land".to_owned()).spawn(move || {
+            while asked.recv().is_ok() {
+                while asked.try_recv().is_ok() {}
+                land();
+            }
+        }).ok().map(|_| send)
+    });
+    match aside {
+        Some(send) if send.send(()).is_ok() => {}
+        _ => land(),
+    }
+}
+
 /// The thread that settles the flights once the card has run them all
 /// ([`late`]): without it a bottom-of-pipe write would reach the title only
 /// at the next call that settles, and a title thread that polls such a
@@ -3739,6 +3760,8 @@ impl Host {
             // SAFETY: the list's last run finished (it ran ahead of a
             // submission that was waited for, and came back after that);
             // live buffers, and the ranges lie in them.
+            #[cfg(feature = "diagnostics")]
+            let list_started = std::time::Instant::now();
             let recorded = unsafe {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
@@ -3792,9 +3815,13 @@ impl Host {
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
+                            #[cfg(feature = "diagnostics")]
+                            let started = std::time::Instant::now();
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                             list.Dispatch(card_compare_groups(run.pieces, card_hash_wide()), 1, 1);
+                            #[cfg(feature = "diagnostics")]
+                            crate::copystat::card_pass(0, run.pieces, started);
                         }
                     }
                     list.Close()?;
@@ -3802,6 +3829,8 @@ impl Host {
                     Ok(())
                 })()
             };
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::card_list(0, list_started);
             if let Err(e) = recorded {
                 fail(format_args!("host copies in the card's memory could not be brought up to date ({e})"));
             }
@@ -3854,6 +3883,8 @@ impl Host {
             // SAFETY: the list's last run finished (its submission was
             // waited for, and it came back after that); live buffers; the
             // compare's own root signature.
+            #[cfg(feature = "diagnostics")]
+            let list_started = std::time::Instant::now();
             let recorded = unsafe {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
@@ -3875,17 +3906,23 @@ impl Host {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
+                        #[cfg(feature = "diagnostics")]
+                        let started = std::time::Instant::now();
                         let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         list.Dispatch(card_compare_groups(r.span.pieces, card_hash_wide()), 1, 1);
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::card_pass(1, r.span.pieces, started);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
                     list.cast()
                 })()
             };
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::card_list(1, list_started);
             match recorded {
                 Ok(list) => plan.check = Some(list),
                 Err(e) => fail(format_args!("the compare of host copies in the card's memory could not be recorded ({e})")),
@@ -4383,7 +4420,7 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        land();
+        land_after_submission();
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a
@@ -4489,7 +4526,10 @@ impl Host {
                             stood(waiting);
                             working(true);
                         }
-                        Err(e) => tracing::warn!(error = %e, "submissions sent ahead not waited for"),
+                        Err(e) => fail(format_args!("could not wait for submissions sent ahead: {e}")),
+                    }
+                    if self.fence.GetCompletedValue() < *submitted {
+                        fail(format_args!("the submission fence did not complete"));
                     }
                 }
                 let gpu = waiting.elapsed();
@@ -7111,6 +7151,8 @@ impl Host {
         };
         let mut buffer: Option<ID3D12Resource> = None;
         // SAFETY: plain creation of a read-back buffer.
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         let made = unsafe {
             self.device.CreateCommittedResource(
                 &heap,
@@ -7121,6 +7163,10 @@ impl Host {
                 &mut buffer,
             )
         };
+        #[cfg(feature = "diagnostics")]
+        if made.is_ok() {
+            crate::copystat::buffer_created(0, started);
+        }
         match made {
             Ok(()) => buffer,
             Err(e) => {
@@ -7153,6 +7199,8 @@ impl Host {
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
         // SAFETY: plain creation and mapping of an upload buffer.
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         let made = unsafe {
             self.device
                 .CreateCommittedResource(
@@ -7164,6 +7212,8 @@ impl Host {
                     &mut buffer,
                 )
                 .and_then(|()| {
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::buffer_created(1, started);
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
                     b.Map(0, None, Some(&mut data))
                 })
@@ -8168,6 +8218,8 @@ impl Host {
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
         // SAFETY: plain creation and mapping of a CPU-visible buffer.
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         let made = unsafe {
             self.device
                 .CreateCommittedResource(
@@ -8179,6 +8231,8 @@ impl Host {
                     &mut buffer,
                 )
                 .and_then(|()| {
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::buffer_created(2, started);
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
                     b.Map(0, None, Some(&mut data))
                 })
