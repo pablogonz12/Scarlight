@@ -56,6 +56,8 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   holes absent instead of a failing `VirtualProtect` and a `VirtualQuery` a block, and the copies' committed-byte
   counts skip the kernel too (`crates/victory-gpu/src/inplace.rs`, `guards.rs`, `VICTORY_PLACEHOLDER_FAST=0` off).
 
+- **brainbudt [VIctory #2796](https://github.com/Marvisak/VIctory/pull/2796)**, GPL-3.0: GFX10 instruction-start bitmap decoder.
+
 ## Design notes
 
 - **Belobug/VIctory-Belobug-AMD `84eae352a`** (local) — identified an indirect
