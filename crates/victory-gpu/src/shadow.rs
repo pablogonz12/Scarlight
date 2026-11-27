@@ -278,6 +278,68 @@ pub(crate) fn card_stats() -> [u64; 10] {
     out
 }
 
+/// Where a frame's copied bytes came from, always on (not `diagnostics`: a
+/// release run is where the volume has to be read). [0]/[1] bytes and pages
+/// a copy had never taken (its first pass over them), [2]/[3] bytes and
+/// pages the title wrote since their last copy, [4]/[5] bytes and ranges no
+/// write watch answered for (copied whole, every refresh, until something
+/// makes them watched).
+pub(crate) static COPY_SOURCES: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// The copies that took the most bytes since the last frame line, by the
+/// title address each holds: bytes, copy calls, the copy's length. Says
+/// whether one buffer is copied several times a frame: the same address
+/// with more bytes than its length is that.
+static COPY_TOP: Mutex<BTreeMap<u64, [u64; 3]>> = Mutex::new(BTreeMap::new());
+
+/// [`COPY_SOURCES`] and the five copies that took the most, taken together
+/// and once a frame; the counters start again for the next frame.
+pub(crate) fn copy_sources() -> ([u64; 6], Vec<(u64, u64, u64, u64)>) {
+    let mut counts = [0u64; 6];
+    for (i, c) in COPY_SOURCES.iter().enumerate() {
+        counts[i] = c.swap(0, Ordering::Relaxed);
+    }
+    let mut top: Vec<(u64, u64, u64, u64)> = {
+        let mut held = COPY_TOP.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *held).into_iter().map(|(start, [bytes, calls, len])| (start, bytes, calls, len)).collect()
+    };
+    top = largest(top);
+    (counts, top)
+}
+
+/// The five copies that took the most bytes, largest first.
+fn largest(mut top: Vec<(u64, u64, u64, u64)>) -> Vec<(u64, u64, u64, u64)> {
+    top.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
+    top.truncate(5);
+    top
+}
+
+/// A copy took `bytes` in `calls` copies: for the frame line's five largest.
+fn taken(start: u64, bytes: u64, calls: u64, len: u64) {
+    if bytes == 0 {
+        return;
+    }
+    let mut held = COPY_TOP.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = held.entry(start).or_insert([0, 0, len]);
+    entry[0] += bytes;
+    entry[1] += calls;
+    entry[2] = len;
+}
+
+/// The five copies that took the most, largest first, as the frame line
+/// prints them; `none` when nothing was copied.
+pub(crate) fn top_copies(top: &[(u64, u64, u64, u64)]) -> String {
+    if top.is_empty() {
+        return "none".to_string();
+    }
+    top.iter()
+        .map(|&(start, bytes, calls, len)| {
+            format!("{start:#x}+{len:#x} {:.1} MB in {} copies{}", bytes as f64 / 1e6, calls, if bytes > len { " (more than its length)" } else { "" })
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
 /// for each 64 KiB piece (a copy that does not start on a piece boundary
 /// has one piece more).
@@ -519,6 +581,29 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 #[cfg(test)]
 mod card_tests {
     use super::{CardSpan, PIECE, card_piece_of, card_span_of, hash_spans, joined, joined_piece_runs};
+
+    /// The frame line's five are the largest, largest first, and the line says
+    /// when a copy took more than its length (a copy taken more than once a
+    /// frame: the duplication the counters are for).
+    #[test]
+    fn the_five_largest_copies_are_named() {
+        let top = vec![
+            (0x1000, 900_000u64, 3u64, 0x400u64),
+            (0x2000, 2_000_000, 1, 0x800),
+            (0x3000, 100_000, 2, 0x100),
+            (0x4000, 5, 9, 0x10),
+            (0x5000, 1, 1, 0x10),
+            (0x6000, 40_000, 1, 0x10),
+        ];
+        let top = super::largest(top);
+        assert_eq!(top.len(), 5, "five are named");
+        assert_eq!(top[0].0, 0x2000, "the largest first");
+        let line = super::top_copies(&top);
+        assert!(line.starts_with("0x2000+0x800 2.0 MB in 1 copies"), "{line}");
+        assert!(line.contains("0x1000+0x400 0.9 MB in 3 copies (more than its length)"), "{line}");
+        assert!(line.contains("0x3000+0x100 0.1 MB in 2 copies"), "{line}");
+        assert_eq!(super::top_copies(&[]), "none");
+    }
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -2845,6 +2930,9 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self.copy(from, to);
+        COPY_SOURCES[4].fetch_add((to - from) as u64, Ordering::Relaxed);
+        COPY_SOURCES[5].fetch_add(1, Ordering::Relaxed);
+        taken(self.start, (to - from) as u64, 1, self.len);
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
@@ -2857,7 +2945,7 @@ impl Shadow {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
+        let (mut bytes, mut run, mut calls) = (0, None, 0);
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -2872,18 +2960,30 @@ impl Shadow {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                let in_range = ((page * PAGE).max(start), ((page + 1) * PAGE).min(end));
+                let n = in_range.1.saturating_sub(in_range.0) as u64;
+                if *at == 0 {
+                    COPY_SOURCES[0].fetch_add(n, Ordering::Relaxed);
+                    COPY_SOURCES[1].fetch_add(1, Ordering::Relaxed);
+                } else {
+                    COPY_SOURCES[2].fetch_add(n, Ordering::Relaxed);
+                    COPY_SOURCES[3].fetch_add(1, Ordering::Relaxed);
+                }
+                if in_range.0 >= from && in_range.1 <= to {
                     *at = now;
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
                 bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                calls += 1;
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
             bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            calls += 1;
         }
+        taken(self.start, bytes as u64, calls, self.len);
         bytes
     }
 
