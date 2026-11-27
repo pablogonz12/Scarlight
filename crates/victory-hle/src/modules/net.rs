@@ -31,6 +31,8 @@ use crate::{HleExport, HleModule, hle_export};
 const SOCKET_ERROR: i32 = -1;
 const INVALID_SOCKET: Socket = !0;
 const WSAEINVAL: i32 = 10022;
+const WSAEWOULDBLOCK: i32 = 10035;
+const WSAETIMEDOUT: i32 = 10060;
 const WSAEADDRNOTAVAIL: i32 = 10049;
 const WSAENETUNREACH: i32 = 10051;
 const WSASERVICE_NOT_FOUND: i32 = 10108;
@@ -315,7 +317,12 @@ pub extern "system" fn WSAConnectByList(
     if !list.is_null() {
         // SAFETY: the title passes a `SOCKET_ADDRESS_LIST`.
         let entries = unsafe {
-            let count = usize::try_from(list.cast::<i32>().read()).unwrap_or(0);
+            let count = list.cast::<i32>().read();
+            if !(1..=1024).contains(&count) {
+                wsa_error(WSAEINVAL);
+                return 0;
+            }
+            let count = count as usize;
             std::slice::from_raw_parts(list.add(8).cast::<SocketAddress>(), count)
         };
         if !entries
@@ -327,22 +334,42 @@ pub extern "system" fn WSAConnectByList(
     }
     static HOST: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     let host = *HOST.get_or_init(|| crate::host::function("ws2_32.dll", "WSAConnectByList"));
-    connect_by_list(host, s, list, local_len, local, remote_len, remote, timeout, reserved)
+    connect_by_list(
+        host, s, list, local_len, local, remote_len, remote, timeout, reserved,
+    )
 }
 
 fn connect_by_list(
-    host: Option<usize>, s: Socket, list: *const u8, local_len: *mut u32,
-    local: *mut c_void, remote_len: *mut u32, remote: *mut c_void,
-    timeout: *const c_void, reserved: *mut c_void,
+    host: Option<usize>,
+    s: Socket,
+    list: *const u8,
+    local_len: *mut u32,
+    local: *mut c_void,
+    remote_len: *mut u32,
+    remote: *mut c_void,
+    timeout: *const c_void,
+    reserved: *mut c_void,
 ) -> i32 {
-    type ByList = extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32;
+    type ByList = extern "system" fn(
+        Socket,
+        *const u8,
+        *mut u32,
+        *mut c_void,
+        *mut u32,
+        *mut c_void,
+        *const c_void,
+        *mut c_void,
+    ) -> i32;
     if let Some(host) = host {
         let f: ByList = unsafe { std::mem::transmute(host) };
-        return f(s, list, local_len, local, remote_len, remote, timeout, reserved);
+        return f(
+            s, list, local_len, local, remote_len, remote, timeout, reserved,
+        );
     }
     static SAID: std::sync::Once = std::sync::Once::new();
     SAID.call_once(|| tracing::info!("WSAConnectByList: using host compatibility fallback"));
-    if list.is_null() || !reserved.is_null()
+    if list.is_null()
+        || !reserved.is_null()
         || (!local.is_null() && local_len.is_null())
         || (!remote.is_null() && remote_len.is_null())
     {
@@ -355,7 +382,10 @@ fn connect_by_list(
         return 0;
     }
     #[repr(C)]
-    struct Timeval { seconds: i32, micros: i32 }
+    struct Timeval {
+        seconds: i32,
+        micros: i32,
+    }
     let duration = if timeout.is_null() {
         None
     } else {
@@ -364,27 +394,108 @@ fn connect_by_list(
             wsa_error(WSAEINVAL);
             return 0;
         }
-        Some(std::time::Duration::new(t.seconds as u64, t.micros as u32 * 1000))
+        Some(std::time::Duration::new(
+            t.seconds as u64,
+            t.micros as u32 * 1000,
+        ))
     };
+    // Winsock's fd_set contains a count and an array of SOCKETs, not a bitset.
+    #[repr(C)]
+    struct FdSet {
+        count: u32,
+        sockets: [Socket; 64],
+    }
+    let ioctl =
+        host!("ws2_32.dll", "ioctlsocket": extern "system" fn(Socket, i32, *mut u32) -> i32);
+    let last_error = host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32);
+    let select = host!("ws2_32.dll", "select": extern "system" fn(i32, *mut FdSet, *mut FdSet, *mut FdSet, *const Timeval) -> i32);
+    let getsockopt = host!("ws2_32.dll", "getsockopt": extern "system" fn(Socket, i32, i32, *mut i32, *mut i32) -> i32);
+    let host_connect =
+        host!("ws2_32.dll", "connect": extern "system" fn(Socket, *const u8, i32) -> i32);
+    let entries =
+        unsafe { std::slice::from_raw_parts(list.add(8).cast::<SocketAddress>(), count as usize) };
     let start = std::time::Instant::now();
-    let entries = unsafe { std::slice::from_raw_parts(list.add(8).cast::<SocketAddress>(), count as usize) };
-    let host_connect = host!("ws2_32.dll", "connect": extern "system" fn(Socket, *const u8, i32) -> i32);
-    for (index, entry) in entries.iter().enumerate() {
-        if index > 0 && duration.is_some_and(|d| start.elapsed() >= d) {
-            wsa_error(10060); // WSAETIMEDOUT
-            return 0;
+    let mut nonblocking = 1;
+    if ioctl(s, 0x8004_667eu32 as i32, &mut nonblocking) != 0 {
+        return 0;
+    }
+    let mut error = WSAEINVAL;
+    let mut connected = false;
+    for entry in entries {
+        if duration.is_some_and(|d| start.elapsed() >= d) {
+            error = WSAETIMEDOUT;
+            break;
         }
         if host_connect(s, entry.addr, entry.len) == 0 {
-            let get_local = host!("ws2_32.dll", "getsockname": extern "system" fn(Socket, *mut c_void, *mut u32) -> i32);
-            let get_remote = host!("ws2_32.dll", "getpeername": extern "system" fn(Socket, *mut c_void, *mut u32) -> i32);
-            if (!local.is_null() && get_local(s, local, local_len) != 0)
-                || (!remote.is_null() && get_remote(s, remote, remote_len) != 0) {
-                return 0;
-            }
-            return 1;
+            connected = true;
+            break;
         }
+        error = last_error();
+        if error != WSAEWOULDBLOCK {
+            continue;
+        }
+        let mut write = FdSet {
+            count: 1,
+            sockets: [0; 64],
+        };
+        write.sockets[0] = s;
+        let mut except = FdSet {
+            count: 1,
+            sockets: [0; 64],
+        };
+        except.sockets[0] = s;
+        let remaining = duration.map(|d| d.saturating_sub(start.elapsed()));
+        if remaining.is_some_and(|r| r.is_zero()) {
+            error = WSAETIMEDOUT;
+            break;
+        }
+        let tv = remaining.map(|r| Timeval {
+            seconds: r.as_secs().min(i32::MAX as u64) as i32,
+            micros: r.subsec_micros() as i32,
+        });
+        let ready = select(
+            0,
+            std::ptr::null_mut(),
+            &mut write,
+            &mut except,
+            tv.as_ref().map_or(std::ptr::null(), |v| v),
+        );
+        if ready == 0 {
+            error = WSAETIMEDOUT;
+            break;
+        }
+        if ready == SOCKET_ERROR {
+            error = last_error();
+            continue;
+        }
+        let mut socket_error = 0;
+        let mut len = std::mem::size_of::<i32>() as i32;
+        if getsockopt(s, 0xffff, 0x1007, &mut socket_error, &mut len) != 0 {
+            error = last_error();
+            continue;
+        }
+        if socket_error == 0 {
+            connected = true;
+            break;
+        }
+        error = socket_error;
     }
-    0
+    let mut blocking = 0;
+    if ioctl(s, 0x8004_667eu32 as i32, &mut blocking) != 0 {
+        return 0;
+    }
+    if !connected {
+        wsa_error(error);
+        return 0;
+    }
+    let get_local = host!("ws2_32.dll", "getsockname": extern "system" fn(Socket, *mut c_void, *mut u32) -> i32);
+    let get_remote = host!("ws2_32.dll", "getpeername": extern "system" fn(Socket, *mut c_void, *mut u32) -> i32);
+    if (!local.is_null() && get_local(s, local, local_len) != 0)
+        || (!remote.is_null() && get_remote(s, remote, remote_len) != 0)
+    {
+        return 0;
+    }
+    1
 }
 
 pub extern "system" fn WSAJoinLeaf(
@@ -865,7 +976,8 @@ fn no_auto_proxy() -> u32 {
 }
 
 pub extern "system" fn WinHttpDetectAutoProxyConfigUrl(_flags: u32, _url: *mut *mut u16) -> i32 {
-    let _stall = victory_gpu::stall_site!("net::WinHttpDetectAutoProxyConfigUrl").enter(format_args!(""));
+    let _stall =
+        victory_gpu::stall_site!("net::WinHttpDetectAutoProxyConfigUrl").enter(format_args!(""));
     // SAFETY: no pointers.
     unsafe { SetLastError(no_auto_proxy()) };
     0
@@ -972,25 +1084,102 @@ mod tests {
     use super::*;
 
     #[test]
+    fn missing_connect_by_list_unreachable_times_out() {
+        let _winsock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        #[repr(C)]
+        struct Addresses {
+            count: i32,
+            items: [SocketAddress; 1],
+        }
+        #[repr(C)]
+        struct Timeval {
+            seconds: i32,
+            micros: i32,
+        }
+        let address = v4([192, 0, 2, 1], 9);
+        let list = Addresses {
+            count: 1,
+            items: [SocketAddress { addr: address.as_ptr(), len: 16 }],
+        };
+        let socket = host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket)(2, 1, 6);
+        let timeout = Timeval { seconds: 0, micros: 100_000 };
+        let start = std::time::Instant::now();
+        let ok = connect_by_list(None, socket, (&raw const list).cast(), std::ptr::null_mut(),
+            std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
+            (&raw const timeout).cast(), std::ptr::null_mut());
+        let error = host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32)();
+        host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32)(socket);
+        assert_eq!(ok, 0);
+        assert_eq!(error, WSAETIMEDOUT);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
     fn missing_connect_by_list_uses_loopback_and_reports_addresses() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = v4(HOME, listener.local_addr().unwrap().port());
         #[repr(C)]
-        struct Addresses { count: i32, items: [SocketAddress; 1] }
-        let list = Addresses { count: 1, items: [SocketAddress { addr: address.as_ptr(), len: 16 }] };
-        let socket = host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket)(2, 1, 6);
+        struct Addresses {
+            count: i32,
+            items: [SocketAddress; 1],
+        }
+        let list = Addresses {
+            count: 1,
+            items: [SocketAddress {
+                addr: address.as_ptr(),
+                len: 16,
+            }],
+        };
+        let socket =
+            host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket)(2, 1, 6);
         let mut local = [0u8; 128];
         let mut remote = [0u8; 128];
         let (mut local_len, mut remote_len) = (128u32, 128u32);
-        let ok = connect_by_list(None, socket, (&raw const list).cast(), &mut local_len,
-            local.as_mut_ptr().cast(), &mut remote_len, remote.as_mut_ptr().cast(),
-            std::ptr::null(), std::ptr::null_mut());
+        let ok = connect_by_list(
+            None,
+            socket,
+            (&raw const list).cast(),
+            &mut local_len,
+            local.as_mut_ptr().cast(),
+            &mut remote_len,
+            remote.as_mut_ptr().cast(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        );
         assert_eq!(ok, 1);
         assert_eq!(&remote[..16], &address);
         assert_eq!(local_len, 16);
         assert_eq!(remote_len, 16);
         listener.accept().unwrap();
         host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32)(socket);
+    }
+
+    #[test]
+    fn missing_connect_by_list_tries_next_after_refusal() {
+        let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let refused = v4(HOME, unused.local_addr().unwrap().port());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let available = v4(HOME, listener.local_addr().unwrap().port());
+        drop(unused);
+        #[repr(C)]
+        struct Addresses {
+            count: i32,
+            items: [SocketAddress; 2],
+        }
+        let list = Addresses {
+            count: 2,
+            items: [
+                SocketAddress { addr: refused.as_ptr(), len: 16 },
+                SocketAddress { addr: available.as_ptr(), len: 16 },
+            ],
+        };
+        let socket = host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket)(2, 1, 6);
+        let ok = connect_by_list(None, socket, (&raw const list).cast(), std::ptr::null_mut(),
+            std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
+            std::ptr::null(), std::ptr::null_mut());
+        let error = host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32)();
+        host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32)(socket);
+        assert_eq!(ok, 1, "WSA error {error}");
     }
     use victory_pe::ImportSymbol;
 
@@ -1159,11 +1348,13 @@ mod tests {
                 named.name
             );
         }
-        // Every override names a real export of its DLL. Some exports only
-        // exist on newer Windows (WinHttpGetProxySettingsEx is absent from
-        // Windows 10's winhttp.dll); the HLE supplies those itself, so skip
-        // them only when the host really lacks them.
-        const NEWER_WINDOWS_ONLY: &[&str] = &["WinHttpGetProxySettingsEx"];
+        // Some hosts lack these exports. WSAConnectByList has a fallback;
+        // GetAddrInfoExA remains unsupported by hosts that lack it.
+        const OPTIONAL_HOST_EXPORTS: &[&str] = &[
+            "WinHttpGetProxySettingsEx",
+            "WSAConnectByList",
+            "GetAddrInfoExA",
+        ];
         for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
             let dll = if e.name.starts_with("WinHttp") {
                 "winhttp.dll"
@@ -1171,7 +1362,7 @@ mod tests {
                 "ws2_32.dll"
             };
             let present = crate::host::function(dll, e.name).is_some();
-            if !present && NEWER_WINDOWS_ONLY.contains(&e.name) {
+            if !present && OPTIONAL_HOST_EXPORTS.contains(&e.name) {
                 continue;
             }
             assert!(present, "{dll} lacks {}", e.name);
