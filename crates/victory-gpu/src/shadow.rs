@@ -285,6 +285,8 @@ pub(crate) fn card_stats() -> [u64; 10] {
 /// write watch answered for (copied whole, every refresh, until something
 /// makes them watched).
 pub(crate) static COPY_SOURCES: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+#[cfg(feature = "diagnostics")]
+pub(crate) static MARKED_NOT_WATCHED: AtomicU64 = AtomicU64::new(0);
 
 /// The copies that took the most bytes since the last frame line, by the
 /// title address each holds: bytes, copy calls, the copy's length. Says
@@ -1264,6 +1266,35 @@ fn skip_clean_enabled(setting: Option<&str>) -> bool {
 fn cut_to_copy(start: usize, len: usize, from: usize, to: usize) -> (usize, usize) {
     let end = start.saturating_add(len);
     (from.clamp(start, end), to.clamp(start, end))
+}
+
+fn mark_copied(at: &mut u64, now: u64, page_start: usize, page_end: usize, from: usize, to: usize) {
+    if page_start >= from && page_end <= to {
+        *at = now;
+    }
+}
+
+#[cfg(test)]
+mod partial_page_tests {
+    use super::{PAGE, mark_copied};
+
+    #[test]
+    fn adjacent_partial_refreshes_preserve_the_shared_page() {
+        let mut source = vec![1u8; PAGE];
+        let mut dest = vec![0u8; PAGE];
+        let mut marker = 0;
+        let mid = PAGE / 2;
+        dest[..mid].copy_from_slice(&source[..mid]);
+        mark_copied(&mut marker, 1, 0, PAGE, 0, mid);
+        assert_eq!(marker, 0);
+        source.fill(2);
+        assert!(marker == 0 || 2 > marker);
+        dest[mid..].copy_from_slice(&source[mid..]);
+        mark_copied(&mut marker, 2, 0, PAGE, mid, PAGE);
+        assert_eq!(marker, 0);
+        assert!(dest[..mid].iter().all(|&x| x == 1));
+        assert!(dest[mid..].iter().all(|&x| x == 2));
+    }
 }
 
 fn clean_decided(placed: bool, watched: u8, all_copied: u64, in_range: bool, written: Option<bool>) -> bool {
@@ -2845,7 +2876,8 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
+            let (ask_from, ask_to) = self.watch_range(a, e);
+            let Some((now, written)) = crate::watch::writes(ask_from, ask_to, true) else {
                 return true;
             };
             let stale: Vec<usize> = {
@@ -2995,11 +3027,25 @@ impl Shadow {
         clean_decided(self.place.is_some(), self.watched.load(Ordering::Relaxed), since, from < to, written)
     }
 
+    fn watch_range(&self, from: usize, to: usize) -> (usize, usize) {
+        let start = self.start as usize;
+        let end = start + self.len as usize;
+        if start.is_multiple_of(PAGE) && end.is_multiple_of(PAGE) {
+            let lo = from / PAGE * PAGE;
+            let hi = to.div_ceil(PAGE) * PAGE;
+            if lo >= start && hi <= end {
+                return (lo, hi);
+            }
+        }
+        (from, to)
+    }
+
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            let (ask_from, ask_to) = self.watch_range(from, to);
+            if let Some((now, written)) = crate::watch::writes(ask_from, ask_to, true) {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -3017,7 +3063,14 @@ impl Shadow {
                 }
                 return copied;
             }
-            self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+            let start = self.start as usize;
+            let end = start + self.len as usize;
+            if ask_from == start && ask_to == end && start.is_multiple_of(PAGE) && end.is_multiple_of(PAGE)
+                && self.watched.swap(NOT_WATCHED, Ordering::Relaxed) != NOT_WATCHED
+            {
+                #[cfg(feature = "diagnostics")]
+                MARKED_NOT_WATCHED.fetch_add(1, Ordering::Relaxed);
+            }
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
@@ -3063,9 +3116,7 @@ impl Shadow {
                     COPY_SOURCES[2].fetch_add(n, Ordering::Relaxed);
                     COPY_SOURCES[3].fetch_add(1, Ordering::Relaxed);
                 }
-                if in_range.0 >= from && in_range.1 <= to {
-                    *at = now;
-                }
+                mark_copied(at, now, in_range.0, in_range.1, from, to);
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
                 bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));

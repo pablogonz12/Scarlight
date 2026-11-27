@@ -266,7 +266,8 @@ fn hooks() -> [usize; 2] {
 /// The title's general allocator, for middleware too: its hook if it has
 /// one, else [`XMemAllocDefault`].
 pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
-    let _stall = victory_gpu::stall_site!("xmem::XMemAlloc").enter(format_args!("size={size} attributes={attributes:#x}"));
+    let _stall = victory_gpu::stall_site!("xmem::XMemAlloc")
+        .enter(format_args!("size={size} attributes={attributes:#x}"));
     match hooks()[0] {
         0 => XMemAllocDefault(size, attributes),
         hook => {
@@ -279,7 +280,9 @@ pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
 
 /// See [`XMemAlloc`].
 pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
-    let _stall = victory_gpu::stall_site!("xmem::XMemFree").enter(format_args!("address={address:p} attributes={attributes:#x}"));
+    let _stall = victory_gpu::stall_site!("xmem::XMemFree").enter(format_args!(
+        "address={address:p} attributes={attributes:#x}"
+    ));
     match hooks()[1] {
         0 => XMemFreeDefault(address, attributes),
         hook => {
@@ -387,6 +390,147 @@ struct Slice {
     index: usize,
 }
 
+#[cfg(any(feature = "diagnostics", test))]
+#[derive(Default)]
+struct AliasCensus {
+    // Weak references keep section identities unique without keeping handles open.
+    pages: HashMap<(usize, usize), (std::sync::Weak<Section>, u32, bool)>,
+    ever: usize,
+    made: usize,
+    destroyed: usize,
+}
+
+#[cfg(any(feature = "diagnostics", test))]
+impl AliasCensus {
+    fn change(&mut self, slice: &Slice, len: usize, add: bool) {
+        let section = Arc::as_ptr(&slice.section) as usize;
+        for index in slice.index..slice.index + len.div_ceil(PAGE) {
+            let entry = self
+                .pages
+                .entry((section, index))
+                .or_insert_with(|| (Arc::downgrade(&slice.section), 0, false));
+            if add {
+                entry.1 += 1;
+                if entry.1 == 2 && !entry.2 {
+                    entry.2 = true;
+                    self.ever += 1;
+                }
+            } else {
+                entry.1 -= 1;
+            }
+        }
+        if add {
+            self.made += 1;
+        } else {
+            self.destroyed += 1;
+        }
+    }
+
+    fn counts(&self) -> [usize; 3] {
+        let mut counts = [0; 3];
+        for (_, views, _) in self.pages.values() {
+            if *views != 0 {
+                counts[(*views as usize).min(3) - 1] += 1;
+            }
+        }
+        counts
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn physical_alias_census_counts_live_views() {
+    let slice = Slice {
+        section: Arc::new(Section(std::ptr::null_mut())),
+        index: 0,
+    };
+    let mut census = AliasCensus::default();
+    census.change(&slice, PAGE, true);
+    census.change(&slice, PAGE, true);
+    assert_eq!(census.counts(), [0, 1, 0]);
+    assert_eq!(census.ever, 1);
+    census.change(&slice, PAGE, false);
+    assert_eq!(census.counts(), [1, 0, 0]);
+    assert_eq!(census.ever, 1);
+}
+
+#[cfg(feature = "diagnostics")]
+static CALL_TIMES: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+#[cfg(feature = "diagnostics")]
+struct CallTimer {
+    start: std::time::Instant,
+    kind: usize,
+}
+
+#[cfg(feature = "diagnostics")]
+impl CallTimer {
+    fn new(kind: usize) -> Self {
+        static REGISTER: std::sync::Once = std::sync::Once::new();
+        REGISTER.call_once(|| {
+            unsafe extern "C" {
+                fn atexit(callback: extern "C" fn()) -> i32;
+            }
+            extern "C" fn report() {
+                log_census(true);
+            }
+            // SAFETY: callback has static lifetime and the required C ABI.
+            unsafe { atexit(report) };
+        });
+        Self {
+            start: std::time::Instant::now(),
+            kind,
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for CallTimer {
+    fn drop(&mut self) {
+        let ns = self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        CALL_TIMES[self.kind * 2].fetch_add(ns, Ordering::Relaxed);
+        CALL_TIMES[self.kind * 2 + 1].fetch_max(ns, Ordering::Relaxed);
+        log_census(false);
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn log_census(force: bool) {
+    use std::time::{Duration, Instant};
+    static LAST: LazyLock<Mutex<Instant>> = LazyLock::new(|| Mutex::new(Instant::now()));
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let elapsed = last.elapsed();
+    if !force && elapsed < Duration::from_secs(10) {
+        return;
+    }
+    *last = Instant::now();
+    let mut physical = physical();
+    let census = &mut physical.census;
+    let [one, two, many] = census.counts();
+    let mapped = one + two + many;
+    let made = std::mem::take(&mut census.made);
+    let destroyed = std::mem::take(&mut census.destroyed);
+    let times = CALL_TIMES
+        .each_ref()
+        .map(|v| v.swap(0, Ordering::Relaxed) as f64 / 1_000_000.0);
+    tracing::info!(
+        "physical pages census: mapped={mapped} ({:.2} MiB), 1_view={one} ({:.2} MiB), 2_views={two} ({:.2} MiB), 3plus_views={many} ({:.2} MiB), ever_aliased={}, views_made={made}, views_destroyed={destroyed}, interval_s={:.2}, map_ms={:.3} max_ms={:.3}, unmap_ms={:.3} max_ms={:.3}, scatter_ms={:.3} max_ms={:.3}",
+        mapped as f64 * PAGE as f64 / MIB as f64,
+        one as f64 * PAGE as f64 / MIB as f64,
+        two as f64 * PAGE as f64 / MIB as f64,
+        many as f64 * PAGE as f64 / MIB as f64,
+        census.ever,
+        elapsed.as_secs_f64(),
+        times[0],
+        times[1],
+        times[2],
+        times[3],
+        times[4],
+        times[5]
+    );
+}
+
 #[derive(Default)]
 struct Physical {
     next_page: usize,
@@ -401,6 +545,8 @@ struct Physical {
     by_section: BTreeMap<(usize, usize, usize), usize>,
     /// Largest view length in pages ever inserted for each section.
     max_pages: HashMap<usize, usize>,
+    #[cfg(feature = "diagnostics")]
+    census: AliasCensus,
 }
 
 /// Whether freed page numbers are handed out again (`VICTORY_PAGE_RECYCLE=0`
@@ -480,10 +626,17 @@ impl Physical {
     fn insert_view(&mut self, base: usize, len: usize, slice: Slice) {
         let sec = Arc::as_ptr(&slice.section) as usize;
         let idx = slice.index;
-        if let Some((_, old)) = self.views.insert(base, (len, slice)) {
+        if let Some((old_len, old)) = self.views.remove(&base) {
+            #[cfg(feature = "diagnostics")]
+            self.census.change(&old, old_len, false);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = old_len;
             let old_sec = Arc::as_ptr(&old.section) as usize;
             self.by_section.remove(&(old_sec, old.index, base));
         }
+        #[cfg(feature = "diagnostics")]
+        self.census.change(&slice, len, true);
+        self.views.insert(base, (len, slice));
         self.by_section.insert((sec, idx, base), len);
         let pages = len.div_ceil(PAGE);
         let max = self.max_pages.entry(sec).or_insert(0);
@@ -494,6 +647,8 @@ impl Physical {
 
     fn remove_view(&mut self, at: usize) -> Option<(usize, Slice)> {
         let (size, slice) = self.views.remove(&at)?;
+        #[cfg(feature = "diagnostics")]
+        self.census.change(&slice, size, false);
         let sec = Arc::as_ptr(&slice.section) as usize;
         self.by_section.remove(&(sec, slice.index, at));
         Some((size, slice))
@@ -501,7 +656,13 @@ impl Physical {
 
     /// Title-address ranges showing bytes `[within, within + len)` of the
     /// `n`-page run starting at `slice`, via the O(log N + k) section index.
-    fn ranges_for(&self, slice: &Slice, n: usize, within: usize, len: usize) -> Vec<(usize, usize)> {
+    fn ranges_for(
+        &self,
+        slice: &Slice,
+        n: usize,
+        within: usize,
+        len: usize,
+    ) -> Vec<(usize, usize)> {
         let sec = Arc::as_ptr(&slice.section) as usize;
         let Some(&max_pages) = self.max_pages.get(&sec) else {
             return Vec::new();
@@ -510,8 +671,9 @@ impl Physical {
         let run_end_page = slice.index.saturating_add(n);
         let lo_page = slice.index.saturating_sub(max_pages);
         let mut out = Vec::new();
-        for (&(_, view_index, at), &view_len) in
-            self.by_section.range((sec, lo_page, 0)..(sec, run_end_page, 0))
+        for (&(_, view_index, at), &view_len) in self
+            .by_section
+            .range((sec, lo_page, 0)..(sec, run_end_page, 0))
         {
             let head = (view_index as i64 - slice.index as i64).saturating_mul(PAGE as i64);
             let lo = head.max(within as i64);
@@ -546,7 +708,8 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     count: *mut usize,
     pages: *mut usize,
 ) -> BOOL {
-    let _stall = victory_gpu::stall_site!("xmem::XMemAllocatePhysicalPages").enter(format_args!(""));
+    let _stall =
+        victory_gpu::stall_site!("xmem::XMemAllocatePhysicalPages").enter(format_args!(""));
     if count.is_null() || pages.is_null() {
         return 0;
     }
@@ -714,7 +877,12 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         // Before the write, never after: the guards are on the title's views
         // of the same pages, and told afterwards they save what we wrote
         // (Marvisak/VIctory #2503).
-        mark_written(slice, *n, within, (data.len() - done).min(n * PAGE - within));
+        mark_written(
+            slice,
+            *n,
+            within,
+            (data.len() - done).min(n * PAGE - within),
+        );
         let Some(mut view) = View::map(slice, *n) else {
             return false;
         };
@@ -911,15 +1079,26 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
+    #[cfg(feature = "diagnostics")]
+    let _timer = CallTimer::new(if pages.is_null() { 1 } else { 0 });
     let _stall = victory_gpu::stall_site!("xmem::XMemMapPhysicalPages").enter(format_args!(""));
-    let base = address as usize;
     let mut physical = physical();
+    map_physical_pages(&mut physical, address, n, pages)
+}
+
+fn map_physical_pages(
+    physical: &mut Physical,
+    address: *mut c_void,
+    n: usize,
+    pages: *const usize,
+) -> *mut c_void {
+    let base = address as usize;
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
     let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, base, n * PAGE);
+    unmap(physical, base, n * PAGE);
     if pages.is_null() {
         return address;
     }
@@ -941,7 +1120,11 @@ pub extern "system" fn XMemMapPhysicalPages(
         // would otherwise be searched once more on every page).
         let at = base + i * PAGE;
         // 0: not a reserved placeholder, so the run is as long as it comes.
-        let room = if clipping() { placeholder_room(at) / PAGE } else { 0 };
+        let room = if clipping() {
+            placeholder_room(at) / PAGE
+        } else {
+            0
+        };
         let most = if room > 0 { room.min(n - i) } else { n - i };
         let run = 1 + pages[i + 1..i + most]
             .iter()
@@ -971,7 +1154,7 @@ pub extern "system" fn XMemMapPhysicalPages(
                 );
             }
         }
-        if !map(&mut physical, at, run * PAGE, first) {
+        if !map(physical, at, run * PAGE, first) {
             return std::ptr::null_mut();
         }
         i += run;
@@ -986,11 +1169,15 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     n: usize,
     pages: *const usize,
 ) -> BOOL {
-    let _stall = victory_gpu::stall_site!("xmem::XMemMapPhysicalPagesScatter").enter(format_args!(""));
+    #[cfg(feature = "diagnostics")]
+    let _timer = CallTimer::new(2);
+    let _stall =
+        victory_gpu::stall_site!("xmem::XMemMapPhysicalPagesScatter").enter(format_args!(""));
     if addresses.is_null() {
         return 0;
     }
-    for i in 0..n {
+    let mut i = 0;
+    while i < n {
         // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
         let (address, page) = unsafe {
             (
@@ -1002,9 +1189,41 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
                 },
             )
         };
-        if XMemMapPhysicalPages(address, 1, page).is_null() {
+        let mut physical = physical();
+        let mut run = 1;
+        if !address.is_null() {
+            // Do not include an unknown page: the original loop unmaps only
+            // through the first failing entry.
+            let first = if page.is_null() {
+                None
+            } else {
+                // SAFETY: `page` points into the caller's array.
+                physical.pages.get(unsafe { &*page }).cloned()
+            };
+            while i + run < n {
+                // SAFETY: both arrays contain `n` entries.
+                let next_address = unsafe { *addresses.add(i + run) } as usize;
+                if (address as usize).checked_add(run * PAGE) != Some(next_address) {
+                    break;
+                }
+                let next_page = if pages.is_null() { 0 } else { unsafe { *pages.add(i + run) } };
+                let same_run = if page.is_null() {
+                    next_page == 0
+                } else if let (Some(first), Some(next)) = (&first, physical.pages.get(&next_page)) {
+                    Arc::ptr_eq(&first.section, &next.section) && next.index == first.index + run
+                } else {
+                    false
+                };
+                if !same_run {
+                    break;
+                }
+                run += 1;
+            }
+        }
+        if map_physical_pages(&mut physical, address, run, page).is_null() {
             return 0;
         }
+        i += run;
     }
     1
 }
@@ -1044,9 +1263,8 @@ fn clip_from(value: Option<&str>) -> bool {
 }
 
 fn clipping() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| {
-        clip_from(std::env::var("VICTORY_MAP_CLIP").ok().as_deref())
-    });
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| clip_from(std::env::var("VICTORY_MAP_CLIP").ok().as_deref()));
     *ON
 }
 
@@ -1131,7 +1349,12 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    victory_gpu::title_memory_view(
+        base,
+        len,
+        slice.section.0 as usize,
+        (slice.index * PAGE) as u64,
+    );
     physical.insert_view(base, len, slice);
     true
 }
@@ -1256,7 +1479,8 @@ pub struct WorkingSet {
 // not split by bandwidth class (GPU-optimal use reads 0); track
 // allocations per class if a title budgets from that field.
 pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut WorkingSet) -> BOOL {
-    let _stall = victory_gpu::stall_site!("xmem::XMemGetWorkingSetStatistics").enter(format_args!(""));
+    let _stall =
+        victory_gpu::stall_site!("xmem::XMemGetWorkingSetStatistics").enter(format_args!(""));
     if out.is_null() {
         return 0;
     }
@@ -1588,11 +1812,72 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
-    /// A scatter of pages at consecutive addresses maps them in one call:
-    /// each address shows its own page, pages asked for in a different order
-    /// still land where they are asked for, a zero page in the middle unmaps
-    /// only its own address, and an unmap run goes in one call
-    /// (idea from ivall/xcl#254).
+    #[test]
+    fn scatter_mapping_microbench() {
+        const N: usize = 4096;
+        let pages = allocate(N);
+        for contiguous in [false, true] {
+            let pool = XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                2 * N * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            );
+            assert!(!pool.is_null());
+            let addresses: Vec<_> = (0..N)
+                .map(|i| pool.wrapping_byte_add(i * if contiguous { PAGE } else { 2 * PAGE }))
+                .collect();
+            let order: Vec<_> = (0..N)
+                .map(|i| pages[if contiguous { i } else { (i * 2053) % N }])
+                .collect();
+            let start = std::time::Instant::now();
+            assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), N, order.as_ptr()), 1);
+            println!(
+                "scatter microbench {}: {:.6} ms/page",
+                if contiguous { "contiguous" } else { "scattered" },
+                start.elapsed().as_secs_f64() * 1000.0 / N as f64
+            );
+            assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), N, std::ptr::null()), 1);
+        }
+        assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn scatter_coalesces_views_and_preserves_aliases() {
+        let pages = allocate(4);
+        let pool = XMemVirtualAlloc(
+            std::ptr::null_mut(), 6 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE,
+        );
+        assert!(!pool.is_null());
+        let at = |i: usize| pool.wrapping_byte_add(i * PAGE);
+        let addresses = [at(0), at(1), at(2), at(4), at(5)];
+        let mapped = [pages[0], pages[1], pages[2], pages[3], pages[0]];
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 5, mapped.as_ptr()), 1);
+        {
+            let physical = physical();
+            assert_eq!(physical.views.get(&(at(0) as usize)).unwrap().0, 3 * PAGE);
+            assert_eq!(physical.views.get(&(at(4) as usize)).unwrap().0, PAGE);
+            assert_eq!(physical.views.get(&(at(5) as usize)).unwrap().0, PAGE);
+        }
+        // SAFETY: the two views alias the same mapped physical page.
+        unsafe {
+            at(0).cast::<u8>().write(42);
+            assert_eq!(at(5).cast::<u8>().read(), 42);
+        }
+        assert_eq!(XMemMapPhysicalPagesScatter([at(1)].as_ptr(), 1, std::ptr::null()), 1);
+        assert_eq!(query(at(1)).host.State, MEM_RESERVE);
+        // SAFETY: the remaining parts of the view are still mapped.
+        unsafe {
+            assert_eq!(at(0).cast::<u8>().read(), 42);
+            assert_eq!(at(5).cast::<u8>().read(), 42);
+            at(2).cast::<u8>().write(7);
+        }
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 5, std::ptr::null()), 1);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    /// Consecutive and reordered scatter mappings, including unmapping.
     #[test]
     fn scatter_maps_runs_of_consecutive_addresses() {
         let pages = allocate(3);
@@ -1661,7 +1946,10 @@ mod tests {
         );
         assert_eq!(query(at(1)).host.State, MEM_RESERVE);
         assert_eq!(query(at(2)).host.State, MEM_RESERVE);
-        assert_eq!(XMemMapPhysicalPagesScatter([at(0)].as_ptr(), 1, std::ptr::null()), 1);
+        assert_eq!(
+            XMemMapPhysicalPagesScatter([at(0)].as_ptr(), 1, std::ptr::null()),
+            1
+        );
         assert_eq!(query(at(0)).host.State, MEM_RESERVE);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
@@ -1675,7 +1963,11 @@ mod tests {
     fn a_run_of_mappings_stops_at_the_end_of_its_placeholder() {
         let pages = allocate(2);
         for (k, page) in pages.iter().enumerate() {
-            assert!(write_physical(std::slice::from_ref(page), 0, &[b'0' + k as u8]));
+            assert!(write_physical(
+                std::slice::from_ref(page),
+                0,
+                &[b'0' + k as u8]
+            ));
         }
         // Two 64 KiB pages reserved as one pool, then split in two
         // placeholders of their own, as the title hands its pool out.
@@ -1690,17 +1982,15 @@ mod tests {
         let second = pool.wrapping_byte_add(PAGE);
         // SAFETY: our own placeholder; the range freed stays a placeholder.
         assert_ne!(
-            unsafe {
-                VirtualFree(
-                    second,
-                    PAGE,
-                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-                )
-            },
+            unsafe { VirtualFree(second, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,) },
             0
         );
         for at in [pool, second] {
-            assert_eq!(query(at).host.State, MEM_RESERVE, "a placeholder of its own");
+            assert_eq!(
+                query(at).host.State,
+                MEM_RESERVE,
+                "a placeholder of its own"
+            );
         }
         // Two consecutive slices of one section, the run crossing from the
         // first placeholder into the second.
@@ -1955,11 +2245,35 @@ mod tests {
         let s1 = empty_section();
         let s2 = empty_section();
         let mut p = owned_physical(FIRST_PAGE_NUMBER);
-        p.insert_view(0x1000_0000, 4 * PAGE, Slice { section: Arc::clone(&s1), index: 2 });
-        p.insert_view(0x2000_0000, 2 * PAGE, Slice { section: Arc::clone(&s1), index: 4 });
-        p.insert_view(0x3000_0000, 2 * PAGE, Slice { section: Arc::clone(&s2), index: 2 });
+        p.insert_view(
+            0x1000_0000,
+            4 * PAGE,
+            Slice {
+                section: Arc::clone(&s1),
+                index: 2,
+            },
+        );
+        p.insert_view(
+            0x2000_0000,
+            2 * PAGE,
+            Slice {
+                section: Arc::clone(&s1),
+                index: 4,
+            },
+        );
+        p.insert_view(
+            0x3000_0000,
+            2 * PAGE,
+            Slice {
+                section: Arc::clone(&s2),
+                index: 2,
+            },
+        );
 
-        let query = Slice { section: Arc::clone(&s1), index: 3 };
+        let query = Slice {
+            section: Arc::clone(&s1),
+            index: 3,
+        };
         let mut got = p.ranges_for(&query, 3, PAGE / 2, 2 * PAGE);
         got.sort_unstable();
         assert_eq!(
