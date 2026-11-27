@@ -820,8 +820,21 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::frame_drew(frame, crate::draw::drawn());
+        let shown = crate::capture::shown(frame);
         if crate::capture::listed(frame) {
             crate::capture::dump_targets(frame);
+        }
+        if let (Some(copy), Some(host)) = (&shown, crate::host::host())
+            && host.present(std::ptr::null_mut(), copy, frame, false).is_some()
+        {
+            static FIRST: std::sync::Once = std::sync::Once::new();
+            FIRST.call_once(|| {
+                // SAFETY: the presented texture is retained for this frame.
+                let desc = unsafe { copy.texture.GetDesc() };
+                tracing::info!(frame, width=desc.Width, height=desc.Height, format=desc.Format.0,
+                    "presented the first render target preview");
+            });
+            return S_OK;
         }
     }
     #[cfg(windows)]

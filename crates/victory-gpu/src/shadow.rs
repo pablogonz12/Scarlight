@@ -1461,33 +1461,65 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
     jobs
 }
 
+/// One compare of a copy (`find_pieces`): where the copy's bytes are and
+/// its snapshot's, the title address the copy starts at, the offsets
+/// `[from, to)` looked at, the copy's number and, per page of the range,
+/// whether its snapshot piece is one the copy may leave out
+/// (`crate::picked`; `None`: every page is compared).
+struct Scan {
+    data: usize,
+    before: usize,
+    start: usize,
+    from: usize,
+    to: usize,
+    id: u64,
+    baseline: Option<Vec<bool>>,
+}
+
+impl Scan {
+    /// A range whose snapshot is gone: nothing to compare.
+    fn none() -> Scan {
+        Scan { data: 0, before: 0, start: 0, from: 0, to: 0, id: 0, baseline: None }
+    }
+}
+
 /// With [`wide_back`]: for each of `work` (a copy not in the card's memory
 /// and a range `[address, end)` its shaders may have written, declared and
 /// not yet done), the 64 KiB pieces that differ from the snapshot, as
 /// [`Shadow::copy_back_with`] takes them; found on several threads.
 pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, usize)>> {
-    let scans = work
+    let scans: Vec<Scan> = work
         .iter()
         .map(|(shadow, address, end)| {
             let (from, to) = shadow.inside(*address, end.saturating_sub(*address));
             // The snapshot's memory stays until the range is done with
             // (`copy_back_done`), which comes after this.
             match shadow.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                Some(before) => (shadow.data as usize, before.as_ptr() as usize, shadow.start as usize, from, to),
-                None => (0, 0, 0, 0, 0),
+                Some(before) => Scan {
+                    data: shadow.data as usize,
+                    before: before.as_ptr() as usize,
+                    start: shadow.start as usize,
+                    from,
+                    to,
+                    id: shadow.id(),
+                    baseline: if crate::picked::on() { shadow.baseline_pages(from, to) } else { None },
+                },
+                None => Scan::none(),
             }
         })
         .collect();
     find_pieces(scans)
 }
 
-/// For each of `scans` (where a copy's bytes are, where its snapshot's
-/// are, the title address the copy starts at, offsets from and to): the
+/// For each of `scans` (a copy, a snapshot, the offsets to look at): the
 /// 64 KiB pieces (cut at multiples of 64 KiB of title memory, as
-/// [`Shadow::differing`] cuts them) of `[from, to)` whose bytes differ, as
+/// [`Shadow::differing`] cuts them) of its range whose bytes differ, as
 /// (offset, bytes) in order. On several threads ([`wide`]), in pieces of
-/// work of about [`WIDE_JOB`] bytes that hold whole pieces.
-fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usize, usize)>> {
+/// work of about [`WIDE_JOB`] bytes that hold whole pieces. Of a range
+/// whose copy's snapshot outlives the submission only the pages its
+/// shaders wrote are looked at, and this look's page among the others
+/// (`crate::picked`); what is found there is learned for the looks after.
+fn find_pieces(scans: Vec<Scan>) -> Vec<Vec<(usize, usize)>> {
     // What a job finds: (which scan, its place among that scan's jobs, the
     // pieces).
     type Found = Vec<(usize, usize, Vec<(usize, usize)>)>;
@@ -1531,25 +1563,37 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
         }));
     };
     let count = scans.len();
-    for (which, (data, before, start, from, to)) in scans.into_iter().enumerate() {
-        let (mut at, mut place) = (from, 0);
-        while at < to {
-            // Cut where pieces end, so that every job sees whole pieces.
-            let room = (WIDE_JOB - bytes).max(PIECE);
-            let mut next = (at + room).min(to);
-            if next < to {
-                next -= (start + next) % PIECE;
-                if next <= at {
-                    next = (at + PIECE - (start + at) % PIECE).min(to);
+    for (which, scan) in scans.iter().enumerate() {
+        // This copy's turn: the same for every span of this compare, so that
+        // a copy with several spans in one submission is covered by the
+        // sweep, and its own count, so that a copy compared every other
+        // submission still walks every page (`crate::picked`).
+        let turn = crate::picked::next_turn(scan.id);
+        let (data, before, start) = (scan.data, scan.before, scan.start);
+        // The spans of the range this look examines (`crate::picked`), or
+        // the range whole.
+        let mut place = 0;
+        let ranges = crate::picked::spans_for_turn(turn, scan.id, start, scan.from, scan.to, scan.baseline.as_deref());
+        for (from, to) in ranges {
+            let mut at = from;
+            while at < to {
+                // Cut where pieces end, so that every job sees whole pieces.
+                let room = (WIDE_JOB - bytes).max(PIECE);
+                let mut next = (at + room).min(to);
+                if next < to {
+                    next -= (start + next) % PIECE;
+                    if next <= at {
+                        next = (at + PIECE - (start + at) % PIECE).min(to);
+                    }
                 }
-            }
-            group.push((data, before, start, at, next, which, place));
-            bytes += next - at;
-            place += 1;
-            at = next;
-            if bytes >= WIDE_JOB {
-                flush(&mut group, &mut jobs);
-                bytes = 0;
+                group.push((data, before, start, at, next, which, place));
+                bytes += next - at;
+                place += 1;
+                at = next;
+                if bytes >= WIDE_JOB {
+                    flush(&mut group, &mut jobs);
+                    bytes = 0;
+                }
             }
         }
     }
@@ -1560,6 +1604,9 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
     let mut out = vec![Vec::new(); count];
     for (which, _, pieces) in found {
         out[which].extend(pieces);
+    }
+    for (which, scan) in scans.iter().enumerate() {
+        crate::picked::found(scan.id, scan.start, &out[which]);
     }
     out
 }
@@ -1580,6 +1627,7 @@ pub(crate) fn back_line(frames: f64) {
     if c.iter().all(|&v| v == 0.0) {
         return;
     }
+    crate::picked::log(frames);
     let mb = |v: f64| v / (1 << 20) as f64;
     let least = (crate::shadow::card_limits().0 >> 20).max(1);
     tracing::info!(
@@ -1599,7 +1647,7 @@ pub(crate) fn back_line(frames: f64) {
 
 #[cfg(test)]
 mod wide_tests {
-    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide};
+    use super::{Job, PIECE, Scan, WIDE_JOB, copy_jobs, find_pieces, wide};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1656,11 +1704,12 @@ mod wide_tests {
             *byte ^= 0x01;
         }
         let (data, before) = (now.as_ptr() as usize, old.as_ptr() as usize);
+        let scan = |start: usize, from: usize, to: usize| Scan { data, before, start, from, to, id: 0, baseline: None };
         let mut scans = Vec::new();
         let mut wanted = Vec::new();
         for start in [0usize, 4096, PIECE - 16, 0xd_b790_df00] {
             for (from, to) in [(0, len), (0, 1), (1, 2), (PIECE - 1, PIECE + 1), (3 * PIECE, 3 * PIECE), (12345, len - 1), (WIDE_JOB - 3, 2 * WIDE_JOB + 10)] {
-                scans.push((data, before, start, from, to));
+                scans.push(scan(start, from, to));
                 let mut pieces = Vec::new();
                 let mut at = from;
                 while at < to {
@@ -1674,7 +1723,7 @@ mod wide_tests {
             }
         }
         // A scan of nothing (a range whose snapshot is gone).
-        scans.push((0, 0, 0, 0, 0));
+        scans.push(Scan::none());
         wanted.push(Vec::new());
         assert_eq!(find_pieces(scans), wanted);
     }
@@ -1768,6 +1817,7 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        crate::picked::forget(self.id);
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -2039,6 +2089,40 @@ impl Shadow {
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Per page of offsets `[from, to)` of the copy, from the range's
+    /// first, whether a compare may leave that page out and find its
+    /// difference later (`crate::picked`): its snapshot piece is kept from
+    /// one submission to the next ([`keeps`]), was taken whole, and has not
+    /// been taken again since — so both the copy's bytes and their
+    /// reference stay as they are until the page's turn comes. `None` where
+    /// nothing may be left out: no kept snapshot, memory not write-watched
+    /// (a refresh copies it whole), or the copy placed in title memory.
+    pub(crate) fn baseline_pages(&self, from: usize, to: usize) -> Option<Vec<bool>> {
+        if !keeps() || self.place.is_some() || self.unwatched() || from >= to {
+            return None;
+        }
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        if !kept.1 || kept.0.is_empty() {
+            return None;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = cut_to_copy(start, end - start, from, to);
+        if from >= to {
+            return None;
+        }
+        let base = start / PAGE;
+        let first = (start + from) / PAGE - base;
+        let last = (start + to - 1) / PAGE - base;
+        let mut out = vec![false; last - first + 1];
+        for page in first..=last {
+            // A page the range holds in part is not left out: the rest of
+            // it belongs to another range.
+            let whole = (base + page) * PAGE >= start + from && (base + page + 1) * PAGE <= start + to;
+            out[page - first] = whole && kept.0.get(page).copied().unwrap_or(false);
+        }
+        Some(out)
     }
 
     /// Offset of a title address from the buffer's start.
@@ -3095,6 +3179,8 @@ impl Shadow {
         // SAFETY: inside the mapping (checked above); only the submitting
         // thread writes it.
         let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::fetched(gpu, old);
         let Some(first) = first_difference(gpu, old) else {
             return 0;
         };
@@ -3162,6 +3248,8 @@ impl Shadow {
         // does write it (the title's bytes put in under shader writes)
         // holds the lock held here.
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::fetched(gpu, held);
         let Some(first) = first_difference(gpu, held) else {
             return 0;
         };

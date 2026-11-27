@@ -258,6 +258,37 @@ fn run_cases_on(
     assert!(ran > 0, "no SM 6.6 device available ({devices:?})");
 }
 
+#[test]
+fn vector_sad_variants_accumulate_unsigned_differences() {
+    let inputs = [
+        [0x0403_0201, 0x0100_0204, 0xffff_fff0, 0],
+        [0xffff_ffff, 0, 7, 0],
+        [0, 0xffff_ffff, 0xffff_fffe, 0],
+    ];
+    for (op, width, high, masked) in [
+        (0x15a, 8, false, false),
+        (0x15b, 8, true, false),
+        (0x15c, 16, false, false),
+        (0x15d, 32, false, false),
+        (0x171, 8, false, true),
+    ] {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        run_cases(&shader, &inputs, |backend, _, input, got| {
+            let mask = u32::MAX >> (32 - width);
+            let mut sum = 0u32;
+            for i in 0..(32 / width) {
+                let a = (input[0] >> (i * width)) & mask;
+                let b = (input[1] >> (i * width)) & mask;
+                if !masked || b != 0 {
+                    sum = sum.wrapping_add(a.abs_diff(b));
+                }
+            }
+            let want = input[2].wrapping_add(if high { sum << 16 } else { sum });
+            assert_eq!(got, want, "{backend}: opcode {op:#x} {input:x?}");
+        });
+    }
+}
+
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }
@@ -867,6 +898,31 @@ fn v_div_fixup_f16_follows_the_isa_special_cases() {
             ),
         }
     });
+}
+
+#[test]
+fn v_cvt_off_f32_i4_uses_the_signed_low_nibble() {
+    // v_cvt_off_f32_i4 v0, v1 (VOP1 opcode 0x00e)
+    let shader = build_valu_cs(&[vop1(0x00e, 0, vgpr(1))]);
+    let nibble = |n: u32| (((n as i32) << 28) >> 28) as f32 / 16.0;
+
+    let mut cases: Vec<u32> = (0..16).collect();
+    // Bits above the low nibble are ignored.
+    cases.extend([0xABCD_EF05, 0xFFFF_FFF8, 0x1234_5670, 0x8000_000F, 0x0000_00F7]);
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&x| [x, 0, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = nibble(cases[i]).to_bits();
+        assert_eq!(
+            got, want,
+            "{backend}: v_cvt_off_f32_i4({:#010x}) = {got:#010x} ({:?}), want {want:#010x}",
+            inp[0],
+            f32::from_bits(got),
+        );
+    });
+    // Spot-check the reference itself: 0x5 -> 0.3125, 0x8 -> -0.5, 0xF -> -0.0625.
+    assert_eq!(nibble(0xABCD_EF05), 0.3125);
+    assert_eq!(nibble(8), -0.5);
+    assert_eq!(nibble(0xF), -0.0625);
 }
 
 #[test]
