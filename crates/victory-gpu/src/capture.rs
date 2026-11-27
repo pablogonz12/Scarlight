@@ -441,6 +441,14 @@ pub(crate) fn save_shot(
             reasons.join(", ")
         ));
     }
+    let design = crate::pipeline::design_snapshot();
+    if !design.is_empty() {
+        let reasons: Vec<String> = design
+            .iter()
+            .map(|(why, n)| format!("{why} x{n}"))
+            .collect();
+        line.push_str(&format!(" | by design: {}", reasons.join(", ")));
+    }
     let path = shots.join(format!("{name}.txt"));
     if let Err(e) = std::fs::write(&path, format!("{line}\n")) {
         tracing::warn!(error = %e, path = %path.display(), "shot stats not saved");

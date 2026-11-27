@@ -10,6 +10,7 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
@@ -91,6 +92,7 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    let _stall = victory_gpu::stall_site!("xmem::XMemVirtualAlloc").enter(format_args!(""));
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
@@ -153,6 +155,11 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if placeholder && base.is_null() && !at.is_null() {
+        // The GPU side answers its placeholder questions from this table
+        // (`victory_gpu::inplace`): nothing else maps or unmaps inside one.
+        victory_gpu::title_memory_placeholder(at as usize, size);
+    }
     if !at.is_null() && kind & MEM_COMMIT != 0 && protect == PAGE_READWRITE {
         // Committed private memory the GPU may use: the arena's registry
         // (`VICTORY_ARENA=1`, off by default; a no-op when off).
@@ -189,6 +196,7 @@ pub extern "system" fn XMemVirtualQuery(
     address: *const c_void,
     out: *mut BasicInformation,
 ) -> BOOL {
+    let _stall = victory_gpu::stall_site!("xmem::XMemVirtualQuery").enter(format_args!(""));
     let size = size_of::<MEMORY_BASIC_INFORMATION>();
     // SAFETY: the title passes room for the whole structure; the host
     // fails on a null one.
@@ -258,6 +266,7 @@ fn hooks() -> [usize; 2] {
 /// The title's general allocator, for middleware too: its hook if it has
 /// one, else [`XMemAllocDefault`].
 pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
+    let _stall = victory_gpu::stall_site!("xmem::XMemAlloc").enter(format_args!("size={size} attributes={attributes:#x}"));
     match hooks()[0] {
         0 => XMemAllocDefault(size, attributes),
         hook => {
@@ -270,6 +279,7 @@ pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
 
 /// See [`XMemAlloc`].
 pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
+    let _stall = victory_gpu::stall_site!("xmem::XMemFree").enter(format_args!("address={address:p} attributes={attributes:#x}"));
     match hooks()[1] {
         0 => XMemFreeDefault(address, attributes),
         hook => {
@@ -282,6 +292,7 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
+    let _stall = victory_gpu::stall_site!("xmem::XMemAllocDefault").enter(format_args!(""));
     if attributes & ALLOC_32BIT != 0 {
         return XMemVirtualAlloc(
             std::ptr::null_mut(),
@@ -316,6 +327,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
 
 /// Frees what [`XMemAllocDefault`] returned, given the same attributes.
 pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
+    let _stall = victory_gpu::stall_site!("xmem::XMemFreeDefault").enter(format_args!(""));
     if address.is_null() {
         return;
     }
@@ -337,6 +349,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
 
 /// A retail console has no tools memory.
 pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
+    let _stall = victory_gpu::stall_site!("xmem::XMemIsToolsMemAvailable").enter(format_args!(""));
     0
 }
 
@@ -356,6 +369,11 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        // A null handle is the non-owning placeholder the tests build (and
+        // `CloseHandle(NULL)` raises under a debugger, so it must not run).
+        if self.0.is_null() {
+            return;
+        }
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
@@ -372,15 +390,93 @@ struct Slice {
 #[derive(Default)]
 struct Physical {
     next_page: usize,
+    /// Page numbers whose pages the title freed; handed out again before
+    /// `next_page` grows (a long session must not walk off the number space).
+    free_pages: Vec<usize>,
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
 }
 
+/// Whether freed page numbers are handed out again (`VICTORY_PAGE_RECYCLE=0`
+/// keeps the old ever-growing counter).
+fn page_recycle() -> bool {
+    #[cfg(test)]
+    if let Some(on) = forced_recycle() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PAGE_RECYCLE").as_deref() != Ok("0"))
+}
+
+// Tests set the policy they exercise on their own thread, so a run with
+// `VICTORY_PAGE_RECYCLE=0` still tests the reuse (see `force_recycle`).
+#[cfg(test)]
+thread_local! {
+    static FORCED_RECYCLE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// The policy a test asked for on this thread, if any.
+#[cfg(test)]
+fn forced_recycle() -> Option<bool> {
+    FORCED_RECYCLE.with(std::cell::Cell::get)
+}
+
+/// Tests: whether this thread's allocator reuses freed page numbers.
+#[cfg(test)]
+fn force_recycle(value: Option<bool>) {
+    FORCED_RECYCLE.with(|c| c.set(value));
+}
+
+impl Physical {
+    /// Reserves `numbers.len()` page numbers for `section`, reusing freed
+    /// ones first. False when the number space would run past the title's
+    /// 21-bit `number >> 4` field.
+    fn allocate(&mut self, section: &Arc<Section>, numbers: &mut [MaybeUninit<usize>]) -> bool {
+        let reuse = if page_recycle() {
+            self.free_pages.len()
+        } else {
+            0
+        };
+        let fresh = numbers.len().saturating_sub(reuse);
+        if fresh > (PAGE_NUMBER_LIMIT - self.next_page) / FRAMES {
+            return false;
+        }
+        for (index, out) in numbers.iter_mut().enumerate() {
+            let recycled = if page_recycle() {
+                self.free_pages.pop()
+            } else {
+                None
+            };
+            let number = recycled.unwrap_or_else(|| {
+                let number = self.next_page;
+                self.next_page += FRAMES;
+                number
+            });
+            self.pages.insert(
+                number,
+                Slice {
+                    section: section.clone(),
+                    index,
+                },
+            );
+            out.write(number);
+        }
+        true
+    }
+
+    /// Drops a page and keeps its number for reuse.
+    fn free(&mut self, number: usize) {
+        if self.pages.remove(&number).is_some() {
+            self.free_pages.push(number);
+        }
+    }
+}
+
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
     Mutex::new(Physical {
         // Page numbers are opaque to titles; 0 stays unused.
-        next_page: 0x10_0000,
+        next_page: FIRST_PAGE_NUMBER,
         ..Default::default()
     })
 });
@@ -395,6 +491,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     count: *mut usize,
     pages: *mut usize,
 ) -> BOOL {
+    let _stall = victory_gpu::stall_site!("xmem::XMemAllocatePhysicalPages").enter(format_args!(""));
     if count.is_null() || pages.is_null() {
         return 0;
     }
@@ -438,17 +535,13 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
     let section = Arc::new(Section(handle));
     let mut physical = physical();
-    let first = physical.next_page;
-    physical.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
+    // SAFETY: the title passes room for `n` page numbers.
+    let numbers = unsafe { std::slice::from_raw_parts_mut(pages.cast::<MaybeUninit<usize>>(), n) };
+    if !physical.allocate(&section, numbers) {
+        tracing::warn!(n, "XMemAllocatePhysicalPages: page numbers exhausted");
+        // SAFETY: checked non-null.
+        unsafe { count.write(0) };
+        return 0;
     }
     1
 }
@@ -457,16 +550,21 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 /// 16: the title keeps them as 21-bit `number >> 4` and rebuilds
 /// them with `<< 4` (128 GiB of pages at most).
 const FRAMES: usize = PAGE >> 12;
+/// One past the largest page number the title's 21-bit `number >> 4` holds.
+const PAGE_NUMBER_LIMIT: usize = (1 << 21) * FRAMES;
+/// The first number handed out (0 stays unused).
+const FIRST_PAGE_NUMBER: usize = 0x10_0000;
 
 /// Pages still mapped stay readable through their views until unmapped.
 pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
+    let _stall = victory_gpu::stall_site!("xmem::XMemFreePhysicalPages").enter(format_args!(""));
     if pages.is_null() {
         return 0;
     }
     let mut physical = physical();
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+        physical.free(unsafe { *pages.add(i) });
     }
     1
 }
@@ -779,6 +877,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
+    let _stall = victory_gpu::stall_site!("xmem::XMemMapPhysicalPages").enter(format_args!(""));
     let base = address as usize;
     let mut physical = physical();
     // Until the pages are mapped again: `unmap` takes whole views away and
@@ -853,6 +952,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     n: usize,
     pages: *const usize,
 ) -> BOOL {
+    let _stall = victory_gpu::stall_site!("xmem::XMemMapPhysicalPagesScatter").enter(format_args!(""));
     if addresses.is_null() {
         return 0;
     }
@@ -1122,6 +1222,7 @@ pub struct WorkingSet {
 // not split by bandwidth class (GPU-optimal use reads 0); track
 // allocations per class if a title budgets from that field.
 pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut WorkingSet) -> BOOL {
+    let _stall = victory_gpu::stall_site!("xmem::XMemGetWorkingSetStatistics").enter(format_args!(""));
     if out.is_null() {
         return 0;
     }
@@ -1165,6 +1266,7 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
 /// Hands title memory (standard, in 2 MiB pages) to the system. The other
 /// transfers involve tools memory, which a retail console has none of.
 pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
+    let _stall = victory_gpu::stall_site!("xmem::XMemTransferMemory").enter(format_args!(""));
     const TITLE_TO_SYSTEM: u32 = 0;
     tracing::info!(kind, size, "XMemTransferMemory");
     if size == 0 {
@@ -1723,5 +1825,94 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// An owned allocator, so the page-number tests touch no shared state and
+    /// no other test can hand out or free numbers under them.
+    fn owned_physical(next_page: usize) -> Physical {
+        Physical {
+            next_page,
+            ..Default::default()
+        }
+    }
+
+    /// A section that owns nothing: the number bookkeeping under test never
+    /// looks inside it (`Drop` closes a null handle, which does nothing).
+    fn empty_section() -> Arc<Section> {
+        Arc::new(Section(std::ptr::null_mut()))
+    }
+
+    fn take(numbers: &[MaybeUninit<usize>]) -> Vec<usize> {
+        // SAFETY: `allocate` wrote every entry.
+        numbers.iter().map(|n| unsafe { n.assume_init() }).collect()
+    }
+
+    /// Streaming allocate/free must reuse page numbers: without a free list
+    /// `next_page` climbs by `FRAMES` a page, and a long session packs past
+    /// the title's 21-bit `number >> 4` field, after which allocation fails.
+    #[test]
+    fn freed_page_numbers_are_handed_out_again() {
+        // The policy is the test's, not the environment's.
+        force_recycle(Some(true));
+        let section = empty_section();
+        let mut physical = owned_physical(FIRST_PAGE_NUMBER);
+        let mut numbers = [MaybeUninit::<usize>::uninit(); 2];
+        assert!(physical.allocate(&section, &mut numbers));
+        let first = take(&numbers);
+        let ceiling = physical.next_page;
+        for &n in &first {
+            physical.free(n);
+        }
+        for round in 0..1024 {
+            assert!(physical.allocate(&section, &mut numbers), "round {round}");
+            let again = take(&numbers);
+            assert_eq!(physical.next_page, ceiling, "round {round}: next_page grew");
+            let mut got = again.clone();
+            got.sort_unstable();
+            let mut want = first.clone();
+            want.sort_unstable();
+            assert_eq!(got, want, "round {round}: the same numbers come back");
+            for &n in &again {
+                physical.free(n);
+            }
+        }
+        force_recycle(None);
+    }
+
+    /// `VICTORY_PAGE_RECYCLE=0` is the old ever-growing counter, which the
+    /// switch keeps testable without the environment.
+    #[test]
+    fn the_page_recycle_switch_keeps_the_counter_growing() {
+        force_recycle(Some(false));
+        let section = empty_section();
+        let mut physical = owned_physical(FIRST_PAGE_NUMBER);
+        let mut numbers = [MaybeUninit::<usize>::uninit(); 2];
+        assert!(physical.allocate(&section, &mut numbers));
+        for &n in &take(&numbers) {
+            physical.free(n);
+        }
+        let ceiling = physical.next_page;
+        assert!(physical.allocate(&section, &mut numbers));
+        let grown = physical.next_page;
+        force_recycle(None);
+        assert!(grown > ceiling, "VICTORY_PAGE_RECYCLE=0 must not reuse");
+        assert_eq!(take(&numbers), vec![ceiling, ceiling + FRAMES]);
+    }
+
+    /// A page number at the top of the title's 21-bit field still allocates;
+    /// one round past it is refused, which the caller turns into "no pages".
+    #[test]
+    fn page_numbers_stop_at_the_title_field() {
+        let section = empty_section();
+        let mut physical = owned_physical(PAGE_NUMBER_LIMIT - FRAMES);
+        let mut numbers = [MaybeUninit::<usize>::uninit(); 1];
+        assert!(physical.allocate(&section, &mut numbers));
+        let last = take(&numbers)[0];
+        // The title keeps `number >> 4` in 21 bits.
+        assert!(last >> 4 < 1 << 21, "{last:#x}");
+        assert!(
+            !physical.allocate(&section, &mut numbers),
+            "one round past the field must be refused"
+        );
     }
 }

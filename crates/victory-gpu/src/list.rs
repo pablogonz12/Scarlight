@@ -1483,6 +1483,13 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
+        // The host does not take the render target use of this texture's
+        // format: its host copy was made without that use
+        // (`resource::taken_flags`), and a view of it would be refused
+        // (`resource::host_use_allowed`): neither is made, nor the clear.
+        if !crate::resource::host_use_allowed(texture, false) {
+            return;
+        }
         let rtv = host.rtv(Some(texture), record.desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {

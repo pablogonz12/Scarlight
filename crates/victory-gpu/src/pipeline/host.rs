@@ -541,13 +541,42 @@ pub(crate) struct HostPipeline {
     pub(crate) state: String,
 }
 
-/// Logs a pipeline that gets no host pipeline, once per reason.
+/// Logs a pipeline that gets no host pipeline, once per reason; counts
+/// every refusal, since the draws that name a refused pipeline are skipped
+/// and a run should say how many it lost.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
-    static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.contains(&reason) {
-        seen.push(reason);
-        tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
+    refuse_why(reason, "-", shaders)
+}
+
+/// `refuse` with `why` in the log line: the adapter family, a driver's
+/// answer, whatever makes this reason narrower than its text.
+fn refuse_why(reason: &'static str, why: &str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEEN: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    static REFUSED: AtomicU64 = AtomicU64::new(0);
+    let refused = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+    let first = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.contains(&reason) {
+            false
+        } else {
+            seen.push(reason);
+            true
+        }
+    };
+    if first {
+        tracing::warn!(
+            ?shaders,
+            why,
+            "no host pipeline: {reason} (logged once; the draws with it are skipped and counted)"
+        );
+    } else if refused.is_power_of_two() {
+        // Cheap, bounded: 1, 2, 4, 8 ... refusals, so a run reports what it
+        // lost without a line per pipeline.
+        tracing::warn!(
+            refused,
+            "host pipelines refused so far; their draws are skipped"
+        );
     }
     None
 }
@@ -587,8 +616,24 @@ impl HostPipeline {
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             stages
         };
-        if mesh.is_some() && !host()?.mesh_shaders() {
-            return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
+        if mesh.is_some() {
+            let host = host()?;
+            if !host.mesh_shaders() {
+                return refuse(
+                    "the host GPU has no mesh shaders (or no shader model 6.6)",
+                    shaders,
+                );
+            }
+            if !host.mesh_pipelines_safe() {
+                return refuse_why(
+                    "the host GPU's driver does not expose mesh shaders, so a mesh \
+                     pipeline is refused before it reaches the driver (it would be \
+                     refused or would abort it): the draws that name it are lost, \
+                     other work goes on",
+                    host.mesh_family().unwrap_or("-"),
+                    shaders,
+                );
+            }
         }
         for (s, _) in &stages {
             s.translated()?;

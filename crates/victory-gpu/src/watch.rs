@@ -6,6 +6,10 @@
 //! buffers), so what one asks is kept here for the others: a journal of
 //! each page's last write, numbered by the asking.
 //!
+//! The pools' own pages (xmem's GPU memory, committed privately) can be
+//! guarded instead of asked about: their asking costs the span, a guard costs
+//! only what was written ([`guard_pools`], `VICTORY_GUARD_POOLS`).
+//!
 //! Physical-page views (xmem's sections) cannot be write-watched. There a
 //! copy leaves each 64 KiB block it took read-only, and our vectored handler
 //! takes the first write to it: it notes the block as written and gives the
@@ -83,7 +87,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
@@ -138,7 +142,7 @@ pub(crate) fn slow_asks() -> [u64; 3] {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     if !j.kept {
         j.ahead.clear();
     }
@@ -177,7 +181,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     ask_once_end();
     ask_ahead(ranges);
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     let j = &mut *j;
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
@@ -208,7 +212,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     if j.kept {
         j.kept = false;
         j.ahead.clear();
@@ -219,7 +223,7 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     if !j.kept || len == 0 {
         return;
     }
@@ -254,11 +258,21 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
 fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    // A pool the guards hold is left to `writes`, which costs what was
+    // written in it, not what its span is ([`guard_pools`]).
+    if guard_pools()
+        && first < last
+        && (crate::guards::block_known(first * PAGE) || is_pool(first * PAGE))
+    {
+        return false;
+    }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    #[cfg(test)]
+    tests::KERNEL_ASKED.with(|n| n.set(n.get() + 1));
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -295,17 +309,45 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 /// it). `None` if the kernel would have to be asked.
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     covers(&j.ahead, first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
+/// One test at a time on the journal: the journal is one for the whole
+/// process, and the harness runs the tests in parallel.
+///
+/// Held for the length of a test that asks ([`ask_once`], [`asked`],
+/// [`written_since`], [`forget_askings`]) or notes writes ([`writing`],
+/// [`wrote`], [`copied`], [`title_memory_remapped`]) in the journal. Without
+/// it another test's asking resets `ahead` between this test's `ask_once`
+/// and its `asked` ("asked ahead" failing), and its write lands under a
+/// higher asking number in this test's pages, so a range nothing was
+/// written in reads as written (`a_range_is_known_clean_until_an_asking_
+/// finds_it_written` failed on `main`'s CI run 45835616327, and 1 run in 5
+/// locally in parallel; it passes 5 of 5 with `--test-threads=1`). Nothing
+/// in a single test is wrong, and no test skips itself: they take this lock
+/// and run in turn.
+///
+/// Taken as the first thing a test does, before any device lock
+/// (`crate::warptest`), so the two never form a cycle. Taking it also
+/// [`forget_askings`]s, so each test starts from a journal of its own and
+/// leaves none for the next.
+#[cfg(test)]
+pub(crate) fn journal_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    forget_askings();
+    guard
+}
+
 /// Forgets every asking and every page found written: for a test that
-/// starts from a journal of its own and leaves none behind (it must run
-/// with `--test-threads=1`).
+/// starts from a journal of its own and leaves none behind (take
+/// [`journal_test_lock`], which does this, so no other test asks or writes
+/// meanwhile).
 #[cfg(test)]
 pub(crate) fn forget_askings() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     j.asked = 0;
     j.ahead_asked = 0;
     j.written.clear();
@@ -327,7 +369,7 @@ pub(crate) fn written_since(start: usize, end: usize, since: u64) -> Option<bool
     if first >= last {
         return Some(false);
     }
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     let covered = j.ahead_asked >= since && covers(&j.ahead, first, last);
     covered.then(|| j.written.range(first..last).any(|(_, &w)| w > since))
 }
@@ -365,12 +407,13 @@ fn covers(pieces: &[(usize, usize)], first: usize, last: usize) -> bool {
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the
 /// kernel just reported. `None` if the memory is not write-watched (nor,
-/// with `guarded`, view memory, which is then guarded).
+/// with `guarded`, view memory, which is then guarded, nor a pool the guards
+/// hold, [`guard_pools`]).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if covers(&j.ahead, first, last) {
@@ -382,11 +425,27 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 .collect(),
         ));
     }
+    // A pool the guards hold answers out of its own blocks, without a walk of
+    // the pages asked about ([`guard_pools`]). Pages only a verifying asking
+    // found are kept too: the copy needs them.
+    let mut verified: Vec<usize> = Vec::new();
+    if guard_pools() && !guarded {
+        if !verify_due(first)
+            && let Some(written) = guarded_range(start, end, true)
+        {
+            return Some(guarded_answer(j, first, last, &written));
+        }
+        if verify_due(first) {
+            verified = guarded_range(start, end, true).unwrap_or_default();
+        }
+    }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    #[cfg(test)]
+    tests::KERNEL_ASKED.with(|n| n.set(n.get() + 1));
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -400,15 +459,36 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     } != 0;
     let guarded = if failed {
         count = 0;
-        if !guarded {
-            return None;
-        }
         #[cfg(feature = "diagnostics")]
         let guarding = std::time::Instant::now();
-        let written = guard(first * PAGE, last * PAGE);
+        // Verified already on this asking: the guards' answer is taken. A
+        // copy (`guarded`) whose pages are a pool the kernel will not
+        // write-watch is guarded too, instead of being copied whole at
+        // every refresh ([`guard_copy_pools`], `VICTORY_GUARD_COPY_POOLS=0`
+        // for the old way).
+        let pools = !guarded || !verified.is_empty() || guard_copy_pools();
+        // A range that is not whole blocks is not one we own: the block it
+        // rounds into holds memory somebody else writes (our own heap, the
+        // title's private allocations), and making that read-only faults in
+        // its writer. Our own allocator writes there, so the fault came back
+        // into this thread's own guard locks and the run hung
+        // (`watch::tests`: a guarded page of the CRT heap). Refused and
+        // counted; the copy takes its range whole, as it did before the pool
+        // guard existed.
+        let ours = start.is_multiple_of(PAGE) && end.is_multiple_of(PAGE);
+        let written = match if pools && !ours {
+            REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            None
+        } else {
+            guarded_range(first * PAGE, last * PAGE, pools)
+        } {
+            Some(written) => written,
+            None if verified.is_empty() => return None,
+            None => verified.clone(),
+        };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
-        written?
+        written
     } else {
         Vec::new()
     };
@@ -418,10 +498,21 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         add(C::Watches, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
+        if !verified.is_empty() {
+            // What the kernel found and the guards had not: a write that made
+            // no fault (the card's, or one through another view).
+            let kernel: std::collections::BTreeSet<usize> =
+                j.found[..count].iter().map(|&at| at / PAGE).collect();
+            add(C::GuardMissed, verified.iter().filter(|p| !kernel.contains(p)).count() as u64);
+        }
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
+    let pages = j.found[..count]
+        .iter()
+        .map(|&at| at / PAGE)
+        .chain(guarded)
+        .chain(verified);
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
     }
@@ -432,6 +523,141 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
+}
+
+/// [`writes`]' answer for a range the guards answered: the asking's number
+/// and the journal's pages of the range, with the pages the guards found
+/// written noted under it.
+fn guarded_answer(
+    j: &mut Journal,
+    first: usize,
+    last: usize,
+    written: &[usize],
+) -> (u64, Vec<(usize, u64)>) {
+    j.asked += 1;
+    let now = j.asked;
+    for &page in written {
+        j.written.insert(page, now);
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::Guarded, 1);
+        add(C::GuardSpan, ((last - first) * PAGE) as u64);
+    }
+    (
+        now,
+        j.written
+            .range(first..last)
+            .map(|(&p, &w)| (p, w))
+            .collect(),
+    )
+}
+
+/// Whether a copy whose pages the kernel will not write-watch (a pool's
+/// memory, committed privately: `GetWriteWatch` refuses it) is guarded
+/// instead of copied whole at every refresh: on.
+///
+/// The class this removes: copies of 1 MiB and up that went to the card with
+/// the 1 MiB floor (`VICTORY_CARD_BUFFERS_MIN_MB`) and whose refresh found
+/// no answer, so `Shadow::update` marked the copy `NOT_WATCHED` and took its
+/// whole window at every refresh for the rest of the run (run 11.14.5: 97
+/// copies, 941 MB, 758-1,373 MB sent a frame). A guard costs what is
+/// written: the first asking reports every block (the whole range once, as
+/// before), and after it only the blocks the title wrote, 8-9 us a block.
+///
+/// `VICTORY_GUARD_COPY_POOLS=0` puts the whole-range copy back. The kernel
+/// cannot verify this class (that is why it cannot answer), so a write that
+/// makes no fault (the card's into host memory, one through another view of
+/// the same section) is not seen: `crate::guards` never guards an aliased
+/// block, and a pool the runtime shows twice is the aliased case.
+pub(crate) fn guard_copy_pools() -> bool {
+    #[cfg(test)]
+    if let Some(on) = tests::COPY_POOLS.with(|v| v.get()) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_COPY_POOLS").is_none_or(|v| v != "0"))
+}
+
+/// Whether a range the kernel will not answer for is guarded as a pool: for
+/// the test that proves the class removed (`None` is the default).
+#[cfg(test)]
+pub(crate) fn set_guard_copy_pools(on: Option<bool>) -> Option<bool> {
+    tests::COPY_POOLS.with(|v| v.replace(on))
+}
+
+/// Whether the pools' own pages are watched by our guards instead of the
+/// kernel's page walk: `VICTORY_GUARD_POOLS=1`, off unless asked for (the
+/// kernel is asked about every range, as before).
+///
+/// An asking costs what its span is, not what was written in it: the world's
+/// 2,409 askings over 10.7 GB a frame are 2.0 us each in the quiet, 625 us
+/// apiece while other threads map and unmap memory (the title's own churn,
+/// `tools/copybench` b). A guard costs what is written: one fault per 64 KiB
+/// block, 8.2 us round trip in the same bench (d), and an asking about a span
+/// whose blocks are all clean costs a search of the guards' sets (e: 1.0 ms
+/// a frame against 4.7, quiet, with 240 blocks written a frame).
+///
+/// What a guard cannot see is a write that makes no fault: the card's into
+/// host memory, or one through another view of the same pages. So the kernel
+/// still answers about each range as the verifier, on one frame in
+/// [`verify_every`], and the pages only it found are counted
+/// (`copystat::C::GuardMissed`).
+pub(crate) fn guard_pools() -> bool {
+    #[cfg(test)]
+    if let Some(on) = tests::POOLS.with(|v| v.get()) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Off unless asked for: a guard that misses a write leaves a texture
+    // silently wrong, so the asking stays the default until a run's counter
+    // reads no pages missed.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_POOLS").is_some_and(|v| v == "1"))
+}
+
+/// Every how many frames the kernel verifies a range's guards (the range's
+/// first block decides which frame, so the askings of a frame are a share of
+/// the spans, not all of them at once). `VICTORY_GUARD_VERIFY=1` verifies at
+/// every asking, `0` never.
+fn verify_every() -> u64 {
+    #[cfg(test)]
+    if let Some(n) = tests::VERIFY.with(|v| v.get()) {
+        return n;
+    }
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_GUARD_VERIFY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    })
+}
+
+/// Whether this asking of the range starting at `first` is also verified by
+/// the kernel.
+fn verify_due(first: usize) -> bool {
+    let every = verify_every();
+    if every == 0 {
+        return false;
+    }
+    crate::frame::current()
+        .wrapping_add((first as u64) >> 6)
+        .is_multiple_of(every)
+}
+
+/// Whether `start` is memory the guards can hold as a pool: committed private
+/// memory (the title's allocations, xmem's GPU memory) the layer's own copies
+/// may make read-only.
+fn is_pool(start: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.State == MEM_COMMIT && info.Type == MEM_PRIVATE && info.Protect == PAGE_READWRITE
 }
 
 /// The unit a write-back job holds and a copy guards: one page.
@@ -631,6 +857,17 @@ pub(crate) fn remapped_taken(generation: u64, at: usize, len: usize) {
 /// their state and protection, so one answer covers every copy inside it;
 /// it is forgotten when the range's protection changes ([`title_memory_remapped`],
 /// our own guards and write-back jobs) or a kernel write into it fails.
+/// Range askings whose guard was refused because the range is not whole
+/// blocks ([`writes`]): memory we did not allocate.
+static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many askings were answered without a guard because the range was not
+/// whole blocks (asked by a copy whose destination is not ours to guard).
+#[cfg(test)]
+pub(crate) fn guard_refusals() -> u64 {
+    REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static DESTINATIONS: Mutex<BTreeMap<usize, (usize, bool)>> = Mutex::new(BTreeMap::new());
 
 /// Forgets the destination answers that overlap `[at, at + len)`: what was
@@ -719,10 +956,11 @@ pub(crate) fn write_failed(at: usize, len: usize) {
     forget(at, len);
 }
 
-/// For view memory: the pages of `[start, end)`'s blocks written since
-/// they were last guarded (all of a block's pages), guarding them again
-/// before the caller copies them. `None` if the memory is not a view.
-fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+/// For view memory, and for a pool with `pools`: the pages of `[start, end)`'s
+/// blocks written since they were last guarded (all of a block's pages),
+/// guarding them again before the caller copies them. `None` if the memory is
+/// neither a view nor, with `pools`, a pool the guards can hold.
+fn guarded_range(start: usize, end: usize, pools: bool) -> Option<Vec<usize>> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -731,14 +969,29 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
-        && crate::guards::block_known(start);
-    if !known && !is_view(start, end) {
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // A range inside a runtime placeholder reservation is view memory (the
+    // runtime maps its pages through `xmem::map`, which tells us), and its
+    // holes are in the views: no question to Windows either way.
+    let in_placeholder = crate::inplace::placeholder_range(first * BLOCK, last * BLOCK);
+    if in_placeholder {
+        crate::inplace::PLACEHOLDER_HITS[0]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let known = in_placeholder
+        || (!*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
+            && crate::guards::block_known(start));
+    if !known && !is_view(start, end) && !(pools && is_pool(start)) {
         return None;
     }
     install();
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     Some(crate::guards::reguard(first, last))
+}
+
+/// [`guarded_range`] for view memory alone (the tests' entry).
+#[cfg(test)]
+fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    guarded_range(start, end, false)
 }
 
 /// Whether `[start, end)` is view memory. The title's views lie in
@@ -862,6 +1115,14 @@ pub(crate) fn back_begin(done: &std::sync::Arc<Done>, from: usize, to: usize) ->
     install();
     let mut held = Vec::new();
     let take = |a: usize, b: usize, held: &mut Vec<usize>| {
+        // The map is taken *before* the pages are made inaccessible: a title
+        // thread that faults in between would find no job for the block
+        // (`back_pending`), so the handler could not wait for the merge and
+        // would pass the fault on. With the map held across the protect, that
+        // fault waits here and then finds the job. Nothing inside this block
+        // touches title memory, so the handler cannot be entered on this
+        // thread while it holds the map.
+        let mut map = back();
         let mut old = 0;
         // SAFETY: title memory; only its protection changes.
         if unsafe {
@@ -873,7 +1134,6 @@ pub(crate) fn back_begin(done: &std::sync::Arc<Done>, from: usize, to: usize) ->
             )
         } != 0
         {
-            let mut map = back();
             for block in a..b {
                 // A block an earlier job holds keeps the protection it had
                 // before the first job took it: `back_release` gives that
@@ -924,14 +1184,60 @@ pub(crate) fn back_wait(from: usize, to: usize) {
             .collect()
     };
     for done in jobs {
-        done.wait();
+        let _ = done.wait_for(
+            "a fence signal behind a write-back job",
+            crate::writeback::MERGE_DEADLINE,
+        );
+    }
+}
+
+/// Waits for the job that holds `at`, if one does; on the deadline the job's
+/// hold is given up (`back_open_now`: the merge is lost, and said so by
+/// `Done::wait_for`) so the title's access can go through instead of the run
+/// stopping on a job that will never finish. The worker never waits for its
+/// own job: it opens the block and goes on.
+pub(crate) fn wait_held(at: usize) {
+    let Some(done) = back_pending(at) else {
+        return;
+    };
+    if crate::writeback::this_is_worker() {
+        back_open_now(at, 1);
+        return;
+    }
+    if !done.wait_for(
+        "a title access to a block a write-back job holds",
+        crate::writeback::MERGE_DEADLINE,
+    ) {
+        back_open_now(at, 1);
     }
 }
 
 /// Before a kernel write into title memory `[at, at + len)`: the blocks are
-/// given back writable, as [`open`] does for the guarded ones (the write is
-/// the title's, or the job's own, so nothing waits for the job there).
+/// given back writable, as [`open`] does for the guarded ones. A job that
+/// holds one is waited for first (bounded: [`wait_held`] and the deadline):
+/// opening the block under it would let the job's merge put the GPU's older
+/// bytes over the title's write afterwards, i.e. lose the merge *and* the
+/// title's bytes.
 pub(crate) fn back_open(at: usize, len: usize) {
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    if !crate::writeback::this_is_worker() {
+        let jobs: Vec<std::sync::Arc<Done>> = {
+            let map = back();
+            map.range(first..last).map(|(_, (done, _))| done.clone()).collect()
+        };
+        for done in jobs {
+            let _ = done.wait_for(
+                "a write into a block a write-back job holds",
+                crate::writeback::MERGE_DEADLINE,
+            );
+        }
+    }
+    back_open_now(at, len);
+}
+
+/// [`back_open`] without waiting for the job: the worker's own write into its
+/// blocks, and the repair after a wait gave up.
+pub(crate) fn back_open_now(at: usize, len: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut opened = Vec::new();
@@ -1110,17 +1416,13 @@ fn install() {
         let at = r.ExceptionInformation[1];
         // A write-back job has this block (inaccessible to reads and writes
         // alike): wait for the GPU's bytes to be put back before the
-        // instruction reads or writes them.
-        if let Some(done) = back_pending(at) {
-            // The worker itself must never wait for its own job: the block
-            // is opened and the instruction goes on.
-            if crate::writeback::this_is_worker() {
-                back_open(at, 1);
-                return EXCEPTION_CONTINUE_EXECUTION;
-            }
+        // instruction reads or writes them, but never past the deadline with
+        // no word said: `wait_held` gives the block up, names the job it
+        // waited for, and this instruction goes on with the title's range.
+        if back_pending(at).is_some() {
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
-            done.wait();
+            wait_held(at);
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::add(crate::copystat::C::AsyncWaits, 1);
@@ -1204,10 +1506,27 @@ mod tests {
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+    thread_local! {
+        /// The kernel askings `writes` and the ahead asking made on this
+        /// thread (each test runs on its own).
+        pub(super) static KERNEL_ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// `VICTORY_GUARD_POOLS` and `VICTORY_GUARD_VERIFY` for one test: the
+        /// environment is read once a process.
+        pub(super) static POOLS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+        pub(super) static VERIFY: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+        /// `VICTORY_GUARD_COPY_POOLS` for one test.
+        pub(super) static COPY_POOLS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+
+    fn kernel_asked() -> usize {
+        KERNEL_ASKED.with(|n| n.get())
+    }
+
     /// A copy's whole range is known mapped, and only that: not one byte
     /// past its end, and nothing before it was copied.
     #[test]
     fn a_copy_marks_the_blocks_it_took() {
+        let _journal = journal_test_lock();
         let at = 0x7000_0000_0000usize;
         let len = 3 * BLOCK;
         assert!(!mapped(at, len), "nothing copied there yet");
@@ -1224,6 +1543,7 @@ mod tests {
     /// job released them, and a thread that faulted there waits for it.
     #[test]
     fn write_back_blocks_wait_for_their_job() {
+        let _journal = journal_test_lock();
         // SAFETY: two blocks of private memory, freed at the end.
         let at = unsafe {
             VirtualAlloc(
@@ -1251,6 +1571,7 @@ mod tests {
     /// releases it: only the job that last held it gives it back.
     #[test]
     fn a_held_block_passes_to_the_next_job() {
+        let _journal = journal_test_lock();
         // SAFETY: one block of private memory, freed at the end.
         let at = unsafe {
             VirtualAlloc(
@@ -1284,6 +1605,7 @@ mod tests {
     /// block was an unhandled 0xc0000005.
     #[test]
     fn a_title_write_into_a_held_block_is_resolved() {
+        let _journal = journal_test_lock();
         // SAFETY: two blocks of private memory, freed at the end.
         let at = unsafe {
             VirtualAlloc(
@@ -1330,6 +1652,10 @@ mod tests {
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
+        let _journal = journal_test_lock();
+        // The kernel's answering: the pools' guarding is off unless
+        // `VICTORY_GUARD_POOLS=1`.
+        tests::POOLS.with(|v| v.set(Some(false)));
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
             VirtualAlloc(
@@ -1351,15 +1677,165 @@ mod tests {
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
         assert_eq!(again, [(p / PAGE + 1, now)]);
-        let mut plain = vec![0u8; PAGE];
-        assert!(
-            writes(
-                plain.as_mut_ptr() as usize,
-                plain.as_ptr() as usize + PAGE,
-                true
+        // Nor is a plain allocation write-watched: with the copies' pool
+        // guarding off (the old way, `VICTORY_GUARD_COPY_POOLS=0`) its asking
+        // is not answered at all, and a copy takes the whole range at every
+        // refresh for the rest of the run.
+        // A private region of ours, page aligned: a copy's destination is
+        // title memory we own. The old fixture was a page of the CRT heap,
+        // unaligned, so the guard took in the block after it — our own
+        // allocator's memory. Making that read-only made our allocator fault
+        // inside the guard's own shard lock, and the run hung.
+        let plain = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
             )
-            .is_none()
+        } as usize;
+        assert_ne!(plain, 0);
+        let (at, plane_end) = (plain, plain + PAGE);
+        set_guard_copy_pools(Some(false));
+        assert!(writes(at, plane_end, true).is_none(), "not answered, as before");
+        // With the pool guarded for a copy (the default) the range is
+        // answered: its blocks once, then nothing newer. Set explicitly, so
+        // a run with `VICTORY_GUARD_COPY_POOLS=0` in its environment still
+        // tests the guarded path.
+        set_guard_copy_pools(Some(true));
+        let (first, held) = writes(at, plane_end, true).expect("guarded for a copy");
+        // The blocks the range covers: PAGE bytes of heap are not PAGE
+        // aligned, so the range may take in two of them (under WARP's
+        // allocator it does).
+        let blocks = (at / PAGE..plane_end.div_ceil(PAGE)).collect::<Vec<_>>();
+        assert_eq!(
+            held.iter().map(|&(page, _)| page).collect::<Vec<_>>(),
+            blocks,
+            "the blocks, once"
         );
+        let (_, again) = writes(at, plane_end, true).expect("guarded");
+        assert_eq!(again.iter().filter(|&&(_, w)| w > first).count(), 0, "nothing written since");
+        crate::guards::open(at, plane_end);
+        tests::POOLS.with(|v| v.set(None));
+        // SAFETY: our allocations.
+        unsafe {
+            VirtualFree(plain as *mut _, 0, MEM_RELEASE);
+            VirtualFree(p as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// A copy's destination that is not whole blocks is not ours to guard:
+    /// the guard would make the block it rounds into read-only, and that
+    /// block holds memory somebody else writes — our own heap, which faulted
+    /// back into the guard's own lock and hung the run. Refused and counted,
+    /// the copy takes its range whole.
+    #[test]
+    fn a_range_that_is_not_whole_blocks_is_not_guarded() {
+        tests::POOLS.with(|v| v.set(Some(false)));
+        set_guard_copy_pools(Some(true));
+        let mut plain = vec![0u8; PAGE];
+        plain[0] = 1;
+        let at = plain.as_mut_ptr() as usize;
+        // A page of heap is not page aligned (the fixture that hung).
+        let before = guard_refusals();
+        assert!(writes(at, at + PAGE, true).is_none(), "refused");
+        assert_eq!(guard_refusals(), before + 1, "counted");
+        set_guard_copy_pools(None);
+        tests::POOLS.with(|v| v.set(None));
+    }
+
+    /// A pool's asking is the guards' to answer: the kernel is not asked at
+    /// all, the title's write is reported at the next asking, and a span
+    /// nothing was written in reports nothing. The default off asks the
+    /// default off) asks the kernel, as every asking did before.
+    #[test]
+    fn a_pools_asking_is_answered_by_the_guards_not_the_kernel() {
+        let _journal = journal_test_lock();
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        forget_askings();
+        tests::POOLS.with(|v| v.set(Some(true)));
+        tests::VERIFY.with(|v| v.set(Some(0)));
+        let (start, end) = (p, p + 4 * PAGE);
+        let before = kernel_asked();
+        let (now, written) = writes(start, end, false).expect("a pool the guards hold");
+        // A block that was never guarded counts as written: the first asking
+        // reports the whole range (the copy takes it whole, as a new
+        // texture's first refresh does anyway).
+        assert_eq!(written.len(), 4, "a block never guarded counts as written");
+        assert_eq!(kernel_asked(), before, "the guards answered, the kernel was not asked");
+        let (_, written) = writes(start, end, false).expect("a pool the guards hold");
+        assert!(written.iter().all(|&(_, w)| w <= now), "nothing written since");
+        assert_eq!(kernel_asked(), before, "still the guards");
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
+        let (later, written) = writes(start, end, false).expect("a pool the guards hold");
+        assert!(later > now);
+        assert_eq!(
+            written.iter().filter(|&&(_, w)| w == later).map(|&(p, _)| p).collect::<Vec<_>>(),
+            [p / PAGE + 1],
+            "the page the title wrote, under this asking"
+        );
+        assert_eq!(kernel_asked(), before, "still the guards");
+        tests::VERIFY.with(|v| v.set(None));
+        // The default: the kernel answers the same range, as before.
+        tests::POOLS.with(|v| v.set(Some(false)));
+        let (_, off) = writes(start, end, false).expect("watched");
+        assert!(kernel_asked() > before, "off, the kernel is asked");
+        assert!(off.iter().any(|&(page, _)| page == p / PAGE + 1));
+        forget_askings();
+        // The pool is gone: the guards drop what they held of it, so the next
+        // allocation at these addresses starts unknown (as `XMemFree` tells
+        // the layer).
+        title_memory_remapped(start, 4 * PAGE);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// The kernel's asking verifies the guards: on the frame a range is due it
+    /// is asked as well, and a page only it found (a write that made no fault:
+    /// the card's, or one through another view) is kept in the journal, so no
+    /// copy goes without it.
+    #[test]
+    fn the_kernels_asking_verifies_what_the_guards_hold() {
+        let _journal = journal_test_lock();
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        forget_askings();
+        tests::POOLS.with(|v| v.set(Some(true)));
+        tests::VERIFY.with(|v| v.set(Some(1)));
+        let (start, end) = (p, p + 4 * PAGE);
+        let (_, written) = writes(start, end, false).expect("a pool the guards hold");
+        assert_eq!(written.len(), 4, "a block never guarded counts as written");
+        let before = kernel_asked();
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + 2 * PAGE + 8) as *mut u8).write(1) };
+        let (now, written) = writes(start, end, false).expect("a pool the guards hold");
+        assert!(kernel_asked() > before, "the verifier asked the kernel");
+        assert!(
+            written.iter().any(|&(page, w)| page == p / PAGE + 2 && w == now),
+            "the page the asking found is kept"
+        );
+        tests::POOLS.with(|v| v.set(None));
+        tests::VERIFY.with(|v| v.set(None));
+        forget_askings();
+        title_memory_remapped(start, 4 * PAGE);
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
@@ -1370,6 +1846,11 @@ mod tests {
     /// nothing in *its* range was written.
     #[test]
     fn a_range_is_known_clean_until_an_asking_finds_it_written() {
+        let _journal = journal_test_lock();
+        // A pool the guards hold is left to `writes`, not asked ahead: this
+        // is the asking of everything else, with the pools' guarding off
+        // (its default).
+        tests::POOLS.with(|v| v.set(Some(false)));
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
             VirtualAlloc(
@@ -1409,6 +1890,7 @@ mod tests {
         );
         ask_once_end();
         forget_askings();
+        tests::POOLS.with(|v| v.set(None));
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
@@ -1418,6 +1900,7 @@ mod tests {
     /// answers for it instead of the kernel being asked again.
     #[test]
     fn overlapping_askings_are_merged_so_a_range_inside_any_is_covered() {
+        let _journal = journal_test_lock();
         let mut ahead = vec![(0usize, 12_000usize), (8_000, 20_000)];
         normalize_ahead(&mut ahead);
         assert_eq!(ahead, [(0, 20_000)], "the second overlapping the first");
@@ -1449,6 +1932,7 @@ mod tests {
     #[test]
     #[ignore]
     fn clean_copies_bench() {
+        let _journal = journal_test_lock();
         use std::time::Instant;
         for pages in [1024usize, 4096] {
             // SAFETY: a fresh write-watched allocation, freed at the end.
@@ -1492,6 +1976,7 @@ mod tests {
     /// lands and the block counts as written.
     #[test]
     fn kernel_reads_into_guarded_blocks_after_opening() {
+        let _journal = journal_test_lock();
         use std::io::{Read, Seek, Write};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
@@ -1546,6 +2031,7 @@ mod tests {
 
     #[test]
     fn writes_in_partly_committed_view_blocks_are_reported() {
+        let _journal = journal_test_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -1607,6 +2093,7 @@ mod tests {
     /// or mapped since.
     #[test]
     fn a_range_that_begins_in_an_unmapped_block_is_guarded() {
+        let _journal = journal_test_lock();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
             MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
@@ -1698,6 +2185,7 @@ mod tests {
     /// again (they cannot be guarded) until the runtime maps them.
     #[test]
     fn unmapped_blocks_are_reported_once_until_mapped() {
+        let _journal = journal_test_lock();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
             MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
@@ -1783,6 +2271,7 @@ mod tests {
     /// to overflow. Up there no test has guarded blocks.
     #[test]
     fn ranges_past_the_address_space_end_do_not_overflow() {
+        let _journal = journal_test_lock();
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
@@ -1793,6 +2282,7 @@ mod tests {
     /// runtime remap (or a failed kernel write) makes it ask again.
     #[test]
     fn a_destination_is_writable_only_where_the_region_is_committed_read_write() {
+        let _journal = journal_test_lock();
         use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
         // SAFETY: a fresh allocation of ours, freed at the end.
         let at = unsafe {
@@ -1848,6 +2338,7 @@ mod tests {
     /// that an earlier answer also covers.
     #[test]
     fn a_change_forgets_every_answer_that_reaches_into_it() {
+        let _journal = journal_test_lock();
         use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
         // SAFETY: a fresh allocation of ours, freed at the end.
         let at = unsafe {
@@ -1884,6 +2375,7 @@ mod tests {
     /// opens it ([`writing`]).
     #[test]
     fn a_guarded_block_is_no_destination_until_the_write_opens_it() {
+        let _journal = journal_test_lock();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
             UnmapViewOfFile,
@@ -1921,6 +2413,7 @@ mod tests {
     /// copies of the same 16 MiB range.
     #[test]
     fn the_destination_check_costs_under_two_percent_of_the_copy() {
+        let _journal = journal_test_lock();
         use std::time::Instant;
         const N: usize = 16 << 20;
         const ROUNDS: u32 = 64;
@@ -1985,6 +2478,7 @@ mod mapping_tests {
     /// a read in place waits for a change of mapping.
     #[test]
     fn reads_in_place_and_remappings_wait_for_each_other() {
+        let _journal = super::journal_test_lock();
         // A reader holds; the change does not begin until it lets go.
         let changed = Arc::new(AtomicBool::new(false));
         let reading = title_memory_reading();
@@ -2028,6 +2522,7 @@ mod mapping_tests {
     /// a pending copy-back's bytes out of a new mapping.
     #[test]
     fn remapping_marks_blocks_until_a_copy_takes_them_again() {
+        let _journal = super::journal_test_lock();
         if !copy_back_skips_remapped() {
             return; // VICTORY_SKIP_REMAPPED=0: nothing is marked.
         }
@@ -2070,6 +2565,200 @@ mod mapping_tests {
         remapped_taken(crate::watch::remap_generation(), at, BLOCK);
         assert!(!remapped_any(at, BLOCK), "a copy that read it clears it");
         *remapped() = saved;
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A pool the kernel will not write-watch (private, committed, not
+    /// reserved with `MEM_WRITE_WATCH`: exactly what `GetWriteWatch`
+    /// refuses) is guarded for a copy instead of its whole range being
+    /// copied at every refresh. The first asking names every block (the
+    /// whole range once, what the old path copied), and after it only the
+    /// blocks the title wrote: never more than was written. Fails on the
+    /// old path at the second step (`None`: the copy is `NOT_WATCHED` and
+    /// takes its whole window at every refresh for the rest of the run).
+    #[test]
+    fn a_pool_the_kernel_cannot_watch_is_guarded_for_a_copy() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const N: usize = 4 * BLOCK;
+        // SAFETY: a fresh private region of four blocks, read-write, and not
+        // write-watched.
+        let start = unsafe { VirtualAlloc(std::ptr::null(), N, MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(start, 0);
+        struct Pool(usize);
+        impl Drop for Pool {
+            fn drop(&mut self) {
+                crate::guards::open(self.0, self.0 + N);
+                // The guards' sets for the range go with the memory, so a
+                // later allocation at the same address starts clean.
+                super::title_memory_remapped(self.0, N);
+                // SAFETY: our allocation.
+                unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE) };
+            }
+        }
+        let _pool = Pool(start);
+        super::forget_askings();
+        let pages = |written: &[(usize, u64)]| written.iter().map(|&(page, _)| page).collect::<Vec<_>>();
+        // The old way: no answer, so the caller copies the whole range.
+        super::set_guard_copy_pools(Some(false));
+        assert_eq!(super::writes(start, start + N, true), None, "the kernel does not watch a pool");
+        // The switch is set for the test, not inherited from the environment,
+        // so this holds whatever a run's `VICTORY_GUARD_COPY_POOLS` says.
+        super::set_guard_copy_pools(Some(true));
+        // The first asking takes every block: the whole range, once.
+        let (first, written) = super::writes(start, start + N, true).expect("guarded for a copy");
+        assert_eq!(pages(&written), (start / super::PAGE..(start + N) / super::PAGE).collect::<Vec<_>>());
+        // The caller copies a page whose write number is newer than its last
+        // copy (`Shadow::copy_stale`): nothing here is.
+        let newer = |written: &[(usize, u64)], since: u64| written.iter().filter(|&&(_, w)| w > since).count();
+        let (quiet, written) = super::writes(start, start + N, true).expect("guarded");
+        assert_eq!(newer(&written, first), 0, "nothing written since: nothing newer");
+        // One byte in the third block: that block, and only it.
+        // SAFETY: inside our committed region; the guard's fault hands the
+        // block back before the write goes on.
+        unsafe { ((start + 2 * BLOCK + 7) as *mut u8).write_volatile(1) };
+        let (found, written) = super::writes(start, start + N, true).expect("guarded");
+        let fresh: Vec<usize> = written.iter().filter(|&&(_, w)| w > quiet).map(|&(page, _)| page).collect();
+        assert_eq!(fresh, vec![(start + 2 * BLOCK) / super::PAGE], "one block written, one named");
+        // And the next asking, with nothing written, is quiet again: nothing
+        // newer than the asking that found the write (the journal keeps the
+        // write's number; an asking with nothing to report does not re-date
+        // it).
+        let (_, written) = super::writes(start, start + N, true).expect("guarded");
+        assert_eq!(newer(&written, found), 0, "{written:?}");
+    }
+
+    /// The class removed, measured: a 64 MiB pool the kernel refuses, three
+    /// samples a side. The old path answers `None` (the copy takes its whole
+    /// window, 64 MiB, at every refresh); the guarded path names the 16
+    /// blocks written and nothing else.
+    #[test]
+    #[ignore]
+    fn bench_copy_pools_guard() {
+        use std::time::Instant;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const N: usize = 64 << 20;
+        // SAFETY: a fresh private region, read-write, not write-watched.
+        let start = unsafe { VirtualAlloc(std::ptr::null(), N, MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(start, 0);
+        super::forget_askings();
+        let was = super::set_guard_copy_pools(Some(true));
+        // What a copy takes is the blocks whose write number is newer than
+        // its last copy (`Shadow::copy_stale`): `writes` answers with the
+        // range's whole journal, so counting its length would name all 1,024
+        // blocks for ever, written or not.
+        let fresh = |written: &[(usize, u64)], since: u64| {
+            written.iter().filter(|&&(_, w)| w > since).count()
+        };
+        let (mut since, first) = super::writes(start, start + N, true).expect("the first asking takes every block");
+        println!("{N} pool: first asking names {} blocks (the whole range once)", first.len());
+        let (_, quiet) = super::writes(start, start + N, true).expect("guarded");
+        assert_eq!(fresh(&quiet, since), 0, "nothing written yet: nothing named");
+        let mut named = 0;
+        let mut us = 0;
+        for _ in 0..3 {
+            for block in 0..16 {
+                // SAFETY: inside the region; the guard hands the block back.
+                unsafe { ((start + block * BLOCK + 3) as *mut u8).write_volatile(1) };
+            }
+            let started = Instant::now();
+            let (now, written) = super::writes(start, start + N, true).expect("guarded");
+            let took = started.elapsed();
+            let took_blocks = fresh(&written, since);
+            since = now;
+            assert_eq!(took_blocks, 16, "16 blocks written, 16 named");
+            named += took_blocks;
+            us += took.as_micros() as u64;
+            println!("sample: 16 blocks written, {took_blocks} blocks named, {} us, {} bytes copied (was {N})", took.as_micros(), took_blocks * BLOCK);
+        }
+        println!("three samples: {named} blocks named, {us} us, {} bytes (the whole-range path copied {N} bytes each time)", named * BLOCK);
+        super::set_guard_copy_pools(was);
+        crate::guards::open(start, start + N);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(start as *mut _, 0, MEM_RELEASE) };
+    }
+}
+#[cfg(test)]
+mod back_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    /// A kernel write of ours into a block a job holds waits for the job
+    /// before it opens it: opening first would let the job's merge write the
+    /// GPU's older bytes over the title's, and lose the merge.
+    #[test]
+    fn back_open_waits_for_the_job_that_holds_the_block() {
+        let _journal = super::journal_test_lock();
+        use std::sync::mpsc;
+        // SAFETY: one block of private memory, freed at the end.
+        let at = unsafe {
+            VirtualAlloc(std::ptr::null(), BLOCK, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(at, 0);
+        let done = std::sync::Arc::new(Done::default());
+        let blocks = back_begin(&done, at, at + BLOCK);
+        assert_eq!(blocks, [at / BLOCK]);
+        let (opened, when) = mpsc::channel();
+        let opener = std::thread::spawn(move || {
+            back_open(at, 1);
+            opened.send(()).unwrap();
+        });
+        assert!(
+            when.recv_timeout(std::time::Duration::from_millis(50)).is_err(),
+            "back_open opened a block a job still holds (the job's merge is lost)"
+        );
+        assert!(!writable_now(at));
+        done.finish();
+        assert!(
+            when.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            "back_open goes on once the job is done"
+        );
+        assert!(writable_now(at), "the title's write has the block");
+        assert!(back_pending(at).is_none());
+        opener.join().unwrap();
+        back_release(&blocks, &done);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A read of a block a job holds returns within the deadline and names
+    /// the job it waited for; on the deadline the block is the title's again,
+    /// so the instruction that faulted goes through instead of the title's
+    /// thread never running again.
+    #[test]
+    fn a_read_of_a_held_block_returns_within_the_deadline_and_names_the_job() {
+        let _journal = super::journal_test_lock();
+        use std::sync::mpsc;
+        // SAFETY: one block of private memory, freed at the end.
+        let at = unsafe {
+            VirtualAlloc(std::ptr::null(), BLOCK, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(at, 0);
+        let done = std::sync::Arc::new(Done::default());
+        let id = done.id();
+        let blocks = back_begin(&done, at, at + BLOCK);
+        assert_eq!(blocks, [at / BLOCK]);
+        let (back, when) = mpsc::channel();
+        let waited = done.clone();
+        let reader = std::thread::spawn(move || {
+            wait_held(at);
+            back.send((waited.id(), waited.finished())).unwrap();
+        });
+        assert!(
+            when.recv_timeout(std::time::Duration::from_millis(50)).is_err(),
+            "the read waits while the job is outstanding"
+        );
+        let (named, finished) = when
+            .recv_timeout(crate::writeback::MERGE_DEADLINE + std::time::Duration::from_secs(2))
+            .expect("the read returns within the deadline");
+        assert_eq!(named, id, "the wait names the job it waited for");
+        assert!(!finished, "the job never finished: only the deadline returned it");
+        assert!(writable_now(at), "the block is given back to the title");
+        assert!(back_pending(at).is_none(), "and no job holds it any more");
+        reader.join().unwrap();
+        back_release(&blocks, &done);
         // SAFETY: our allocation.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
