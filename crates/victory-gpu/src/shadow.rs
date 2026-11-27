@@ -3354,6 +3354,38 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
     crate::stall::guard(crate::stall::Lock::Shadow, &BUFFERS)
 }
 
+fn matching_entry(
+    map: &mut BTreeMap<(u64, usize), Entry>,
+    address: u64,
+    end: u64,
+) -> Option<(&(u64, usize), &mut Entry)> {
+    map.range_mut(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, entry)| entry.end >= end)
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    use super::{Entry, matching_entry};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn matching_entry_prefers_the_latest_covering_buffer() {
+        let entry = |end| Entry { end, read_only: false, shadow: None };
+        let mut map = BTreeMap::from([
+            ((100, 1), entry(300)),
+            ((150, 1), entry(180)),
+            ((150, 2), entry(250)),
+            ((210, 1), entry(300)),
+        ]);
+        assert_eq!(*matching_entry(&mut map, 200, 240).unwrap().0, (150, 2));
+        assert_eq!(*matching_entry(&mut map, 200, 260).unwrap().0, (100, 1));
+        assert!(matching_entry(&mut map, 200, 301).is_none());
+        assert!(matching_entry(&mut map, 99, 100).is_none());
+    }
+}
+
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64, read_only: bool) {
     buffers().insert(
@@ -3463,17 +3495,10 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
-    let Some(key) = key else {
+    let Some((key, entry)) = matching_entry(&mut map, address, end) else {
         drop(map);
         return loose(address, end, len <= 1, any);
     };
-    let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up to whole slots of the small buffers' pool, so that views

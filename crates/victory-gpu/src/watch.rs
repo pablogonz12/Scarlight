@@ -42,14 +42,46 @@ const KERNEL_PAGE: usize = 4096;
 ///
 /// One sequence for every shard ([`crate::journal`]): a page's number is
 /// compared with the asking a copy took, so a number from one shard has to
-/// mean the same as one from another. Resetting and numbering are serialized
-/// by RESET_ORDER so the numbers reflect the order writes were observed.
+/// mean the same as one from another. Overlapping resets and their numbering
+/// are ordered so each page's numbers reflect the order writes were observed.
 static ASKED: AtomicU64 = AtomicU64::new(0);
 
-static RESET_ORDER: Mutex<()> = Mutex::new(());
+static RESET_ORDER: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+static RESET_READY: std::sync::Condvar = std::sync::Condvar::new();
 
-fn reset_order() -> std::sync::MutexGuard<'static, ()> {
-    RESET_ORDER.lock().unwrap_or_else(|e| e.into_inner())
+struct ResetRange(usize, usize);
+
+impl Drop for ResetRange {
+    fn drop(&mut self) {
+        let mut active = RESET_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+        let index = active.iter().position(|r| *r == (self.0, self.1)).unwrap();
+        active.swap_remove(index);
+        RESET_READY.notify_all();
+    }
+}
+
+/// Overlapping ranges remain ordered across reset, numbering and recording.
+fn reset_order(first: usize, last: usize) -> ResetRange {
+    #[cfg(test)]
+    let started = std::time::Instant::now();
+    let mut active = RESET_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+    while active.iter().any(|&(from, to)| first < to && from < last) {
+        active = RESET_READY.wait(active).unwrap_or_else(|e| e.into_inner());
+    }
+    active.push((first, last));
+    drop(active);
+    #[cfg(test)]
+    BENCH_WAIT.with(|v| v.set(v.get() + started.elapsed().as_nanos()));
+    ResetRange(first, last)
+}
+
+fn reset_all() -> ResetRange {
+    reset_order(0, usize::MAX)
+}
+
+#[cfg(test)]
+thread_local! {
+    static BENCH_WAIT: std::cell::Cell<u128> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether a submission's one asking stands ([`ask_once`]): what [`wrote`]
@@ -100,7 +132,7 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
-    let _order = reset_order();
+    let _order = reset_all();
     ask_ahead_locked(ranges);
 }
 
@@ -205,7 +237,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         return;
     }
     ask_once_end();
-    let _order = reset_order();
+    let _order = reset_all();
     ask_ahead_locked(ranges);
     let mut a = asking();
     let a = &mut *a;
@@ -252,7 +284,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
     if len == 0 || !KEPT.load(Relaxed) {
         return;
     }
-    let _order = reset_order();
+    let _order = reset_order(at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let now = next_asking();
     crate::journal::record(at / PAGE, at.saturating_add(len).div_ceil(PAGE), now);
 }
@@ -423,7 +455,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     // The guard reset, kernel reset, number assignment and journal records
     // must be ordered together, including across the two reset paths.
-    let _order = reset_order();
+    let _order = reset_order(first, last);
     // A pool the guards hold answers out of its own blocks, without a walk of
     // the pages asked about ([`guard_pools`]). Pages only a verifying asking
     // found are kept too: the copy needs them.
@@ -1498,6 +1530,72 @@ mod tests {
     }
 
     #[test]
+    fn disjoint_resets_proceed_while_overlapping_resets_wait() {
+        let _journal = journal_test_lock();
+        let held = reset_order(100, 200);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let tx2 = tx.clone();
+            scope.spawn(move || {
+                let _range = reset_order(200, 300);
+                tx2.send(1).unwrap();
+            });
+            assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), 1);
+            scope.spawn(move || {
+                let _range = reset_order(150, 250);
+                tx.send(2).unwrap();
+            });
+            assert!(rx.recv_timeout(std::time::Duration::from_millis(50)).is_err());
+            drop(held);
+            assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), 2);
+        });
+    }
+
+    #[test]
+    fn watch_microbench() {
+        let _journal = journal_test_lock();
+        const ITER: u128 = 100;
+        for size in [PAGE, 1 << 20, 50 << 20] {
+            for threads in [1, 7] {
+                let barrier = std::sync::Barrier::new(threads);
+                let results = std::thread::scope(|scope| {
+                    let mut workers = Vec::new();
+                    for _ in 0..threads {
+                        let barrier = &barrier;
+                        workers.push(scope.spawn(move || {
+                            let at = unsafe {
+                                VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+                            } as usize;
+                            assert_ne!(at, 0);
+                            POOLS.with(|v| v.set(Some(false)));
+                            BENCH_WAIT.with(|v| v.set(0));
+                            crate::journal::BENCH_KERNEL.with(|v| v.set(0));
+                            barrier.wait();
+                            let started = std::time::Instant::now();
+                            for i in 0..ITER {
+                                unsafe { (at as *mut u8).write_volatile(i as u8) };
+                                let (now, pages) = writes(at, at + size, false).unwrap();
+                                assert!(pages.iter().any(|&(page, generation)| page == at / PAGE && generation == now));
+                            }
+                            let elapsed = started.elapsed().as_nanos();
+                            let wait = BENCH_WAIT.with(|v| v.get());
+                            let kernel = crate::journal::BENCH_KERNEL.with(|v| v.get());
+                            unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+                            (elapsed, wait, kernel)
+                        }));
+                    }
+                    workers.into_iter().map(|w| w.join().unwrap()).collect::<Vec<_>>()
+                });
+                let n = ITER * threads as u128;
+                let elapsed: u128 = results.iter().map(|v| v.0).sum();
+                let wait: u128 = results.iter().map(|v| v.1).sum();
+                let kernel: u128 = results.iter().map(|v| v.2).sum();
+                println!("watch-bench size={size} threads={threads} ns/call total={} wait={} kernel={} journal_and_other={} guards=0", elapsed/n, wait/n, kernel/n, (elapsed-wait-kernel)/n);
+            }
+        }
+    }
+
+    #[test]
     fn reset_order_also_orders_numbers_and_records() {
         let _journal = journal_test_lock();
         let at = unsafe {
@@ -1511,7 +1609,7 @@ mod tests {
         assert_ne!(at, 0);
         unsafe { (at as *mut u8).write_volatile(1) };
         let page = at / PAGE;
-        let first = reset_order();
+        let first = reset_order(page, page + 1);
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
