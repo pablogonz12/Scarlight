@@ -1,5 +1,8 @@
 # Credits
 
+- **Marvisak/VIctory [13091f6e](https://github.com/Marvisak/VIctory/commit/13091f6e)**, GPL-3.0:
+  array level queries use spatial coordinates only.
+
 Scarlight is a port of **VIctory** ([Marvisak/VIctory](https://github.com/Marvisak/VIctory)),
 GPL-3.0. Its history, authorship and commit dates are kept.
 
