@@ -1085,6 +1085,11 @@ mod tests {
         // Windows 10's winhttp.dll); the HLE supplies those itself, so skip
         // them only when the host really lacks them.
         const NEWER_WINDOWS_ONLY: &[&str] = &["WinHttpGetProxySettingsEx"];
+        let wine = unsafe {
+            use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        };
         for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
             let dll = if e.name.starts_with("WinHttp") {
                 "winhttp.dll"
@@ -1093,6 +1098,10 @@ mod tests {
             };
             let present = crate::host::function(dll, e.name).is_some();
             if !present && NEWER_WINDOWS_ONLY.contains(&e.name) {
+                continue;
+            }
+            if !present && wine && ["WSAConnectByList", "GetAddrInfoExA"].contains(&e.name) {
+                eprintln!("skipped export check: Wine does not provide {}", e.name);
                 continue;
             }
             assert!(present, "{dll} lacks {}", e.name);
