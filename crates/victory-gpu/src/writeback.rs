@@ -114,25 +114,73 @@ impl Drop for Job {
     }
 }
 
+/// How long a title's access to a job's block, or a submission's snapshot of
+/// one, waits for the job before the merge is given up: a merge takes
+/// milliseconds, and `Job`'s own drop finishes it on every early return, so a
+/// wait this long means the job is never going to finish. `Done::wait_for`
+/// then says so, with the job's id, and the caller takes the block back
+/// instead of waiting forever (a title's loader thread that never returns is
+/// the whole run stalled).
+pub(crate) const MERGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The id of the next job, so a wait that gives up can name it.
+static NEXT_JOB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Whether a job has finished, for threads that faulted on its blocks.
-#[derive(Default)]
 pub(crate) struct Done {
+    id: u64,
     finished: Mutex<bool>,
     ready: Condvar,
 }
 
+impl Default for Done {
+    fn default() -> Done {
+        Done {
+            id: NEXT_JOB.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            finished: Mutex::new(false),
+            ready: Condvar::new(),
+        }
+    }
+}
+
 impl Done {
+    /// The job this waits for (for a test that checks the wait named it).
+    #[cfg(test)]
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     pub(crate) fn finish(&self) {
         *self.finished.lock().unwrap_or_else(|e| e.into_inner()) = true;
         self.ready.notify_all();
     }
 
-    /// Waits until the job's copy-back and writes are done.
-    pub(crate) fn wait(&self) {
+    /// Waits until the job's copy-back and writes are done; false, with a log
+    /// line naming the job and what waited, if `limit` went by first. A wait
+    /// that gives up must take the block back from the job (`watch::wait_held`):
+    /// the job's own release will then find the block gone from `Back`, and
+    /// the title's range is its own again.
+    pub(crate) fn wait_for(&self, what: &str, limit: std::time::Duration) -> bool {
+        let started = std::time::Instant::now();
         let mut finished = self.finished.lock().unwrap_or_else(|e| e.into_inner());
         while !*finished {
-            finished = self.ready.wait(finished).unwrap_or_else(|e| e.into_inner());
+            let left = limit.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                tracing::error!(
+                    job = self.id,
+                    what,
+                    ms = started.elapsed().as_millis() as u64,
+                    "a write-back job did not finish: giving its range up (that merge is lost, and named here)"
+                );
+                return false;
+            }
+            finished = self
+                .ready
+                .wait_timeout(finished, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
+        true
     }
 
     /// Whether the job is done (no wait).
@@ -215,6 +263,7 @@ mod tests {
     /// of its own inaccessible for the rest of the run (issue #32).
     #[test]
     fn a_job_dropped_without_running_gives_its_pages_back() {
+        let _journal = crate::watch::journal_test_lock();
         use windows_sys::Win32::System::Memory::{
             MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS,
             PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualQuery,
@@ -253,10 +302,11 @@ mod tests {
     /// waiting for a job that will never finish (issue #32).
     #[test]
     fn a_panicking_job_finishes_and_lets_its_waiters_go() {
+        let _journal = crate::watch::journal_test_lock();
         let done = Arc::new(Done::default());
         let waiter = done.clone();
         let thread = std::thread::spawn(move || {
-            waiter.wait();
+            waiter.wait_for("a waiter of a test job", MERGE_DEADLINE);
             true
         });
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
@@ -274,6 +324,7 @@ mod tests {
     /// A wait returns only once the job finished, on another thread.
     #[test]
     fn done_waits_for_the_finish() {
+        let _journal = crate::watch::journal_test_lock();
         let done = Arc::new(Done::default());
         assert!(!done.finished());
         let flag = done.clone();
@@ -281,8 +332,85 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
             flag.finish();
         });
-        done.wait();
+        assert!(done.wait_for("a wait for a test job", MERGE_DEADLINE));
         assert!(done.finished());
         thread.join().unwrap();
+    }
+
+    /// A job with nothing to put back and nothing to write (every shadow of
+    /// its ranges was carded, or its range list came out empty) still gives
+    /// its pages back when it is dropped: a title read of them must go
+    /// through, and no one may be left waiting for a job that has no work.
+    #[test]
+    fn an_empty_job_gives_its_pages_back_and_lets_a_read_through() {
+        let _journal = crate::watch::journal_test_lock();
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualQuery,
+        };
+        let block = crate::watch::BLOCK;
+        // SAFETY: an allocation of the test's own.
+        unsafe {
+            let base = VirtualAlloc(
+                std::ptr::null(),
+                block,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!base.is_null());
+            base.write_bytes(0x5a, 16);
+            let mut job = Job::new();
+            let done = job.done();
+            job.blocks = crate::watch::back_begin(&done, base as usize, base as usize + block);
+            assert!(!job.blocks.is_empty(), "the job holds the page");
+            assert!(job.is_empty(), "nothing to put back, nothing to write");
+            assert_eq!(
+                {
+                    let mut info: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION =
+                        std::mem::zeroed();
+                    assert_ne!(
+                        VirtualQuery(base.cast(), &mut info, std::mem::size_of_val(&info)),
+                        0
+                    );
+                    info.Protect
+                },
+                PAGE_NOACCESS
+            );
+            drop(job);
+            assert!(done.finished(), "a job with no work still finishes");
+            assert_eq!(
+                {
+                    let mut info: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION =
+                        std::mem::zeroed();
+                    assert_ne!(
+                        VirtualQuery(base.cast(), &mut info, std::mem::size_of_val(&info)),
+                        0
+                    );
+                    info.Protect
+                },
+                PAGE_READWRITE,
+                "the title's read goes through"
+            );
+            assert_eq!(base.read(), 0x5a);
+            VirtualFree(base.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    /// A wait that is never satisfied gives up at its deadline and says which
+    /// job it waited for; it does not sleep forever (the title's thread that
+    /// faults on the block would never run again).
+    #[test]
+    fn a_wait_gives_up_at_the_deadline_and_names_the_job() {
+        let _journal = crate::watch::journal_test_lock();
+        let done = Done::default();
+        assert_ne!(done.id(), 0, "a job has an id to name it");
+        let limit = std::time::Duration::from_millis(50);
+        let started = std::time::Instant::now();
+        assert!(!done.wait_for("a title read of a block a job holds", limit));
+        let took = started.elapsed();
+        assert!(took >= limit, "it waited the deadline: {took:?}");
+        assert!(took < std::time::Duration::from_secs(5), "and no longer: {took:?}");
+        assert!(!done.finished());
     }
 }

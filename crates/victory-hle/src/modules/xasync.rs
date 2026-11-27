@@ -557,6 +557,7 @@ pub fn XAsyncBegin(
 /// Queues the provider's `DoWork` on the block's work port.
 pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
     extern "system" fn work(block: *mut c_void, canceled: bool) {
+        let _stall = victory_gpu::stall_site!("xasync::work").enter(format_args!(""));
         let block = block.cast::<AsyncBlock>();
         let Some(call) = call(block) else { return };
         let hr = if canceled {
@@ -583,6 +584,7 @@ pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
 /// completion routine on the block's completion port.
 pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
     extern "system" fn complete(block: *mut c_void, _canceled: bool) {
+        let _stall = victory_gpu::stall_site!("xasync::complete").enter(format_args!(""));
         let block = block.cast::<AsyncBlock>();
         // SAFETY: read before the status was published; see below.
         if let Some(routine) = unsafe { (*block).callback } {
@@ -710,6 +712,7 @@ pub fn finished_with(
 ) -> HRESULT {
     type Data = Result<Vec<u8>, HRESULT>;
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+        let _stall = victory_gpu::stall_site!("xasync::provider").enter(format_args!(""));
         // SAFETY: the runtime passes valid provider data; the context is the
         // boxed result until cleanup frees it.
         let data = unsafe { &*data };
@@ -762,6 +765,7 @@ pub fn pending_with(
 ) -> HRESULT {
     type Data = Mutex<(Option<Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>>, Vec<u8>)>;
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+        let _stall = victory_gpu::stall_site!("xasync::provider").enter(format_args!(""));
         // SAFETY: the runtime passes valid provider data; the context is the
         // boxed state until cleanup frees it.
         let data = unsafe { &*data };
@@ -832,6 +836,7 @@ type Work = extern "system" fn(*mut AsyncBlock) -> HRESULT;
 /// return value is the call's result.
 pub fn XAsyncRun(block: *mut AsyncBlock, work: Option<Work>) -> HRESULT {
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+        let _stall = victory_gpu::stall_site!("xasync::provider").enter(format_args!(""));
         // SAFETY: the runtime passes valid provider data.
         let data = unsafe { &*data };
         match op {
@@ -867,15 +872,19 @@ pub const INTERFACES: &[Interface] = &[(PROVIDER, PROVIDER, &OBJECT)];
 
 type This = *const Object;
 extern "system" fn m_get_status(_: This, b: *mut AsyncBlock, wait: u8) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xasync::m_get_status").enter(format_args!(""));
     XAsyncGetStatus(b, wait != 0)
 }
 extern "system" fn m_get_result_size(_: This, b: *mut AsyncBlock, out: *mut usize) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xasync::m_get_result_size").enter(format_args!(""));
     XAsyncGetResultSize(b, out)
 }
 extern "system" fn m_cancel(_: This, b: *mut AsyncBlock) {
+    let _stall = victory_gpu::stall_site!("xasync::m_cancel").enter(format_args!(""));
     XAsyncCancel(b)
 }
 extern "system" fn m_run(_: This, b: *mut AsyncBlock, work: Option<Work>) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xasync::m_run").enter(format_args!(""));
     XAsyncRun(b, work)
 }
 extern "system" fn m_begin(
@@ -886,12 +895,15 @@ extern "system" fn m_begin(
     name: *const u8,
     provider: Option<Provider>,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xasync::m_begin").enter(format_args!(""));
     XAsyncBegin(b, context, identity, name, provider)
 }
 extern "system" fn m_schedule(_: This, b: *mut AsyncBlock, delay: u32) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xasync::m_schedule").enter(format_args!(""));
     XAsyncSchedule(b, delay)
 }
 extern "system" fn m_complete(_: This, b: *mut AsyncBlock, hr: HRESULT, size: usize) {
+    let _stall = victory_gpu::stall_site!("xasync::m_complete").enter(format_args!(""));
     XAsyncComplete(b, hr, size)
 }
 extern "system" fn m_get_result(
@@ -902,6 +914,7 @@ extern "system" fn m_get_result(
     buffer: *mut c_void,
     used: *mut usize,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xasync::m_get_result").enter(format_args!(""));
     XAsyncGetResult(b, identity, size, buffer, used)
 }
 extern "system" fn m_create(
@@ -910,6 +923,7 @@ extern "system" fn m_create(
     completion: u32,
     out: *mut *const Queue,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xasync::m_create").enter(format_args!(""));
     XTaskQueueCreate(work, completion, out)
 }
 extern "system" fn m_create_composite(
@@ -918,6 +932,7 @@ extern "system" fn m_create_composite(
     completion: *const c_void,
     out: *mut *const Queue,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xasync::m_create_composite").enter(format_args!(""));
     XTaskQueueCreateComposite(work, completion, out)
 }
 extern "system" fn m_get_port(
@@ -926,15 +941,19 @@ extern "system" fn m_get_port(
     port: u32,
     out: *mut *const c_void,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xasync::m_get_port").enter(format_args!(""));
     XTaskQueueGetPort(q, port, out)
 }
 extern "system" fn m_duplicate(_: This, q: *const Queue, out: *mut *const Queue) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xasync::m_duplicate").enter(format_args!(""));
     XTaskQueueDuplicateHandle(q, out)
 }
 extern "system" fn m_dispatch(_: This, q: *const Queue, port: u32, timeout: u32) -> bool {
+    let _stall = victory_gpu::stall_site!("xasync::m_dispatch").enter(format_args!(""));
     XTaskQueueDispatch(q, port, timeout)
 }
 extern "system" fn m_close(_: This, q: *const Queue) {
+    let _stall = victory_gpu::stall_site!("xasync::m_close").enter(format_args!(""));
     XTaskQueueCloseHandle(q)
 }
 extern "system" fn m_submit(
@@ -944,6 +963,7 @@ extern "system" fn m_submit(
     context: *mut c_void,
     callback: Option<Callback>,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xasync::m_submit").enter(format_args!(""));
     XTaskQueueSubmitDelayedCallback(q, port, 0, context, callback)
 }
 extern "system" fn m_submit_delayed(
@@ -954,6 +974,7 @@ extern "system" fn m_submit_delayed(
     context: *mut c_void,
     callback: Option<Callback>,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xasync::m_submit_delayed").enter(format_args!(""));
     XTaskQueueSubmitDelayedCallback(q, port, delay, context, callback)
 }
 extern "system" fn m_terminate(
@@ -963,6 +984,7 @@ extern "system" fn m_terminate(
     context: *mut c_void,
     callback: Option<TerminatedCallback>,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xasync::m_terminate").enter(format_args!(""));
     XTaskQueueTerminate(q, wait != 0, context, callback)
 }
 extern "system" fn m_register_monitor(
@@ -972,20 +994,24 @@ extern "system" fn m_register_monitor(
     callback: Option<MonitorCallback>,
     token: *mut u64,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("xasync::m_register_monitor").enter(format_args!(""));
     XTaskQueueRegisterMonitor(q, context, callback, token)
 }
 extern "system" fn m_unregister_monitor(_: This, q: *const Queue, token: u64) {
+    let _stall = victory_gpu::stall_site!("xasync::m_unregister_monitor").enter(format_args!(""));
     XTaskQueueUnregisterMonitor(q, token)
 }
 extern "system" fn m_get_process_queue(_: This, out: *mut *const Queue) -> bool {
+    let _stall = victory_gpu::stall_site!("xasync::m_get_process_queue").enter(format_args!(""));
     XTaskQueueGetCurrentProcessTaskQueue(out)
 }
 extern "system" fn m_set_process_queue(_: This, q: *const Queue) {
+    let _stall = victory_gpu::stall_site!("xasync::m_set_process_queue").enter(format_args!(""));
     XTaskQueueSetCurrentProcessTaskQueue(q)
 }
 /// The runtime's debug check that the caller is not a time-critical thread,
 /// which every runtime call in a title makes first.
-extern "system" fn m_check_thread(_: This) {}
+extern "system" fn m_check_thread(_: This) { let _stall = victory_gpu::stall_site!("xasync::m_check_thread").enter(format_args!("")); }
 
 static VTABLE: Methods<31> = Methods([
     missing::<0> as *const (),         // 0x00 QueryInterface
@@ -1032,6 +1058,7 @@ mod tests {
 
     static RAN: AtomicU32 = AtomicU32::new(0);
     extern "system" fn count(context: *mut c_void, canceled: bool) {
+        let _stall = victory_gpu::stall_site!("xasync::count").enter(format_args!(""));
         RAN.fetch_add(
             if canceled { 100 } else { context as u32 },
             Ordering::SeqCst,
@@ -1064,6 +1091,7 @@ mod tests {
 
     /// A provider that schedules its work and returns a u64 result.
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+        let _stall = victory_gpu::stall_site!("xasync::provider").enter(format_args!(""));
         // SAFETY: the runtime passes valid provider data.
         let data = unsafe { &*data };
         match op {
@@ -1083,6 +1111,7 @@ mod tests {
 
     static COMPLETED: AtomicU32 = AtomicU32::new(0);
     extern "system" fn completed(_: *mut AsyncBlock) {
+        let _stall = victory_gpu::stall_site!("xasync::completed").enter(format_args!(""));
         COMPLETED.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -1138,6 +1167,7 @@ mod tests {
     fn a_nonnegative_completion_still_returns_its_payload() {
         const S_FALSE: HRESULT = 1;
         extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            let _stall = victory_gpu::stall_site!("xasync::provider").enter(format_args!(""));
             // SAFETY: the runtime passes valid provider data.
             let data = unsafe { &*data };
             match op {
@@ -1186,6 +1216,7 @@ mod tests {
     #[test]
     fn run_returns_the_work_result() {
         extern "system" fn work(_: *mut AsyncBlock) -> HRESULT {
+            let _stall = victory_gpu::stall_site!("xasync::work").enter(format_args!(""));
             E_ABORT
         }
         let mut block = AsyncBlock {
@@ -1210,6 +1241,7 @@ mod tests {
         static SECOND: AtomicBool = AtomicBool::new(false);
         static FIRST: AtomicBool = AtomicBool::new(false);
         extern "system" fn waits(_: *mut c_void, _: bool) {
+            let _stall = victory_gpu::stall_site!("xasync::waits").enter(format_args!(""));
             let start = std::time::Instant::now();
             while !SECOND.load(Ordering::SeqCst) && start.elapsed().as_secs() < 5 {
                 std::thread::yield_now();
@@ -1217,6 +1249,7 @@ mod tests {
             FIRST.store(SECOND.load(Ordering::SeqCst), Ordering::SeqCst);
         }
         extern "system" fn releases(_: *mut c_void, _: bool) {
+            let _stall = victory_gpu::stall_site!("xasync::releases").enter(format_args!(""));
             SECOND.store(true, Ordering::SeqCst);
         }
         let mut q = std::ptr::null();
@@ -1245,6 +1278,7 @@ mod tests {
     fn terminate_ends_a_waiting_dispatch() {
         static RAN: AtomicU32 = AtomicU32::new(0);
         extern "system" fn ran(_: *mut c_void, _: bool) {
+            let _stall = victory_gpu::stall_site!("xasync::ran").enter(format_args!(""));
             RAN.fetch_add(1, Ordering::SeqCst);
         }
         /// Dispatches `queue`'s work until a dispatch returns false, then
@@ -1309,9 +1343,11 @@ mod tests {
     fn terminate_cancels_what_is_queued() {
         static TERMINATED: AtomicBool = AtomicBool::new(false);
         extern "system" fn terminated(_: *mut c_void) {
+            let _stall = victory_gpu::stall_site!("xasync::terminated").enter(format_args!(""));
             TERMINATED.store(true, Ordering::SeqCst);
         }
         extern "system" fn note(context: *mut c_void, canceled: bool) {
+            let _stall = victory_gpu::stall_site!("xasync::note").enter(format_args!(""));
             // SAFETY: the test passes a pointer to its flag.
             unsafe { *context.cast::<bool>() = canceled };
         }

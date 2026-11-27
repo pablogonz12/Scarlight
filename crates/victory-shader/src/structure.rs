@@ -570,6 +570,16 @@ struct SopMasks {
 
 const MAX_ROUNDS: usize = 256;
 
+/// Whether a wave64 lane mask split into two scalar moves is recognised as
+/// the mask it was copied from. `VICTORY_DX_LANE_MASK_MOVES=0` turns the
+/// recovery off, leaving the split pair as an opaque atom.
+fn wave64_mask_from_moves() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var_os("VICTORY_DX_LANE_MASK_MOVES").is_some_and(|v| v == "0")
+    })
+}
+
 impl<'a> Lanes<'a> {
     fn new(p: &'a Program) -> Result<Self, ShaderError> {
         let blocks = &p.blocks;
@@ -901,12 +911,12 @@ impl<'a> Lanes<'a> {
         // dword at a time. The spill pass turns these into scalar moves.
         // Recover the original lane predicate only when the two words
         // still come from the same known mask, in their original order.
-        if self.p.wave64 {
-            let source = (self.move_source(k.0), self.move_source(k.1));
-            if source != k && let Some(&m) = self.masks.get(&source) {
-                self.masks.insert(k, m);
-                return (m, true);
-            }
+        if self.p.wave64
+            && wave64_mask_from_moves()
+            && let Some(m) = self.moved_mask(k)
+        {
+            self.masks.insert(k, m);
+            return (m, true);
         }
         let p = self.p;
         let (m, derived) = match self.join(k) {
@@ -948,6 +958,16 @@ impl<'a> Lanes<'a> {
         };
         cache.insert(k, m);
         (m, derived)
+    }
+
+    /// The mask `k` was copied from, through scalar moves only, when both of
+    /// its dwords still trace back to the same known mask of the same pair.
+    fn moved_mask(&self, k: Key) -> Option<Bool> {
+        let source = (self.move_source(k.0), self.move_source(k.1));
+        if source == k {
+            return None;
+        }
+        self.masks.get(&source).copied()
     }
 
     fn move_source(&self, mut value: Value) -> Value {
