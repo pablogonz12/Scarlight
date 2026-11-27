@@ -886,6 +886,7 @@ mod tests {
 
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
+        let _journal = crate::watch::journal_test_lock();
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 5 << 16;
         // SAFETY: we reserve a private region, commit selected pages inside it,
@@ -921,6 +922,7 @@ mod tests {
 
     #[test]
     fn a_read_only_title_destination_is_written_through_the_kernel() {
+        let _journal = crate::watch::journal_test_lock();
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 2 << 16;
         // SAFETY: a private region committed whole, accessed directly.
@@ -983,6 +985,7 @@ mod tests {
 
     #[test]
     fn a_copy_of_title_memory_the_layer_has_seen_goes_at_the_bytes() {
+        let _journal = crate::watch::journal_test_lock();
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 2 << 16;
         // SAFETY: a private region committed whole, accessed directly.
