@@ -1,5 +1,8 @@
 # Credits
 
+- **Marvis [da82e444](https://github.com/Marvisak/VIctory/commit/da82e444)**, GPL-3.0:
+  correctly rounded normalized buffer format conversion.
+
 - **GrapeJuice429 [#29](https://github.com/pablogonz12/Scarlight/pull/29)**, GPL-3.0:
   diagnostics for previewing a selected render target.
 - **Duff [c430b1de](https://github.com/Marvisak/VIctory/commit/c430b1de)**, GPL-3.0:
@@ -414,3 +417,4 @@ D
 - **Rareuncommon**, [vector sum of absolute differences](https://github.com/Marvisak/VIctory/commit/5d6889e8b): lower vector SAD variants.
 - **AnoHunted**, [signed nibble conversion](https://github.com/Marvisak/VIctory/commit/78c12677e): lower `v_cvt_off_f32_i4` and test its conversion.
 - **loyodea**, Belobug/VIctory-Belobug-AMD `a31fa6cbf`, GPL-3.0: reject zero translation worker counts and test CLI validation.
+- **sawetco**, Belobug/VIctory-Belobug-AMD commit 4fd34fdd6, GPL-3.0: follow unchanged scalar joins when removing wave64 early-out skips.
