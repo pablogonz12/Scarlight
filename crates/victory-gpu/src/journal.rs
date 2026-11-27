@@ -18,7 +18,6 @@
 //! number is what the callers use, never a whole range's.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// The unit the journal tracks: `watch`'s page.
@@ -151,11 +150,21 @@ pub(crate) fn any_since(first: usize, last: usize, since: u64) -> bool {
     false
 }
 
-/// The kernel's answer to [`ask`]: its room is held until this is dropped,
-/// so an asking never allocates and the one buffer serves every thread.
+/// The kernel's answer to [`ask`]. Each thread reuses its own answer buffer.
 pub(crate) struct Answer {
-    room: std::sync::MutexGuard<'static, Vec<usize>>,
+    room: Vec<usize>,
     count: usize,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+thread_local! {
+    static ROOM: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl Drop for Answer {
+    fn drop(&mut self) {
+        ROOM.with(|room| *room.borrow_mut() = std::mem::take(&mut self.room));
+    }
 }
 
 impl Answer {
@@ -175,21 +184,20 @@ impl Answer {
 /// (the caller then looks at the guards).
 ///
 /// This is the one place a kernel call is made, and it costs 30-70
-/// microseconds whatever the range: askings were serialised by the journal's
-/// lock before and are by the answer's room now, never by a page shard (a
-/// copy reads pages meanwhile).
+/// microseconds whatever the range. Each thread has its own answer buffer;
+/// overlapping resets are ordered by the caller.
 pub(crate) fn ask(first: usize, last: usize) -> Option<Answer> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
-    static ROOM: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-    let mut guard = ROOM.lock().unwrap_or_else(|e| e.into_inner());
-    let room = &mut *guard;
+    let mut room = ROOM.with(|room| std::mem::take(&mut *room.borrow_mut()));
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     room.resize(count.max(room.len()), 0);
     let mut granularity = 0;
     #[cfg(test)]
     note_kernel_ask();
     // SAFETY: the answer buffer holds `count` entries.
+    #[cfg(test)]
+    let started = std::time::Instant::now();
     let failed = unsafe {
         GetWriteWatch(
             WRITE_WATCH_FLAG_RESET,
@@ -200,10 +208,18 @@ pub(crate) fn ask(first: usize, last: usize) -> Option<Answer> {
             &mut granularity,
         )
     } != 0;
+    #[cfg(test)]
+    BENCH_KERNEL.with(|v| v.set(v.get() + started.elapsed().as_nanos()));
     if failed {
+        ROOM.with(|slot| *slot.borrow_mut() = room);
         return None;
     }
-    Some(Answer { room: guard, count })
+    Some(Answer { room, count, _thread: std::marker::PhantomData })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BENCH_KERNEL: std::cell::Cell<u128> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
