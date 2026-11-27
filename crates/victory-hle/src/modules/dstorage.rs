@@ -628,8 +628,12 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     scheduler.worker_count.get_or_init(|| {
-        let workers =
-            dstorage_worker_count(std::thread::available_parallelism().map_or(4, |n| n.get()));
+        let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let override_count = std::env::var("VICTORY_DSTORAGE_WORKERS").ok()
+            .and_then(|v| v.trim().parse::<usize>().ok());
+        let physical = physical_cores();
+        let workers = choose_workers(logical, physical, override_count);
+        tracing::info!(logical, ?physical, workers, "dstorage: worker topology");
         let started = (0..workers)
             .filter(|i| {
                 let Some(worker) = Worker::new() else {
@@ -652,6 +656,77 @@ fn scheduler() -> Option<&'static Scheduler> {
 fn dstorage_worker_count(cores: usize) -> usize {
     cores.clamp(2, 16)
 }
+
+fn choose_workers(logical: usize, physical: Option<usize>, requested: Option<usize>) -> usize {
+    requested.filter(|n| (1..=64).contains(n))
+        .or_else(|| physical.filter(|n| *n > 0).map(|n| n.clamp(1, 32)))
+        .unwrap_or_else(|| dstorage_worker_count(logical))
+}
+
+#[cfg(any(windows, test))]
+fn core_in_affinity(masks: impl IntoIterator<Item = (u16, usize)>, group: u16, mask: usize) -> bool {
+    masks.into_iter().any(|(g, bits)| g == group && bits & mask != 0)
+}
+
+/// Count cores with at least one logical processor available to this process.
+#[cfg(windows)]
+fn physical_cores() -> Option<usize> {
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, RelationProcessorCore, GROUP_AFFINITY,
+        PROCESSOR_RELATIONSHIP, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessAffinityMask, GetProcessGroupAffinity,
+    };
+    let process = unsafe { GetCurrentProcess() };
+    let (mut mask, mut system) = (0usize, 0usize);
+    if unsafe { GetProcessAffinityMask(process, &mut mask, &mut system) } == 0 || mask == 0 {
+        return None;
+    }
+    let (mut groups, mut group) = (1u16, 0u16);
+    let group_known = unsafe { GetProcessGroupAffinity(process, &mut groups, &mut group) } != 0;
+    if group_known && groups != 1 {
+        return None;
+    }
+    let mut len = 0u32;
+    unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut len) };
+    if len == 0 { return None; }
+    let mut buf = vec![0u8; len as usize];
+    if unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, buf.as_mut_ptr().cast(), &mut len) } == 0 {
+        return None;
+    }
+    let bytes = buf.get(..len as usize)?;
+    let rel = std::mem::offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous);
+    let masks = rel + std::mem::offset_of!(PROCESSOR_RELATIONSHIP, GroupMask);
+    let group_count = rel + std::mem::offset_of!(PROCESSOR_RELATIONSHIP, GroupCount);
+    let mut at = 0usize;
+    let mut cores = 0usize;
+    while at < bytes.len() {
+        let header = bytes.get(at..at.checked_add(8)?)?;
+        let size = u32::from_ne_bytes(header[4..8].try_into().ok()?) as usize;
+        let record = bytes.get(at..at.checked_add(size)?)?;
+        if size < masks || group_count + 2 > size { return None; }
+        let count = u16::from_ne_bytes(record[group_count..group_count + 2].try_into().ok()?) as usize;
+        if count == 0 || masks.checked_add(count.checked_mul(std::mem::size_of::<GROUP_AFFINITY>())?)? > size {
+            return None;
+        }
+        let mut core_masks = Vec::with_capacity(count);
+        for i in 0..count {
+            let offset = masks + i * std::mem::size_of::<GROUP_AFFINITY>();
+            let affinity = unsafe { record.as_ptr().add(offset).cast::<GROUP_AFFINITY>().read_unaligned() };
+            // Some Wine versions lack GetProcessGroupAffinity. Its process
+            // mask is unambiguous only when the topology has one group.
+            if !group_known && affinity.Group != 0 { return None; }
+            core_masks.push((affinity.Group, affinity.Mask));
+        }
+        cores += usize::from(core_in_affinity(core_masks, group, mask));
+        at += size;
+    }
+    (cores > 0).then_some(cores)
+}
+
+#[cfg(not(windows))]
+fn physical_cores() -> Option<usize> { None }
 
 impl Scheduler {
     /// The scheduler while a worker runs its requests. With no worker a
@@ -2892,6 +2967,38 @@ mod tests {
         assert_eq!(dstorage_worker_count(16), 16);
         assert_eq!(dstorage_worker_count(28), 16);
         assert_eq!(dstorage_worker_count(64), 16);
+    }
+
+    #[test]
+    fn physical_workers_respect_affinity_and_fallback() {
+        let smt = [[(0, 0b0011)], [(0, 0b1100)]];
+        let count = |mask| smt.iter().filter(|core| core_in_affinity(**core, 0, mask)).count();
+        assert_eq!(count(0b1111), 2);
+        assert_eq!(count(0b0101), 2);
+        assert_eq!(count(0b0010), 1);
+        assert!(!core_in_affinity([(1, 1)], 0, 1));
+        assert_eq!(choose_workers(24, Some(12), None), 12);
+        assert_eq!(choose_workers(24, Some(6), None), 6);
+        assert_eq!(choose_workers(24, None, None), 16);
+        assert_eq!(choose_workers(1, None, None), 2);
+        assert_eq!(choose_workers(24, Some(12), Some(3)), 3);
+        assert_eq!(choose_workers(24, Some(12), Some(65)), 12);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn system_physical_core_query_reports_affinity() {
+        use windows_sys::Win32::System::SystemInformation::{GetLogicalProcessorInformationEx, RelationProcessorCore};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessAffinityMask, GetProcessGroupAffinity};
+        let (mut mask, mut sys, mut group, mut n, mut len) = (0usize, 0usize, 0u16, 1u16, 0u32);
+        let process = unsafe { GetCurrentProcess() };
+        let a = unsafe { GetProcessAffinityMask(process, &mut mask, &mut sys) };
+        let g = unsafe { GetProcessGroupAffinity(process, &mut n, &mut group) };
+        unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut len) };
+        eprintln!("affinity={a} mask={mask:x} group={g}/{n}/{group} topology_bytes={len}");
+        let count = physical_cores();
+        assert_ne!(count, Some(0));
+        eprintln!("affinity-visible physical cores: {count:?}");
     }
 
     #[test]
