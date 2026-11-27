@@ -461,11 +461,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         count = 0;
         #[cfg(feature = "diagnostics")]
         let guarding = std::time::Instant::now();
-        // Verified already on this asking: the guards' answer is taken. A
-        // copy (`guarded`) whose pages are a pool the kernel will not
-        // write-watch is guarded too, instead of being copied whole at
-        // every refresh ([`guard_copy_pools`], `VICTORY_GUARD_COPY_POOLS=0`
-        // for the old way).
+        // A copy of private memory the kernel cannot watch must be copied
+        // whole. Alignment does not establish ownership of heap pages.
         let pools = !guarded || !verified.is_empty() || guard_copy_pools();
         // A range that is not whole blocks is not one we own: the block it
         // rounds into holds memory somebody else writes (our own heap, the
@@ -480,7 +477,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             None
         } else {
-            guarded_range(first * PAGE, last * PAGE, pools)
+            guarded_range(first * PAGE, last * PAGE, !guarded || !verified.is_empty())
         } {
             Some(written) => written,
             None if verified.is_empty() => return None,
@@ -554,23 +551,9 @@ fn guarded_answer(
     )
 }
 
-/// Whether a copy whose pages the kernel will not write-watch (a pool's
-/// memory, committed privately: `GetWriteWatch` refuses it) is guarded
-/// instead of copied whole at every refresh: on.
-///
-/// The class this removes: copies of 1 MiB and up that went to the card with
-/// the 1 MiB floor (`VICTORY_CARD_BUFFERS_MIN_MB`) and whose refresh found
-/// no answer, so `Shadow::update` marked the copy `NOT_WATCHED` and took its
-/// whole window at every refresh for the rest of the run (run 11.14.5: 97
-/// copies, 941 MB, 758-1,373 MB sent a frame). A guard costs what is
-/// written: the first asking reports every block (the whole range once, as
-/// before), and after it only the blocks the title wrote, 8-9 us a block.
-///
-/// `VICTORY_GUARD_COPY_POOLS=0` puts the whole-range copy back. The kernel
-/// cannot verify this class (that is why it cannot answer), so a write that
-/// makes no fault (the card's into host memory, one through another view of
-/// the same section) is not seen: `crate::guards` never guards an aliased
-/// block, and a pool the runtime shows twice is the aliased case.
+/// Keep the alignment refusal and its accounting for copy-pool requests.
+/// This switch no longer enables new private copy-pool guards: alignment does
+/// not prove page ownership. The older opt-in pool watcher is separate.
 pub(crate) fn guard_copy_pools() -> bool {
     #[cfg(test)]
     if let Some(on) = tests::COPY_POOLS.with(|v| v.get()) {
@@ -580,8 +563,7 @@ pub(crate) fn guard_copy_pools() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_COPY_POOLS").is_none_or(|v| v != "0"))
 }
 
-/// Whether a range the kernel will not answer for is guarded as a pool: for
-/// the test that proves the class removed (`None` is the default).
+/// Overrides the copy-pool alignment refusal switch for tests.
 #[cfg(test)]
 pub(crate) fn set_guard_copy_pools(on: Option<bool>) -> Option<bool> {
     tests::COPY_POOLS.with(|v| v.replace(on))
@@ -1698,24 +1680,11 @@ mod tests {
         let (at, plane_end) = (plain, plain + PAGE);
         set_guard_copy_pools(Some(false));
         assert!(writes(at, plane_end, true).is_none(), "not answered, as before");
-        // With the pool guarded for a copy (the default) the range is
-        // answered: its blocks once, then nothing newer. Set explicitly, so
-        // a run with `VICTORY_GUARD_COPY_POOLS=0` in its environment still
-        // tests the guarded path.
+        // Even when the old copy-pool switch is enabled, a private copy
+        // receives no guard answer and is copied whole.
         set_guard_copy_pools(Some(true));
-        let (first, held) = writes(at, plane_end, true).expect("guarded for a copy");
-        // The blocks the range covers: PAGE bytes of heap are not PAGE
-        // aligned, so the range may take in two of them (under WARP's
-        // allocator it does).
-        let blocks = (at / PAGE..plane_end.div_ceil(PAGE)).collect::<Vec<_>>();
-        assert_eq!(
-            held.iter().map(|&(page, _)| page).collect::<Vec<_>>(),
-            blocks,
-            "the blocks, once"
-        );
-        let (_, again) = writes(at, plane_end, true).expect("guarded");
-        assert_eq!(again.iter().filter(|&&(_, w)| w > first).count(), 0, "nothing written since");
-        crate::guards::open(at, plane_end);
+        assert!(writes(at, plane_end, true).is_none());
+        set_guard_copy_pools(None);
         tests::POOLS.with(|v| v.set(None));
         // SAFETY: our allocations.
         unsafe {
@@ -2569,114 +2538,32 @@ mod mapping_tests {
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
 
-    /// A pool the kernel will not write-watch (private, committed, not
-    /// reserved with `MEM_WRITE_WATCH`: exactly what `GetWriteWatch`
-    /// refuses) is guarded for a copy instead of its whole range being
-    /// copied at every refresh. The first asking names every block (the
-    /// whole range once, what the old path copied), and after it only the
-    /// blocks the title wrote: never more than was written. Fails on the
-    /// old path at the second step (`None`: the copy is `NOT_WATCHED` and
-    /// takes its whole window at every refresh for the rest of the run).
+    /// A block-aligned heap allocation is still heap-owned, not guard-owned.
     #[test]
-    fn a_pool_the_kernel_cannot_watch_is_guarded_for_a_copy() {
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+    fn aligned_private_heap_is_copied_whole() {
+        use std::alloc::{Layout, alloc_zeroed, dealloc};
+        use windows_sys::Win32::System::Memory::{MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery};
         const N: usize = 4 * BLOCK;
-        // SAFETY: a fresh private region of four blocks, read-write, and not
-        // write-watched.
-        let start = unsafe { VirtualAlloc(std::ptr::null(), N, MEM_COMMIT, PAGE_READWRITE) } as usize;
-        assert_ne!(start, 0);
-        struct Pool(usize);
-        impl Drop for Pool {
-            fn drop(&mut self) {
-                crate::guards::open(self.0, self.0 + N);
-                // The guards' sets for the range go with the memory, so a
-                // later allocation at the same address starts clean.
-                super::title_memory_remapped(self.0, N);
-                // SAFETY: our allocation.
-                unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE) };
-            }
-        }
-        let _pool = Pool(start);
-        super::forget_askings();
-        let pages = |written: &[(usize, u64)]| written.iter().map(|&(page, _)| page).collect::<Vec<_>>();
-        // The old way: no answer, so the caller copies the whole range.
-        super::set_guard_copy_pools(Some(false));
-        assert_eq!(super::writes(start, start + N, true), None, "the kernel does not watch a pool");
-        // The switch is set for the test, not inherited from the environment,
-        // so this holds whatever a run's `VICTORY_GUARD_COPY_POOLS` says.
-        super::set_guard_copy_pools(Some(true));
-        // The first asking takes every block: the whole range, once.
-        let (first, written) = super::writes(start, start + N, true).expect("guarded for a copy");
-        assert_eq!(pages(&written), (start / super::PAGE..(start + N) / super::PAGE).collect::<Vec<_>>());
-        // The caller copies a page whose write number is newer than its last
-        // copy (`Shadow::copy_stale`): nothing here is.
-        let newer = |written: &[(usize, u64)], since: u64| written.iter().filter(|&&(_, w)| w > since).count();
-        let (quiet, written) = super::writes(start, start + N, true).expect("guarded");
-        assert_eq!(newer(&written, first), 0, "nothing written since: nothing newer");
-        // One byte in the third block: that block, and only it.
-        // SAFETY: inside our committed region; the guard's fault hands the
-        // block back before the write goes on.
-        unsafe { ((start + 2 * BLOCK + 7) as *mut u8).write_volatile(1) };
-        let (found, written) = super::writes(start, start + N, true).expect("guarded");
-        let fresh: Vec<usize> = written.iter().filter(|&&(_, w)| w > quiet).map(|&(page, _)| page).collect();
-        assert_eq!(fresh, vec![(start + 2 * BLOCK) / super::PAGE], "one block written, one named");
-        // And the next asking, with nothing written, is quiet again: nothing
-        // newer than the asking that found the write (the journal keeps the
-        // write's number; an asking with nothing to report does not re-date
-        // it).
-        let (_, written) = super::writes(start, start + N, true).expect("guarded");
-        assert_eq!(newer(&written, found), 0, "{written:?}");
-    }
-
-    /// The class removed, measured: a 64 MiB pool the kernel refuses, three
-    /// samples a side. The old path answers `None` (the copy takes its whole
-    /// window, 64 MiB, at every refresh); the guarded path names the 16
-    /// blocks written and nothing else.
-    #[test]
-    #[ignore]
-    fn bench_copy_pools_guard() {
-        use std::time::Instant;
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
-        const N: usize = 64 << 20;
-        // SAFETY: a fresh private region, read-write, not write-watched.
-        let start = unsafe { VirtualAlloc(std::ptr::null(), N, MEM_COMMIT, PAGE_READWRITE) } as usize;
-        assert_ne!(start, 0);
+        let layout = Layout::from_size_align(N, BLOCK).unwrap();
+        // SAFETY: valid layout, released below with the same layout.
+        let p = unsafe { alloc_zeroed(layout) };
+        assert!(!p.is_null());
+        let start = p as usize;
+        assert_eq!(start % BLOCK, 0);
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        assert_ne!(unsafe { VirtualQuery(p.cast(), &mut info, size_of_val(&info)) }, 0);
+        assert_eq!(info.Type, MEM_PRIVATE);
         super::forget_askings();
         let was = super::set_guard_copy_pools(Some(true));
-        // What a copy takes is the blocks whose write number is newer than
-        // its last copy (`Shadow::copy_stale`): `writes` answers with the
-        // range's whole journal, so counting its length would name all 1,024
-        // blocks for ever, written or not.
-        let fresh = |written: &[(usize, u64)], since: u64| {
-            written.iter().filter(|&&(_, w)| w > since).count()
-        };
-        let (mut since, first) = super::writes(start, start + N, true).expect("the first asking takes every block");
-        println!("{N} pool: first asking names {} blocks (the whole range once)", first.len());
-        let (_, quiet) = super::writes(start, start + N, true).expect("guarded");
-        assert_eq!(fresh(&quiet, since), 0, "nothing written yet: nothing named");
-        let mut named = 0;
-        let mut us = 0;
-        for _ in 0..3 {
-            for block in 0..16 {
-                // SAFETY: inside the region; the guard hands the block back.
-                unsafe { ((start + block * BLOCK + 3) as *mut u8).write_volatile(1) };
-            }
-            let started = Instant::now();
-            let (now, written) = super::writes(start, start + N, true).expect("guarded");
-            let took = started.elapsed();
-            let took_blocks = fresh(&written, since);
-            since = now;
-            assert_eq!(took_blocks, 16, "16 blocks written, 16 named");
-            named += took_blocks;
-            us += took.as_micros() as u64;
-            println!("sample: 16 blocks written, {took_blocks} blocks named, {} us, {} bytes copied (was {N})", took.as_micros(), took_blocks * BLOCK);
+        for _ in 0..2 {
+            assert!(super::writes(start, start + N, true).is_none(),
+                "no watch answer means the caller copies the whole range");
+            assert!(!crate::guards::any_protected(start / BLOCK, (start + N) / BLOCK));
         }
-        println!("three samples: {named} blocks named, {us} us, {} bytes (the whole-range path copied {N} bytes each time)", named * BLOCK);
         super::set_guard_copy_pools(was);
-        crate::guards::open(start, start + N);
-        // SAFETY: our allocation.
-        unsafe { VirtualFree(start as *mut _, 0, MEM_RELEASE) };
+        unsafe { dealloc(p, layout) };
     }
+
 }
 #[cfg(test)]
 mod back_tests {
