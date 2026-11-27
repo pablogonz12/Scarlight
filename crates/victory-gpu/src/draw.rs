@@ -849,8 +849,9 @@ impl State {
     }
 
     pub(crate) fn set_stencil_ref(&mut self, list: &HostList, reference: u32) {
-        self.stencil = Some(reference);
-        crate::draw::stencil_ref(list, reference);
+        if update_stencil(&mut self.stencil, reference) {
+            crate::draw::stencil_ref(list, reference);
+        }
     }
 
     pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
@@ -3385,6 +3386,14 @@ impl State {
     }
 }
 
+fn update_stencil(current: &mut Option<u32>, reference: u32) -> bool {
+    if *current == Some(reference) {
+        return false;
+    }
+    *current = Some(reference);
+    true
+}
+
 impl State {
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
@@ -3957,6 +3966,20 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 mod tests {
     use super::names_view;
     use victory_shader::{ResourceType, RootType, UsedResource};
+
+    #[test]
+    fn repeated_stencil_sets_leave_the_same_effective_state() {
+        let mut current = None;
+        let input = [0, 0, 3, 3, 0, 7, 7];
+        let mut emitted = Vec::new();
+        for value in input {
+            if super::update_stencil(&mut current, value) {
+                emitted.push(value);
+            }
+            assert_eq!(current, Some(value));
+        }
+        assert_eq!(emitted, [0, 3, 0, 7]);
+    }
 
     /// A view a program names, as a table entry (the stand-in compares
     /// root parameter and offset in dwords, `crate::ambient`).
