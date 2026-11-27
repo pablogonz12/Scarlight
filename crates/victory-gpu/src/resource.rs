@@ -1402,6 +1402,12 @@ pub(crate) struct HostTexture {
     /// Whether its contents come from title memory ([`fills`]): counted in
     /// [`KINDS`] while it lives.
     filled: bool,
+    /// Submission number (`crate::host::started`) after which the host
+    /// texture was allocated: a title descriptor slot must not point at it
+    /// until the earlier submissions finish (on RADV/amdgpu a new BO's page
+    /// tables are only mapped by a later submission, so a view of it
+    /// submitted now faults the GPU).
+    pub(crate) born_after: u64,
 }
 
 /// A host copy of `texture` the host believes is in `state`, for a test that
@@ -1418,6 +1424,7 @@ pub(crate) fn test_copy(
         dropped: 0,
         bytes: 0,
         filled: false,
+        born_after: 0,
     })
 }
 
@@ -1909,6 +1916,7 @@ impl HostTexture {
             bytes,
             filled: false,
             dropped: 0,
+            born_after: crate::host::started(),
         }
     }
 }
@@ -1973,6 +1981,27 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
         return None;
     }
     hosted(this, true).map(|made| made.0)
+}
+
+/// Submission number after which `this`'s host copy was allocated; 0 if none
+/// is made. A title-slot view of a resource allocated after submission `n`
+/// waits until `n` has finished on the card: a new BO's memory is only
+/// mapped by a later submission on RADV/amdgpu.
+#[cfg(windows)]
+pub(crate) fn host_born_after(this: This) -> u64 {
+    if this.is_null() {
+        return 0;
+    }
+    hosted(this, false).map_or(0, |(host, twin)| {
+        let born = host.born_after;
+        twin.map_or(born, |t| {
+            let mut born = born.max(t.colour.born_after);
+            if let Some(plane) = &t.plane {
+                born = born.max(plane.born_after);
+            }
+            born
+        })
+    })
 }
 
 /// How many top mip levels of title texture `this` its host copy lacks (made

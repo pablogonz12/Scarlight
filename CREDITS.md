@@ -40,6 +40,10 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   buffers that a list copies title memory through: a buffer a list let go of is kept by its size class and reused by
   the next copy, and only after every submission in the air has finished
   ([`upload_pool.rs`](crates/victory-gpu/src/upload_pool.rs), `VICTORY_UPLOAD_POOL=0` off).
+- **UwUCammie, fxceless/victory-fork [#1033](https://github.com/fxceless/victory-fork/pull/1033)**, GPL-3.0: a
+  title descriptor slot's view of a host texture or buffer copy allocated while an earlier submission is still on
+  the card waits for that submission (RADV/amdgpu maps a new BO's page tables on a later one), then the next
+  submission publishes it (`VICTORY_DEFER_NEW_VIEWS=0` off) (`crates/victory-gpu/src/descriptor/host.rs`).
 - **fxceless/victory-fork [#1097](https://github.com/fxceless/victory-fork/pull/1097)** (Azemed), GPL-3.0 — a
   runtime placeholder reservation's mapped runs come off the views the GPU side already keeps, so the guards note its
   holes absent instead of a failing `VirtualProtect` and a `VirtualQuery` a block, and the copies' committed-byte

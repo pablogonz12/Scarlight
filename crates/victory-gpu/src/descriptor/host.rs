@@ -94,6 +94,9 @@ pub(crate) struct HostHeap {
     /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
     dynamic: u32,
     sampler: bool,
+    /// Title slots whose view of a new host resource was held back until
+    /// the earlier submissions finish ([`must_defer`]).
+    deferred: DeferredViews,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
     /// [`HostHeap::made`] again in atomics, for the hit path of
@@ -145,6 +148,8 @@ pub(crate) struct HostHeap {
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
     /// buffers from the whole heap.
     buffers: Mutex<std::collections::BTreeSet<u32>>,
+    /// Written buffer views awaiting their first host descriptor.
+    pending_buffers: Mutex<std::collections::BTreeSet<u32>>,
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
     changed: Mutex<std::collections::HashSet<u32>>,
@@ -811,6 +816,7 @@ impl HostHeap {
             base,
             dynamic: extra,
             sampler,
+            deferred: DeferredViews::default(),
             made: Mutex::new(vec![0; count as usize]),
             made_fast: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             narrowed: Mutex::default(),
@@ -821,6 +827,7 @@ impl HostHeap {
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Mutex::default(),
+            pending_buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
             tabled: (0..if sampler { 0 } else { count })
@@ -1212,7 +1219,8 @@ impl HostHeap {
     /// The title slots that hold buffer views.
     pub(crate) fn buffer_slots(&self) -> Vec<u32> {
         let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        buffers.iter().copied().collect()
+        let pending = self.pending_buffers.lock().unwrap_or_else(|e| e.into_inner());
+        buffers.union(&pending).copied().collect()
     }
 
     /// The title slots whose buffer view was written, or went, since the
@@ -1234,6 +1242,7 @@ impl HostHeap {
         if self.sampler {
             return Vec::new();
         }
+        self.pending_buffers.lock().unwrap_or_else(|e| e.into_inner()).remove(&index);
         // Measured for the texture side of the same gap (textures a shader
         // picks by a computed index are neither made, if placed, nor
         // uploaded): slots written with a placed texture view, and with a
@@ -1503,6 +1512,13 @@ impl HostHeap {
         }
     }
 
+    /// The record key slot `index` was last made from (0: never, or left
+    /// null): a test can tell a published slot from one still held back.
+    #[cfg(test)]
+    pub(crate) fn made_key(&self, index: u32) -> u64 {
+        self.made_fast[index as usize].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
@@ -1561,7 +1577,55 @@ impl HostHeap {
         }
     }
 
+    /// Makes host slot `index` from the record the title has at `handle` if
+    /// it changed since. A view of a host resource allocated while an
+    /// earlier submission is still on the card waits for it here too: a
+    /// title's descriptor write is where such a view first appears.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_as(index, handle, for_draw, false, true)
+    }
+
+    /// [`HostHeap::mirror`] for a draw that binds the title slot directly
+    /// (not through a fresh table): a view of a new host resource it needs
+    /// now makes the submission wait for the earlier ones instead of being
+    /// held back.
+    pub(crate) fn mirror_required(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_as(index, handle, for_draw, true, true)
+    }
+
+    /// Whether a view a draw needs now is still held back
+    /// ([`HostHeap::deferred`]) because the resource it shows was allocated
+    /// while an earlier submission was on the card.
+    pub(crate) fn has_required_deferred(&self, finished: u64) -> bool {
+        self.deferred.any_required(finished)
+    }
+
+    /// Publishes the held-back views whose earlier submissions have finished
+    /// on the card; their slots were never pointed at the new resource
+    /// before that. Returns how many.
+    pub(crate) fn flush_deferred(&self, finished: u64) -> usize {
+        let ready = self.deferred.take_ready(finished);
+        let n = ready.len();
+        for (index, handle, for_draw, _required) in ready {
+            // The entry is re-mirrored from the handle's current contents: a
+            // write since it was queued may show another resource, whose own
+            // allocation is deferred in turn rather than published early.
+            self.mirror_as(index, handle, for_draw, false, true);
+        }
+        if n > 0 {
+            DEFERRED_VIEWS[1].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        n
+    }
+
+    fn mirror_as(
+        &self,
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+        required: bool,
+        defer_now: bool,
+    ) -> Option<View> {
         if index >= self.count {
             // Diagnostic (heap cap): slots above the host heap's count are not
             // mirrored. The title walks them in increasing order, so a line per
@@ -1608,14 +1672,6 @@ impl HostHeap {
         // though its descriptor did not change: bindless draws never write
         // the slot again, so nothing else would widen it (#672).
         if made[index as usize] != key || self.widen_due(index) {
-            // Views of other textures in the memory this one describes
-            // are stale: their host slots read nothing from here on, and
-            // let go of the host copies they held.
-            for stale in self.note_buffer(index, Some(&view), for_draw) {
-                if stale != index {
-                    self.unmake(&mut made, stale);
-                }
-            }
             // A view of a texture object that has no host copy yet waits
             // for it, as buffer views wait for a draw: the slot is made
             // when the texture is first used (`super::make_waiting`), or
@@ -1625,6 +1681,19 @@ impl HostHeap {
                 super::wait_for(texture, handle);
             }
             let later = !for_draw && (view.is_buffer() || waiting.is_some());
+            if later {
+                // Discovery is separate from published descriptor metadata:
+                // the sweep must still find a buffer whose first view waits.
+                let mut pending = self.pending_buffers.lock().unwrap_or_else(|e| e.into_inner());
+                if view_stride(&view).is_some() {
+                    pending.insert(index);
+                    self.changed.lock().unwrap_or_else(|e| e.into_inner()).insert(index);
+                } else {
+                    pending.remove(&index);
+                }
+                drop(pending);
+                self.queue_texture(index, is_texture_view(&view), false, crate::frame::current());
+            }
             // Another view of the placed texture the slot shows already (a
             // title that streams a texture in writes its view again with
             // more mips each time some arrive): the slot goes on showing
@@ -1640,29 +1709,62 @@ impl HostHeap {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
             }
-            made[index as usize] = if later { 0 } else { key };
-            self.made_fast[index as usize].store(if later { 0 } else { key }, std::sync::atomic::Ordering::Release);
-            let kept = if later {
-                self.forget_narrowed(index);
-                None
-            } else {
-                let kept = make(&view, self.cpu(index));
-                self.note_narrowed(index);
-                kept
-            };
-            // A view that could not be made yet (its host copy or its host
-            // resource is not there) does not record its key: the fast path
-            // would hand back the null descriptor for good, and the draw that
-            // reads the slot would see nothing until the title rewrote it.
-            // The next call makes it again, for as long as it is not there.
-            if kept.is_none() {
+            if later {
                 made[index as usize] = 0;
                 self.made_fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
+                self.forget_narrowed(index);
+                self.keep(index, None);
+                return Some(view);
             }
-            if kept.is_none() && !self.sampler {
-                null_for(&view, self.cpu(index));
+            // A view of a host resource allocated while an earlier
+            // submission is still on the card waits for it: the slot and its
+            // record stay as they were, so nothing points at the new memory
+            // until it is mapped (`must_defer`).
+            let max_born = (defer_now && defer_new_views()).then(crate::host::finished);
+            match make_checked(&view, self.cpu(index), max_born) {
+                Make::Deferred(born_after) => {
+                    // Neither key is recorded: the flush that finds the
+                    // submission finished must make the slot, and the hit path
+                    // would hand back the old view for good.
+                    DEFERRED_VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.deferred.push(index, handle, for_draw, born_after, required);
+                    return Some(view);
+                }
+                Make::Made(kept) => {
+                    // Publish metadata only with the descriptor it describes.
+                    for stale in self.note_buffer(index, Some(&view), for_draw) {
+                        if stale != index {
+                            self.unmake(&mut made, stale);
+                        }
+                    }
+                    made[index as usize] = key;
+                    self.made_fast[index as usize]
+                        .store(key, std::sync::atomic::Ordering::Release);
+                    self.note_narrowed(index);
+                    self.keep(index, kept);
+                }
+                Make::None => {
+                    // A view that could not be made yet (its host copy or its
+                    // host resource is not there) does not record its key: the
+                    // fast path would hand back the null descriptor for good,
+                    // and the draw that reads the slot would see nothing until
+                    // the title rewrote it. The next call makes it again, for
+                    // as long as it is not there.
+                    made[index as usize] = 0;
+                    self.made_fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
+                    self.note_narrowed(index);
+                    if !self.sampler {
+                        null_for(&view, self.cpu(index));
+                    }
+                    let _ = self.note_buffer(index, None, false);
+                    if view_stride(&view).is_some() {
+                        self.pending_buffers.lock().unwrap_or_else(|e| e.into_inner()).insert(index);
+                        self.changed.lock().unwrap_or_else(|e| e.into_inner()).insert(index);
+                    }
+                    self.queue_texture(index, is_texture_view(&view), false, crate::frame::current());
+                    self.keep(index, None);
+                }
             }
-            self.keep(index, kept.flatten());
         }
         Some(view)
     }
@@ -2548,6 +2650,201 @@ fn twin_uav(
     Some(desc)
 }
 
+/// Title-slot views held back until the submission that allocated the host
+/// resource they show has finished on the card ([`must_defer`]).
+#[derive(Default)]
+pub(crate) struct DeferredViews {
+    /// (slot, title handle, for a draw, born after, required before the next
+    /// submission): the latest request per slot.
+    entries: Mutex<Vec<(u32, u64, bool, u64, bool)>>,
+}
+
+impl DeferredViews {
+    /// Holds `slot`'s view back until submission `born_after` has finished,
+    /// keeping one entry per slot (the latest handle, the later born-after,
+    /// and whether a draw or the next submission needs it).
+    fn push(&self, slot: u32, handle: u64, for_draw: bool, born_after: u64, required: bool) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.0 == slot) {
+            *entry = (
+                slot,
+                handle,
+                for_draw || entry.2,
+                born_after.max(entry.3),
+                required || entry.4,
+            );
+            return;
+        }
+        entries.push((slot, handle, for_draw, born_after, required));
+    }
+
+    /// Whether a view a draw needs now waits for a submission that has not
+    /// finished.
+    pub(crate) fn any_required(&self, finished: u64) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|&(_, _, _, born_after, required)| required && born_after > finished)
+    }
+
+    /// The views whose earlier submissions have finished (`born_after <=
+    /// finished`), taken out: (slot, handle, for a draw, required).
+    fn take_ready(&self, finished: u64) -> Vec<(u32, u64, bool, bool)> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if entries.is_empty() {
+            return Vec::new();
+        }
+        let mut ready = Vec::new();
+        let mut keep = Vec::with_capacity(entries.len());
+        for entry in entries.drain(..) {
+            if entry.3 <= finished {
+                ready.push((entry.0, entry.1, entry.2, entry.4));
+            } else {
+                keep.push(entry);
+            }
+        }
+        *entries = keep;
+        ready
+    }
+}
+
+/// Whether a title-slot view of a host resource allocated after submission
+/// `born_after` waits for that submission to finish before the live slot
+/// points at it. On RADV/amdgpu a new BO's page tables are only mapped by a
+/// later submission, so a view published in the same submission as the
+/// allocation faults the GPU (GPUVM fault, device removed). `max_born` is
+/// `None` when the view may be published at once (the switch off, or a
+/// flush of one already waited for).
+pub(crate) fn must_defer(born_after: u64, max_born: Option<u64>) -> bool {
+    max_born.is_some_and(|finished| born_after > finished)
+}
+
+/// Counts of title-slot views held back for a new host resource, since the
+/// start: `[deferred, published]`.
+pub(crate) static DEFERRED_VIEWS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether a title-slot view of a newly-allocated host resource waits for
+/// the earlier submissions to finish; `VICTORY_DEFER_NEW_VIEWS=0` publishes
+/// it at once, as before.
+fn defer_new_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DEFER_NEW_VIEWS").is_none_or(|v| v != "0"))
+}
+
+/// [`make`] with a new-resource view held back while the submissions that
+/// ran before its resource was allocated are still on the card.
+enum Make {
+    /// Made (holding the resource it views, if any).
+    Made(Kept),
+    /// Not made: the slot reads null instead.
+    None,
+    /// Held back: the host resource was allocated after submission
+    /// `born_after` ([`must_defer`]).
+    Deferred(u64),
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_BORN_AFTER: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`make`], or [`Make::Deferred`] when `max_born` is `Some(finished)` and
+/// the host resource `view` shows was allocated after that submission.
+fn make_checked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, max_born: Option<u64>) -> Make {
+    // A host copy this call would make was allocated now (`make`'s
+    // `host_resource`, its `shadow::find`): make it first, so the check is
+    // made on the copy's own allocation before the descriptor is written.
+    if max_born.is_some() {
+        prepare(view);
+    }
+    let born_after = view_born_after(view);
+    #[cfg(test)]
+    let born_after = TEST_BORN_AFTER.with(|value| value.get().unwrap_or(born_after));
+    if must_defer(born_after, max_born) {
+        return Make::Deferred(born_after);
+    }
+    match make(view, at) {
+        Some(kept) => Make::Made(kept),
+        None => Make::None,
+    }
+}
+
+/// Makes the host copy `view`'s descriptor will name (`make`), without
+/// writing a descriptor: a table's view of a resource with no copy yet is
+/// the one whose allocation this submission is; it must be held back before
+/// the slot is written, not after.
+fn prepare(view: &View) {
+    match view {
+        &View::Constant(address, size) => {
+            let _ = crate::shadow::find(address, u64::from(size));
+        }
+        View::Shader(resource, desc) | View::Unordered(resource, _, desc) => {
+            let resource = *resource as crate::object::This;
+            if crate::resource::host_resource(resource).is_some() {
+                return;
+            }
+            if desc.is_some()
+                && let Some((data, len)) = crate::resource::buffer_bytes(resource)
+            {
+                let _ = crate::shadow::find(data as u64, len);
+            }
+        }
+        View::Placed(unordered, resource, desc) => {
+            if let Some(inner) = placed_texture(view) {
+                prepare(&inner);
+                return;
+            }
+            const BUFFER: u32 = 1;
+            if resource[0] != BUFFER {
+                return;
+            }
+            let _ = unordered;
+            let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let _ = crate::shadow::find(address, len);
+        }
+        View::Sampler(_) | View::ConsoleSampler(_) => {}
+    }
+}
+
+/// The submission number (`crate::host::started`) after which the host
+/// resource `view` shows was allocated; 0 for a sampler or a resource whose
+/// host copy is older than any submission we count.
+fn view_born_after(view: &View) -> u64 {
+    match view {
+        &View::Constant(address, size) => crate::shadow::find(address, u64::from(size))
+            .map_or(0, |shadow| shadow.born_after()),
+        View::Shader(resource, _) | View::Unordered(resource, _, _) => {
+            let resource = *resource as crate::object::This;
+            let host = crate::resource::host_born_after(resource);
+            if host != 0 {
+                return host;
+            }
+            // A buffer view of title buffer memory: its host copy's
+            // allocation (`Shadow::born_after`).
+            crate::resource::buffer_bytes(resource)
+                .and_then(|(data, len)| crate::shadow::find(data as u64, len))
+                .map_or(0, |shadow| shadow.born_after())
+        }
+        View::Placed(unordered, resource, desc) => {
+            if let Some(inner) = placed_texture(view) {
+                return view_born_after(&inner);
+            }
+            const BUFFER: u32 = 1;
+            if resource[0] != BUFFER {
+                return 0;
+            }
+            let _ = unordered;
+            let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            crate::shadow::find(address, len).map_or(0, |shadow| shadow.born_after())
+        }
+        View::Sampler(_) | View::ConsoleSampler(_) => 0,
+    }
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -2965,6 +3262,147 @@ mod tests {
         // A sampler heap keeps none, whatever the host's view limit.
         assert_eq!(view_layout_with(100, 0, 0, true), (100, 100, 100));
         assert_eq!(view_layout_with(100, limit, 0, true), (100, 100, 100));
+    }
+
+    /// A title slot's view of a host resource allocated after the last
+    /// finished submission waits: published now, its page tables may not be
+    /// mapped yet on RADV/amdgpu and the GPU faults (device removed). At a
+    /// submission that has finished, or with no limit, it does not.
+    #[test]
+    fn a_view_of_a_new_resource_waits_for_its_submission() {
+        assert!(must_defer(5, Some(3)));
+        assert!(!must_defer(3, Some(3)), "a finished submission is waited for");
+        assert!(!must_defer(0, Some(0)), "an old host resource never waits");
+        assert!(must_defer(7, Some(0)), "nothing has finished yet");
+        assert!(!must_defer(9, None), "no wait asked for");
+    }
+
+    /// A hand-built title slot whose view was queued for submission 5 (3 the
+    /// last finished) stays out of the live heap — its slot reads null — and
+    /// the flush that finds 5 finished publishes it once: the slot's
+    /// descriptor is made, and the frame line counts one published.
+    #[test]
+    fn a_deferred_view_is_flushed_once_its_submission_finished() {
+        let _once = crate::warptest::lock();
+        let Some(_host) = host() else {
+            return; // no host GPU
+        };
+        // Title memory for a constant buffer, 256-byte aligned in its copy.
+        let memory = vec![0u8; 0x1000];
+        let start = memory.as_ptr() as u64;
+        let address = start + (256 - start % 256) % 256 + 256;
+        crate::shadow::register(usize::MAX, start, 0x1000, false);
+        let Some(shadow) = crate::shadow::find(address, 16) else {
+            return; // no host copy
+        };
+        assert_eq!(shadow.gpu(address) % 256, 0, "a constant buffer view's alignment on the host");
+        // The title wrote its constant buffer view record here.
+        let mut record = [0u32; 4];
+        let desc: [u32; 4] = [address as u32, (address >> 32) as u32, 16, 0];
+        crate::descriptor::create_cbv(std::ptr::null(), &desc, record.as_mut_ptr() as u64);
+        let handle = record.as_mut_ptr() as u64;
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        // A view of a resource allocated during submission 5, a draw needing
+        // it: held back, not published.
+        heap.deferred.push(0, handle, true, 5, true);
+        assert!(heap.has_required_deferred(4), "a draw needs it before submission 4");
+        assert_eq!(heap.made_key(0), 0, "the slot reads null before its submission");
+        assert_eq!(heap.flush_deferred(4), 0, "submission 5 has not finished");
+        assert_eq!(heap.made_key(0), 0, "still null");
+        let published = super::DEFERRED_VIEWS[1].load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(heap.flush_deferred(5), 1, "published once submission 5 has finished");
+        assert_ne!(heap.made_key(0), 0, "the slot's view is made: the descriptor is valid");
+        assert_eq!(
+            super::DEFERRED_VIEWS[1].load(std::sync::atomic::Ordering::Relaxed),
+            published + 1,
+            "the frame line counts it"
+        );
+        assert!(!heap.has_required_deferred(5), "nothing waits any more");
+        assert_eq!(heap.flush_deferred(5), 0, "published once");
+    }
+
+    #[test]
+    fn deferred_structured_replacement_publishes_its_metadata_with_the_view() {
+        let _once = crate::warptest::lock();
+        let Some(_host) = host() else { return };
+        let memory = vec![0u8; 0x1000];
+        let start = memory.as_ptr() as u64;
+        crate::shadow::register(usize::MAX, start, 0x1000, false);
+        let Some(heap) = HostHeap::new(false, 4) else { return };
+        let Some((_, _, stride_data)) = &heap.strides else { return };
+        let stride = || unsafe { (*stride_data as *const u32).read_volatile() };
+        let mut record = [0u32; 4];
+        let handle = record.as_mut_ptr() as u64;
+        let write = |record: &mut [u32; 4], width: u32| {
+            let resource = [1, 0, 0, 0, 0x1000, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            let mut desc = [0u32; 16];
+            desc[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+            desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            desc[6] = 4;
+            desc[7] = width;
+            desc[10] = start as u32;
+            desc[11] = (start >> 32) as u32;
+            let [i, generation] = super::super::words_for(View::Placed(false, resource, desc));
+            record[..3].copy_from_slice(&[super::super::VIEW_TAG, i, generation]);
+        };
+        write(&mut record, 16);
+        heap.mirror_as(0, handle, false, false, false);
+        assert_eq!(heap.made_key(0), 0);
+        assert_eq!(stride(), 0);
+        assert_eq!(heap.buffer_slots(), [0], "the sweep can discover a waiting buffer");
+        heap.mirror_as(0, handle, true, true, false);
+        let old = heap.made_key(0);
+        assert_ne!(old, 0);
+        assert_eq!(stride(), 16);
+        assert_eq!(heap.buffer_slots(), [0]);
+        TEST_BORN_AFTER.with(|value| value.set(Some(u64::MAX)));
+        write(&mut record, 32);
+        heap.mirror_as(0, handle, true, true, true);
+        assert_eq!(heap.made_key(0), old);
+        assert_eq!(stride(), 16);
+        assert_eq!(heap.buffer_slots(), [0]);
+        // The title replaces the queued view before it becomes ready.
+        write(&mut record, 64);
+        heap.mirror_as(0, handle, true, true, true);
+        assert_eq!(heap.made_key(0), old);
+        assert_eq!(stride(), 16);
+        assert_eq!(heap.flush_deferred(u64::MAX - 1), 0);
+        TEST_BORN_AFTER.with(|value| value.set(None));
+        assert_eq!(heap.flush_deferred(u64::MAX), 1);
+        assert_ne!(heap.made_key(0), old);
+        assert_eq!(stride(), 64);
+        assert_eq!(heap.buffer_slots(), [0]);
+    }
+
+    /// A buffer view the host refuses is left null and counted, once per
+    /// refusal, for the frame line: the slot is never used.
+    #[test]
+    fn a_refused_view_is_counted_and_left_null() {
+        let _once = crate::warptest::lock();
+        let Some(_host) = host() else {
+            return; // no host GPU
+        };
+        let memory = vec![0u8; 0x1000];
+        let start = memory.as_ptr() as u64;
+        crate::shadow::register(usize::MAX, start, 0x1000, false);
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        // Typed with no format and structured with no stride: no view the
+        // host has (format 0, stride 0 in `buffer_view_ok`).
+        let mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC = unsafe { std::mem::zeroed() };
+        desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        desc.Anonymous.Buffer.NumElements = 4096;
+        let first = super::REFUSED_VIEWS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(buffer_srv(start, 0x1000, desc, heap.cpu(0)).is_none());
+        assert_eq!(
+            super::REFUSED_VIEWS.load(std::sync::atomic::Ordering::Relaxed),
+            first + 1,
+            "the null descriptor is counted"
+        );
     }
 
     /// A subscriber that only counts the lines said: what a diagnostic's cost
