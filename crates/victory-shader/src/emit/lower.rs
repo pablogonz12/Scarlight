@@ -30,6 +30,7 @@ use group_wide::{all_group_blocks, lane_regions};
 /// The wide reads of a console buffer load (`bitcode::opt::WIDE`).
 #[path = "lower/wide.rs"]
 mod wide;
+mod quad;
 
 /// The form a test asks for the wide reads to take, whatever the process's
 /// `VICTORY_SHADER_OPT` says (`None`: the switch again).
@@ -4582,10 +4583,31 @@ impl<'a> Lower<'a> {
     }
 
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
-    /// lane must be a constant.
-    fn quad_pick(&mut self, x: V, src: V) -> V {
+    /// lane must be a constant. A quad read keeps a helper lane's value,
+    /// which a pixel shader needs across a triangle edge; `pattern` is the
+    /// instruction's quad permutation, when it has one (common broadcasts
+    /// then take one read instead of four and a select).
+    fn quad_pick(&mut self, x: V, src: V, pattern: Option<u8>) -> V {
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
+        let broadcast = |l: &mut Self, lane: V| {
+            l.s.op(
+                c,
+                "quadReadLaneAt.i32",
+                Attr::NoUnwind,
+                l.s.t.i32,
+                122,
+                &[x, lane],
+            )
+        };
+        match pattern {
+            Some(0xe4) => return x,
+            Some(p @ (0x00 | 0x55 | 0xaa | 0xff)) => {
+                let lane = self.s.m.i32(u32::from(p & 3));
+                return broadcast(self, lane);
+            }
+            _ => {}
+        }
         let three = self.s.m.i32(3);
         let q = self.s.m.bin(c, Bin::And, src, three);
         let mut r = x;
@@ -4697,10 +4719,10 @@ impl<'a> Lower<'a> {
             // of each group of 32 combine their index with and/or/xor masks.
             let quad = offset & 0x8000 != 0
                 || offset & 0x1C == 0x1C && offset & 0x380 == 0 && offset >> 10 & 0x1F < 4;
-            // Mesh: host quads are threads 4n..4n+3 of a 1D group, as the
-            // console's, so quad-local swizzles read through quad operations.
-            let mesh_quad = self.s.mesh.is_some() && quad;
-            if !mesh_quad {
+            // Host quads are threads 4n..4n+3 of a group, as the console's,
+            // in a mesh stage and in a pixel one (helpers included).
+            let use_quad = quad && (quad::on() && self.s.pixel || self.s.mesh.is_some());
+            if !use_quad {
                 self.cross_lane(quad)?;
             }
             // The source sits in the address field.
@@ -4725,8 +4747,8 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
-                self.quad_pick(x, src)
+            let r = if use_quad {
+                self.quad_pick(x, src, (offset & 0x8000 != 0).then_some(offset as u8))
             } else if self.s.threads.is_some()
                 && self.s.mesh.is_none()
                 && crate::emit::shader_swizzle_zero()
@@ -7084,10 +7106,14 @@ impl<'a> Lower<'a> {
             return Err("a DPP operand");
         };
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
-        // Quad permutations and DPP8 stay in groups the pixel layout shares.
-        let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
-        let mesh_quad = self.s.mesh.is_some() && quad;
-        if !mesh_quad {
+        // Quad permutations and DPP8 stay in groups the pixel layout shares:
+        // a DPP8 selection that crosses quads cannot be a quad read.
+        let quad = match dpp {
+            Dpp::Row { ctrl, .. } => ctrl <= 0xff,
+            Dpp::Lanes { sel, .. } => (0..8).all(|i| ((sel >> (3 * i)) ^ i) & 4 == 0),
+        };
+        let use_quad = quad && (quad::on() && self.s.pixel || self.s.mesh.is_some());
+        if !use_quad {
             self.cross_lane(quad)?;
         }
         let c = self.cur;
@@ -7165,8 +7191,12 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
-            self.quad_pick(x, src)
+        let mut r = if use_quad {
+            let pattern = match dpp {
+                Dpp::Row { ctrl, .. } => Some(ctrl as u8),
+                Dpp::Lanes { .. } => None,
+            };
+            self.quad_pick(x, src, pattern)
         } else {
             self.read_lane(x, src)
         };
