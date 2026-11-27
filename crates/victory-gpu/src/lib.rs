@@ -122,6 +122,10 @@ mod warptest;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]
+mod linux_dirty;
+#[cfg(all(test, windows, target_arch = "x86_64"))]
+mod linux_dirty_probe;
+#[cfg(windows)]
 mod writeback;
 
 #[cfg(windows)]
