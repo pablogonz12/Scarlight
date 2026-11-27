@@ -79,6 +79,10 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// Placed in an arena as a range the card only reads (`crate::resident`):
+    /// its copies are not merely no-ops, they are never made, and its drop
+    /// and its counters are the resident class's.
+    resident: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -1665,8 +1669,12 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {
-            // Never counted with the copies (`Shadow::placed`).
-            crate::inplace::gone(self.window, self.len);
+            if self.resident {
+                crate::resident::gone(self.start, self.len);
+            } else {
+                // Never counted with the copies (`Shadow::placed`).
+                crate::inplace::gone(self.window, self.len);
+            }
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
@@ -1972,6 +1980,21 @@ impl Shadow {
         shadow
     }
 
+    /// Title memory `[start, start + len)` the card only reads, placed in an
+    /// arena part ([`crate::resident::place`]): not a copy at all. Its
+    /// upload and copy-back steps are gone (as a level 2 placement's), and
+    /// its own counters and drop are the resident class's.
+    fn resident(placed: crate::inplace::Placed, start: u64, len: u64) -> Shadow {
+        crate::host::name(&placed.buffer, || format!("title memory {start:#x}+{len:#x} resident (the card only reads it)"));
+        let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len);
+        LIVE[0].fetch_sub(1, Ordering::Relaxed);
+        LIVE[1].fetch_sub(len, Ordering::Relaxed);
+        *shadow.watched.get_mut() = NOT_WATCHED;
+        shadow.place = Some((placed.heap, placed.bias));
+        shadow.resident = true;
+        shadow
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
@@ -2005,6 +2028,7 @@ impl Shadow {
             },
             card: None,
             window: false,
+            resident: false,
             place: None,
             born_after: crate::host::started(),
         }
@@ -2033,6 +2057,11 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            if self.resident {
+                // The class only admits buffers without a UAV: a declared
+                // write here is a finding (counted, and the region goes).
+                crate::resident::wrote(address, len.min(self.left(address)));
+            }
             return;
         }
         let len = len.min(self.left(address));
@@ -2216,6 +2245,11 @@ impl Shadow {
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
         if self.place.is_some() {
+            if self.resident {
+                // The card writes the title's memory itself: counted, because
+                // a resident buffer has no UAV and this should never happen.
+                crate::resident::copy_back_skipped(len as u64);
+            }
             return 0;
         }
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -2730,6 +2764,10 @@ impl Shadow {
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
         // In place: the card reads title memory itself.
         if self.place.is_some() {
+            if self.resident {
+                // The upload a copy would have paid for this step.
+                crate::resident::refreshed(len as u64);
+            }
             return 0;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -3061,6 +3099,10 @@ impl Shadow {
 
 struct Entry {
     end: u64,
+    /// The buffer's resource was created without
+    /// `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS`: D3D12 gives shaders no
+    /// UAV over it, so the card can only read it (`crate::resident`).
+    read_only: bool,
     shadow: Option<Arc<Shadow>>,
 }
 
@@ -3072,11 +3114,12 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
 }
 
 /// A title buffer exists at `start` (`len` bytes).
-pub(crate) fn register(resource: usize, start: u64, len: u64) {
+pub(crate) fn register(resource: usize, start: u64, len: u64, read_only: bool) {
     buffers().insert(
         (start, resource),
         Entry {
             end: start + len,
+            read_only,
             shadow: None,
         },
     );
@@ -3104,6 +3147,9 @@ pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
 /// tables, so that the next ask makes a copy or opens the memory anew, and
 /// goes when no list and no slot holds it any more. Returns how many.
 pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
+    // Nothing resident stays over pages that show something else now, whatever
+    // its placement: the next ask proves the part again or is a copy.
+    crate::resident::changed(at, len);
     let end = at.saturating_add(len);
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
@@ -3201,6 +3247,15 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && size >= card_limits().0;
+        // A read-only title buffer, from an arena part: the card reads the
+        // title's own memory and nothing is copied either way
+        // (`crate::resident`, `VICTORY_RESIDENT=read`).
+        if !big
+            && let Some(placed) = crate::resident::place(key.0, len, entry.read_only)
+        {
+            entry.shadow = Some(Arc::new(Shadow::resident(placed, key.0, len)));
+            return entry.shadow.clone();
+        }
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();

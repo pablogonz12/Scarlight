@@ -878,13 +878,22 @@ fn guarded_range(start: usize, end: usize, pools: bool) -> Option<Vec<usize>> {
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
-        && crate::guards::block_known(start);
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // A range inside a runtime placeholder reservation is view memory (the
+    // runtime maps its pages through `xmem::map`, which tells us), and its
+    // holes are in the views: no question to Windows either way.
+    let in_placeholder = crate::inplace::placeholder_range(first * BLOCK, last * BLOCK);
+    if in_placeholder {
+        crate::inplace::PLACEHOLDER_HITS[0]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let known = in_placeholder
+        || (!*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
+            && crate::guards::block_known(start));
     if !known && !is_view(start, end) && !(pools && is_pool(start)) {
         return None;
     }
     install();
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     Some(crate::guards::reguard(first, last))
 }
 
