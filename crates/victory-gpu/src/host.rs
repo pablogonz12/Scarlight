@@ -7726,8 +7726,12 @@ impl Host {
             // list of its own, one whose last flight has finished or a new
             // one.
             #[cfg(feature = "diagnostics")]
-            let read_now =
-                cfg!(test) || crate::capture::wanted(frame) || crate::capture::listed(frame);
+            let shot = crate::capture::take_request();
+            #[cfg(feature = "diagnostics")]
+            let read_now = cfg!(test)
+                || crate::capture::wanted(frame)
+                || crate::capture::listed(frame)
+                || shot.is_some();
             #[cfg(not(feature = "diagnostics"))]
             let read_now = cfg!(test);
             let slot = if late_free_present() && !read_now && composition.is_none() {
@@ -7834,8 +7838,6 @@ impl Host {
                 list.CopyResource(&back, texture);
                 texture
             };
-            #[cfg(feature = "diagnostics")]
-            let shot = crate::capture::take_request();
             #[cfg(feature = "diagnostics")]
             let capture = (cfg!(test) || crate::capture::wanted(frame) || shot.is_some())
                 .then(|| crate::capture::read_back(&self.device, list, capture_source))
