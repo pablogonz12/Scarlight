@@ -2,6 +2,8 @@
 
 - **Duff [c430b1de](https://github.com/Marvisak/VIctory/commit/c430b1de)**, GPL-3.0:
   pack typed buffer d16 loads two channels per register, retaining integer bits.
+- **Marvisak/VIctory [13091f6e](https://github.com/Marvisak/VIctory/commit/13091f6e)**, GPL-3.0:
+  array level queries use spatial coordinates only.
 
 Scarlight is a port of **VIctory** ([Marvisak/VIctory](https://github.com/Marvisak/VIctory)),
 GPL-3.0. Its history, authorship and commit dates are kept.
@@ -19,7 +21,7 @@ in `Co-authored-by:` trailers, read from `git log main`.
 alessiodeia, Andrea Casale, artor410, AscilCH, BaggyALPHA, bartikele, BastienRdz, Brazlucas, CaravelaLabs,
 Carlos Sant'Anna, dadou000, Dathinel, desp, Duartt - Ryu Garage, Duff, EatCodeSleep2,
 Enzo Souza Duarte, ESAT, Exorion, fever308, FIocker, franticfrostin, fuzeofficial, Gabriel Cruz,
-gingertonik, Halfect, Henrique Bueno, hophaver, ifBars, ismailchaka1, itsRevela, Jeremy Goldberg,
+gingertonik, GrapeJuice429, Halfect, Henrique Bueno, hophaver, ifBars, ismailchaka1, itsRevela, Jeremy Goldberg,
 JMAN730, julio, KaiserBloo, KoLolX3, lameloball2813-ui, LaunchDoesntCode, LF2000 Builder,
 localshotgun, lordon1a, Louis Faust, LUIS LARIOS, Luiz Neves, Lyrnc, Manuel Pérez, Maraco91,
 marquezini, Marvis, Matheus, meower, nathanbzrr, Nikita Romanovich, Noname0202, Nostyxx, Ortomanic,
@@ -50,6 +52,8 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
 
 ## Design notes
 
+- **Belobug/VIctory-Belobug-AMD `84eae352a`** (local) — identified an indirect
+  dispatch requesting 67,440 groups that lost its tail under the 65,535-group clamp.
 - **fuzeofficial** ([Marvisak/VIctory #2608](https://github.com/Marvisak/VIctory/pull/2608)), GPL-3.0: the
   idea of cutting a command list at its texture read-backs and running the part after one in a submission
   of its own, so a copy or draw recorded behind a read-back is prepared after its bytes are in title
@@ -388,4 +392,5 @@ D
   after the copy, behind `VICTORY_TEXTURE_BACK_UNION=1` (off by default) (`crates/victory-gpu/src/texback.rs`,
   `crates/victory-gpu/src/host.rs`, `crates/victory-gpu/src/draw.rs`, `crates/victory-gpu/src/descriptor/host.rs`).
 
+- **Manuel Pérez**, [VIctory #114](https://github.com/Marvisak/VIctory/pull/114): run failed asynchronous call cleanup outside the completion lock.
 - **Senchsus**, [VIctory #682](https://github.com/Marvisak/VIctory/pull/682): legacy multiply treats denormal operands as zero.
