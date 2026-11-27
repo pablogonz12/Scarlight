@@ -455,7 +455,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     // The guard reset, kernel reset, number assignment and journal records
     // must be ordered together, including across the two reset paths.
+    #[cfg(feature = "diagnostics")]
+    let order_wait = crate::trace::span("reset_order wait");
     let _order = reset_order(first, last);
+    #[cfg(feature = "diagnostics")]
+    drop(order_wait);
+    #[cfg(feature = "diagnostics")]
+    let _order_hold = crate::trace::span("reset_order hold");
     // A pool the guards hold answers out of its own blocks, without a walk of
     // the pages asked about ([`guard_pools`]). Pages only a verifying asking
     // found are kept too: the copy needs them.
@@ -467,6 +473,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             return Some(guarded_answer(first, last, &written));
         }
         if verify_due(first) {
+            #[cfg(feature = "diagnostics")]
+            let _verify = crate::trace::span("verify");
             verified = guarded_range(start, end, true).unwrap_or_default();
         }
     }
@@ -969,6 +977,8 @@ pub(crate) fn write_failed(at: usize, len: usize) {
 /// guarding them again before the caller copies them. `None` if the memory is
 /// neither a view nor, with `pools`, a pool the guards can hold.
 fn guarded_range(start: usize, end: usize, pools: bool) -> Option<Vec<usize>> {
+    #[cfg(feature = "diagnostics")]
+    let _trace = crate::trace::span_bytes("guarded_range", end.saturating_sub(start));
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -1420,6 +1430,8 @@ fn install() {
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
             return EXCEPTION_CONTINUE_SEARCH;
         }
+        #[cfg(feature = "diagnostics")]
+        let _trace = crate::trace::fault_span();
         let is_write = r.ExceptionInformation[0] == WRITE;
         let at = r.ExceptionInformation[1];
         // A write-back job has this block (inaccessible to reads and writes
