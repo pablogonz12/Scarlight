@@ -3179,6 +3179,8 @@ impl Shadow {
         // SAFETY: inside the mapping (checked above); only the submitting
         // thread writes it.
         let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::fetched(gpu, old);
         let Some(first) = first_difference(gpu, old) else {
             return 0;
         };
@@ -3246,6 +3248,8 @@ impl Shadow {
         // does write it (the title's bytes put in under shader writes)
         // holds the lock held here.
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::fetched(gpu, held);
         let Some(first) = first_difference(gpu, held) else {
             return 0;
         };

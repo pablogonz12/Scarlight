@@ -203,6 +203,18 @@ impl ThreadCounters {
 static BUFFER_CREATES: [ThreadCounters; 3] = [const { ThreadCounters::new() }; 3];
 static CARD_RECORDING: [ThreadCounters; 2] = [const { ThreadCounters::new() }; 2];
 static CARD_PIECES: [[AtomicU64; 2]; 2] = [const { [const { AtomicU64::new(0) }; 2] }; 2];
+static FETCH_BYTES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Count fetched bytes, bytes in pieces containing a difference, and bytes
+/// equal to the CPU side before merging. The slices are already accessible.
+pub(crate) fn fetched(gpu: &[u8], cpu: &[u8]) {
+    let equal = gpu.iter().zip(cpu).filter(|(g, c)| g == c).count();
+    FETCH_BYTES[0].fetch_add(gpu.len() as u64, Relaxed);
+    if equal != gpu.len() {
+        FETCH_BYTES[1].fetch_add(gpu.len() as u64, Relaxed);
+    }
+    FETCH_BYTES[2].fetch_add(equal as u64, Relaxed);
+}
 
 pub(crate) fn buffer_created(kind: usize, started: std::time::Instant) {
     BUFFER_CREATES[kind].record_current(started.elapsed().as_nanos() as u64);
@@ -1161,6 +1173,11 @@ fn page_faults() -> u64 {
 /// second or more: a 4 s frame after an unlogged 4 s frame showed two
 /// frames' counts as one's).
 pub(crate) fn log(frames: f64) {
+    let fetched = FETCH_BYTES.each_ref().map(|v| v.swap(0, Relaxed) as f64 / 1e6 / frames);
+    tracing::info!(
+        "card fetch per frame: {:.3} MB fetched; {:.3} MB in pieces with differences; {:.3} MB equal to CPU side",
+        fetched[0], fetched[1], fetched[2]
+    );
     for (name, counters) in ["readback", "upload", "shared"].into_iter().zip(&BUFFER_CREATES) {
         let [submit, submit_ns, other, other_ns] = counters.take();
         tracing::info!(
