@@ -1594,6 +1594,37 @@ mod tests {
     /// only its own address, and an unmap run goes in one call
     /// (idea from ivall/xcl#254).
     #[test]
+    fn scatter_mapping_microbench() {
+        const N: usize = 4096;
+        let pages = allocate(N);
+        for contiguous in [false, true] {
+            let pool = XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                2 * N * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            );
+            assert!(!pool.is_null());
+            let addresses: Vec<_> = (0..N)
+                .map(|i| pool.wrapping_byte_add(i * if contiguous { PAGE } else { 2 * PAGE }))
+                .collect();
+            let order: Vec<_> = (0..N)
+                .map(|i| pages[if contiguous { i } else { (i * 2053) % N }])
+                .collect();
+            let start = std::time::Instant::now();
+            assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), N, order.as_ptr()), 1);
+            println!(
+                "scatter microbench {}: {:.6} ms/page",
+                if contiguous { "contiguous" } else { "scattered" },
+                start.elapsed().as_secs_f64() * 1000.0 / N as f64
+            );
+            assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), N, std::ptr::null()), 1);
+        }
+        assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
+    }
+
+    #[test]
     fn scatter_maps_runs_of_consecutive_addresses() {
         let pages = allocate(3);
         let a = XMemVirtualAlloc(
