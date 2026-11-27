@@ -128,18 +128,35 @@ pub struct Call {
     /// Index in the in-flight table, or `usize::MAX` when not published.
     slot: usize,
     args: Args,
+    /// Whether the instruments are on: with `VICTORY_STALL_INSTR=0` a call
+    /// records nothing and says nothing.
+    on: bool,
 }
 
 impl Call {
     fn new(site: &'static Site, args: fmt::Arguments<'_>) -> Call {
         let at = Instant::now();
-        let args = Args::of(args);
+        let on = enabled();
+        let args = if on {
+            Args::of(args)
+        } else {
+            Args {
+                bytes: [0; ARGS],
+                len: 0,
+            }
+        };
         let mut slot = usize::MAX;
-        if enabled() {
+        if on {
             slot = publish(site, at, &args);
             watchdog();
         }
-        Call { site, at, slot, args }
+        Call {
+            site,
+            at,
+            slot,
+            args,
+            on,
+        }
     }
 
     /// How long this call has been running.
@@ -150,6 +167,9 @@ impl Call {
 
 impl Drop for Call {
     fn drop(&mut self) {
+        if !self.on {
+            return;
+        }
         if self.slot != usize::MAX {
             release(self.slot);
         }
