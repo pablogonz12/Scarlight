@@ -3116,6 +3116,11 @@ impl Shadow {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn bench_card_changed(&self, from: usize, to: usize) {
+        self.card_changed(from, to);
+    }
+
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
     /// card side's bytes from before if made yet, and their size.
     pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
@@ -3627,6 +3632,24 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+pub(crate) fn bench_card(host: &crate::host::Host, start: usize, size: usize) -> Option<Arc<Shadow>> {
+    let (staging, data) = host.shared_buffer(size as u64)?;
+    let buffer = host.uav_buffer(size as u64)?;
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let mut shadow = Shadow::new(buffer, data, gpu, start as u64, size as u64);
+    shadow.card = Some(Card {
+        staging,
+        before: Mutex::default(),
+        dirty: Mutex::default(),
+        sent: Mutex::default(),
+        size: size as u64,
+    });
+    let shadow = Arc::new(shadow);
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    Some(shadow)
+}
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let mut map = crate::stall::guard(crate::stall::Lock::Shadow, &LOOSE);

@@ -728,7 +728,13 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        #[cfg(test)]
+        if std::env::var_os("VICTORY_BENCH_CARD_BEFORE").is_some() {
+            device = crate::test_device::device(D3D_FEATURE_LEVEL_12_0);
+        }
+        if device.is_some() {
+            // The benchmark selected its requested adapter.
+        } else if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -889,6 +895,92 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn card_before_benchmark() {
+        if std::env::var_os("VICTORY_BENCH_CARD_BEFORE").is_none() {
+            return;
+        }
+        use super::*;
+        use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+        use windows::Win32::Foundation::CloseHandle;
+        use std::sync::atomic::Ordering;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentThread() -> isize;
+            fn GetThreadTimes(thread: isize, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
+        }
+        fn cpu_time() -> u64 {
+            let (mut c, mut e, mut k, mut u) = (0, 0, 0, 0);
+            assert_ne!(unsafe { GetThreadTimes(GetCurrentThread(), &mut c, &mut e, &mut k, &mut u) }, 0);
+            k + u
+        }
+        assert_eq!(std::env::var("VICTORY_TEST_ADAPTER").as_deref(), Ok("hw"));
+        let host = create().expect("D3D12 host");
+        assert!(!crate::test_device::is_software(&host.device), "hardware adapter required");
+        assert!(host.card_ready());
+        const PIECE: usize = 65536;
+        const START: usize = 0x100000000;
+        let shadow = crate::shadow::bench_card(&host, START, (840 + 250) * PIECE).expect("card buffer");
+        let list = host.new_list().expect("host list");
+        let mut ranges = Vec::new();
+        let mut at = 0;
+        for i in 0..250 {
+            let pieces = if i < 90 { 4 } else { 3 };
+            ranges.push((at * PIECE, (at + pieces) * PIECE));
+            at += pieces + 1;
+        }
+        {
+            let mut deferred = list.deferred.lock().unwrap();
+            for &(a, b) in &ranges {
+                deferred.copies.push(Step::GpuWrite(shadow.clone(), START + a, b - a));
+            }
+        }
+        let fence: ID3D12Fence = unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap() };
+        let event = unsafe { CreateEventW(None, false, false, None).unwrap() };
+        let mut samples = Vec::new();
+        let mut wall_samples = Vec::new();
+        let mut counts = Vec::new();
+        for iteration in 0..21 {
+            for &(a, b) in &ranges {
+                shadow.bench_card_changed(a, b);
+            }
+            let before = [
+                CARD_PASSES[0].load(Ordering::Relaxed),
+                CARD_PASSES[2].load(Ordering::Relaxed),
+            ];
+            let start = cpu_time();
+            let wall_start = std::time::Instant::now();
+            let plan = host.card_before(&[&list], false).expect("card plan");
+            let wall_elapsed = wall_start.elapsed();
+            let elapsed = cpu_time() - start;
+            let passes = [
+                CARD_PASSES[0].load(Ordering::Relaxed) - before[0],
+                CARD_PASSES[2].load(Ordering::Relaxed) - before[1],
+            ];
+            if iteration > 0 {
+                samples.push(elapsed);
+                wall_samples.push(wall_elapsed);
+                counts.push(passes);
+            }
+            unsafe {
+                if let Some(check) = &plan.check {
+                    host.queue.ExecuteCommandLists(&[Some(check.clone())]);
+                }
+                host.queue.Signal(&fence, iteration + 1).unwrap();
+                fence.SetEventOnCompletion(iteration + 1, event).unwrap();
+                assert_eq!(WaitForSingleObject(event, INFINITE).0, 0);
+            }
+            host.card_done(plan);
+        }
+        unsafe { let _ = CloseHandle(event); }
+        samples.sort_unstable();
+        wall_samples.sort_unstable();
+        assert!(counts.iter().all(|x| *x == counts[0]));
+        println!("card_before median_cpu_ms={:.4} hash_passes={} compare_passes={} samples=20", (samples[9] + samples[10]) as f64 * 0.00005, counts[0][0], counts[0][1]);
+        println!("card_before median_wall_ms={:.4}", (wall_samples[9].as_secs_f64() + wall_samples[10].as_secs_f64()) * 500.0);
+    }
+
     #[test]
     fn a_barrier_into_the_state_a_texture_is_already_in_is_not_recorded() {
         use windows::Win32::Graphics::Direct3D12::{
