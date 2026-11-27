@@ -96,6 +96,7 @@ mod shader_meta;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+pub mod stall;
 #[cfg(all(windows, test))]
 mod test_device;
 #[cfg(windows)]

@@ -140,6 +140,7 @@ fn heap_free(ptr: *mut u8) {
 // shortcut: the cached and non-cached sizes are not enforced as limits;
 // enforce them if a title relies on running out.
 pub extern "system" fn ApuCreateHeap(cached: u32, _non_cached: u32) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("audio::ApuCreateHeap").enter(format_args!(""));
     const ALREADY_ALLOCATED: HRESULT = 0x8ACA_0001_u32 as i32;
     if cached == 0 {
         return E_INVALIDARG;
@@ -155,6 +156,7 @@ pub extern "system" fn ApuCreateHeap(cached: u32, _non_cached: u32) -> HRESULT {
 
 /// The host address of a device address, null outside the heap.
 pub extern "system" fn ApuMapApuAddress(apu: u32) -> *mut c_void {
+    let _stall = victory_gpu::stall_site!("audio::ApuMapApuAddress").enter(format_args!(""));
     heap_unmap(apu).map_or(std::ptr::null_mut(), |p| p.cast())
 }
 
@@ -197,6 +199,7 @@ pub extern "system" fn ApuAlloc(
     align: u32,
     _flags: u32,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("audio::ApuAlloc").enter(format_args!(""));
     if out.is_null() || size == 0 || align < 4 || !align.is_power_of_two() {
         return E_INVALIDARG;
     }
@@ -214,14 +217,17 @@ pub extern "system" fn ApuAlloc(
 }
 
 pub extern "system" fn ApuFree(ptr: *mut c_void) {
+    let _stall = victory_gpu::stall_site!("audio::ApuFree").enter(format_args!(""));
     heap_free(ptr.cast());
 }
 
 pub extern "system" fn ApuMapVirtualAddress(ptr: *const c_void) -> u32 {
+    let _stall = victory_gpu::stall_site!("audio::ApuMapVirtualAddress").enter(format_args!(""));
     heap_map(ptr as usize)
 }
 
 pub extern "system" fn ApuIsVirtualAddressValid(ptr: *const c_void, align: u32) -> bool {
+    let _stall = victory_gpu::stall_site!("audio::ApuIsVirtualAddressValid").enter(format_args!(""));
     let apu = heap_map(ptr as usize);
     apu != 0 && (align == 0 || apu.is_multiple_of(align))
 }
@@ -244,6 +250,7 @@ const CONTEXT_BYTES: [usize; 6] = [32, 256, 256, 16, 64, 256];
 static CONTEXTS: Mutex<Option<[usize; 6]>> = Mutex::new(None);
 
 pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("audio::AcpHalAllocateShapeContexts").enter(format_args!(""));
     if contexts.is_null() {
         return E_INVALIDARG;
     }
@@ -278,6 +285,7 @@ pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts)
 }
 
 pub extern "system" fn AcpHalReleaseShapeContexts() -> HRESULT {
+    let _stall = victory_gpu::stall_site!("audio::AcpHalReleaseShapeContexts").enter(format_args!(""));
     match lock(&CONTEXTS).take() {
         Some(arrays) => {
             *XMA.write().unwrap_or_else(|e| e.into_inner()) = Xma::EMPTY;
@@ -824,6 +832,7 @@ fn state(this: *mut Acp) -> MutexGuard<'static, State> {
 }
 
 extern "system" fn connect(this: *mut Acp, commands: u32, messages: u32) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("audio::connect").enter(format_args!(""));
     if commands == 0 {
         return E_INVALIDARG;
     }
@@ -834,6 +843,7 @@ extern "system" fn connect(this: *mut Acp, commands: u32, messages: u32) -> HRES
 }
 
 extern "system" fn disconnect(this: *mut Acp) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("audio::disconnect").enter(format_args!(""));
     let mut state = state(this);
     if !state.connected {
         return E_FAIL;
@@ -854,6 +864,7 @@ extern "system" fn submit(
     data: *const c_void,
     notification: u32,
 ) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("audio::submit").enter(format_args!(""));
     static SEEN: Mutex<u64> = Mutex::new(0);
     if command < 64 && *lock(&SEEN) & 1 << command == 0 {
         *lock(&SEEN) |= 1 << command;
@@ -894,6 +905,7 @@ extern "system" fn submit(
 }
 
 extern "system" fn pop_message(this: *mut Acp, out: *mut Message) -> bool {
+    let _stall = victory_gpu::stall_site!("audio::pop_message").enter(format_args!(""));
     let Some(message) = state(this).messages.pop_front() else {
         return false;
     };
@@ -905,15 +917,18 @@ extern "system" fn pop_message(this: *mut Acp, out: *mut Message) -> bool {
 }
 
 extern "system" fn message_count(this: *mut Acp) -> u32 {
+    let _stall = victory_gpu::stall_site!("audio::message_count").enter(format_args!(""));
     state(this).messages.len() as u32
 }
 
 extern "system" fn release(this: *mut Acp) {
+    let _stall = victory_gpu::stall_site!("audio::release").enter(format_args!(""));
     // SAFETY: made by `AcpHalCreate` with `Box::into_raw`; released once.
     drop(unsafe { Box::from_raw(this) });
 }
 
 pub extern "system" fn AcpHalCreate(out: *mut *mut Acp) -> HRESULT {
+    let _stall = victory_gpu::stall_site!("audio::AcpHalCreate").enter(format_args!(""));
     if out.is_null() {
         return E_INVALIDARG;
     }

@@ -130,11 +130,11 @@ static SLOTS: [Slot; MAX_SHARDS] = [const {
 }; MAX_SHARDS];
 
 fn slot(s: usize) -> RwLockWriteGuard<'static, Guards> {
-    SLOTS[s].0.write().unwrap_or_else(|e| e.into_inner())
+    crate::stall::write(crate::stall::Lock::Guards, &SLOTS[s].0)
 }
 
 fn reading(s: usize) -> RwLockReadGuard<'static, Guards> {
-    SLOTS[s].0.read().unwrap_or_else(|e| e.into_inner())
+    crate::stall::read(crate::stall::Lock::Guards, &SLOTS[s].0)
 }
 
 /// Shards `0..` as a bitset, set bits taken in ascending order (fever308's

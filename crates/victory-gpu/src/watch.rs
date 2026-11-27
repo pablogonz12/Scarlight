@@ -87,7 +87,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
@@ -142,7 +142,7 @@ pub(crate) fn slow_asks() -> [u64; 3] {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     if !j.kept {
         j.ahead.clear();
     }
@@ -181,7 +181,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     ask_once_end();
     ask_ahead(ranges);
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     let j = &mut *j;
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
@@ -212,7 +212,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     if j.kept {
         j.kept = false;
         j.ahead.clear();
@@ -223,7 +223,7 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     if !j.kept || len == 0 {
         return;
     }
@@ -309,7 +309,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 /// it). `None` if the kernel would have to be asked.
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     covers(&j.ahead, first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
@@ -319,7 +319,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// with `--test-threads=1`).
 #[cfg(test)]
 pub(crate) fn forget_askings() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     j.asked = 0;
     j.ahead_asked = 0;
     j.written.clear();
@@ -341,7 +341,7 @@ pub(crate) fn written_since(start: usize, end: usize, since: u64) -> Option<bool
     if first >= last {
         return Some(false);
     }
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     let covered = j.ahead_asked >= since && covers(&j.ahead, first, last);
     covered.then(|| j.written.range(first..last).any(|(_, &w)| w > since))
 }
@@ -385,7 +385,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if covers(&j.ahead, first, last) {
