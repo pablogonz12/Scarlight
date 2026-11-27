@@ -518,8 +518,7 @@ impl Submitted {
         for recording in &self.recordings {
             recording.wait();
         }
-        let backs: Vec<_> = self.recordings.iter().map(|r| r.back()).collect();
-        if backs.iter().any(|back| back.is_null()) { Vec::new() } else { backs }
+        self.recordings.iter().map(|r| r.back()).filter(|back| !back.is_null()).collect()
     }
 }
 
@@ -1247,6 +1246,24 @@ mod tests {
         assert!(allocate_upload(this, 128, 16).is_null());
         list.thin.leave();
         assert_eq!(held(&recording.inner).failed_chunks.len(), 1);
+    }
+
+    #[test]
+    fn failed_backing_does_not_discard_other_submitted_lists() {
+        let mut good = test_list();
+        let mut bad = test_list();
+        for list in [&mut good, &mut bad] {
+            let mut inner = held(&list.thin.recording.as_ref().unwrap().inner);
+            inner.fake_back = true;
+            inner.inline_only = true;
+        }
+        held(&bad.thin.recording.as_ref().unwrap().inner).fail_allocations = 1;
+        let good_ptr: This = (&mut *good as *mut List).cast();
+        let bad_ptr: This = (&mut *bad as *mut List).cast();
+        let submission = submitted(&[good_ptr, bad_ptr]);
+        let backs = submission.ready();
+        assert_eq!(backs.len(), 1);
+        assert_eq!(backs[0], good.thin.recording.as_ref().unwrap().back());
     }
 
     /// Nothing of a submission waits for a thread of ours that is not there:
