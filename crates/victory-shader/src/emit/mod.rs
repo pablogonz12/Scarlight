@@ -1111,6 +1111,53 @@ mod tests {
     use super::*;
     use crate::native::{ComputeIo, StageIo};
 
+    #[test]
+    fn early_depth_changes_eligible_pixel_output_but_not_depth_exports() {
+        let emitted = |words: &[u32], kind, db_shader_control| {
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 1,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps { inputs: vec![], input_addr: 0, db_shader_control, patches: vec![] },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let target = kind == 16;
+            let output = SigElement {
+                name: if target { "SV_Target" } else { "SV_Depth" }.into(),
+                index: 0,
+                kind,
+                comp: 9,
+                interp: 0,
+                row: target.then_some(0),
+                col: 0,
+                cols: if target { 4 } else { 1 },
+                usage: if target { 15 } else { 1 },
+                half: false,
+            };
+            let sig = container::signature(&[output], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &sig)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            emit(&c, &native, &p, &st, &io, &res).unwrap().dxil
+        };
+        let color = [0x7E00_02F2, 0xF800_180F, 0, 0xBF81_0000];
+        let depth = [0x7E00_02F2, 0xF800_1881, 0, 0xBF81_0000];
+        let early = emitted(&color, 16, 0x1050);
+        assert_ne!(emitted(&color, 16, 0x50), early);
+        assert_eq!(emitted(&depth, 17, 0x51), emitted(&depth, 17, 0x1051));
+        #[cfg(windows)]
+        if let Ok(mut validator) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            validator.validate(&mut early.clone()).unwrap();
+        }
+    }
+
     /// A pixel shader writing SV_StencilRef (channel y of `exp mrtz`).
     /// DXC sets ShaderFlags.StencilRef (bit 11) for a pixel shader whose
     /// output signature has SV_StencilRef, and the feature bit
