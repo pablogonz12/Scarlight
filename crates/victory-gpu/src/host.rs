@@ -4783,6 +4783,7 @@ impl Host {
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
+            batch.watch_ranges = ranges;
         } else if behind && stale_under_flights(runs) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
@@ -6519,6 +6520,8 @@ impl HostList {
                     // submission's one asking ends, later refreshes ask anew.
                     if matches!(step, Step::Run(_)) {
                         crate::watch::ask_once_end();
+                        crate::watch::invalidated();
+                        batch.watch_invalid = true;
                     }
                     #[cfg(feature = "diagnostics")]
                     {
@@ -6546,6 +6549,7 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
+                        batch.ensure_watch();
                         staging.refresh();
                     }
                     continue;
@@ -6613,6 +6617,8 @@ mod wide_refresh_tests {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
+    watch_ranges: Vec<(usize, usize)>,
+    watch_invalid: bool,
     /// One entry per copy, and the runs of title memory it took this
     /// submission: the ranges themselves, not the span that covers them.
     /// The heap's ready list records thousands of small copies of the same
@@ -6630,6 +6636,12 @@ struct Batch {
 }
 
 impl Batch {
+    fn ensure_watch(&mut self) {
+        if self.watch_invalid {
+            crate::watch::ask_once(&self.watch_ranges);
+            self.watch_invalid = false;
+        }
+    }
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
@@ -6655,6 +6667,7 @@ impl Batch {
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
+        self.ensure_watch();
         let (shadow, runs) = self.refreshes.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
@@ -6690,6 +6703,9 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        if !self.refreshes.is_empty() {
+            self.ensure_watch();
+        }
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -7535,6 +7551,8 @@ impl Meter {
         let (sources, top) = crate::shadow::copy_sources();
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::slow_asks();
+        #[cfg(feature = "diagnostics")]
+        let watch_counts = (crate::journal::take_kernel_calls(), crate::watch::take_invalidations());
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
@@ -7569,7 +7587,11 @@ impl Meter {
             }
             #[cfg(feature = "diagnostics")]
             tracing::info!(
-                "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms",
+                "write-watch kernel calls: {:.1} answered, {:.1} failed, {:.1} skipped a frame, invalidations: {:.1} a frame; askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms",
+                watch_counts.0[0] as f64 / frames,
+                watch_counts.0[1] as f64 / frames,
+                watch_counts.0[2] as f64 / frames,
+                watch_counts.1 as f64 / frames,
                 slow[0] as f64 / frames,
                 slow[1] as f64 / 1e3 / frames,
                 slow[2] as f64 / 1e3
