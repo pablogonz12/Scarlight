@@ -119,6 +119,9 @@ mod upload_pool;
 mod warptest;
 #[cfg(windows)]
 mod watch;
+
+#[cfg(all(test, windows, target_arch = "x86_64"))]
+mod linux_dirty_probe;
 #[cfg(windows)]
 mod writeback;
 
