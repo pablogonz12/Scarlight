@@ -381,3 +381,5 @@ D
   mip and slice), leaves the texels it did not take as they were, and the texture's recorded state is put back
   after the copy, behind `VICTORY_TEXTURE_BACK_UNION=1` (off by default) (`crates/victory-gpu/src/texback.rs`,
   `crates/victory-gpu/src/host.rs`, `crates/victory-gpu/src/draw.rs`, `crates/victory-gpu/src/descriptor/host.rs`).
+
+- **Belobug**, [e70e031c](https://github.com/Belobug/VIctory-Belobug-AMD/commit/e70e031cf): native shader support, and [1162d38f](https://github.com/Belobug/VIctory-Belobug-AMD/commit/1162d38f9) for the translator cache version idea.
