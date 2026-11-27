@@ -245,6 +245,12 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   console's sampler (`crates/victory-shader/src/emit/lower.rs`); this is what recovered the archive's refused
   windshield and wiper pixel and mesh variants.
 
+- **avatarmanz/VIctory-7900XTX** (GPL-3.0), commit [b1da72814](https://github.com/avatarmanz/VIctory-7900XTX/commit/b1da72814):
+  the scheme of `VICTORY_PICKED_WRITES`: a declared range is not compared whole, only the pages its shaders wrote,
+  learned from the compares themselves, with one page in 64 looked at in turn so that nothing stays missed, and
+  what is found late still landed (`crates/victory-gpu/src/picked.rs`; 69 -> 6 ms of page compares a frame on
+  his machine). Reimplemented for this tree's compares, which keep the snapshot per copy rather than the card's
+  hashes, and so need `VICTORY_KEEP_SNAPSHOTS=1`.
 - **avatarmanz/VIctory-7900XTX** (GPL-3.0), commit [b6202840a](https://github.com/avatarmanz/VIctory-7900XTX/commit/b6202840a):
   the idea of comparing title bytes under shader writes with AVX2 rather than eight bytes at a time: the copy-back's
   piece walk, its first and last difference and the differing runs take thirty-two bytes a compare where the CPU has
