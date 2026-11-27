@@ -21,7 +21,44 @@ fn a_swap_also_depends_on_its_old_destination() {
     let swap = &p.blocks[0].insts[1];
     assert_eq!(swap.name(), "v_swap_b32");
     let new_v1 = swap.write(ir::Reg::V(1)).unwrap();
-    assert!(!super::lane_uniform(&p, &st, &[true]).contains(&new_v1));
+    assert!(!super::lane_uniform(&p, &st, &[true], None).contains(&new_v1));
+}
+
+#[test]
+fn wave_index_shift_is_proved_without_accepting_wrapping_counts() {
+    for (shift, expected) in [(6, true), (5, false), (32, false), (64, false)] {
+        let words = [0x2C0E_0080u32 + shift, S_ENDPGM];
+        let code: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let p = ir::build(&code, true, 8).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let inst = &p.blocks[0].insts[0];
+        let tid = inst.read(ir::Reg::V(0)).unwrap();
+        let shifted = inst.write(ir::Reg::V(7)).unwrap();
+        assert_eq!(super::lane_uniform(&p, &st, &[true], Some(tid)).contains(&shifted), expected);
+    }
+}
+
+#[test]
+fn wave_uniform_running_sum_is_proved_inside_a_loop() {
+    let words: [u32; 35] = [
+        0x2C0E_0086, 0x3410_0E82, 0x4A12_0E8A, 0xD760_0013, 0x0201_7F09,
+        0x7E12_0213, 0xD834_0000, 0x0000_0908, 0xBF8C_C07F, 0xBF8A_0000,
+        0x7E10_0280, 0xBE80_047E, 0x7DAA_0E80, 0xBF88_0011, 0xBE86_047E,
+        0xBE92_0380, 0xBE91_0380, 0xBF82_0002, 0x87FE_0614, 0x7E22_0508,
+        0x8F10_8212, 0x8112_8112, 0x7E10_0210, 0xD8D8_0000, 0x0800_0008,
+        0xBF8C_C07F, 0x4A10_1011, 0xBE94_047E, 0x7DA4_0E12, 0x8A86_7E06,
+        0xBF85_FFF3, 0xBEFE_0400, 0x3402_0082, 0xE070_1000, 0x8002_0801,
+    ];
+    let mut code: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    code.extend_from_slice(&S_ENDPGM.to_le_bytes());
+    let p = ir::build(&code, true, 64).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let tid = p.inputs.iter().find(|x| x.0 == ir::Reg::V(0)).unwrap().1;
+    let first = p.blocks.iter().flat_map(|b| &b.insts)
+        .find(|i| i.name() == "v_readfirstlane_b32").unwrap();
+    let value = first.read(ir::Reg::V(8)).unwrap();
+    let all = vec![true; p.blocks.len()];
+    assert!(super::lane_uniform(&p, &st, &all, Some(tid)).contains(&value));
 }
 
 #[test]
