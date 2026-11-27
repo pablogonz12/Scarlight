@@ -318,11 +318,12 @@ pub(crate) fn module() -> HleModule {
 mod tests {
     use super::*;
 
-    extern "system" fn noop(_: u8, _: *mut c_void) {}
+    extern "system" fn noop(_: u8, _: *mut c_void) {
+    let _stall = victory_gpu::stall_site!("lifecycle::noop").enter(format_args!(""));
+}
 
     #[test]
     fn registrations_come_and_go() {
-        let _stall = victory_gpu::stall_site!("lifecycle::noop").enter(format_args!(""));
         let (mut a, mut b) = (0, 0);
         assert_eq!(
             RegisterAppStateChangeNotification(Some(noop), std::ptr::null_mut(), &mut a),

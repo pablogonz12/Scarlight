@@ -79,7 +79,9 @@ extern "system" fn create_context(_: This, _user: *const c_void, out: *mut Handl
     let _stall = victory_gpu::stall_site!("xstore::create_context").enter(format_args!(""));
     put(out, handle(&CONTEXT))
 }
-extern "system" fn close(_: This, _: Handle) {}
+extern "system" fn close(_: This, _: Handle) {
+    let _stall = victory_gpu::stall_site!("xstore::close").enter(format_args!(""));
+}
 
 extern "system" fn associated_products_async(
     _: This,
@@ -88,7 +90,7 @@ extern "system" fn associated_products_async(
     _per_page: u32,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xstore::close").enter(format_args!(""));
+    let _stall = victory_gpu::stall_site!("xstore::associated_products_async").enter(format_args!(""));
     offline(block, "associated products")
 }
 

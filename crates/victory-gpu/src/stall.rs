@@ -224,12 +224,18 @@ impl fmt::Display for Args {
     }
 }
 
+/// A slot's state: free, claimed by a call that is still writing its
+/// payload, and ready for the watchdog to read.
+const FREE: u32 = 0;
+const CLAIMED: u32 = 1;
+const READY: u32 = 2;
+
 /// One call in flight, per slot: reads from the watchdog are racy by design
 /// (a call can end as it is looked at), so every field is atomic and the
-/// owner CASes the slot before writing it.
+/// owner CASes the slot before writing it, then publishes it ready.
 #[repr(align(64))]
 struct Slot {
-    /// `0` free, `1` a call in flight.
+    /// [`FREE`], [`CLAIMED`] or [`READY`].
     live: AtomicU32,
     /// Set when the watchdog has said this call is still running.
     said: AtomicBool,
@@ -275,35 +281,34 @@ fn since_epoch(at: Instant) -> u64 {
     at.saturating_duration_since(*EPOCH).as_nanos().min(u64::MAX as u128) as u64
 }
 
+/// Takes `index` if it is free. The owner writes its payload while the slot
+/// says [`CLAIMED`], so the watchdog never reads half a call.
+fn claim(index: usize) -> bool {
+    SLOTS[index]
+        .live
+        .compare_exchange(FREE, CLAIMED, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+}
+
 fn publish(site: &'static Site, at: Instant, args: &Args) -> usize {
     let tid = thread_id();
-    let mine = MINE.lock().unwrap_or_else(|e| e.into_inner());
-    let cached = mine.iter().position(|&(t, _)| t == tid);
-    let index = match cached {
-        Some(i) => mine[i].1,
-        None => usize::MAX,
+    let cached = {
+        let mine = MINE.lock().unwrap_or_else(|e| e.into_inner());
+        mine.iter().find(|&&(t, _)| t == tid).map(|&(_, i)| i)
     };
-    drop(mine);
-    let index = if index < MAX_CALLS && SLOTS[index].live.load(Ordering::Relaxed) == 0 {
-        index
-    } else {
-        let claim = SLOTS
-            .iter()
-            .position(|s| {
-                s.live
-                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-            });
-        let Some(index) = claim else {
-            return usize::MAX;
-        };
-        let mut mine = MINE.lock().unwrap_or_else(|e| e.into_inner());
-        match mine.iter_mut().find(|(t, _)| *t == tid) {
-            Some(entry) => entry.1 = index,
-            None => mine.push((tid, index)),
+    let index = match cached {
+        Some(index) if index < MAX_CALLS && claim(index) => index,
+        _ => {
+            let Some(index) = (0..MAX_CALLS).find(|&i| claim(i)) else {
+                return usize::MAX;
+            };
+            let mut mine = MINE.lock().unwrap_or_else(|e| e.into_inner());
+            match mine.iter_mut().find(|(t, _)| *t == tid) {
+                Some(entry) => entry.1 = index,
+                None => mine.push((tid, index)),
+            }
+            index
         }
-        SLOTS[index].live.store(1, Ordering::Release);
-        index
     };
     let slot = &SLOTS[index];
     slot.said.store(false, Ordering::Relaxed);
@@ -318,11 +323,12 @@ fn publish(site: &'static Site, at: Instant, args: &Args) -> usize {
         bytes[..take].copy_from_slice(&args.bytes[from..from + take]);
         word.store(u64::from_le_bytes(bytes), Ordering::Relaxed);
     }
+    slot.live.store(READY, Ordering::Release);
     index
 }
 
 fn release(index: usize) {
-    SLOTS[index].live.store(0, Ordering::Release);
+    SLOTS[index].live.store(FREE, Ordering::Release);
 }
 
 /// A call in flight, as the watchdog sees it.
@@ -338,7 +344,7 @@ fn running() -> Vec<Running> {
     let now = Instant::now();
     let mut out = Vec::new();
     for (index, slot) in SLOTS.iter().enumerate() {
-        if slot.live.load(Ordering::Acquire) != 1 {
+        if slot.live.load(Ordering::Acquire) != READY {
             continue;
         }
         let site = slot.site.load(Ordering::Relaxed);
@@ -516,6 +522,9 @@ fn waited(lock: Lock, took: Duration) {
 
 /// [`Mutex::lock`], with the wait recorded against `lock`.
 pub fn guard<T>(lock: Lock, mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    if !enabled() {
+        return mutex.lock().unwrap_or_else(|e| e.into_inner());
+    }
     let at = Instant::now();
     let held = mutex.lock().unwrap_or_else(|e| e.into_inner());
     waited(lock, at.elapsed());
@@ -524,6 +533,9 @@ pub fn guard<T>(lock: Lock, mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// [`RwLock::read`], with the wait recorded against `lock`.
 pub fn read<T>(lock: Lock, rw: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    if !enabled() {
+        return rw.read().unwrap_or_else(|e| e.into_inner());
+    }
     let at = Instant::now();
     let held = rw.read().unwrap_or_else(|e| e.into_inner());
     waited(lock, at.elapsed());
@@ -532,6 +544,9 @@ pub fn read<T>(lock: Lock, rw: &RwLock<T>) -> RwLockReadGuard<'_, T> {
 
 /// [`RwLock::write`], with the wait recorded against `lock`.
 pub fn write<T>(lock: Lock, rw: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    if !enabled() {
+        return rw.write().unwrap_or_else(|e| e.into_inner());
+    }
     let at = Instant::now();
     let held = rw.write().unwrap_or_else(|e| e.into_inner());
     waited(lock, at.elapsed());
@@ -602,10 +617,19 @@ fn totals() -> MutexGuard<'static, Totals> {
 mod tests {
     use super::*;
 
+    /// The frame counters are process-wide: the tests that record into them
+    /// or take them hold this, so one test cannot see another's call.
+    static TESTS: Mutex<()> = Mutex::new(());
+
+    fn one_at_a_time() -> MutexGuard<'static, ()> {
+        TESTS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The latch is per site and the count is per call: a stall loop says one
     /// line, and the frame line still counts every slow call.
     #[test]
     fn a_call_that_sleeps_two_point_one_seconds_is_logged_once() {
+        let _serial = one_at_a_time();
         static SITE: Site = Site::new("Test::DeliberatelySlow");
         let said = said_lines();
         let slow = SITE.slow_calls();
@@ -643,14 +667,18 @@ mod tests {
     /// The frame line names the lock that was actually held.
     #[test]
     fn the_longest_lock_line_reports_the_lock_actually_held() {
+        let _serial = one_at_a_time();
         static HELD: Mutex<u8> = Mutex::new(0);
         let _ = frame_summary(); // clear what other tests left
-        let holder = std::thread::spawn(|| {
+        let (signals, held) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
             let _held = guard(Lock::Journal, &HELD);
+            // Tell the test only now: it queues behind a lock that is held,
+            // not behind one the holder might still be about to take.
+            signals.send(()).expect("the test is waiting");
             std::thread::sleep(Duration::from_millis(120));
         });
-        // Wait for the holder to take it, then queue up behind it.
-        std::thread::sleep(Duration::from_millis(40));
+        held.recv().expect("the holder has the journal");
         {
             let _mine = guard(Lock::Journal, &HELD);
         }
@@ -696,6 +724,7 @@ mod tests {
     /// The frame line says the count and the worst site.
     #[test]
     fn the_frame_line_names_the_longest_call_and_counts_it() {
+        let _serial = one_at_a_time();
         static SITE: Site = Site::new("Test::CountedSlow");
         let _ = frame_summary();
         totals().record(&SITE, Duration::from_millis(16_550));

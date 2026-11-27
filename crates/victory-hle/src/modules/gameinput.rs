@@ -886,7 +886,9 @@ extern "system" fn enable_oem_device(
     let _stall = victory_gpu::stall_site!("gameinput::enable_oem_device").enter(format_args!(""));
     S_OK
 }
-extern "system" fn set_focus_policy(_: This, _policy: u32) {}
+extern "system" fn set_focus_policy(_: This, _policy: u32) {
+    let _stall = victory_gpu::stall_site!("gameinput::set_focus_policy").enter(format_args!(""));
+}
 
 static INPUT: Table<22> = Table([
     no_interface as *const (),        // 0x00
@@ -914,7 +916,7 @@ static INPUT: Table<22> = Table([
 ]);
 
 extern "system" fn device_info(this: *const Device) -> *const DeviceInfo {
-    let _stall = victory_gpu::stall_site!("gameinput::set_focus_policy").enter(format_args!(""));
+    let _stall = victory_gpu::stall_site!("gameinput::device_info").enter(format_args!(""));
     // SAFETY: one of our devices.
     unsafe { &(*this).info }
 }

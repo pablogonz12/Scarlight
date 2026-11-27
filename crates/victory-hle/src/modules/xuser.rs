@@ -93,9 +93,11 @@ extern "system" fn duplicate(_: This, _: Handle, out: *mut Handle) -> HRESULT {
     let _stall = victory_gpu::stall_site!("xuser::duplicate").enter(format_args!(""));
     put(out, user())
 }
-extern "system" fn close(_: This, _: Handle) {}
-extern "system" fn compare(_: This, a: Handle, b: Handle) -> i32 {
+extern "system" fn close(_: This, _: Handle) {
     let _stall = victory_gpu::stall_site!("xuser::close").enter(format_args!(""));
+}
+extern "system" fn compare(_: This, a: Handle, b: Handle) -> i32 {
+    let _stall = victory_gpu::stall_site!("xuser::compare").enter(format_args!(""));
     i32::from(a != b)
 }
 
