@@ -6554,7 +6554,13 @@ mod wide_refresh_tests {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// One entry per copy, and the runs of title memory it took this
+    /// submission: the ranges themselves, not the span that covers them.
+    /// The heap's ready list records thousands of small copies of the same
+    /// few buffers; one span per copy made every refresh ask the kernel,
+    /// and read the title, over the gaps between them (a 4 MiB window
+    /// asked for 8 KiB of vertices: [`refresh_runs`]).
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
     /// Where each copy (by address) is in `refreshes`: the list that makes
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
@@ -6570,12 +6576,16 @@ impl Batch {
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         match self.index.get(&key) {
             Some(&at) => {
-                let r = &mut self.refreshes[at];
-                (r.1, r.2) = (r.1.min(address), r.2.max(end));
+                let runs = &mut self.refreshes[at].1;
+                if crate::refresh_runs::on() {
+                    crate::refresh_runs::add(runs, address, end);
+                } else if let Some(r) = runs.first_mut() {
+                    (r.0, r.1) = (r.0.min(address), r.1.max(end));
+                }
             }
             None => {
                 self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), vec![(address, end)]));
             }
         }
     }
@@ -6586,12 +6596,14 @@ impl Batch {
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
-        let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let (shadow, runs) = self.refreshes.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
+        for (from, to) in runs {
+            Self::update(&shadow, from, to);
+        }
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
@@ -6629,7 +6641,7 @@ impl Batch {
                 .refreshes
                 .iter()
                 .filter(|r| !r.0.unwatched())
-                .map(|r| (r.1, r.2))
+                .flat_map(|r| r.1.iter().copied())
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -6639,17 +6651,21 @@ impl Batch {
         // where the check would have left them ([`crate::shadow::skip_clean`]).
         if crate::shadow::skip_clean() {
             let started = std::time::Instant::now();
-            self.refreshes.retain(|(shadow, from, to)| {
-                let clean = shadow.clean(*from, *to);
-                #[cfg(feature = "diagnostics")]
-                if clean {
-                    crate::copystat::add(crate::copystat::C::Skipped, 1);
-                    crate::copystat::add(crate::copystat::C::SkippedBytes, (to - from) as u64);
-                }
-                !clean
-            });
+            for (shadow, runs) in &mut self.refreshes {
+                runs.retain(|&(from, to)| {
+                    let clean = shadow.clean(from, to);
+                    #[cfg(feature = "diagnostics")]
+                    if clean {
+                        crate::copystat::add(crate::copystat::C::Skipped, 1);
+                        crate::copystat::add(crate::copystat::C::SkippedBytes, (to - from) as u64);
+                    }
+                    !clean
+                });
+            }
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
+        // A copy with nothing left to do is no job at all.
+        self.refreshes.retain(|r| !r.1.is_empty());
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
@@ -6659,14 +6675,22 @@ impl Batch {
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                .map(|(shadow, runs)| {
+                    Box::new(move || {
+                        for (from, to) in runs {
+                            Self::update(&shadow, from, to);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
                 .collect();
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
+            for (shadow, runs) in self.refreshes.drain(..) {
+                for (from, to) in runs {
+                    Self::update(&shadow, from, to);
+                }
             }
         }
         if ahead {
