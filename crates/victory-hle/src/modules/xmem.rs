@@ -92,6 +92,7 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    let _stall = victory_gpu::stall_site!("xmem::XMemVirtualAlloc").enter(format_args!(""));
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
@@ -154,6 +155,11 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if placeholder && base.is_null() && !at.is_null() {
+        // The GPU side answers its placeholder questions from this table
+        // (`victory_gpu::inplace`): nothing else maps or unmaps inside one.
+        victory_gpu::title_memory_placeholder(at as usize, size);
+    }
     if !at.is_null() && kind & MEM_COMMIT != 0 && protect == PAGE_READWRITE {
         // Committed private memory the GPU may use: the arena's registry
         // (`VICTORY_ARENA=1`, off by default; a no-op when off).
@@ -190,6 +196,7 @@ pub extern "system" fn XMemVirtualQuery(
     address: *const c_void,
     out: *mut BasicInformation,
 ) -> BOOL {
+    let _stall = victory_gpu::stall_site!("xmem::XMemVirtualQuery").enter(format_args!(""));
     let size = size_of::<MEMORY_BASIC_INFORMATION>();
     // SAFETY: the title passes room for the whole structure; the host
     // fails on a null one.
@@ -259,6 +266,7 @@ fn hooks() -> [usize; 2] {
 /// The title's general allocator, for middleware too: its hook if it has
 /// one, else [`XMemAllocDefault`].
 pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
+    let _stall = victory_gpu::stall_site!("xmem::XMemAlloc").enter(format_args!("size={size} attributes={attributes:#x}"));
     match hooks()[0] {
         0 => XMemAllocDefault(size, attributes),
         hook => {
@@ -271,6 +279,7 @@ pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
 
 /// See [`XMemAlloc`].
 pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
+    let _stall = victory_gpu::stall_site!("xmem::XMemFree").enter(format_args!("address={address:p} attributes={attributes:#x}"));
     match hooks()[1] {
         0 => XMemFreeDefault(address, attributes),
         hook => {
@@ -283,6 +292,7 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
+    let _stall = victory_gpu::stall_site!("xmem::XMemAllocDefault").enter(format_args!(""));
     if attributes & ALLOC_32BIT != 0 {
         return XMemVirtualAlloc(
             std::ptr::null_mut(),
@@ -317,6 +327,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
 
 /// Frees what [`XMemAllocDefault`] returned, given the same attributes.
 pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
+    let _stall = victory_gpu::stall_site!("xmem::XMemFreeDefault").enter(format_args!(""));
     if address.is_null() {
         return;
     }
@@ -338,6 +349,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
 
 /// A retail console has no tools memory.
 pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
+    let _stall = victory_gpu::stall_site!("xmem::XMemIsToolsMemAvailable").enter(format_args!(""));
     0
 }
 
@@ -479,6 +491,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     count: *mut usize,
     pages: *mut usize,
 ) -> BOOL {
+    let _stall = victory_gpu::stall_site!("xmem::XMemAllocatePhysicalPages").enter(format_args!(""));
     if count.is_null() || pages.is_null() {
         return 0;
     }
@@ -544,6 +557,7 @@ const FIRST_PAGE_NUMBER: usize = 0x10_0000;
 
 /// Pages still mapped stay readable through their views until unmapped.
 pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
+    let _stall = victory_gpu::stall_site!("xmem::XMemFreePhysicalPages").enter(format_args!(""));
     if pages.is_null() {
         return 0;
     }
@@ -863,6 +877,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
+    let _stall = victory_gpu::stall_site!("xmem::XMemMapPhysicalPages").enter(format_args!(""));
     let base = address as usize;
     let mut physical = physical();
     // Until the pages are mapped again: `unmap` takes whole views away and
@@ -937,6 +952,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     n: usize,
     pages: *const usize,
 ) -> BOOL {
+    let _stall = victory_gpu::stall_site!("xmem::XMemMapPhysicalPagesScatter").enter(format_args!(""));
     if addresses.is_null() {
         return 0;
     }
@@ -1206,6 +1222,7 @@ pub struct WorkingSet {
 // not split by bandwidth class (GPU-optimal use reads 0); track
 // allocations per class if a title budgets from that field.
 pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut WorkingSet) -> BOOL {
+    let _stall = victory_gpu::stall_site!("xmem::XMemGetWorkingSetStatistics").enter(format_args!(""));
     if out.is_null() {
         return 0;
     }
@@ -1249,6 +1266,7 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
 /// Hands title memory (standard, in 2 MiB pages) to the system. The other
 /// transfers involve tools memory, which a retail console has none of.
 pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
+    let _stall = victory_gpu::stall_site!("xmem::XMemTransferMemory").enter(format_args!(""));
     const TITLE_TO_SYSTEM: u32 = 0;
     tracing::info!(kind, size, "XMemTransferMemory");
     if size == 0 {

@@ -87,7 +87,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
@@ -142,7 +142,7 @@ pub(crate) fn slow_asks() -> [u64; 3] {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     if !j.kept {
         j.ahead.clear();
     }
@@ -181,7 +181,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     ask_once_end();
     ask_ahead(ranges);
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     let j = &mut *j;
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
@@ -212,7 +212,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     if j.kept {
         j.kept = false;
         j.ahead.clear();
@@ -223,7 +223,7 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     if !j.kept || len == 0 {
         return;
     }
@@ -309,17 +309,45 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 /// it). `None` if the kernel would have to be asked.
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     covers(&j.ahead, first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
+/// One test at a time on the journal: the journal is one for the whole
+/// process, and the harness runs the tests in parallel.
+///
+/// Held for the length of a test that asks ([`ask_once`], [`asked`],
+/// [`written_since`], [`forget_askings`]) or notes writes ([`writing`],
+/// [`wrote`], [`copied`], [`title_memory_remapped`]) in the journal. Without
+/// it another test's asking resets `ahead` between this test's `ask_once`
+/// and its `asked` ("asked ahead" failing), and its write lands under a
+/// higher asking number in this test's pages, so a range nothing was
+/// written in reads as written (`a_range_is_known_clean_until_an_asking_
+/// finds_it_written` failed on `main`'s CI run 45835616327, and 1 run in 5
+/// locally in parallel; it passes 5 of 5 with `--test-threads=1`). Nothing
+/// in a single test is wrong, and no test skips itself: they take this lock
+/// and run in turn.
+///
+/// Taken as the first thing a test does, before any device lock
+/// (`crate::warptest`), so the two never form a cycle. Taking it also
+/// [`forget_askings`]s, so each test starts from a journal of its own and
+/// leaves none for the next.
+#[cfg(test)]
+pub(crate) fn journal_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    forget_askings();
+    guard
+}
+
 /// Forgets every asking and every page found written: for a test that
-/// starts from a journal of its own and leaves none behind (it must run
-/// with `--test-threads=1`).
+/// starts from a journal of its own and leaves none behind (take
+/// [`journal_test_lock`], which does this, so no other test asks or writes
+/// meanwhile).
 #[cfg(test)]
 pub(crate) fn forget_askings() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     j.asked = 0;
     j.ahead_asked = 0;
     j.written.clear();
@@ -341,7 +369,7 @@ pub(crate) fn written_since(start: usize, end: usize, since: u64) -> Option<bool
     if first >= last {
         return Some(false);
     }
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     let covered = j.ahead_asked >= since && covers(&j.ahead, first, last);
     covered.then(|| j.written.range(first..last).any(|(_, &w)| w > since))
 }
@@ -385,7 +413,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::stall::guard(crate::stall::Lock::Journal, &JOURNAL);
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if covers(&j.ahead, first, last) {
@@ -916,13 +944,22 @@ fn guarded_range(start: usize, end: usize, pools: bool) -> Option<Vec<usize>> {
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
-        && crate::guards::block_known(start);
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // A range inside a runtime placeholder reservation is view memory (the
+    // runtime maps its pages through `xmem::map`, which tells us), and its
+    // holes are in the views: no question to Windows either way.
+    let in_placeholder = crate::inplace::placeholder_range(first * BLOCK, last * BLOCK);
+    if in_placeholder {
+        crate::inplace::PLACEHOLDER_HITS[0]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let known = in_placeholder
+        || (!*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
+            && crate::guards::block_known(start));
     if !known && !is_view(start, end) && !(pools && is_pool(start)) {
         return None;
     }
     install();
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     Some(crate::guards::reguard(first, last))
 }
 
@@ -1053,6 +1090,14 @@ pub(crate) fn back_begin(done: &std::sync::Arc<Done>, from: usize, to: usize) ->
     install();
     let mut held = Vec::new();
     let take = |a: usize, b: usize, held: &mut Vec<usize>| {
+        // The map is taken *before* the pages are made inaccessible: a title
+        // thread that faults in between would find no job for the block
+        // (`back_pending`), so the handler could not wait for the merge and
+        // would pass the fault on. With the map held across the protect, that
+        // fault waits here and then finds the job. Nothing inside this block
+        // touches title memory, so the handler cannot be entered on this
+        // thread while it holds the map.
+        let mut map = back();
         let mut old = 0;
         // SAFETY: title memory; only its protection changes.
         if unsafe {
@@ -1064,7 +1109,6 @@ pub(crate) fn back_begin(done: &std::sync::Arc<Done>, from: usize, to: usize) ->
             )
         } != 0
         {
-            let mut map = back();
             for block in a..b {
                 // A block an earlier job holds keeps the protection it had
                 // before the first job took it: `back_release` gives that
@@ -1115,14 +1159,60 @@ pub(crate) fn back_wait(from: usize, to: usize) {
             .collect()
     };
     for done in jobs {
-        done.wait();
+        let _ = done.wait_for(
+            "a fence signal behind a write-back job",
+            crate::writeback::MERGE_DEADLINE,
+        );
+    }
+}
+
+/// Waits for the job that holds `at`, if one does; on the deadline the job's
+/// hold is given up (`back_open_now`: the merge is lost, and said so by
+/// `Done::wait_for`) so the title's access can go through instead of the run
+/// stopping on a job that will never finish. The worker never waits for its
+/// own job: it opens the block and goes on.
+pub(crate) fn wait_held(at: usize) {
+    let Some(done) = back_pending(at) else {
+        return;
+    };
+    if crate::writeback::this_is_worker() {
+        back_open_now(at, 1);
+        return;
+    }
+    if !done.wait_for(
+        "a title access to a block a write-back job holds",
+        crate::writeback::MERGE_DEADLINE,
+    ) {
+        back_open_now(at, 1);
     }
 }
 
 /// Before a kernel write into title memory `[at, at + len)`: the blocks are
-/// given back writable, as [`open`] does for the guarded ones (the write is
-/// the title's, or the job's own, so nothing waits for the job there).
+/// given back writable, as [`open`] does for the guarded ones. A job that
+/// holds one is waited for first (bounded: [`wait_held`] and the deadline):
+/// opening the block under it would let the job's merge put the GPU's older
+/// bytes over the title's write afterwards, i.e. lose the merge *and* the
+/// title's bytes.
 pub(crate) fn back_open(at: usize, len: usize) {
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    if !crate::writeback::this_is_worker() {
+        let jobs: Vec<std::sync::Arc<Done>> = {
+            let map = back();
+            map.range(first..last).map(|(_, (done, _))| done.clone()).collect()
+        };
+        for done in jobs {
+            let _ = done.wait_for(
+                "a write into a block a write-back job holds",
+                crate::writeback::MERGE_DEADLINE,
+            );
+        }
+    }
+    back_open_now(at, len);
+}
+
+/// [`back_open`] without waiting for the job: the worker's own write into its
+/// blocks, and the repair after a wait gave up.
+pub(crate) fn back_open_now(at: usize, len: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut opened = Vec::new();
@@ -1301,17 +1391,13 @@ fn install() {
         let at = r.ExceptionInformation[1];
         // A write-back job has this block (inaccessible to reads and writes
         // alike): wait for the GPU's bytes to be put back before the
-        // instruction reads or writes them.
-        if let Some(done) = back_pending(at) {
-            // The worker itself must never wait for its own job: the block
-            // is opened and the instruction goes on.
-            if crate::writeback::this_is_worker() {
-                back_open(at, 1);
-                return EXCEPTION_CONTINUE_EXECUTION;
-            }
+        // instruction reads or writes them, but never past the deadline with
+        // no word said: `wait_held` gives the block up, names the job it
+        // waited for, and this instruction goes on with the title's range.
+        if back_pending(at).is_some() {
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
-            done.wait();
+            wait_held(at);
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::add(crate::copystat::C::AsyncWaits, 1);
@@ -1415,6 +1501,7 @@ mod tests {
     /// past its end, and nothing before it was copied.
     #[test]
     fn a_copy_marks_the_blocks_it_took() {
+        let _journal = journal_test_lock();
         let at = 0x7000_0000_0000usize;
         let len = 3 * BLOCK;
         assert!(!mapped(at, len), "nothing copied there yet");
@@ -1431,6 +1518,7 @@ mod tests {
     /// job released them, and a thread that faulted there waits for it.
     #[test]
     fn write_back_blocks_wait_for_their_job() {
+        let _journal = journal_test_lock();
         // SAFETY: two blocks of private memory, freed at the end.
         let at = unsafe {
             VirtualAlloc(
@@ -1458,6 +1546,7 @@ mod tests {
     /// releases it: only the job that last held it gives it back.
     #[test]
     fn a_held_block_passes_to_the_next_job() {
+        let _journal = journal_test_lock();
         // SAFETY: one block of private memory, freed at the end.
         let at = unsafe {
             VirtualAlloc(
@@ -1491,6 +1580,7 @@ mod tests {
     /// block was an unhandled 0xc0000005.
     #[test]
     fn a_title_write_into_a_held_block_is_resolved() {
+        let _journal = journal_test_lock();
         // SAFETY: two blocks of private memory, freed at the end.
         let at = unsafe {
             VirtualAlloc(
@@ -1537,6 +1627,7 @@ mod tests {
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
+        let _journal = journal_test_lock();
         // The kernel's answering: the pools' guarding is off unless
         // `VICTORY_GUARD_POOLS=1`.
         tests::POOLS.with(|v| v.set(Some(false)));
@@ -1564,9 +1655,14 @@ mod tests {
         // Nor is a plain allocation write-watched: with the copies' pool
         // guarding off (the old way, `VICTORY_GUARD_COPY_POOLS=0`) its asking
         // is not answered at all, and a copy takes the whole range at every
-        // refresh for the rest of the run.
-        let mut plain = vec![0u8; PAGE];
-        let (at, plane_end) = (plain.as_mut_ptr() as usize, plain.as_mut_ptr() as usize + PAGE);
+        // refresh for the rest of the run. The window starts seven bytes into
+        // the reservation, so it is no block's (`div_ceil` names two); a
+        // private region, not an allocator page, because the guards make the
+        // blocks they hold read-only and a page the CRT heap hands out would
+        // fault on the heap's own writes.
+        let plain = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(plain, 0);
+        let (at, plane_end) = (plain + 7, plain + 2 * PAGE);
         // A page an earlier test used may still be in the journal: this asks
         // about an empty one.
         forget_askings();
@@ -1578,14 +1674,15 @@ mod tests {
         let (first, held) = writes(at, plane_end, true).expect("guarded for a copy");
         // The heap's address need not be a block's: the range's blocks, and
         // each named once, at this asking.
-        let touched: Vec<usize> = (at / PAGE..=(at + PAGE - 1) / PAGE).collect();
+        let touched: Vec<usize> = (at / PAGE..=(plane_end - 1) / PAGE).collect();
         assert!(held.iter().all(|&(page, _)| touched.contains(&page)), "the range's blocks: {held:?}");
         assert!(held.iter().all(|&(_, write)| write == first), "named by this asking: {held:?}");
         let (_, again) = writes(at, plane_end, true).expect("guarded");
         assert_eq!(again.iter().filter(|&&(_, w)| w > first).count(), 0, "nothing written since");
         crate::guards::open(at, plane_end);
         tests::POOLS.with(|v| v.set(None));
-        // SAFETY: our allocation.
+        // SAFETY: our allocations.
+        unsafe { VirtualFree(plain as *mut _, 0, MEM_RELEASE) };
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
@@ -1595,6 +1692,7 @@ mod tests {
     /// default off) asks the kernel, as every asking did before.
     #[test]
     fn a_pools_asking_is_answered_by_the_guards_not_the_kernel() {
+        let _journal = journal_test_lock();
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
             VirtualAlloc(
@@ -1650,6 +1748,7 @@ mod tests {
     /// copy goes without it.
     #[test]
     fn the_kernels_asking_verifies_what_the_guards_hold() {
+        let _journal = journal_test_lock();
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
             VirtualAlloc(
@@ -1689,6 +1788,7 @@ mod tests {
     /// nothing in *its* range was written.
     #[test]
     fn a_range_is_known_clean_until_an_asking_finds_it_written() {
+        let _journal = journal_test_lock();
         // A pool the guards hold is left to `writes`, not asked ahead: this
         // is the asking of everything else, with the pools' guarding off
         // (its default).
@@ -1742,6 +1842,7 @@ mod tests {
     /// answers for it instead of the kernel being asked again.
     #[test]
     fn overlapping_askings_are_merged_so_a_range_inside_any_is_covered() {
+        let _journal = journal_test_lock();
         let mut ahead = vec![(0usize, 12_000usize), (8_000, 20_000)];
         normalize_ahead(&mut ahead);
         assert_eq!(ahead, [(0, 20_000)], "the second overlapping the first");
@@ -1773,6 +1874,7 @@ mod tests {
     #[test]
     #[ignore]
     fn clean_copies_bench() {
+        let _journal = journal_test_lock();
         use std::time::Instant;
         for pages in [1024usize, 4096] {
             // SAFETY: a fresh write-watched allocation, freed at the end.
@@ -1816,6 +1918,7 @@ mod tests {
     /// lands and the block counts as written.
     #[test]
     fn kernel_reads_into_guarded_blocks_after_opening() {
+        let _journal = journal_test_lock();
         use std::io::{Read, Seek, Write};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
@@ -1870,6 +1973,7 @@ mod tests {
 
     #[test]
     fn writes_in_partly_committed_view_blocks_are_reported() {
+        let _journal = journal_test_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -1931,6 +2035,7 @@ mod tests {
     /// or mapped since.
     #[test]
     fn a_range_that_begins_in_an_unmapped_block_is_guarded() {
+        let _journal = journal_test_lock();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
             MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
@@ -2022,6 +2127,7 @@ mod tests {
     /// again (they cannot be guarded) until the runtime maps them.
     #[test]
     fn unmapped_blocks_are_reported_once_until_mapped() {
+        let _journal = journal_test_lock();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
             MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
@@ -2107,6 +2213,7 @@ mod tests {
     /// to overflow. Up there no test has guarded blocks.
     #[test]
     fn ranges_past_the_address_space_end_do_not_overflow() {
+        let _journal = journal_test_lock();
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
@@ -2117,6 +2224,7 @@ mod tests {
     /// runtime remap (or a failed kernel write) makes it ask again.
     #[test]
     fn a_destination_is_writable_only_where_the_region_is_committed_read_write() {
+        let _journal = journal_test_lock();
         use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
         // SAFETY: a fresh allocation of ours, freed at the end.
         let at = unsafe {
@@ -2172,6 +2280,7 @@ mod tests {
     /// that an earlier answer also covers.
     #[test]
     fn a_change_forgets_every_answer_that_reaches_into_it() {
+        let _journal = journal_test_lock();
         use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
         // SAFETY: a fresh allocation of ours, freed at the end.
         let at = unsafe {
@@ -2208,6 +2317,7 @@ mod tests {
     /// opens it ([`writing`]).
     #[test]
     fn a_guarded_block_is_no_destination_until_the_write_opens_it() {
+        let _journal = journal_test_lock();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
             UnmapViewOfFile,
@@ -2245,6 +2355,7 @@ mod tests {
     /// copies of the same 16 MiB range.
     #[test]
     fn the_destination_check_costs_under_two_percent_of_the_copy() {
+        let _journal = journal_test_lock();
         use std::time::Instant;
         const N: usize = 16 << 20;
         const ROUNDS: u32 = 64;
@@ -2309,6 +2420,7 @@ mod mapping_tests {
     /// a read in place waits for a change of mapping.
     #[test]
     fn reads_in_place_and_remappings_wait_for_each_other() {
+        let _journal = super::journal_test_lock();
         // A reader holds; the change does not begin until it lets go.
         let changed = Arc::new(AtomicBool::new(false));
         let reading = title_memory_reading();
@@ -2352,6 +2464,7 @@ mod mapping_tests {
     /// a pending copy-back's bytes out of a new mapping.
     #[test]
     fn remapping_marks_blocks_until_a_copy_takes_them_again() {
+        let _journal = super::journal_test_lock();
         if !copy_back_skips_remapped() {
             return; // VICTORY_SKIP_REMAPPED=0: nothing is marked.
         }
@@ -2408,6 +2521,7 @@ mod mapping_tests {
     /// takes its whole window at every refresh for the rest of the run).
     #[test]
     fn a_pool_the_kernel_cannot_watch_is_guarded_for_a_copy() {
+        let _journal = super::journal_test_lock();
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
         const N: usize = 4 * BLOCK;
         // SAFETY: a fresh private region of four blocks, read-write, and not
@@ -2459,6 +2573,7 @@ mod mapping_tests {
     #[test]
     #[ignore]
     fn bench_copy_pools_guard() {
+        let _journal = super::journal_test_lock();
         use std::time::Instant;
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
         const N: usize = 64 << 20;
@@ -2510,5 +2625,90 @@ mod mapping_tests {
         // SAFETY: our allocation.
         unsafe { VirtualFree(start as *mut _, 0, MEM_RELEASE) };
     }
+}
 
+#[cfg(test)]
+mod back_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    /// A kernel write of ours into a block a job holds waits for the job
+    /// before it opens it: opening first would let the job's merge write the
+    /// GPU's older bytes over the title's, and lose the merge.
+    #[test]
+    fn back_open_waits_for_the_job_that_holds_the_block() {
+        let _journal = super::journal_test_lock();
+        use std::sync::mpsc;
+        // SAFETY: one block of private memory, freed at the end.
+        let at = unsafe {
+            VirtualAlloc(std::ptr::null(), BLOCK, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(at, 0);
+        let done = std::sync::Arc::new(Done::default());
+        let blocks = back_begin(&done, at, at + BLOCK);
+        assert_eq!(blocks, [at / BLOCK]);
+        let (opened, when) = mpsc::channel();
+        let opener = std::thread::spawn(move || {
+            back_open(at, 1);
+            opened.send(()).unwrap();
+        });
+        assert!(
+            when.recv_timeout(std::time::Duration::from_millis(50)).is_err(),
+            "back_open opened a block a job still holds (the job's merge is lost)"
+        );
+        assert!(!writable_now(at));
+        done.finish();
+        assert!(
+            when.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            "back_open goes on once the job is done"
+        );
+        assert!(writable_now(at), "the title's write has the block");
+        assert!(back_pending(at).is_none());
+        opener.join().unwrap();
+        back_release(&blocks, &done);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A read of a block a job holds returns within the deadline and names
+    /// the job it waited for; on the deadline the block is the title's again,
+    /// so the instruction that faulted goes through instead of the title's
+    /// thread never running again.
+    #[test]
+    fn a_read_of_a_held_block_returns_within_the_deadline_and_names_the_job() {
+        let _journal = super::journal_test_lock();
+        use std::sync::mpsc;
+        // SAFETY: one block of private memory, freed at the end.
+        let at = unsafe {
+            VirtualAlloc(std::ptr::null(), BLOCK, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(at, 0);
+        let done = std::sync::Arc::new(Done::default());
+        let id = done.id();
+        let blocks = back_begin(&done, at, at + BLOCK);
+        assert_eq!(blocks, [at / BLOCK]);
+        let (back, when) = mpsc::channel();
+        let waited = done.clone();
+        let reader = std::thread::spawn(move || {
+            wait_held(at);
+            back.send((waited.id(), waited.finished())).unwrap();
+        });
+        assert!(
+            when.recv_timeout(std::time::Duration::from_millis(50)).is_err(),
+            "the read waits while the job is outstanding"
+        );
+        let (named, finished) = when
+            .recv_timeout(crate::writeback::MERGE_DEADLINE + std::time::Duration::from_secs(2))
+            .expect("the read returns within the deadline");
+        assert_eq!(named, id, "the wait names the job it waited for");
+        assert!(!finished, "the job never finished: only the deadline returned it");
+        assert!(writable_now(at), "the block is given back to the title");
+        assert!(back_pending(at).is_none(), "and no job holds it any more");
+        reader.join().unwrap();
+        back_release(&blocks, &done);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
 }

@@ -61,7 +61,7 @@ static WAITING: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new())
 
 #[cfg(windows)]
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|e| e.into_inner())
+    crate::stall::guard(crate::stall::Lock::Queue, mutex)
 }
 
 /// Whether queues wait for fences. `VICTORY_QUEUE_WAIT=0`: they do not,

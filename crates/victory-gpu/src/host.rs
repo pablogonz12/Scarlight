@@ -930,6 +930,7 @@ mod tests {
 
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
+        let _journal = crate::watch::journal_test_lock();
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 5 << 16;
         // SAFETY: we reserve a private region, commit selected pages inside it,
@@ -965,6 +966,7 @@ mod tests {
 
     #[test]
     fn a_read_only_title_destination_is_written_through_the_kernel() {
+        let _journal = crate::watch::journal_test_lock();
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 2 << 16;
         // SAFETY: a private region committed whole, accessed directly.
@@ -1027,6 +1029,7 @@ mod tests {
 
     #[test]
     fn a_copy_of_title_memory_the_layer_has_seen_goes_at_the_bytes() {
+        let _journal = crate::watch::journal_test_lock();
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 2 << 16;
         // SAFETY: a private region committed whole, accessed directly.
@@ -7376,11 +7379,19 @@ impl Meter {
         {
             let [own, asking, still, all] =
                 [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            // Taken every interval, logged when there is a refresh to price:
+            // a counter left to accumulate would be divided by a single
+            // interval's frames when the line comes back.
+            let [ph_check, ph_holes, ph_bytes] = [0, 1, 2]
+                .map(|i| crate::inplace::PLACEHOLDER_HITS[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if all >= 1.0 {
                 tracing::info!(
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
                      is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
-                     hold still (the runtime remapping it); the rest is reading, hashing and detiling"
+                     hold still (the runtime remapping it); the rest is reading, hashing and detiling. Placeholder fast path \
+                     (VICTORY_PLACEHOLDER_FAST={}): {ph_check:.0} view checks, {ph_holes:.0} hole blocks and {ph_bytes:.0} byte \
+                     counts never asked of the kernel, per frame",
+                    u8::from(crate::inplace::placeholder_fast())
                 );
             }
             let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
