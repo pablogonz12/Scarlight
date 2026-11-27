@@ -889,6 +889,22 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// Allocation-only comparison with the upstream readback benchmark.
+    #[test]
+    #[ignore = "hardware readback allocation benchmark"]
+    fn benchmark_explicit_readback_allocations() {
+        let host = super::host().expect("benchmark needs a D3D12 host");
+        let started = std::time::Instant::now();
+        for _ in 0..2_000 {
+            let buffer = host.read_back_buffer(4096).expect("readback buffer");
+            let mut data = std::ptr::null_mut();
+            // SAFETY: the new buffer is a CPU-readable readback resource.
+            unsafe { buffer.Map(0, None, Some(&mut data)).expect("map readback") };
+            assert!(!data.is_null());
+        }
+        println!("2000 x 4096 B readback buffers: {:?}", started.elapsed());
+    }
+
     #[test]
     fn a_barrier_into_the_state_a_texture_is_already_in_is_not_recorded() {
         use windows::Win32::Graphics::Direct3D12::{
