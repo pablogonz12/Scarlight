@@ -90,21 +90,7 @@ impl Front {
     /// Let go of the upload blocks the words written down still name: they
     /// never reached a thread of ours, so nothing else will free them.
     fn free_uploads(&mut self) {
-        let mut i = 0;
-        while i < self.words.len() {
-            let (op, len) = (self.words[i] & 0xffff, (self.words[i] >> 16) as usize);
-            if i + 1 + len > self.words.len() {
-                break;
-            }
-            if op == UPLOAD {
-                // SAFETY: made by `allocate_upload`, named once, and never
-                // handed over.
-                drop(unsafe { Box::from_raw(self.words[i + 1] as usize as *mut Upload) });
-                #[cfg(test)]
-                LET_GO.fetch_add(1, Relaxed);
-            }
-            i += 1 + len;
-        }
+        free_uploads(&self.words);
     }
 
     /// Begins a recording, with `pipeline` bound.
@@ -115,7 +101,27 @@ impl Front {
         self.submitted = false;
         self.put(RESET, &[pipeline as usize as u64]);
     }
+}
 
+fn free_uploads(words: &[u64]) {
+        let mut i = 0;
+        while i < words.len() {
+            let (op, len) = (words[i] & 0xffff, (words[i] >> 16) as usize);
+            if i + 1 + len > words.len() {
+                break;
+            }
+            if op == UPLOAD {
+                // SAFETY: made by `allocate_upload`, named once, and never
+                // handed over.
+                drop(unsafe { Box::from_raw(words[i + 1] as usize as *mut Upload) });
+                #[cfg(test)]
+                LET_GO.fetch_add(1, Relaxed);
+            }
+            i += 1 + len;
+        }
+    }
+
+impl Front {
     #[inline]
     fn put(&mut self, op: u64, args: &[u64]) {
         if self.closed || self.recording.is_none() {
@@ -167,6 +173,11 @@ impl Front {
         STREAMS.fetch_add(1, Relaxed);
         let schedule = {
             let mut inner = held(&recording.inner);
+            if inner.failed {
+                free_uploads(&words);
+                give_back(vec![words]);
+                return;
+            }
             inner.chunks.push_back(words);
             !std::mem::replace(&mut inner.scheduled, true)
         };
@@ -234,6 +245,13 @@ struct Inner {
     back: usize,
     /// That list was closed by the stream.
     closed: bool,
+    failed: bool,
+    #[cfg(test)]
+    fail_allocations: usize,
+    #[cfg(test)]
+    replays: usize,
+    #[cfg(test)]
+    fake_back: bool,
 }
 
 impl Recording {
@@ -276,7 +294,8 @@ impl Recording {
 
     /// The list of ours it went to (null: it was never begun).
     pub(crate) fn back(&self) -> This {
-        held(&self.inner).back as This
+        let inner = held(&self.inner);
+        if inner.failed { std::ptr::null() } else { inner.back as This }
     }
 
     /// Translates what there is.
@@ -289,13 +308,34 @@ impl Recording {
                     return;
                 };
                 if inner.back == 0 {
-                    inner.back = back_list(self.kind) as usize;
+                    #[cfg(test)]
+                    let fail = if inner.fail_allocations > 0 {
+                        inner.fail_allocations -= 1;
+                        true
+                    } else { false };
+                    #[cfg(not(test))]
+                    let fail = false;
+                    if !fail {
+                        #[cfg(test)]
+                        if inner.fake_back {
+                            inner.back = Box::into_raw(super::boxed(self.kind, std::ptr::null(), false)) as usize;
+                        } else {
+                            inner.back = back_list(self.kind) as usize;
+                        }
+                        #[cfg(not(test))]
+                        { inner.back = back_list(self.kind) as usize; }
+                    }
                     if inner.back == 0 {
                         // No list of ours to run it in (the host has none:
                         // the device has failed, and is reported so). What
                         // was written down is not run, rather than run into
                         // a list that cannot be submitted.
+                        free_uploads(&chunk);
+                        for pending in &inner.chunks {
+                            free_uploads(pending);
+                        }
                         inner.chunks.clear();
+                        inner.failed = true;
                         inner.scheduled = false;
                         self.done.store(true, Release);
                         self.moved.notify_all();
@@ -303,6 +343,8 @@ impl Recording {
                     }
                 }
                 inner.working = true;
+                #[cfg(test)]
+                { inner.replays += 1; }
                 (chunk, inner.back as This)
             };
             let began = std::time::Instant::now();
@@ -335,6 +377,12 @@ impl Drop for Recording {
                 // Left in the middle.
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
+            }
+            #[cfg(test)]
+            if inner.fake_back {
+                // SAFETY: the test backing was allocated above and is not pooled.
+                drop(unsafe { Box::from_raw(inner.back as *mut List) });
+                return;
             }
             held(&BACKS).push(inner.back);
         }
@@ -456,7 +504,8 @@ pub(crate) fn submitted(lists: &[This]) -> Submitted {
     for recording in &recordings {
         recording.wait();
     }
-    let backs = recordings.iter().map(|r| r.back()).collect();
+    let backs: Vec<_> = recordings.iter().map(|r| r.back()).collect();
+    let backs = if backs.iter().any(|back| back.is_null()) { Vec::new() } else { backs };
     Submitted { backs, recordings }
 }
 
@@ -1109,6 +1158,37 @@ mod tests {
         list
     }
 
+    #[test]
+    fn failed_backing_discards_suffix_and_wakes_waiters() {
+        let mut list = test_list();
+        let recording = list.thin.recording.clone().unwrap();
+        {
+            let mut inner = held(&recording.inner);
+            inner.fail_allocations = 1;
+            inner.fake_back = true;
+        }
+        list.thin.hand_over();
+        recording.run();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = recording.clone();
+        std::thread::spawn(move || {
+            waiter.wait();
+            waiter.quiet();
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        list.thin.put(RESET, &[0]);
+        list.thin.close();
+        recording.run();
+        let inner = held(&recording.inner);
+        assert!(inner.failed);
+        assert_eq!(inner.replays, 0);
+        assert!(inner.chunks.is_empty());
+        drop(inner);
+        let this: This = (&mut *list as *mut List).cast();
+        assert!(submitted(&[this]).backs().is_empty());
+    }
+
     /// How many records a stream holds (a call each).
     fn records(stream: &[u64]) -> u64 {
         let (mut i, mut calls) = (0, 0);
@@ -1129,6 +1209,7 @@ mod tests {
     fn a_submission_with_no_thread_of_ours_translates_here() {
         let mut list = test_list();
         let this: This = (&mut *list as *mut List).cast();
+        held(&list.thin.recording.as_ref().unwrap().inner).fake_back = true;
         for n in 0..8u32 {
             draw(this, n, 1, 0, 0);
         }
@@ -1137,12 +1218,13 @@ mod tests {
         let bits = this as usize;
         std::thread::spawn(move || {
             let submitted = super::submitted(&[bits as This]);
-            tx.send(submitted.backs().len()).ok();
+            tx.send((submitted.backs().len(), submitted.backs().first().is_some_and(|p| !p.is_null()))).ok();
         });
         let backs = rx
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("a submission waited for a translation no thread of ours would do");
-        assert_eq!(backs, 1);
+        assert_eq!(backs, (1, true));
+        assert!(held(&list.thin.recording.as_ref().unwrap().inner).replays > 0);
         let chunks = held(&list.thin.recording.as_ref().expect("a recording").inner).chunks.len();
         assert_eq!(chunks, 0, "what it wrote down was translated");
     }
@@ -1153,6 +1235,7 @@ mod tests {
     #[test]
     fn a_recording_let_go_of_is_not_read_afterwards() {
         let mut list = test_list();
+        held(&list.thin.recording.as_ref().unwrap().inner).fake_back = true;
         let this: This = (&mut *list as *mut List).cast();
         for n in 0..64u32 {
             draw(this, n, 1, 0, 0);
