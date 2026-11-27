@@ -13,6 +13,18 @@ use crate::{io, ir, resource, structure};
 const S_ENDPGM: u32 = 0xBF81_0000;
 
 #[test]
+fn a_swap_also_depends_on_its_old_destination() {
+    let words = [0x7E02_0280u32, 0x7E00_CB01, S_ENDPGM];
+    let code: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    let p = ir::build(&code, true, 8).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let swap = &p.blocks[0].insts[1];
+    assert_eq!(swap.name(), "v_swap_b32");
+    let new_v1 = swap.write(ir::Reg::V(1)).unwrap();
+    assert!(!super::lane_uniform(&p, &st, &[true]).contains(&new_v1));
+}
+
+#[test]
 fn early_depth_only_for_eligible_pixel_shaders() {
     use super::super::container::SigElement;
     let ps = |db_shader_control| StageIo::Ps {

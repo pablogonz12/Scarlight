@@ -486,6 +486,10 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
                         && v.sdwa.is_none()
                         && !name.starts_with("v_mbcnt")
                         && !name.starts_with("v_cmpx")
+                        && !name.starts_with("v_movrel")
+                        && !name.starts_with("v_swaprel")
+                        && !name.starts_with("v_div_fmas")
+                        && name != "v_cndmask_b32"
                         && !name.contains("lane") =>
                 {
                     v.src.clone()
@@ -508,7 +512,10 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
                 }
                 _ => true,
             });
-            if alike {
+            // Include implicit vector inputs such as an accumulator or the other side
+            // of a swap. This is conservative for preserved destination reads.
+            let implicit_alike = inst.reads.iter().all(|(reg, value)| !matches!(reg, Reg::V(_)) || same.contains(value));
+            if alike && implicit_alike {
                 same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
             }
         }
