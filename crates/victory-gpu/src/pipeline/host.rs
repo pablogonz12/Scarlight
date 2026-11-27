@@ -1560,6 +1560,36 @@ mod tests {
         );
         let native = crate::list::host_list(list).expect("a host list");
         slot::<extern "system" fn(This, This)>(list, 0xc8)(list, pipeline);
+        // The directly indexed root signature requires a shader-visible view heap.
+        #[repr(C)]
+        struct ViewHeapDesc {
+            kind: u32,
+            count: u32,
+            flags: u32,
+            nodes: u32,
+            placement_address: u64,
+            placement_size: u64,
+        }
+        let desc = ViewHeapDesc {
+            kind: 0,
+            count: 1,
+            flags: 1,
+            nodes: 0,
+            placement_address: 0,
+            placement_size: 0,
+        };
+        let heap_iid = guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let mut view_heap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(null, std::ptr::from_ref(&desc).cast(), &heap_iid, &mut view_heap),
+            S_OK
+        );
+        slot::<extern "system" fn(This, u32, *const This)>(list, 0x100)(list, 1, &view_heap);
         let groups = [(2, 1, 1), (2, 3, 1), (2, 1, 4), (2, 3, 4), (2, 0, 4)];
         let count = groups.len() as u32 + 1;
         let mut queries: Option<ID3D12QueryHeap> = None;
@@ -1659,7 +1689,7 @@ mod tests {
             readback.Unmap(0, None);
             actual
         };
-        for object in [list, alloc, pipeline] {
+        for object in [list, alloc, pipeline, view_heap] {
             slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
         }
         assert_eq!(actual, [2, 6, 8, 24, 0, 2]);

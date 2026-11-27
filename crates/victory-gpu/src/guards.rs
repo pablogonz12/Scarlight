@@ -10,8 +10,9 @@
 //! never wait on each other. How many we use is a switch,
 //! `VICTORY_GUARD_SHARDS` (`1`: the single lock of before).
 //!
-//! Lock order: `watch`'s `JOURNAL`, then a shard, then `watch`'s
-//! `DESTINATIONS` and `BACK` (taken by [`protect`] and [`open`] under it).
+//! Lock order: `watch`'s asking ranges, then a journal page shard, then a
+//! shard here, then `watch`'s `DESTINATIONS` and `BACK` (taken by [`protect`]
+//! and [`open`] under it).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};

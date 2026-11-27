@@ -107,6 +107,21 @@ pub(crate) struct IndexView {
     format: u32,
 }
 
+/// Whether a list that holds the title's heaps `heaps` needs a sampler heap
+/// of ours as well: the title binds none, and every root signature we make
+/// indexes the sampler heap directly, which D3D12 refuses without a heap of
+/// that kind bound (the debug layer's id 1419; NVIDIA removes the device).
+fn wants_our_samplers(heaps: [usize; 2], on: bool) -> bool {
+    heaps[1] == 0 && on
+}
+
+/// `VICTORY_SAMPLER_HEAP=0` stops binding a sampler heap of ours, the way
+/// back if a title's own sampler binds come out wrong with one bound.
+fn fallback_samplers_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAMPLER_HEAP").is_none_or(|v| v != "0"))
+}
+
 /// Host states of a depth target, and of a texture shaders read.
 const DEPTH_WRITE: u32 = 0x10;
 const DEPTH_READ: u32 = 0x20;
@@ -315,7 +330,10 @@ pub(crate) struct State {
     host_pipeline: usize,
     /// Graphics, compute.
     host_roots: [usize; 2],
-    host_heaps: [usize; 2],
+    /// The heaps the host list has, or none if it has never been given
+    /// any: a list that binds nothing is not a list that bound `[0, 0]`,
+    /// and the heap block (and the sampler heap of ours) must run for it.
+    host_heaps: Option<[usize; 2]>,
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
@@ -855,7 +873,7 @@ impl State {
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
-        self.host_heaps = [0; 2];
+        self.host_heaps = None;
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -1120,18 +1138,46 @@ impl State {
         }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+        if self.host_heaps != Some(self.heaps) {
+            if self.heaps[0] == 0 || crate::descriptor::heap(self.heaps[0] as This).host().is_none() {
+                once!("no view heap to bind");
+                return false;
+            }
+            if self.heaps[1] != 0 && crate::descriptor::heap(self.heaps[1] as This).host().is_none() {
+                once!("no host sampler heap to bind");
+                return false;
+            }
+            if self.heaps[1] == 0 && !fallback_samplers_on() {
+                once!("no sampler heap to bind");
+                return false;
+            }
+            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
                 .heaps
                 .iter()
                 .filter(|&&h| h != 0)
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
                 .map(|h| Some(h.heap.clone()))
                 .collect();
+            // A list that binds a view heap and no sampler heap — a compute
+            // list that only reads views — while the signatures we make
+            // index the sampler heap directly: a heap of that kind must be
+            // bound before such a signature is set.
+            if wants_our_samplers(self.heaps, fallback_samplers_on()) {
+                match crate::descriptor::fallback_samplers() {
+                    Some(h) => {
+                        tracing::debug!("the title binds no sampler heap: binding ours");
+                        heaps.push(Some(h.heap.clone()));
+                    }
+                    None => {
+                        once!("no sampler heap of ours to bind");
+                        return false;
+                    }
+                }
+            }
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
+            self.host_heaps = Some(self.heaps);
             self.host_roots = [0; 2];
         }
         // The depth target a draw only tests, for the views of it that the
@@ -2337,7 +2383,7 @@ impl State {
             // Our pass set its own pipeline, root signature and heap: the next bind sets the title's again.
             self.host_pipeline = 0;
             self.host_roots = [0; 2];
-            self.host_heaps = [0; 2];
+            self.host_heaps = None;
         }
     }
 
@@ -2669,8 +2715,9 @@ impl State {
             let _ = list.transition(resource, before);
         }
         // The title's own heaps are not those of the clear: the next bind
-        // sets them again.
-        self.host_heaps = [0; 2];
+        // sets them again, and `None` is what a list that has bound
+        // nothing holds.
+        self.host_heaps = None;
         true
     }
 
@@ -3413,8 +3460,20 @@ impl State {
             },
             None => None,
         };
+        let wide = kind == DISPATCH
+            && std::env::var_os("VICTORY_INDIRECT_WIDE").is_none_or(|v| v != "0")
+            && std::env::var_os("VICTORY_GROUP_SPLIT").is_none_or(|v| v != "0");
+        let wide_slot = wide.then(|| Self::group_base_slot(p)).flatten();
+        let wide_max = wide.then(|| max.checked_mul(16)).flatten();
+        if wide && wide_max.is_none() {
+            why("too many expanded dispatch records");
+            return false;
+        }
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
+            .then(|| match wide_slot {
+                Some(slot) => wide_signature(&p.root, slot),
+                None => host_signature(kind, if wide { 12 } else { stride }),
+            })
             .flatten()
         else {
             why("no host signature");
@@ -3493,7 +3552,15 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
+                let bounded = if wide {
+                    crate::indirect::bound_wide(
+                        list,
+                        (&args.buffer, offset),
+                        count_arg,
+                        (kind, step, records),
+                        wide_slot.is_some(),
+                    )
+                } else if windowed && records > 1 {
                     crate::indirect::bound_ahead(
                         list,
                         (&args.buffer, offset),
@@ -3552,13 +3619,17 @@ impl State {
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
-                max,
+                wide_max.unwrap_or(max),
                 &bounded,
                 at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                if wide { None } else { counter.as_ref().map(|(s, _)| &s.buffer) },
+                if wide { 0 } else { counter.as_ref().map_or(0, |(s, at)| s.offset(*at)) },
             )
         };
+        if wide_slot.is_some() {
+            // ExecuteIndirect resets modified root arguments to zero.
+            self.host_roots[1] = 0;
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
@@ -3577,6 +3648,50 @@ impl State {
         }
         true
     }
+}
+
+/// A command writes the shader's X group base, then dispatches a piece.
+fn wide_signature(root: &ID3D12RootSignature, (param, offset): (u32, u32)) -> Option<ID3D12CommandSignature> {
+    static MADE: std::sync::Mutex<Vec<(ID3D12RootSignature, u32, u32, ID3D12CommandSignature)>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, _, _, signature)) = made.iter().find(|(r, p, o, _)| r == root && *p == param && *o == offset) {
+        return Some(signature.clone());
+    }
+    let signature = make_wide_signature(&crate::host::host()?.device, root, (param, offset))?;
+    made.push((root.clone(), param, offset, signature.clone()));
+    Some(signature)
+}
+
+pub(crate) fn make_wide_signature(device: &ID3D12Device, root: &ID3D12RootSignature, (param, offset): (u32, u32)) -> Option<ID3D12CommandSignature> {
+    let arguments = [
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                    RootParameterIndex: param,
+                    DestOffsetIn32BitValues: offset,
+                    Num32BitValuesToSet: 1,
+                },
+            },
+        },
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        },
+    ];
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: 16,
+        NumArgumentDescs: 2,
+        pArgumentDescs: arguments.as_ptr(),
+        NodeMask: 0,
+    };
+    let mut signature: Option<ID3D12CommandSignature> = None;
+    // SAFETY: the root constant is a slot in this pipeline's live signature.
+    if unsafe { device.CreateCommandSignature(&desc, Some(root), &mut signature) }.is_err() {
+        return None;
+    }
+    signature
 }
 
 /// The host command signature for one argument of `kind` with records
@@ -3887,7 +4002,7 @@ mod tests {
 
     use super::{
         VertexView, expanded_rectangle_vertices_guarded, rectangle_vertex_range_guarded,
-        staging_budget_per_frame,
+        staging_budget_per_frame, wants_our_samplers,
     };
 
     /// What a rectangle draw asks of the tile's vertex buffer with the guard
@@ -3998,5 +4113,21 @@ mod tests {
         assert_eq!(staging_budget_per_frame(Some(20 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(24 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(32 * GIB)), 384 * MIB);
+    }
+
+    /// A list that binds no sampler heap asks for ours: every signature we
+    /// make indexes the sampler heap directly, which D3D12 refuses without
+    /// one of that kind bound.
+    #[test]
+    fn a_list_without_a_sampler_heap_asks_for_ours() {
+        // The title binds both kinds: nothing of ours.
+        assert!(!wants_our_samplers([0x10, 0x20], true));
+        // Views only (a compute list that reads views): ours goes after them.
+        assert!(wants_our_samplers([0x10, 0], true));
+        // Nothing at all: still one of each kind.
+        assert!(wants_our_samplers([0, 0], true));
+        // `VICTORY_SAMPLER_HEAP=0`: none of ours, whatever the title bound.
+        assert!(!wants_our_samplers([0x10, 0], false));
+        assert!(!wants_our_samplers([0, 0], false));
     }
 }
