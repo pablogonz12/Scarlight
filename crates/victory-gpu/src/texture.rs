@@ -1196,6 +1196,11 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             bytes: staging.bytes,
         };
         let detiling = staging.clone();
+        // A very fast job can finish before its callback is registered. A
+        // refresh may then observe its fence and detile newer contents before
+        // that callback runs, so remember exactly what the job prepared.
+        let prepared = Arc::new(Mutex::new(Vec::new()));
+        let prepared_by_job = prepared.clone();
         // The claim is taken with the job (and the registry's lock), so
         // exactly one list starts a texture's first upload: two batches
         // copying one texture is not something D3D12 allows, and the second
@@ -1206,6 +1211,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             upload,
             Box::new(move || {
                 detiling.refresh_now();
+                let last = detiling.last.lock().unwrap_or_else(|e| e.into_inner());
+                *prepared_by_job.lock().unwrap_or_else(|e| e.into_inner()) =
+                    last.upload_generations.clone();
             }),
         ) {
             // The host texture holds what the staging buffer was detiled to
@@ -1217,9 +1225,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
                 use std::sync::atomic::Ordering::Relaxed;
                 if copied {
                     let mut last = ran.last.lock().unwrap_or_else(|e| e.into_inner());
-                    last.upload_generations.fill(0);
+                    let prepared = prepared.lock().unwrap_or_else(|e| e.into_inner());
+                    last.acknowledge_uploads(&prepared);
                     ran.uploaded.store(true, Relaxed);
-                    ran.dirty.store(false, Relaxed);
+                    ran.dirty.store(last.upload_generations.iter().any(|&g| g != 0), Relaxed);
                     #[cfg(feature = "diagnostics")]
                     ran.present.queued();
                 }
@@ -2547,6 +2556,15 @@ mod dirty_upload_tests {
         assert_eq!(selected(&last), [1], "a later write must remain pending");
         last.mark_all_uploads();
         assert_eq!(selected(&last), [0, 1, 2]);
+    }
+
+    #[test]
+    fn late_ahead_completion_keeps_a_later_refresh_pending() {
+        let mut last = Last { upload_generations: vec![1; 2], next_generation: 1, ..Last::default() };
+        let prepared = last.upload_generations.clone();
+        last.mark_uploads([1]);
+        last.acknowledge_uploads(&prepared);
+        assert_eq!(selected(&last), [1]);
     }
 }
 
