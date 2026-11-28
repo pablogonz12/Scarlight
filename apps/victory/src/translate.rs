@@ -647,8 +647,7 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                     let first = emit::emit_with_retries(container, &p, &program, &s, &i, &r);
                     let emitted = match first {
                         // (killed lanes leaving at the kill, as `emit::translate` tries next)
-                        Err(ShaderError::Unsupported { what, .. })
-                            if what == "a constant lane mask" =>
+                        Err(ShaderError::Unsupported { what: "a constant lane mask", .. }) =>
                         {
                             structure::without_live_quads(|| structure::structure(&program))
                                 .and_then(|s| {

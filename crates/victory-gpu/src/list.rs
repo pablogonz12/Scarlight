@@ -2005,7 +2005,9 @@ impl ValueWait {
         if self.address == 0 {
             return true;
         }
+        #[cfg(windows)]
         static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        #[cfg(windows)]
         if *ASK.get_or_init(|| std::env::var_os("VICTORY_WAIT_ASK").is_some_and(|v| v == "1"))
             && !crate::texture::committed(self.address as *const u8, bytes)
         {
@@ -2013,8 +2015,18 @@ impl ValueWait {
         }
         // The low `bytes` bytes; the rest stays zero.
         let mut raw = [0u8; 8];
+        #[cfg(windows)]
         if !crate::host::read_into(self.address as *const u8, &mut raw[..bytes]) {
             return true;
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::FileExt;
+            let read = std::fs::File::open("/proc/self/mem")
+                .and_then(|file| file.read_exact_at(&mut raw[..bytes], self.address));
+            if read.is_err() {
+                return true;
+            }
         }
         self.holds_for(u64::from_le_bytes(raw))
     }
