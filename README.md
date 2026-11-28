@@ -52,28 +52,22 @@ Scarlight ships no game files. It runs a copy of a game you legally own, on your
 
 ## Install
 
-Three steps. Full detail — every option, logs, uninstall, troubleshooting — in
-**[docs/steam.md](docs/steam.md)**.
+Install the newest release (including pre-releases):
 
-1. **Put Scarlight in Steam's compatibility tools folder.** Download `Scarlight-<version>.tar.gz`
-   from [Releases](https://github.com/pablogonz12/Scarlight/releases), then run this in the folder you
-   downloaded it to (or give `tar` the archive's full path, e.g.
-   `~/Downloads/Scarlight-0.1.0.tar.gz`):
+```bash
+curl -fsSL https://raw.githubusercontent.com/pablogonz12/Scarlight/main/install.sh | bash
+```
 
-   ```bash
-   cd ~/Downloads
-   mkdir -p ~/.local/share/Steam/compatibilitytools.d/
-   tar -xzf Scarlight-<version>.tar.gz -C ~/.local/share/Steam/compatibilitytools.d/
-   ```
+To install a particular version instead:
 
-   Flatpak Steam uses `~/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d/`.
-   From a source checkout instead, `tools/steam-compat/install.sh` does the same.
-2. **Restart Steam.**
-3. **Choose it for the game.** If the game is not in your library yet, add it first: *Steam → Games →
-   Add a Non-Steam Game to My Library → Browse…* and pick its `.exe`. Then *Library → right-click the
-   game → Properties → Compatibility →* tick
-   **Force the use of a specific Steam Play compatibility tool** and pick **Scarlight 11.14.1** (the release you installed).
-   Press Play.
+```bash
+curl -fsSL https://raw.githubusercontent.com/pablogonz12/Scarlight/main/install.sh | SCARLIGHT_VERSION=11.14.8 bash
+```
+
+The installer checks the download and reports how to install the required GE-Proton base.
+To install that base too, pass `--with-proton` to bash after `-s --`.
+Restart Steam, then choose **Scarlight <version>** under the game's Properties > Compatibility.
+For more options and troubleshooting, see [docs/steam.md](docs/steam.md).
 
 Two things a release leaves to you, both one step: if Steam cannot find the Proton Scarlight should run
 on, name yours in `compatibilitytools.d/Scarlight-<version>/scarlight.conf` (`PROTON=`); and put your own copy of
