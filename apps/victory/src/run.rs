@@ -5,6 +5,41 @@ use anyhow::{Context, Result};
 use crate::{Console, Unimplemented};
 
 #[cfg(windows)]
+#[path = "fsr_4k.rs"]
+mod fsr_4k;
+
+#[cfg(any(windows, test))]
+const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
+
+#[cfg(any(windows, test))]
+fn skip_cpu_check(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(any(windows, test))]
+fn check_cpu_features_with(has_avx2: bool, skip_env: Option<&str>) -> Result<()> {
+    if has_avx2 || skip_cpu_check(skip_env) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "this CPU does not support AVX2, which Xbox Series titles require; \
+         set {SKIP_CPU_CHECK_ENV}=1 to bypass this check (for example under CPU emulation such as Intel SDE)"
+    );
+}
+
+/// Pre-flight check before executing title code: Xbox Series binaries are
+/// compiled for Zen 2 and require AVX2.
+#[cfg(windows)]
+fn check_cpu_features() -> Result<()> {
+    #[cfg(target_arch = "x86_64")]
+    let has_avx2 = std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    let has_avx2 = true;
+    let skip = std::env::var(SKIP_CPU_CHECK_ENV).ok();
+    check_cpu_features_with(has_avx2, skip.as_deref())
+}
+
+#[cfg(windows)]
 pub fn run(
     exe: &Path,
     unimplemented: Unimplemented,
@@ -16,48 +51,46 @@ pub fn run(
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
+    if execute {
+        check_cpu_features()?;
+    }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    let fsr = fsr_4k::FsrPreset::requested()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    // The user's profile for this build, if there is one: it decides which
-    // hooks are placed and which work the GPU layer leaves out. Selected by
-    // the image's own hash, before any title code runs.
-    let profile = cfg.title_profile(&hash);
-    match &profile {
-        Some(found) => {
-            let file = found
-                .file()
-                .map_or_else(|| "<inline>".to_owned(), |path| path.display().to_string());
-            println!("build          {} ({hash})", found.label());
-            tracing::info!("title profile: {file} matched, {} hooks", found.hooks.len());
-            tracing::debug!("title profile: image {hash}");
-        }
-        None => {
-            println!("build          unknown ({hash})");
-            // No image hash in the info line: users paste logs into issues,
-            // and the asset policy keeps hashes of game files out of them.
-            // `victory title-id <exe>` prints it on request.
-            tracing::info!("title profile: none matched");
-            let dirs: Vec<String> = cfg
-                .profile_dirs
-                .iter()
-                .map(|dir| dir.display().to_string())
-                .collect();
-            tracing::debug!("title profile: image {hash}, searched {}", dirs.join(", "));
-        }
+    match victory_game::identify(&hash) {
+        Some(build) => println!("build          {} ({hash})", build.label),
+        None => println!("build          unknown ({hash})"),
     }
-    victory_core::profile::set_current(profile);
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
-    let image = victory_loader::load(&prepared, &images)?;
+    let image = if let Some(preset) = fsr {
+        anyhow::ensure!(matches!(console, Console::SeriesX), "FSR 4K requires Series X mode");
+        fsr_4k::prepare_fsr_4k(&mut prepared, preset)?;
+        let dir = cfg.fidelityfx_dir.as_deref().context(
+            "FSR 4K requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
+        )?;
+        // Select the provider before the first lookup builds the import registry.
+        victory_hle::modules::fidelityfx::use_host_dir(dir)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("loading the PC FSR upscaler from {}", dir.display()))?;
+        // SAFETY: Windows supports setting the environment across threads.
+        // No title code has run or queried DXGI yet.
+        unsafe { std::env::set_var("VICTORY_DISPLAY_MODE", "3840x2160") };
+        let cache = cfg.cache_subdir(&format!("images/fsr-{}-4k-sdr", preset.name()))?;
+        victory_loader::load(&prepared, &cache)?
+    } else {
+        victory_loader::load(&prepared, &images)?
+    };
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
     // whole run (two blocks of 114.7 MB each for the title, in
     // physical memory: run 65's memory map).
+    let image_name = prepared.file_name();
     drop(prepared);
     drop(original);
     victory_hle::runtime::set_main_image(image.base());
@@ -100,6 +133,32 @@ pub fn run(
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
     }
+    let imported: Vec<&str> = image
+        .info()
+        .imports
+        .iter()
+        .map(|m| m.dll.as_str())
+        .collect();
+    let mapped: Vec<&str> = dlls.iter().map(|(name, _)| name.as_str()).collect();
+    let absent = absent_title_dlls(&imported, &mapped, &wanted);
+    if !absent.is_empty() {
+        let message = format!(
+            "{} not in {}, and neither the host nor VIctory provides {}: the package is \
+             incomplete; copy every file of the package next to the executable",
+            absent.join(", "),
+            title_dir.display(),
+            if absent.len() == 1 { "it" } else { "them" },
+        );
+        println!("missing dlls   {message}");
+        // None of their imports can be bound, so the title stops at its first
+        // call into one (the title 1.0.2.1 at +0x2237178 during
+        // System Init, #930) with nothing saying why. Stubs only if asked for.
+        if execute && matches!(unimplemented, Unimplemented::Trap) {
+            anyhow::bail!(
+                "the title's own DLLs are missing: {message} (`--unimplemented zero` runs it anyway)"
+            );
+        }
+    }
 
     let policy = match unimplemented {
         Unimplemented::Trap => UnimplementedPolicy::Trap,
@@ -126,13 +185,61 @@ pub fn run(
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
     show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    if execute {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped, and nothing of it has run yet.
+        unsafe { victory_loader::write_sites::apply_asked(&image_name, image.base(), size) };
+    }
+    // Renderer port #2 (VICTORY_PORT_DESCRIPTORS=1): the title's stores of
+    // descriptor records tell the layer their slots.
+    #[cfg(windows)]
+    if execute && victory_hle::port_descriptors::on() {
+        use victory_loader::descriptor_sites::{Hooked, SITES, apply};
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped, nothing of it has run yet, and the
+        // marks are a static.
+        let done = unsafe { apply(image.base(), size, victory_hle::port_descriptors::marks_address(), &SITES) };
+        let patched = done.iter().filter(|d| **d == Hooked::Done).count();
+        println!("renderer port 2: {patched} of {} descriptor record stores of the title patched", SITES.len());
+        victory_hle::port_descriptors::hooked(image.base(), size, patched);
+    }
+    // The frame rate (VICTORY_FRAME_INTERVAL_MS, off without it): our frame
+    // clock ticks at that interval (victory-gpu), and the title is given
+    // the matching rate in place of its setting's 30 (VICTORY_TITLE_FPS
+    // overrides it; `off` leaves the title alone).
+    #[cfg(windows)]
+    if execute && let Some(ms) = victory_loader::frame_rate::asked_interval_ms() {
+        use victory_loader::frame_rate::{Patched, SITES, apply, title_interval_us, title_rate};
+        let asked = std::env::var("VICTORY_TITLE_FPS").ok();
+        match title_rate(ms, asked.as_deref()) {
+            Some(rate) => {
+                let size = image.info().size_of_image as usize;
+                // SAFETY: the image stays mapped and nothing of it has run yet.
+                let done = unsafe { apply(image.base(), size, rate, &SITES) };
+                let patched = done.iter().filter(|d| **d == Patched::Done).count();
+                println!(
+                    "frame rate: our clock {ms} ms; the title's rate {rate} ({patched} of {} reads of its setting patched; it asks for {} us at 60 Hz)",
+                    SITES.len(),
+                    title_interval_us(rate, false)
+                );
+            }
+            None => println!("frame rate: our clock {ms} ms; the title's own rate (30) left as it is"),
+        }
+    }
+    // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
+    // VICTORY_UPSCALER; each off without it).
+    #[cfg(windows)]
+    if execute && fsr.is_none() {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
-    // Before any title code runs: its watchdog and timers do not see it.
-    victory_hle::modules::d3d12x::warm_up();
     victory_loader::report_crashes();
+    victory_loader::set_before_thread_shutdown(victory_hle::known_pipelines::flush);
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
@@ -153,36 +260,9 @@ pub fn run(
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    victory_hle::known_pipelines::flush();
     println!("title exited with {code}");
-    victory_hle::modules::d3d12x::report_shader_caches();
     Ok(())
-}
-
-/// `victory warmup`: makes the pipelines of earlier runs that the library
-/// lacks, without starting the title.
-#[cfg(windows)]
-pub fn warmup() -> Result<()> {
-    let cfg = victory_core::Config::load()?;
-    victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
-    match victory_hle::modules::d3d12x::warm_up() {
-        Some(r) => println!(
-            "warm-up        {} listed, {} compiled, {} already in the library, {} without a host pipeline, {:.1} s{}",
-            r.listed,
-            r.compiled,
-            r.loaded,
-            r.failed,
-            r.seconds,
-            if r.stopped { " (stopped)" } else { "" }
-        ),
-        None => println!("warm-up        nothing to do (no list yet, VICTORY_WARMUP=0, or no host GPU)"),
-    }
-    victory_hle::modules::d3d12x::report_shader_caches();
-    Ok(())
-}
-
-#[cfg(not(windows))]
-pub fn warmup() -> Result<()> {
-    anyhow::bail!("the pipeline warm-up needs the host D3D12 (Windows)")
 }
 
 /// The debugging aids (README): scheduled stack dumps, watched values and
@@ -190,8 +270,11 @@ pub fn warmup() -> Result<()> {
 #[cfg(all(windows, feature = "diagnostics"))]
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
     victory_loader::dump_stacks_on_schedule();
+    victory_loader::profile_on_schedule(victory_hle::frame_phase);
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
+    timers(image.base(), image.info().size_of_image as usize);
+    poke(image.base(), image.info().size_of_image as usize);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
     // title ranges to `crash-<rva>.bin` in the cache dir on a crash.
     let size = image.info().size_of_image as usize;
@@ -239,14 +322,101 @@ fn watch(base: usize, size: usize) {
     });
 }
 
+/// Debugging aid: `VICTORY_TIMER_LOG=1` logs the title's timers once a
+/// second (`victory_loader::frame_rate`): its frame time and limiter flag,
+/// and each timer's two times, step in seconds and in milliseconds. Whether
+/// game time keeps to the wall clock at any frame rate is read from these.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn timers(base: usize, size: usize) {
+    use victory_loader::frame_rate::{FRAME_US, LIMITER_ON, TIMERS};
+    if std::env::var("VICTORY_TIMER_LOG").ok().as_deref() != Some("1") {
+        return;
+    }
+    if TIMERS.iter().chain([&FRAME_US, &LIMITER_ON]).any(|&rva| rva + 0x14 > size) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        let u32_at = |rva: usize| {
+            // SAFETY: inside the mapped image (checked above), title data.
+            unsafe { ((base + rva) as *const u32).read_volatile() }
+        };
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let timers: Vec<String> = TIMERS
+                .iter()
+                .map(|&t| {
+                    let step = f32::from_bits(u32_at(t + 0xc));
+                    format!("{} {} {step:.4} {}", u32_at(t), u32_at(t + 4), u32_at(t + 0x10))
+                })
+                .collect();
+            eprintln!(
+                "VIctory: the title's timers at {} ms: frame_us {} limiter {} frames {}; timers (time ms, frames, step s, step ms): {}",
+                start.elapsed().as_millis(),
+                u32_at(FRAME_US),
+                u32_at(LIMITER_ON) & 0xff,
+                victory_hle::frames_begun(),
+                timers.join(" | ")
+            );
+        }
+    });
+}
+
+/// Debugging aid: `VICTORY_POKE=<rva>:<byte>,...` (hex) writes the byte at
+/// each title+rva twice a second. A title that ends itself when its main
+/// loop has not ticked for a while (the title: 30 s) runs on
+/// through slower frames with its tick flag poked. The address must be
+/// writable title data.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn poke(base: usize, size: usize) {
+    let Ok(list) = std::env::var("VICTORY_POKE") else {
+        return;
+    };
+    let hex = |s: &str| usize::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+    let pokes: Vec<(usize, u8)> = list
+        .split(',')
+        .filter_map(|p| p.split_once(':'))
+        .filter_map(|(rva, byte)| Some((hex(rva)?, u8::try_from(hex(byte)?).ok()?)))
+        .filter(|&(rva, _)| rva < size)
+        .collect();
+    std::thread::spawn(move || {
+        loop {
+            for &(rva, byte) in &pokes {
+                // SAFETY: a byte inside the mapped image, checked above.
+                unsafe { ((base + rva) as *mut u8).write_volatile(byte) };
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    });
+}
+
 /// DLLs the host or our runtime provide are never taken from the title.
 #[cfg(windows)]
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
     !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
 }
 
+/// The DLLs among `imported` (the main image's static imports) that must
+/// come from the title's folder (`wanted`) but were not mapped from it:
+/// none of their imports can be bound. Each named once, case ignored.
+#[cfg(any(windows, test))]
+fn absent_title_dlls(
+    imported: &[&str],
+    mapped: &[&str],
+    wanted: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut absent: Vec<String> = Vec::new();
+    for &dll in imported {
+        let known = |list: &[&str]| list.iter().any(|m| m.eq_ignore_ascii_case(dll));
+        if wanted(dll) && !known(mapped) && !absent.iter().any(|a| a.eq_ignore_ascii_case(dll)) {
+            absent.push(dll.to_owned());
+        }
+    }
+    absent
+}
+
 /// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports,
-/// e.g. the title's upscaler behind its FidelityFX loader.
+/// e.g. The title's upscaler behind its FidelityFX loader.
 #[cfg(windows)]
 struct LateDlls {
     host: victory_hle::HostPolicy,
@@ -369,6 +539,42 @@ impl LoaderLock {
     }
 }
 
+#[cfg(test)]
+mod absent_tests {
+    use super::absent_title_dlls;
+
+    #[test]
+    fn title_dlls_missing_from_the_folder_are_named_once() {
+        // The host provides kernel32, our runtime d3d12_xs; the rest are the
+        // title's own (#930: the four DLLs beside the executable missing).
+        let wanted = |dll: &str| {
+            !["KERNEL32.dll", "d3d12_xs.dll"]
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(dll))
+        };
+        let imported = [
+            "KERNEL32.dll",
+            "d3d12_xs.dll",
+            "XboxBvhBuilder.dll",
+            "MSVCP140.dll",
+            "Bink2Scarlett.dll",
+            "xboxbvhbuilder.dll",
+        ];
+        let mapped = ["msvcp140.dll"];
+        assert_eq!(
+            absent_title_dlls(&imported, &mapped, &wanted),
+            ["XboxBvhBuilder.dll", "Bink2Scarlett.dll"]
+        );
+    }
+
+    #[test]
+    fn a_complete_package_has_nothing_absent() {
+        let wanted = |dll: &str| dll.starts_with("Title");
+        assert!(absent_title_dlls(&["Title.dll", "Host.dll"], &["TITLE.DLL"], &wanted).is_empty());
+        assert!(absent_title_dlls(&[], &[], &wanted).is_empty());
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -389,6 +595,45 @@ mod tests {
         });
         other.join().unwrap();
         assert_eq!(*order.lock().unwrap(), [1, 2]);
+    }
+
+    #[test]
+    fn cpu_feature_check_matches_host() {
+        let skip = std::env::var(super::SKIP_CPU_CHECK_ENV).ok();
+        #[cfg(target_arch = "x86_64")]
+        let expected_ok =
+            std::arch::is_x86_feature_detected!("avx2") || skip.as_deref() == Some("1");
+        #[cfg(not(target_arch = "x86_64"))]
+        let expected_ok = true;
+        assert_eq!(super::check_cpu_features().is_ok(), expected_ok);
+    }
+}
+
+#[cfg(test)]
+mod cpu_check_tests {
+    use super::{SKIP_CPU_CHECK_ENV, check_cpu_features_with};
+
+    #[test]
+    fn avx2_present_passes() {
+        assert!(check_cpu_features_with(true, None).is_ok());
+        assert!(check_cpu_features_with(true, Some("0")).is_ok());
+        assert!(check_cpu_features_with(true, Some("1")).is_ok());
+    }
+
+    #[test]
+    fn avx2_missing_fails_with_clear_error() {
+        for skip in [None, Some(""), Some("0"), Some("true")] {
+            let err = check_cpu_features_with(false, skip).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("AVX2"), "unexpected error: {msg}");
+            assert!(msg.contains("Xbox Series"), "unexpected error: {msg}");
+            assert!(msg.contains(SKIP_CPU_CHECK_ENV), "unexpected error: {msg}");
+        }
+    }
+
+    #[test]
+    fn skip_env_var_bypasses_missing_avx2() {
+        assert!(check_cpu_features_with(false, Some("1")).is_ok());
     }
 }
 

@@ -81,7 +81,6 @@ pub extern "system" fn XDspConnectWithMaximumStreamLimit(
     max_channels: u32,
     out: *mut *mut Dsp,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("dsp::XDspConnectWithMaximumStreamLimit").enter(format_args!(""));
     if base.is_null()
         || !(0x1_0000..=0x1F40_0000).contains(&base_length)
         || ir_seconds > 0x80
@@ -110,7 +109,6 @@ pub extern "system" fn XDspConnectWithMaximumStreamLimit(
 }
 
 pub extern "system" fn XDspDisconnect(dsp: *mut Dsp) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("dsp::XDspDisconnect").enter(format_args!(""));
     if dsp.is_null() {
         return E_INVALIDARG;
     }
@@ -138,7 +136,6 @@ pub extern "system" fn XDspActivate(
     status: *mut *const Status,
     stream: *mut *mut Stream,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("dsp::XDspActivate").enter(format_args!(""));
     if status.is_null() || stream.is_null() {
         return E_POINTER;
     }
@@ -187,7 +184,6 @@ pub extern "system" fn XDspActivate(
 }
 
 pub extern "system" fn XDspDeactivate(stream: *mut Stream) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("dsp::XDspDeactivate").enter(format_args!(""));
     if stream.is_null() {
         return E_INVALIDARG;
     }
@@ -205,7 +201,6 @@ pub extern "system" fn XDspSubmitCommand(
     command: *const Command,
     ticket: *mut u32,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("dsp::XDspSubmitCommand").enter(format_args!(""));
     if stream.is_null() || command.is_null() {
         return E_INVALIDARG;
     }

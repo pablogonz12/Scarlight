@@ -1,583 +1,646 @@
-//! A constant in place of what one program writes to one of its unordered
-//! views: a stand-in, opt-in at run time, for an output whose inputs the
-//! host never fills (light that rays would gather while the structures
-//! they walk are not built, say).
+//! A stand-in for the indirect light the title traces rays for.
 //!
-//! `VICTORY_AMBIENT=<program>:<view>:<value>`, rules separated by `;`:
-//! - `<program>`: the 16-hex-digit shader hash the log prints for the
-//!   compute program (`compute 0123456789abcdef`);
-//! - `<view>`: the unordered view as the console shader addresses it, root
-//!   parameter and offset in dwords in its descriptor table, `s1+176` or
-//!   `1+176` (the notation of the diagnostics' table listings). That
-//!   address comes from the console code itself, so it holds across
-//!   translator versions, where an order of the views would not;
-//! - `<value>`: a colour `r,g,b[,a]` (alpha 1 if left out), optionally
-//!   with the packing of an integer view: `rgb9e5=`, `r11g11b10=` or
-//!   `rgba16f=`; or a raw word `0x...`, `mask` (all ones) or `zero` for
-//!   an integer view of any width, which keeps each channel's low bits
-//!   (`zero` clears a float view too). A view in a float or normalized
-//!   format takes the colour as it is.
+//! With the ray-tracing structure builder off (`crate::pipeline::builder_runs`)
+//! the title's rays find nothing. Its program that resolves the diffuse light
+//! of its screen probes (`CS_ScreenProbes_TemporalResolve_*`) then leaves the
+//! sky's light outdoors, nothing indoors (walls are black where no lamp or
+//! sun reaches) and, in blocks of the picture's tiles, what the probes'
+//! memory held. Right after that program the light is raised to an estimate
+//! and bounded by a multiple of it.
 //!
-//! After every dispatch of the program, direct or indirect, the view is
-//! cleared to the value (`ClearUnorderedAccessView*`) between unordered
-//! access barriers. Nothing happens while the variable is unset.
-//! The idea and the use of R9G9B9E5 as 32-bit words come from the
-//! Belobug fork's `ambient.rs` (0603123, 4f45ab8, GPL-3.0-or-later),
-//! which matches its program by name; here the user names it. The masks
-//! and zeros for narrower integer outputs follow ScarlettPort's stand-in
-//! encodings (`emit/stand_in.rs`, GPL-3.0-or-later).
+//! That a stand-in can be put there, and in which of the program's images,
+//! is beloooo's find (VIctory-Belobug-AMD, 06031237, 4f45ab88, cd9f78ce,
+//! GPL-3.0-or-later), which puts a constant there, shaded in creases from the
+//! scene's depth. The estimate here is worked out from the frame instead, so
+//! it follows the hour, the room and its lamps by itself: the light the
+//! visible surfaces send out (the title keeps it for its own screen traces:
+//! `CS_CacheScreenSpaceRadiance`, the frame before) is averaged in 64x36
+//! cells, and every point gets the mean of the cells weighted by the share of
+//! its surroundings they cover, as a directional value (first-order harmonics
+//! at 160x90 points, taken between them by depth).
 //!
-//! Ported from VIctory #2619 by r4tedx (GPL-3.0-or-later). It names
-//! neither a title nor a program here: `<program>` and `<view>` are the
-//! runner's, so a title's own pair lives in the environment of its run,
-//! not in this file.
-//! shortcut: the same value everywhere, every frame.
+//! What it assumes: what is not on screen sends out what is (with a slow
+//! mean of the last seconds, so that turning into a dark corner is not black
+//! at once). No occlusion but the creases'.
+//!
+//! `VICTORY_AMBIENT`:
+//! - unset or `0`/`off`: the title's own output.
+//! - a number: that share of the estimate (1: all of it).
+//! - `constant:<level>`: the constant, as beloooo's fork has it.
+//!
+//! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
+//!
+//! The air of a room is lit by the same probes: without rays they hold the
+//! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
+//! bounds what the air scatters by a multiple of the light around.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
 
-/// How an integer view holds a colour.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum Packing {
-    Rgb9e5,
-    R11g11b10,
-    Rgba16f,
+use windows::Win32::Graphics::Direct3D12::*;
+use windows::core::s;
+
+use crate::host::{HostList, host};
+
+/// Programs of the title the stand-in follows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Role {
+    /// Resolves the diffuse light.
+    Resolve,
+    /// Keeps the light visible surfaces send out.
+    Radiance,
+    /// Adds the lamps' light to what the air scatters (the last program
+    /// that writes that volume before it is summed up along the view).
+    Air,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum Value {
-    /// A colour, and the packing an integer view takes (none: by the
-    /// texture's format).
-    Colour([f32; 4], Option<Packing>),
-    /// A word for an integer view (its low bits per channel).
-    Raw(u32),
-}
-
-/// One stand-in: program, view, value.
-#[derive(Debug)]
-pub(crate) struct Rule {
-    /// Lowercase, as logged.
-    pub(crate) program: String,
-    pub(crate) slot: u8,
-    pub(crate) offset: u32,
-    pub(crate) value: Value,
-    /// The first match was logged.
-    pub(crate) seen: AtomicBool,
-}
-
-impl Rule {
-    /// The view as written in the variable and the logs.
-    pub(crate) fn view(&self) -> String {
-        format!("s{}+{}", self.slot, self.offset)
+/// The program's part in this, by its name in the container.
+pub(crate) fn role(container: &[u8]) -> Option<Role> {
+    let has = |name: &[u8]| container.windows(name.len()).any(|w| w == name);
+    if has(b"CS_ScreenProbes_TemporalResolve") {
+        Some(Role::Resolve)
+    } else if has(b"CS_CacheScreenSpaceRadiance") {
+        Some(Role::Radiance)
+    } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
+        Some(Role::Air)
+    } else {
+        None
     }
 }
 
-/// The rules in `text` (the variable's value).
-pub(crate) fn parse(text: &str) -> Result<Vec<Rule>, String> {
-    text.split(';')
-        .map(str::trim)
-        .filter(|r| !r.is_empty())
-        .map(|rule| parse_rule(rule).map_err(|e| format!("{rule:?}: {e}")))
-        .collect()
+/// Where the resolve writes the diffuse light (R9G9B9E5 as 32-bit integers)
+/// and reads the scene's depth, and where the other writes the light of
+/// visible surfaces: root parameter and place in its table, in dwords.
+pub(crate) const LIGHT: (u8, u32) = (1, 176);
+pub(crate) const DEPTH: (u8, u32) = (0, 464);
+pub(crate) const RADIANCE: (u8, u32) = (1, 16);
+/// Where the light the air scatters is.
+pub(crate) const AIR: (u8, u32) = (1, 32);
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Set {
+    Off,
+    Estimate(f32),
+    Constant(f32),
 }
 
-fn parse_rule(rule: &str) -> Result<Rule, String> {
-    let mut parts = rule.splitn(3, ':');
-    let (Some(program), Some(view), Some(value)) = (parts.next(), parts.next(), parts.next())
-    else {
-        return Err("not <program>:<view>:<value>".into());
-    };
-    let program = program.trim().to_ascii_lowercase();
-    if program.len() != 16 || !program.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("the program is not a 16-hex-digit hash".into());
+fn parse(set: &str) -> Set {
+    let set = set.trim();
+    let number = |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0);
+    match set.strip_prefix("constant:") {
+        Some(level) => number(level).map_or(Set::Off, Set::Constant),
+        None => number(set).map_or(Set::Off, Set::Estimate),
     }
-    let view = view.trim();
-    let view = view.strip_prefix(['s', 'S']).unwrap_or(view);
-    let Some((slot, offset)) = view.split_once('+') else {
-        return Err("the view is not <root parameter>+<dwords>".into());
-    };
-    let slot = slot
-        .trim()
-        .parse::<u8>()
-        .map_err(|_| "the view's root parameter is not a number")?;
-    let offset = offset
-        .trim()
-        .parse::<u32>()
-        .map_err(|_| "the view's offset is not a number")?;
-    Ok(Rule {
-        program,
-        slot,
-        offset,
-        value: parse_value(value.trim())?,
-        seen: AtomicBool::new(false),
+}
+
+fn set() -> Set {
+    static SET: OnceLock<Set> = OnceLock::new();
+    *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
+}
+
+/// Whether the stand-in is on: set, and the title's rays find nothing.
+pub(crate) fn on() -> bool {
+    set() != Set::Off && !crate::pipeline::builder_runs()
+}
+
+/// The most the air scatters, as a multiple of the light around
+/// (`VICTORY_AMBIENT_AIR=<multiple>`; unset or 0: what the title has).
+fn air() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
     })
 }
 
-fn parse_value(value: &str) -> Result<Value, String> {
-    match value.to_ascii_lowercase().as_str() {
-        "mask" => return Ok(Value::Raw(u32::MAX)),
-        "zero" => return Ok(Value::Raw(0)),
-        _ => {}
+/// How the slow mean of the light around follows the frames
+/// (`VICTORY_AMBIENT_SETTLE=<time constant in ms>[,<jump factor>[,<fresh
+/// seconds>]]`; unset: 250,3; 0: 0.04 of the way a frame, as before, which is 25
+/// frames: 0.8 s at the console's 30 frames a second, 2-4 s at 7-13). Set,
+/// it is the same share of the way a second whatever the frame rate, and a
+/// change by more than the jump factor (default 3; 0: none) is taken at
+/// once. Fresh seconds (default 0: none): for that long after such a jump
+/// the light the title's own resolve left is bounded by the estimate, not
+/// four times it, rising back to four times by the end.
+#[derive(Clone, Copy)]
+struct Settle {
+    ms: f32,
+    jump: f32,
+    fresh: f32,
+}
+
+fn settle() -> Option<Settle> {
+    static SET: OnceLock<Option<Settle>> = OnceLock::new();
+    *SET.get_or_init(|| {
+        // Default on (250 ms, jump factor 3: reports/LIGHT-POPIN.md); `0`
+        // gives the old 0.04 of the way a frame.
+        let set = std::env::var("VICTORY_AMBIENT_SETTLE").unwrap_or_else(|_| "250,3".to_owned());
+        let mut parts = set.split(',').map(|p| p.trim().parse::<f32>().ok());
+        let ms = parts.next().flatten().filter(|v| v.is_finite() && *v > 0.0)?;
+        let jump = parts.next().flatten().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(3.0);
+        let fresh = parts.next().flatten().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.0);
+        tracing::info!(
+            ms,
+            jump,
+            fresh,
+            "the stand-in's mean of the light around settles by the clock (VICTORY_AMBIENT_SETTLE)"
+        );
+        Some(Settle { ms, jump, fresh })
+    })
+}
+
+/// The share of the way the slow mean goes at this frame's keeping
+/// ([`Role::Radiance`]; the other passes do not read it).
+fn follow(role: Role) -> f32 {
+    match settle() {
+        Some(settle) if role == Role::Radiance => 1.0 - (-frame_ms(role) / settle.ms).exp(),
+        _ => 0.04,
     }
-    if let Some(hex) = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-    {
-        return u32::from_str_radix(hex, 16)
-            .map(Value::Raw)
-            .map_err(|_| "the raw word is not 32-bit hex".into());
+}
+
+/// Milliseconds since the last keeping ([`Role::Radiance`], once a frame);
+/// the first, and after a pause of over a second, as a frame of 30. Other
+/// roles: the last answer.
+fn frame_ms(role: Role) -> f32 {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static DT: AtomicU32 = AtomicU32::new(0x4204_0000); // 33.0
+    if role != Role::Radiance {
+        return f32::from_bits(DT.load(Relaxed));
     }
-    let (packing, colour) = match value.split_once('=') {
-        Some((name, colour)) => {
-            let packing = match name.trim().to_ascii_lowercase().as_str() {
-                "rgb9e5" => Packing::Rgb9e5,
-                "r11g11b10" => Packing::R11g11b10,
-                "rgba16f" => Packing::Rgba16f,
-                other => return Err(format!("no packing {other:?} (rgb9e5, r11g11b10, rgba16f)")),
+    // (Asked twice in a keeping: the words and the share.)
+    static ASKED: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    if ASKED.swap(now, Relaxed) == now {
+        return f32::from_bits(DT.load(Relaxed));
+    }
+    let last = LAST.swap(now, Relaxed);
+    let dt = match now.saturating_sub(last) {
+        0 => 1.0,
+        dt if last == 0 || dt > 1000 => 33.0,
+        dt => dt as f32,
+    };
+    DT.store(dt.to_bits(), Relaxed);
+    dt
+}
+
+/// Strength and radius of the creases' shade.
+fn shade() -> [f32; 2] {
+    static SET: OnceLock<[f32; 2]> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let mut shade = [1.0, 0.6];
+        let set = std::env::var("VICTORY_AMBIENT_SHADE").unwrap_or_default();
+        for (to, v) in shade.iter_mut().zip(set.split(',')) {
+            if let Ok(v) = v.trim().parse() {
+                *to = v;
+            }
+        }
+        shade
+    })
+}
+
+const SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
+#define CX 64
+#define CY 36
+#define CELLS (CX * CY)
+#define PX 160
+#define PY 90
+cbuffer Set : register(b0) {
+    float level; float constant; float strength; float radius;
+    float near; float tan_y; uint width; uint height;
+    float follow; float most; float air; uint probe;
+    float jump; float fresh; float dt;
+};
+Texture2D<float> depth : register(t0);
+// Cells: the light they send out (then, at CELLS, the slow mean), from
+// CELLS + 1 on where they are.
+RWStructuredBuffer<float4> cells : register(u1);
+// Three a point: red, green and blue, each a mean and a direction.
+RWStructuredBuffer<float4> points : register(u2);
+// For the light probe (`crate::lightprobe`): sampled pixels, and the sums of
+// what the title's resolve left, what was found and what was written.
+RWByteAddressBuffer stats : register(u3);
+static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
+
+// The point seen at a texel, in metres from the eye (x right, y up, z away).
+float3 seen(int2 p, float2 size) {
+    float d = depth.Load(int3(clamp(p, int2(0, 0), int2(size) - 1), 0));
+    float z = min(near / max(d, 1e-7), 1000.0);
+    float2 ndc = (float2(p) + 0.5) / size * 2.0 - 1.0;
+    return float3(ndc.x * tan_y * size.x / size.y * z, -ndc.y * tan_y * z, z);
+}
+
+#ifdef KEEP
+RWTexture2D<float3> radiance : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 4, 1)]
+void keep(uint3 at : SV_DispatchThreadID) {
+    uint w, h;
+    radiance.GetDimensions(w, h);
+    float3 sum = 0;
+    for (uint y = 0; y < 5; y++) for (uint x = 0; x < 5; x++) {
+        uint2 p = uint2((float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(w, h) / float2(CX, CY));
+        float3 c = max(radiance[p], 0.0);
+        c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c;
+        // Lamps and glints count, but not for everything.
+        sum += c / max(1.0, dot(c, LUMA) / 20.0);
+    }
+    cells[at.y * CX + at.x] = float4(sum / 25.0, 1.0);
+}
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void mean() {
+    float3 sum = 0;
+    for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
+    float4 was = cells[CELLS];
+    float3 now = sum / CELLS;
+    // (`jump` > 0: a change of more than that factor either way is
+    // followed at once, as a new room is.)
+    float a = max(dot(now, LUMA), 1e-5), b = max(dot(was.rgb, LUMA), 1e-5);
+    bool jumped = jump > 0.0 && max(a / b, b / a) > jump;
+    // Its fourth part: seconds since the light around last jumped (from
+    // 0.001; 0: nothing kept yet).
+    float age = was.a > 0.0 && !jumped ? was.a + dt : 0.001;
+    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, jumped ? 1.0 : follow) : now, age);
+}
+#endif
+
+#ifdef PLACE
+[RootSignature(RS)]
+[numthreads(8, 4, 1)]
+void place(uint3 at : SV_DispatchThreadID) {
+    float2 size = float2(width, height);
+    float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(CX, CY)), size);
+    cells[CELLS + 1 + at.y * CX + at.x] = float4(p, p.z * p.z);
+}
+#endif
+
+#ifdef GATHER
+[RootSignature(RS)]
+[numthreads(8, 2, 1)]
+void gather(uint3 at : SV_DispatchThreadID) {
+    float2 size = float2(width, height);
+    float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size);
+    float r2 = 0.25 + 0.0025 * p.z * p.z;
+    float whole = 0;
+    float3 toward = 0, light = 0, red = 0, green = 0, blue = 0;
+    for (uint i = 0; i < CELLS; i++) {
+        float4 c = cells[CELLS + 1 + i];
+        float3 L = cells[i].rgb;
+        float3 d = c.xyz - p;
+        float dd = dot(d, d);
+        float w = c.w / (dd + r2);
+        float3 dir = d / sqrt(dd + 0.25 * r2);
+        whole += w;
+        toward += w * dir;
+        light += w * L;
+        red += w * L.r * dir;
+        green += w * L.g * dir;
+        blue += w * L.b * dir;
+    }
+    whole = max(whole, 1e-6);
+    light /= whole;
+    toward /= whole;
+    uint at0 = (at.y * PX + at.x) * 3;
+    points[at0] = float4(red / whole - light.r * toward, light.r);
+    points[at0 + 1] = float4(green / whole - light.g * toward, light.g);
+    points[at0 + 2] = float4(blue / whole - light.b * toward, light.b);
+}
+#endif
+
+#ifdef AIR
+RWTexture3D<float3> scattered : register(u0);
+// No more than a multiple of the light around: of the room as the last
+// seconds showed it, and of the surface seen in this direction (towards a
+// window the air outside may be as bright as the sky is).
+[RootSignature(RS)]
+[numthreads(8, 8, 2)]
+void clear_air(uint3 at : SV_DispatchThreadID) {
+    uint w, h, d;
+    scattered.GetDimensions(w, h, d);
+    if (at.x >= w || at.y >= h || at.z >= d) return;
+    uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
+    uint at0 = (q.y * PX + q.x) * 3;
+    float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+    float far = float(at.z) / float(d);
+    float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
+    float3 c = scattered[at];
+    float has = dot(c, LUMA);
+    if (has > cap) scattered[at] = c * (cap / has);
+}
+#endif
+
+#ifdef RAISE
+RWTexture2D<uint> light : register(u0);
+float3 unpack(uint v) {
+    return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
+}
+uint pack(float3 c) {
+    c = clamp(c, 0.0, 65408.0);
+    float top = max(c.r, max(c.g, c.b));
+    int e = clamp(int(floor(log2(max(top, 1e-9)))) + 16, 0, 31);
+    float scale = exp2(float(24 - e));
+    if (top * scale >= 511.5) { e = min(e + 1, 31); scale = exp2(float(24 - e)); }
+    uint3 m = min(uint3(c * scale + 0.5), 511u);
+    return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
+}
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void raise(uint3 at : SV_DispatchThreadID) {
+    float2 size = float2(width, height);
+    if (at.x >= width || at.y >= height) return;
+    int2 p = int2(at.xy);
+    float3 c = seen(p, size);
+    float3 l = seen(p + int2(-1, 0), size), r = seen(p + int2(1, 0), size);
+    float3 u = seen(p + int2(0, -1), size), d = seen(p + int2(0, 1), size);
+    float3 dx = abs(l.z - c.z) < abs(r.z - c.z) ? c - l : r - c;
+    float3 dy = abs(u.z - c.z) < abs(d.z - c.z) ? c - u : d - c;
+    float3 n = normalize(cross(dy, dx) + float3(0, 0, -1e-9));
+    if (dot(n, c) > 0.0) n = -n;
+    // How open it is (as in beloooo's cd9f78ce).
+    float open = 1.0;
+    float px = min(radius * size.y / (2.0 * tan_y * c.z), 128.0);
+    float noise = frac(52.9829189 * frac(dot(float2(p), float2(0.06711056, 0.00583715))));
+    if (strength > 0.0 && px >= 1.5 && c.z < 400.0) {
+        float sum = 0.0;
+        const int N = 12;
+        for (int i = 0; i < N; i++) {
+            float a = i * 2.399963 + noise * 6.2831853;
+            float2 o = float2(cos(a), sin(a)) * (sqrt((i + 0.5) / N) * px);
+            float3 v = seen(p + int2(round(o)), size) - c;
+            float vv = dot(v, v);
+            float over = dot(v, n) - 0.004 * c.z - 0.005;
+            sum += max(over, 0.0) / sqrt(vv + 1e-6) * saturate(1.0 - vv / (radius * radius));
+        }
+        open = saturate(1.0 - strength * 2.0 * sum / N);
+    }
+    float3 found;
+    if (constant > 0.0) {
+        found = float3(1.0, 0.98, 0.94) * constant * open;
+        light[p] = pack(found);
+        return;
+    }
+    // Between the four points around, those at its own depth first; which
+    // four is dithered a little.
+    float2 g = (float2(p) + 0.5) / size * float2(PX, PY) - 0.5 + (noise - 0.5) * 0.5;
+    int2 g0 = int2(floor(g));
+    float2 f = g - float2(g0);
+    float4 sr = 0, sg = 0, sb = 0;
+    float sum = 0;
+    for (int k = 0; k < 4; k++) {
+        int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+        float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
+        float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
+        float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
+        uint at0 = (q.y * PX + q.x) * 3;
+        sr += w * points[at0];
+        sg += w * points[at0 + 1];
+        sb += w * points[at0 + 2];
+        sum += w;
+    }
+    float3 all = float3(sr.w, sg.w, sb.w) / sum;
+    found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
+    found = clamp(found, 0.2 * all, 2.5 * all);
+    found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    float3 was = unpack(light[p]);
+    // Filter magenta garbage probes left by uninitialized/corrupted memory on AMD.
+    if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+    float left = dot(was, LUMA);
+    // What the program left counts as far as it can be true: the sky's light
+    // outdoors, not the blocks of other memory.
+    // For `fresh` seconds after the light around jumped (a new room) the
+    // title's leftover counts for no more than the estimate, then up to
+    // `most` times it again: its history holds the place before.
+    float bound = fresh > 0.0 ? lerp(1.0, most, saturate(cells[CELLS].a / fresh)) : most;
+    float top = max(dot(found, LUMA) * bound, 1e-6);
+    float has = dot(was, LUMA);
+    was *= min(1.0, top / max(has, 1e-6));
+    float3 written = max(was, found);
+    light[p] = pack(written);
+    if (probe != 0 && (at.x & 15) == 0 && (at.y & 15) == 0) {
+        uint ignored;
+        stats.InterlockedAdd(0, 1, ignored);
+        stats.InterlockedAdd(4, uint(min(left, 1000.0) * 256.0), ignored);
+        stats.InterlockedAdd(8, uint(min(dot(found, LUMA), 1000.0) * 256.0), ignored);
+        stats.InterlockedAdd(12, uint(min(dot(written, LUMA), 1000.0) * 256.0), ignored);
+    }
+}
+#endif
+"#;
+
+/// Bytes of the cells' buffer and of the points'.
+const CELLS: u64 = 64 * 36;
+const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
+const POINT_BYTES: u64 = 160 * 90 * 48;
+/// Where the slow mean is among the cells (float4s).
+pub(crate) const CELLS_AT: u32 = CELLS as u32;
+
+struct Pass {
+    root: ID3D12RootSignature,
+    keep: ID3D12PipelineState,
+    mean: ID3D12PipelineState,
+    place: ID3D12PipelineState,
+    gather: ID3D12PipelineState,
+    raise: ID3D12PipelineState,
+    air: ID3D12PipelineState,
+    cells: ID3D12Resource,
+    points: ID3D12Resource,
+    stats: ID3D12Resource,
+}
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Pass {}
+// SAFETY: as above.
+unsafe impl Sync for Pass {}
+
+fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
+    let mut root: Option<ID3D12RootSignature> = None;
+    let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
+        let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
+        // SAFETY: the root signature is inside the shader; plain creations.
+        unsafe {
+            if root.is_none() {
+                root = Some(device.CreateRootSignature(0, &code)?);
+            }
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+                ..Default::default()
             };
-            (Some(packing), colour)
+            device.CreateComputePipelineState(&desc)
         }
-        None => (None, value),
     };
-    let channels = colour
-        .split(',')
-        .map(|c| {
-            c.trim()
-                .parse::<f32>()
-                .ok()
-                .filter(|v| v.is_finite() && *v >= 0.0)
-        })
-        .collect::<Option<Vec<f32>>>()
-        .ok_or("the colour is not 3 or 4 finite numbers of at least 0")?;
-    let rgba = match channels[..] {
-        [r, g, b] => [r, g, b, 1.0],
-        [r, g, b, a] => [r, g, b, a],
-        _ => return Err("the colour is not 3 or 4 numbers".into()),
-    };
-    Ok(Value::Colour(rgba, packing))
-}
-
-/// The rules `VICTORY_AMBIENT` sets, read once; none if unset or wrong.
-pub(crate) fn rules() -> &'static [Rule] {
-    static RULES: OnceLock<Vec<Rule>> = OnceLock::new();
-    RULES.get_or_init(|| {
-        let Ok(text) = std::env::var("VICTORY_AMBIENT") else {
-            return Vec::new();
-        };
-        match parse(&text) {
-            Ok(rules) => {
-                for r in &rules {
-                    tracing::info!(program = %r.program, view = %r.view(), value = ?r.value, "ambient stand-in set");
-                }
-                rules
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "VICTORY_AMBIENT not understood: no stand-in");
-                Vec::new()
-            }
-        }
+    let keep = pipeline("KEEP", s!("keep"))?;
+    let mean = pipeline("KEEP", s!("mean"))?;
+    let place = pipeline("PLACE", s!("place"))?;
+    let gather = pipeline("GATHER", s!("gather"))?;
+    let raise = pipeline("RAISE", s!("raise"))?;
+    let air = pipeline("AIR", s!("clear_air"))?;
+    let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
+    Ok(Pass {
+        root: root.ok_or_else(windows::core::Error::empty)?,
+        keep,
+        mean,
+        place,
+        gather,
+        raise,
+        air,
+        cells: made(CELL_BYTES)?,
+        points: made(POINT_BYTES)?,
+        stats: made(256)?,
     })
 }
 
-/// What the clear writes: floats for a float or normalized view, words for
-/// an integer one.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum Fill {
-    Float([f32; 4]),
-    Uint([u32; 4]),
+fn pass() -> Option<&'static Pass> {
+    static PASS: OnceLock<Option<Pass>> = OnceLock::new();
+    PASS.get_or_init(|| {
+        let host = host()?;
+        make(&host.device, |bytes| host.uav_buffer(bytes))
+            .inspect_err(|e| tracing::warn!(error = %e, "no stand-in for the indirect light"))
+            .ok()
+    })
+    .as_ref()
 }
 
-/// DXGI formats of integer views (UINT and SINT).
-const INTEGER: [u32; 21] = [
-    3, 4, 7, 8, 12, 14, 17, 18, 25, 30, 32, 36, 38, 42, 43, 50, 52, 57, 59, 62, 64,
-];
-/// DXGI formats of float and normalized views a float clear converts to.
-const FLOAT: [u32; 24] = [
-    2, 6, 10, 11, 13, 16, 24, 26, 28, 31, 34, 35, 37, 41, 49, 51, 54, 56, 58, 61, 63, 65, 87, 88,
-];
-const R9G9B9E5: u32 = 67;
-const R11G11B10: u32 = 26;
-const RGBA16F: u32 = 10;
+/// The probe's sums and the cells (with the slow mean), once the passes are
+/// made and the stand-in is on.
+pub(crate) fn probe_buffers() -> Option<(ID3D12Resource, ID3D12Resource)> {
+    if !on() {
+        return None;
+    }
+    pass().map(|p| (p.stats.clone(), p.cells.clone()))
+}
 
-/// The clear of `value` into a view of `view` format of a texture of
-/// `texture` format (DXGI numbers, the title's), or why there is none.
-pub(crate) fn fill(value: Value, view: u32, texture: u32) -> Result<Fill, &'static str> {
-    if FLOAT.contains(&view) {
-        return match value {
-            Value::Colour(rgba, _) => Ok(Fill::Float(rgba)),
-            Value::Raw(0) => Ok(Fill::Float([0.0; 4])),
-            Value::Raw(_) => Err("a raw word other than zero for a view that is not of integers"),
+fn uav_barrier(list: &ID3D12GraphicsCommandList) {
+    let barrier = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() };
+    // SAFETY: an open list; the barrier names no resource.
+    unsafe { list.ResourceBarrier(&[barrier]) };
+}
+
+/// Whether the light of a frame has been kept: the estimate has something
+/// to begin with.
+static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What the passes read and write, as views in the heap the list has set.
+pub(crate) struct Views {
+    /// The image the title's program just wrote.
+    pub(crate) image: D3D12_GPU_DESCRIPTOR_HANDLE,
+    /// The scene's depth, for [`Role::Resolve`].
+    pub(crate) depth: D3D12_GPU_DESCRIPTOR_HANDLE,
+    /// The size of the image, and how many slices it has.
+    pub(crate) size: [u32; 2],
+    pub(crate) slices: u32,
+}
+
+/// After the title's program of that role, in `list` with the program's view
+/// heap set. Replaces the list's compute root signature and pipeline; false
+/// if it recorded nothing.
+pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
+    use std::sync::atomic::Ordering;
+    let Some(pass) = pass() else {
+        return false;
+    };
+    let (level, constant) = match set() {
+        Set::Off => return false,
+        Set::Estimate(level) => (level, 0.0f32),
+        Set::Constant(level) => (0.0, level),
+    };
+    if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
+        return false;
+    }
+    if role == Role::Air && (constant > 0.0 || air() == 0.0) {
+        return false;
+    }
+    static SAID: Mutex<u32> = Mutex::new(0);
+    {
+        let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+        if *said < 4 {
+            *said += 1;
+            tracing::info!(?role, size = ?views.size, level, constant, "a stand-in for the indirect light");
+        }
+    }
+    list.keep(&pass.cells);
+    list.keep(&pass.points);
+    list.keep(&pass.stats);
+    let [strength, radius] = shade();
+    let floats = [level, constant, strength, radius, 0.1, 0.45];
+    let mut words = [0u32; 15];
+    for (to, v) in words.iter_mut().zip(floats) {
+        *to = v.to_bits();
+    }
+    words[6] = views.size[0];
+    words[7] = views.size[1];
+    words[8] = follow(role).to_bits();
+    words[9] = 4.0f32.to_bits();
+    words[10] = air().to_bits();
+    words[11] = u32::from(crate::lightprobe::on());
+    words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
+    words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
+    words[14] = (frame_ms(role) / 1000.0).to_bits();
+    let l = &list.list;
+    // SAFETY: an open list with the heap of the views set; the title's
+    // program has just used both views, so their textures are in the states
+    // these views need; buffers the list keeps.
+    unsafe {
+        uav_barrier(l);
+        l.SetComputeRootSignature(&pass.root);
+        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
+        l.SetComputeRootDescriptorTable(1, views.depth);
+        l.SetComputeRootDescriptorTable(2, views.image);
+        l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(5, pass.stats.GetGPUVirtualAddress());
+        let run = |pso: &ID3D12PipelineState, x, y, z| {
+            l.SetPipelineState(pso);
+            l.Dispatch(x, y, z);
+            uav_barrier(l);
         };
-    }
-    if !INTEGER.contains(&view) {
-        return Err("a view format a clear does not take");
-    }
-    let rgba = match value {
-        // The clear keeps each channel's low bits (all ones stays a mask).
-        Value::Raw(word) => return Ok(Fill::Uint([word; 4])),
-        Value::Colour(rgba, packing) => match packing.or(match texture {
-            R9G9B9E5 => Some(Packing::Rgb9e5),
-            R11G11B10 => Some(Packing::R11g11b10),
-            RGBA16F => Some(Packing::Rgba16f),
-            _ => None,
-        }) {
-            Some(packing) => (rgba, packing),
-            None => {
-                return Err(
-                    "an integer view of a texture whose format does not say the packing: name it",
-                );
+        match role {
+            Role::Radiance => {
+                run(&pass.keep, 8, 9, 1);
+                run(&pass.mean, 1, 1, 1);
+                KEPT.store(true, Ordering::Relaxed);
             }
-        },
-    };
-    let ([r, g, b, a], packing) = rgba;
-    let half = |v: f32| small_float(v, 10);
-    match (packing, view) {
-        (Packing::Rgb9e5, 42 | 43) => Ok(Fill::Uint([rgb9e5([r, g, b]); 4])),
-        (Packing::R11g11b10, 42 | 43) => Ok(Fill::Uint([r11g11b10([r, g, b]); 4])),
-        // R16G16B16A16_UINT: a half per channel.
-        (Packing::Rgba16f, 12) => Ok(Fill::Uint([half(r), half(g), half(b), half(a)])),
-        // R32G32_UINT: two halves per word.
-        (Packing::Rgba16f, 17) => Ok(Fill::Uint([
-            half(r) | half(g) << 16,
-            half(b) | half(a) << 16,
-            0,
-            0,
-        ])),
-        _ => Err("a packing whose size is not the view's"),
-    }
-}
-
-/// R9G9B9E5_SHAREDEXP as the D3D specification packs it: a 5-bit shared
-/// exponent (bias 15) over three 9-bit mantissas, channels clamped to
-/// [0, 65408], rounded to nearest.
-pub(crate) fn rgb9e5(rgb: [f32; 3]) -> u32 {
-    const MAX: f64 = 65408.0;
-    let c = rgb.map(|v| {
-        if v.is_nan() {
-            0.0
-        } else {
-            f64::from(v).clamp(0.0, MAX)
+            Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
+            Role::Resolve => {
+                if constant == 0.0 {
+                    run(&pass.place, 8, 9, 1);
+                    run(&pass.gather, 20, 45, 1);
+                }
+                run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+            }
         }
-    });
-    let most = c[0].max(c[1]).max(c[2]);
-    // floor(log2(most)), exact for the powers of two; -16 at least.
-    let floor_log2 = if most > 0.0 {
-        most.log2().floor() as i32
-    } else {
-        -16
-    };
-    let floor_log2 = match floor_log2 {
-        // log2 may round up just under a power of two.
-        e if 2f64.powi(e) > most => e - 1,
-        e => e,
-    };
-    let mut exponent = floor_log2.max(-16) + 16;
-    let mut scale = 2f64.powi(24 - exponent);
-    if (most * scale + 0.5).floor() >= 512.0 {
-        exponent += 1;
-        scale *= 0.5;
     }
-    let m = c.map(|v| ((v * scale + 0.5).floor() as u32).min(511));
-    m[0] | m[1] << 9 | m[2] << 18 | (exponent as u32) << 27
-}
-
-/// R11G11B10_FLOAT: 11-, 11- and 10-bit floats without sign.
-pub(crate) fn r11g11b10([r, g, b]: [f32; 3]) -> u32 {
-    small_float(r, 6) | small_float(g, 6) << 11 | small_float(b, 5) << 22
-}
-
-/// `v` as a float without sign of a 5-bit exponent (bias 15) and
-/// `mantissa` bits, rounded to nearest even (a half's bits for 10, its
-/// sign 0). Negative and NaN give 0; too large and infinity the largest
-/// finite value (shortcut: not infinity, which a stand-in light must not
-/// be).
-pub(crate) fn small_float(v: f32, mantissa: u32) -> u32 {
-    let largest = (30 << mantissa) | ((1 << mantissa) - 1);
-    if v.is_nan() || v <= 0.0 {
-        return 0;
-    }
-    let bits = v.to_bits();
-    let exponent = ((bits >> 23) & 0xff) as i32 - 127;
-    if exponent > 15 {
-        return largest;
-    }
-    // The significand with its leading 1 (f32 subnormals are far below
-    // the smallest of these floats: they round to 0), in units of
-    // 2^(exponent - 23).
-    let significand = u64::from(bits & 0x7f_ffff | 0x80_0000);
-    // Bits to drop for units of the target's last place: 2^(e - mantissa)
-    // for normals, 2^(-14 - mantissa) below.
-    let shift = (23 - mantissa as i32 + (-14 - exponent).max(0)) as u32;
-    if shift > 40 {
-        return 0;
-    }
-    let mut out = significand >> shift;
-    let rest = significand & ((1 << shift) - 1);
-    let half = 1u64 << (shift - 1);
-    if rest > half || (rest == half && out & 1 == 1) {
-        out += 1;
-    }
-    // Normals: the leading 1 becomes the exponent field (a carry out of the
-    // mantissa raises it, as it must).
-    let out = if exponent >= -14 {
-        out - (1 << mantissa) + (((exponent + 15) as u64) << mantissa)
-    } else {
-        out
-    };
-    (out as u32).min(largest)
-}
-
-static FILLED: AtomicU64 = AtomicU64::new(0);
-static SKIPPED: AtomicU64 = AtomicU64::new(0);
-
-// The stand-ins recorded on this thread (tests): tests run in parallel,
-// each on its own thread, and record their stand-ins there.
-#[cfg(test)]
-thread_local! {
-    static TEST_FILLED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// A stand-in recorded (`filled`) or not, logged every 5 s with the counts
-/// so far.
-pub(crate) fn note(filled: bool) {
-    if filled {
-        FILLED.fetch_add(1, Ordering::Relaxed);
-        #[cfg(test)]
-        TEST_FILLED.with(|n| n.set(n.get() + 1));
-    } else {
-        SKIPPED.fetch_add(1, Ordering::Relaxed);
-    }
-    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-    let now = Instant::now();
-    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-    match *last {
-        Some(t) if now.duration_since(t) < Duration::from_secs(5) => {}
-        Some(_) => {
-            tracing::info!(
-                filled = FILLED.load(Ordering::Relaxed),
-                skipped = SKIPPED.load(Ordering::Relaxed),
-                "ambient stand-in: views filled so far"
-            );
-            *last = Some(now);
-        }
-        None => *last = Some(now),
-    }
-}
-
-/// How many stand-ins this thread recorded (tests): not the run's count,
-/// which tests running alongside add to. Unused until a test of the clear
-/// itself calls it (which needs a device).
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) fn filled() -> u64 {
-    TEST_FILLED.with(std::cell::Cell::get)
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A reference R9G9B9E5 encoder written another way: the smallest
-    /// shared exponent whose rounded mantissas all fit in 9 bits.
-    fn reference_rgb9e5(rgb: [f32; 3]) -> u32 {
-        let c = rgb.map(|v| f64::from(v).clamp(0.0, 65408.0));
-        for e in 0..32u32 {
-            let unit = 2f64.powi(e as i32 - 24);
-            let m = c.map(|v| (v / unit + 0.5).floor() as u32);
-            if m.iter().all(|&m| m <= 511) {
-                return m[0] | m[1] << 9 | m[2] << 18 | e << 27;
-            }
-        }
-        unreachable!("65408 fits at exponent 31")
+    #[test]
+    fn settings() {
+        assert_eq!(parse(""), Set::Off);
+        assert_eq!(parse("off"), Set::Off);
+        assert_eq!(parse("0"), Set::Off);
+        assert_eq!(parse("0.8"), Set::Estimate(0.8));
+        assert_eq!(parse("constant:0.3"), Set::Constant(0.3));
+        assert_eq!(parse("constant:nan"), Set::Off);
     }
 
-    fn decode_rgb9e5(w: u32) -> [f64; 3] {
-        let unit = 2f64.powi((w >> 27) as i32 - 24);
-        [w & 511, (w >> 9) & 511, (w >> 18) & 511].map(|m| f64::from(m) * unit)
+    #[test]
+    fn roles_by_name() {
+        assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
+        assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
+        assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
+        assert_eq!(role(b"CS_TemporalResolve"), None);
     }
 
-    /// The code nearest `v` (ties to the even code), found by decoding
-    /// every code of the small float.
-    fn reference_small(v: f32, mantissa: u32) -> u32 {
-        let decode = |code: u32| {
-            let (e, m) = (
-                (code >> mantissa) as i32,
-                f64::from(code & ((1 << mantissa) - 1)),
-            );
-            let one = f64::from(1u32 << mantissa);
-            if e == 0 {
-                m / one * 2f64.powi(-14)
-            } else {
-                (1.0 + m / one) * 2f64.powi(e - 15)
-            }
+    /// The passes compile with the system's compiler and the host takes them.
+    #[test]
+    fn the_passes_build() {
+        let Some(host) = host() else {
+            return;
         };
-        let largest = (30 << mantissa) | ((1 << mantissa) - 1);
-        let v = f64::from(v).min(decode(largest));
-        (0..=largest)
-            .min_by(|&a, &b| {
-                let (da, db) = ((decode(a) - v).abs(), (decode(b) - v).abs());
-                da.partial_cmp(&db).unwrap().then((a & 1).cmp(&(b & 1)))
-            })
-            .unwrap()
-    }
-
-    #[test]
-    fn rgb9e5_packs_as_the_reference_encoder() {
-        // The sky's tables in the castable test: (1, 0.5, 0.25).
-        assert_eq!(
-            rgb9e5([1.0, 0.5, 0.25]),
-            256 | 128 << 9 | 64 << 18 | 16 << 27
-        );
-        let colours = [
-            [0.0, 0.0, 0.0],
-            [0.6, 0.588, 0.564],
-            [1.0, 1.0, 1.0],
-            [0.25, 0.5, 4.0],
-            [65408.0, 1.0, 0.0],
-            [1e9, 0.0, 0.0],
-            [511.75, 3.0, 0.001],
-            [1.999, 0.01, 0.3],
-            [1e-7, 2e-8, 0.0],
-            [3.0e-5, 1.5e-5, 0.0],
-        ];
-        for c in colours {
-            let w = rgb9e5(c);
-            assert_eq!(w, reference_rgb9e5(c), "{c:?}");
-            // Each channel within half a unit of the shared exponent.
-            let unit = 2f64.powi((w >> 27) as i32 - 24);
-            for (got, want) in decode_rgb9e5(w).iter().zip(c) {
-                assert!(
-                    (got - f64::from(want).min(65408.0)).abs() <= unit / 2.0,
-                    "{c:?}: {got} for {want}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn small_floats_round_to_the_nearest_code() {
-        assert_eq!(small_float(1.0, 10), 0x3c00);
-        assert_eq!(small_float(0.6, 10), 0x38cd);
-        assert_eq!(small_float(65504.0, 10), 0x7bff);
-        assert_eq!(small_float(1e9, 10), 0x7bff);
-        assert_eq!(small_float(f32::INFINITY, 10), 0x7bff);
-        assert_eq!(small_float(-1.0, 10), 0);
-        assert_eq!(small_float(2f32.powi(-24), 10), 1);
-        assert_eq!(small_float(1.0, 6), 15 << 6);
-        assert_eq!(small_float(1.0, 5), 15 << 5);
-        for v in [
-            0.6f32,
-            0.588,
-            0.1,
-            3.3,
-            1000.5,
-            6.1e-5,
-            2.0e-6,
-            1.0e-9,
-            0.99951,
-            2047.9,
-            1.0 + 1.0 / 2048.0,
-        ] {
-            for m in [5, 6, 10] {
-                assert_eq!(small_float(v, m), reference_small(v, m), "{v} in {m} bits");
-            }
-        }
-        assert_eq!(
-            r11g11b10([1.0, 1.0, 1.0]),
-            15 << 6 | (15 << 6) << 11 | (15 << 5) << 22
-        );
-    }
-
-    #[test]
-    fn rules_parse_and_refuse() {
-        let rules =
-            parse(" 0123456789ABCDEF:s1+176:rgb9e5=0.6,0.5,0.4 ; fedcba9876543210:2+8:0x3c00 ;")
-                .unwrap();
-        assert_eq!(rules.len(), 2);
-        assert_eq!(
-            (rules[0].program.as_str(), rules[0].slot, rules[0].offset),
-            ("0123456789abcdef", 1, 176)
-        );
-        assert_eq!(
-            rules[0].value,
-            Value::Colour([0.6, 0.5, 0.4, 1.0], Some(Packing::Rgb9e5))
-        );
-        assert_eq!(rules[0].view(), "s1+176");
-        assert_eq!(rules[1].value, Value::Raw(0x3c00));
-        assert_eq!(
-            parse("0123456789abcdef:0+0:1,2,3,0.5").unwrap()[0].value,
-            Value::Colour([1.0, 2.0, 3.0, 0.5], None)
-        );
-        assert!(parse("").unwrap().is_empty());
-        assert_eq!(
-            parse("0123456789abcdef:1+136:mask").unwrap()[0].value,
-            Value::Raw(u32::MAX)
-        );
-        assert_eq!(
-            parse("0123456789abcdef:1+192:ZERO").unwrap()[0].value,
-            Value::Raw(0)
-        );
-        for wrong in [
-            "0123456789abcde:1+176:1,1,1",
-            "0123456789abcdeg:1+176:1,1,1",
-            "0123456789abcdef:1:1,1,1",
-            "0123456789abcdef:1+x:1,1,1",
-            "0123456789abcdef:1+176:1,1",
-            "0123456789abcdef:1+176:-1,1,1",
-            "0123456789abcdef:1+176:nan,1,1",
-            "0123456789abcdef:1+176:rgb10=1,1,1",
-            "0123456789abcdef:1+176",
-        ] {
-            assert!(parse(wrong).is_err(), "{wrong}");
-        }
-    }
-
-    #[test]
-    fn fills_follow_the_view_and_texture_formats() {
-        let grey = Value::Colour([0.5, 0.5, 0.5, 1.0], None);
-        let packed = |p| Value::Colour([0.5, 0.5, 0.5, 1.0], Some(p));
-        assert_eq!(
-            fill(grey, RGBA16F, RGBA16F),
-            Ok(Fill::Float([0.5, 0.5, 0.5, 1.0]))
-        );
-        assert_eq!(
-            fill(grey, R11G11B10, R11G11B10),
-            Ok(Fill::Float([0.5, 0.5, 0.5, 1.0]))
-        );
-        // R32_UINT of an R9G9B9E5 texture: packed by the texture's format.
-        assert_eq!(
-            fill(grey, 42, R9G9B9E5),
-            Ok(Fill::Uint([rgb9e5([0.5; 3]); 4]))
-        );
-        assert_eq!(
-            fill(grey, 42, R11G11B10),
-            Ok(Fill::Uint([r11g11b10([0.5; 3]); 4]))
-        );
-        // R32_UINT of an R32_UINT texture: only with the packing named.
-        assert!(fill(grey, 42, 42).is_err());
-        assert_eq!(
-            fill(packed(Packing::Rgb9e5), 42, 42),
-            Ok(Fill::Uint([rgb9e5([0.5; 3]); 4]))
-        );
-        assert_eq!(fill(Value::Raw(7), 42, 42), Ok(Fill::Uint([7; 4])));
-        assert!(fill(Value::Raw(7), RGBA16F, RGBA16F).is_err());
-        // Masks and zeros for integer views of any width; zero for floats.
-        assert_eq!(
-            fill(Value::Raw(u32::MAX), 62, 62),
-            Ok(Fill::Uint([u32::MAX; 4]))
-        );
-        assert_eq!(fill(Value::Raw(0), 57, 57), Ok(Fill::Uint([0; 4])));
-        assert_eq!(fill(Value::Raw(0), 54, 54), Ok(Fill::Float([0.0; 4])));
-        assert_eq!(
-            fill(grey, 12, RGBA16F),
-            Ok(Fill::Uint([0x3800, 0x3800, 0x3800, 0x3c00]))
-        );
-        assert_eq!(
-            fill(grey, 17, RGBA16F),
-            Ok(Fill::Uint([0x3800_3800, 0x3c00_3800, 0, 0]))
-        );
-        assert!(fill(packed(Packing::Rgba16f), 42, 42).is_err());
-        assert!(fill(grey, R9G9B9E5, R9G9B9E5).is_err());
+        make(&host.device, |bytes| host.uav_buffer(bytes)).expect("the passes");
     }
 }

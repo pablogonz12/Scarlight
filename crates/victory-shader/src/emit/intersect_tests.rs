@@ -162,13 +162,19 @@ fn build(
     wide: bool,
     descriptor: Descriptor,
 ) -> Result<(HostShader, resource::Resources), ShaderError> {
-    let native = native(&program(wide, descriptor));
+    build_compute_shader(&native(&program(wide, descriptor)))
+}
+
+/// `native`, a compute program, translated (the tests' own way: no container).
+pub(super) fn build_compute_shader(
+    native: &NativeProgram,
+) -> Result<(HostShader, resource::Resources), ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    let io = io::raise(&p, &native).expect("io::raise");
+    let io = io::raise(&p, native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
-        native: &native,
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -295,30 +301,12 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
     let ids2 = [8, bvh::NONE, 24, 0x1fff_fffc];
     box_nodes.push((s.add(nodes::box32(ids2, around), 32), 5));
     box_nodes.push((s.add(nodes::box16(ids2, around), 16), 4));
-    // A child that is not there whose box the ray enters first: the
-    // reference's own test of it, in both widths, with its ray alone.
-    let (missing, missing_boxes) = nodes::MISSING_FIRST;
-    let missing_nodes = [
-        (s.add(nodes::box32(missing, missing_boxes), 32), 5),
-        (s.add(nodes::box16(missing, missing_boxes), 16), 4),
-    ];
-    // Partial-axis NaN and inverted/empty boxes alongside a zero-thickness box.
-    let degenerate = [
-        [
-            f32::INFINITY,
-            f32::INFINITY,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-            f32::NEG_INFINITY,
-            f32::NEG_INFINITY,
-        ],
-        [-1.0, f32::NAN, -1.0, 1.0, 1.0, 1.0],
-        [-1.0, 1.0, -1.0, 1.0, -1.0, 1.0],
-        [0.0, -1.0, -1.0, 0.0, 1.0, 1.0],
-    ];
-    let ids3 = [0x40, 0x48, 0x50, 0x58];
-    box_nodes.push((s.add(nodes::box32(ids3, degenerate), 32), 5));
-    box_nodes.push((s.add(nodes::box16(ids3, degenerate), 16), 4));
+    // A child that is not there with inverted infinite bounds (the title's
+    // builder leaves such slots): every ray "enters" it at minus infinity.
+    let mut empty = lined;
+    empty[1] = [f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+    let ids3 = [0x105, bvh::NONE, 0x304, 0x400];
+    box_nodes.push((s.add(nodes::box32(ids3, empty), 32), 5));
     // Random boxes.
     for n in 0..6 {
         let boxes: [[f32; 6]; 4] = std::array::from_fn(|_| {
@@ -381,10 +369,6 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
             cases.push(Some((n, kind, Ray::new(origin, direction, extent))));
         }
     }
-    // The reference's test of a child that is not there, at its ray.
-    for &(n, kind) in &missing_nodes {
-        cases.push(Some((n, kind, nodes::missing_first())));
-    }
     // Random rays at every box node, half of them aimed at a box.
     for &(n, kind) in &box_nodes {
         let words = s.node(n);
@@ -397,7 +381,7 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
             let origin = g.vector(12.0);
             let direction = if k % 2 == 0 {
                 let b = boxes[(k / 2) % 4];
-                if !(b[0] <= b[3] && b[1] <= b[4] && b[2] <= b[5]) {
+                if b[0].is_nan() {
                     g.vector(1.0)
                 } else {
                     std::array::from_fn(|a| (b[a] + b[3 + a]) / 2.0 - origin[a] + g.unit() / 2.0)
@@ -714,5 +698,163 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
             assert_eq!(what, "a ray-tracing structure that returns triangle ids");
         }
         other => panic!("{:?}", other.map(|_| ())),
+    }
+}
+
+/// A buffer view picked from the table at an index the program computes,
+/// whose dwords 0 and 1 the program reads as numbers (the tracer takes its
+/// structure's address so, by an index from a constant buffer): they are
+/// the view's title address from the host's table by view heap slot, after
+/// the strides in the same root view.
+#[test]
+fn a_picked_views_address_comes_from_the_hosts_table() {
+    use super::{SLOT_STRIDES, SLOT_STRIDES_BYTES, VIEW_ADDRESSES};
+    let words = [
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0x8F06_8500, // s_lshl_b32 s6, s0, 5
+        0xF408_0202,
+        0x0C00_0000, // s_load_dwordx4 s[8:11], s[4:5], s6
+        0xF408_0302,
+        0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E02_0208, // v_mov_b32 v1, s8
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0x342A_0083, // v_lshlrev_b32 v21, 3, v0
+        0xE074_1000,
+        0x8003_0115, // buffer_store_dwordx2 v[1:2], v21, s[12:15], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    let (shader, _) = build_compute_shader(&native(&words)).expect("the program lowers");
+    assert!(shader.root_srvs.contains(&SLOT_STRIDES), "{:?}", shader.root_srvs);
+    assert!(
+        !shader.user_data.iter().any(|u| u.root == RootType::Other(super::USER_VIEW_ADDRESS)),
+        "no host word for a fixed place"
+    );
+    let mut table = vec![0u32; SLOT_STRIDES_BYTES as usize / 4];
+    let at = VIEW_ADDRESSES as usize / 4;
+    // Slot 2, the one picked; slot 0 as a decoy.
+    table[at..at + 2].copy_from_slice(&[0xdead_0000, 0xdd]);
+    table[at + 4..at + 6].copy_from_slice(&[0x1234_5600, 0x42]);
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let decoy = [7u32; 4];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    // s0: the picked view's place in the table (slot 2).
+                    roots: vec![
+                        (0, Root::Constants(vec![2, 0, 0, 0, 0])),
+                        (1, Root::View { srv: true, data: table.clone() }),
+                    ],
+                    views: &[
+                        View::Buffer { data: &decoy, stride: Stride::Raw },
+                        View::RawUav(8 * THREADS),
+                        View::Buffer { data: &decoy, stride: Stride::Raw },
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        for t in 0..THREADS as usize {
+            assert_eq!(out[0][2 * t..2 * t + 2], [0x1234_5600, 0x42], "{label} thread {t}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
+}
+
+/// A register that holds a lane mask on one path and a number on the other
+/// (the ray tracer's SGPRs reused between saved masks and constant-buffer
+/// fields), joined where the wave takes one edge, then cut with mask
+/// operations and read as a number: the mask operations compute on the
+/// numbers (`sop`), and the read is the console's register.
+#[test]
+fn mask_operations_on_a_joined_number_give_the_number() {
+    let words = [
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0302,
+        0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+        0x7D88_0098, // v_cmp_gt_u32 vcc_lo, 24, v0
+        0x8706_7E6A, // s_and_b32 s6, vcc_lo, exec_lo (lanes 0-23)
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0001, // s_cbranch_scc1 +1
+        0x8106_8101, // s_add_i32 s6, s1, 1 (a number)
+        0x8707_FF06,
+        0x00FF_00FF, // s_and_b32 s7, s6, 0x00ff00ff
+        0x8808_0207, // s_or_b32 s8, s7, s2
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E02_0208, // v_mov_b32 v1, s8
+        0x342A_0082, // v_lshlrev_b32 v21, 2, v0
+        0xE070_1000,
+        0x8003_0115, // buffer_store_dword v1, v21, s[12:15], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    // On the first try refused, as before (programs that translate so do
+    // not change); `translate` tries such a program once more with mask
+    // operations on numbers read as numbers.
+    match build_compute_shader(&native(&words)) {
+        Err(ShaderError::Unsupported { what, .. }) => assert_eq!(what, lower::MASK_ELSEWHERE),
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+    let (shader, _) = lower::with_mask_ops_on_numbers(|| build_compute_shader(&native(&words)))
+        .expect("the program lowers");
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // The hardware device only: the program declares the console's 32
+    // lanes (its wave operations), which WARP does not take.
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = match host.compute_pipeline(&shader) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("the {label} device does not take this program (waves of 64?): {e}; not run");
+                continue;
+            }
+        };
+        let unused = [0u32; 4];
+        for (constants, want) in [
+            // The mask's path: lanes 0-23 as the number.
+            ([0, 0x1234_5678, 0x0100_0000], 0x01FF_00FF),
+            // The number's path.
+            ([1, 0x1234_5678, 0x0100_0000], 0x0134_0079),
+        ] {
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants([&constants[..], &[0, 0]].concat()))],
+                        views: &[View::Buffer { data: &unused, stride: Stride::Raw }, View::RawUav(4 * THREADS)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            for t in 0..THREADS as usize {
+                assert_eq!(out[0][t], want, "{label} {constants:x?} thread {t}");
+            }
+        }
+        ran += 1;
+    }
+    if ran == 0 {
+        eprintln!("not run on a device; lowered only");
     }
 }

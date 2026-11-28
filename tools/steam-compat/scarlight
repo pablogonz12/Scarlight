@@ -163,12 +163,21 @@ stage() { # stage SRC DEST
   }
 }
 stage "$EXE" "$RUN/victory.exe"
+CUSTOM_VKD3D="$PDIR/files/lib/wine/vkd3d-proton/x86_64-windows"
+FAST_PROTON=0
+if grep -qa VKD3D_VIEW_HEAP_DESCRIPTORS "$CUSTOM_VKD3D/d3d12core.dll" 2>/dev/null; then
+  FAST_PROTON=1
+fi
 for f in "$HERE"/files/*.dll; do
   [ -e "$f" ] || continue
   base="$(basename "$f")"
   # d3dcompiler_47 is handled below: it is optional, and the conf decides.
   [ "$base" = d3dcompiler_47.dll ] && continue
-  stage "$f" "$RUN/$base"
+  if [ "$FAST_PROTON" = 1 ] && [ -f "$CUSTOM_VKD3D/$base" ]; then
+    stage "$CUSTOM_VKD3D/$base" "$RUN/$base"
+  else
+    stage "$f" "$RUN/$base"
+  fi
 done
 
 # The Proton we run on has its own DXVK DXGI/D3D11 DLLs; a tarball install does
@@ -230,6 +239,19 @@ export VICTORY_NO_WATCHDOG=1 VICTORY_LOG="${VICTORY_LOG:-info}"
 export MESA_SHADER_CACHE_DIR="$DATA/mesa_cache"
 export MESA_SHADER_CACHE_MAX_SIZE="$MESA_CACHE_MAX_SIZE"
 for kv in $EXTRA_ENV; do export "${kv?}"; done
+export VICTORY_RT_FALLBACK_NO_BVH=1 VICTORY_AMBIENT=0.35 VICTORY_AMBIENT_SHADE=0
+export VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=2 VICTORY_WIDE_BACK=1 VICTORY_CARD_REHASH_RUNS=1
+export VICTORY_JOIN_COPIES=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_RELAY_COPY=1 VICTORY_CARD_STEPS=2
+export VICTORY_INDIRECT_BATCH=2 VICTORY_MAP_THREADS=1 VICTORY_CARD_AWAKE=1 VICTORY_SHOW_AFTER=1
+export VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 VICTORY_PORT_DESCRIPTORS=1
+export VICTORY_PORT_CBV=1 VICTORY_PORT_GUARD=1 VICTORY_PORT_JOURNAL=1 VICTORY_WC_NO_BACK=1
+export VICTORY_CARD_BUFFERS_MIN_MB=1
+if [ "$FAST_PROTON" = 1 ]; then
+  export VICTORY_PORT_CONSTANTS=1 WINE_VICTORY_LOCAL_VIEWS=1
+  export VKD3D_DISABLE_EXTENSIONS=VK_EXT_descriptor_heap VKD3D_VIEW_HEAP_DESCRIPTORS=4194304
+else
+  unset VICTORY_PORT_CONSTANTS WINE_VICTORY_LOCAL_VIEWS VKD3D_VIEW_HEAP_DESCRIPTORS
+fi
 
 # victory's own options come first; the title's arguments come after `--`, as
 # its CLI declares them (`#[arg(last = true)]`). Without the separator a title

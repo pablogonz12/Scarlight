@@ -10,8 +10,6 @@
 //! a game update or a converter fix only redoes what changed.
 
 mod cache;
-pub mod caches;
-pub mod warmfile;
 
 pub use cache::{Cache, CacheKey};
 

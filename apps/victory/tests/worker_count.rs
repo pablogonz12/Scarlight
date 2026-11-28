@@ -2,9 +2,16 @@ use std::process::Command;
 
 #[test]
 fn worker_count_is_validated_before_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
     // Accepted arguments reach the config error without reading game files or probing the GPU.
-    let missing_config = std::env::temp_dir().join(format!("victory-missing-config-{}.toml", std::process::id()));
-    let modes: &[&[&str]] = &[&["translate"]];
+    let missing_config = dir.path().join("missing.toml");
+    let modes: &[&[&str]] = &[
+        &["translate"],
+        &["translate", "--warm", "all"],
+        &["shaders"],
+        #[cfg(windows)]
+        &["warm"],
+    ];
 
     for args in modes {
         for jobs in [Some("0"), Some("1"), Some("3"), None] {
@@ -19,12 +26,17 @@ fn worker_count_is_validated_before_dispatch() {
             }
             let output = command.output().unwrap();
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if jobs == Some("0") {
-                assert_eq!(output.status.code(), Some(2), "{args:?} {jobs:?}: {stderr}");
-                assert!(stderr.contains("invalid value '0' for '--jobs"), "{stderr}");
+            let (code, message) = if jobs == Some("0") {
+                (2, "invalid value '0' for '--jobs")
             } else {
-                assert_ne!(output.status.code(), Some(2), "{args:?} {jobs:?}: {stderr}");
-            }
+                (1, "VICTORY_CONFIG points at")
+            };
+            assert_eq!(
+                output.status.code(),
+                Some(code),
+                "{args:?} {jobs:?}: {stderr}"
+            );
+            assert!(stderr.contains(message), "{args:?} {jobs:?}: {stderr}");
         }
     }
 }

@@ -1,65 +1,45 @@
+//! Fingerprints the shader translator, so that cached translations
+//! (`src/shader_cache.rs`) last until the translator itself changes and not
+//! only until the next build of anything.
+
 use std::path::{Path, PathBuf};
 
-const EXTRA_SOURCES: &[&str] = &[
-    "crates/victory-shader/Cargo.toml",
-    "crates/victory-gpu/src/shader_cache.rs",
-    "crates/victory-gpu/src/shader_meta.rs",
-    "crates/victory-gpu/src/pipeline.rs",
-    "crates/victory-gpu/src/pipeline/host.rs",
-    "crates/victory-gpu/build.rs",
-];
-
-fn collect(dir: &Path, files: &mut Vec<PathBuf>) {
-    println!("cargo:rerun-if-changed={}", dir.display());
-    for entry in std::fs::read_dir(dir).expect("read shader source directory") {
-        let path = entry.expect("read source entry").path();
+fn files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
         if path.is_dir() {
-            collect(&path, files);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            files.push(path);
+            files(&path, out);
+        } else {
+            out.push(path);
         }
     }
 }
 
 fn main() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut files = Vec::new();
-    collect(&root.join("crates/victory-shader/src"), &mut files);
-    for path in EXTRA_SOURCES {
-        files.push(root.join(path));
-    }
-    files.sort();
+    let here = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default());
+    let crates = here.join("..");
+    let root = crates.join("..");
+    // The translator, what it is built from, and the form entries are kept in.
+    let mut all = vec![
+        crates.join("victory-shader/Cargo.toml"),
+        here.join("src/shader_cache.rs"),
+        root.join("Cargo.lock"),
+        root.join("rust-toolchain.toml"),
+    ];
+    let source = crates.join("victory-shader/src");
+    println!("cargo:rerun-if-changed={}", source.display());
+    files(&source, &mut all);
+    all.sort();
     let mut hash = blake3::Hasher::new();
-    for path in files {
+    for path in &all {
         println!("cargo:rerun-if-changed={}", path.display());
-        let name = path.strip_prefix(&root).expect("source inside workspace");
-        let name = name.to_str().expect("source path is UTF-8").as_bytes();
-        let data = std::fs::read(&path).expect("read source");
-        hash.update(&(name.len() as u64).to_le_bytes());
-        hash.update(name);
-        hash.update(&(data.len() as u64).to_le_bytes());
-        hash.update(&data);
+        // Names and line endings as they are in every checkout.
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let bytes: Vec<u8> = std::fs::read(path).unwrap_or_default().into_iter().filter(|&b| b != 13).collect();
+        hash.update(name.as_bytes());
+        hash.update(&(bytes.len() as u64).to_le_bytes());
+        hash.update(&bytes);
     }
-    // zlib-rs is the translator's only runtime dependency that processes shader
-    // data. dxil-spirv runs downstream and its output is not stored here.
-    let lock = root.join("Cargo.lock");
-    println!("cargo:rerun-if-changed={}", lock.display());
-    let lock = std::fs::read_to_string(lock).expect("read lockfile");
-    let zlib = lock
-        .split("[[package]]")
-        .find(|p| p.lines().any(|l| l == "name = \"zlib-rs\""))
-        .expect("zlib-rs lock entry");
-    hash.update(zlib.as_bytes());
-    println!(
-        "cargo:rustc-env=VICTORY_TRANSLATOR_KEY={}",
-        hash.finalize().to_hex()
-    );
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn metadata_computation_is_fingerprinted() {
-        assert!(super::EXTRA_SOURCES.contains(&"crates/victory-gpu/src/pipeline.rs"));
-    }
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rustc-env=VICTORY_TRANSLATOR={}", hash.finalize().to_hex());
 }

@@ -62,7 +62,6 @@ type This = *const Object;
 // `TODO.md`); report enabled, with the host display's luminance, once the
 // swap chain can present HDR.
 extern "system" fn try_enable_hdr(_: This, preference: u32, _info: *mut c_void) -> u32 {
-    let _stall = victory_gpu::stall_site!("display::try_enable_hdr").enter(format_args!(""));
     tracing::info!(preference, "HDR mode: disabled (SDR presentation)");
     2
 }
@@ -70,7 +69,6 @@ extern "system" fn try_enable_hdr(_: This, preference: u32, _info: *mut c_void) 
 /// Nothing launches URIs for the title: no store, browser or console app
 /// exists here, and the console's are online services.
 extern "system" fn launch_uri(_: This, _user: *const c_void, uri: *const c_char) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("display::launch_uri").enter(format_args!(""));
     tracing::info!(uri = text(uri).unwrap_or_default(), "URI not launched");
     NOT_SUPPORTED
 }
@@ -79,7 +77,6 @@ extern "system" fn launch_uri(_: This, _user: *const c_void, uri: *const c_char)
 /// power request; the handle is that request.
 #[cfg(windows)]
 extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("display::acquire_deferral").enter(format_args!(""));
     use windows_sys::Win32::System::Power::{
         PowerCreateRequest, PowerRequestDisplayRequired, PowerSetRequest,
     };
@@ -112,7 +109,6 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
 
 #[cfg(windows)]
 extern "system" fn close_deferral(_: This, handle: *mut c_void) {
-    let _stall = victory_gpu::stall_site!("display::close_deferral").enter(format_args!(""));
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Power::{PowerClearRequest, PowerRequestDisplayRequired};
     if !handle.is_null() {
@@ -136,7 +132,6 @@ fn last_error() -> HRESULT {
 // row pitch, bytes) on request, e.g. `victory_gpu::last_frame() ->
 // Option<Frame>`, copied from the back buffer after `PresentX`.
 extern "system" fn take_screenshot(_: This, _user: *const c_void, _result: *mut c_void) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("display::take_screenshot").enter(format_args!(""));
     tracing::info!("screenshot not taken");
     NOT_SUPPORTED
 }
@@ -190,11 +185,14 @@ mod tests {
         type Acquire = extern "system" fn(This, *mut *mut c_void) -> HRESULT;
         type Close = extern "system" fn(This, *mut c_void);
         let mut handle = std::ptr::null_mut();
-        assert_eq!(
-            method::<Acquire>(&SHELL_OBJECT, 0x20)(&SHELL_OBJECT, &mut handle),
-            S_OK
-        );
-        assert!(!handle.is_null());
-        method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
+        match method::<Acquire>(&SHELL_OBJECT, 0x20)(&SHELL_OBJECT, &mut handle) {
+            S_OK => {
+                assert!(!handle.is_null());
+                method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
+            }
+            // Windows can reject display power requests on some hosts.
+            NOT_SUPPORTED => assert!(handle.is_null()),
+            hr => panic!("unexpected display deferral HRESULT {:#010x}", hr as u32),
+        }
     }
 }

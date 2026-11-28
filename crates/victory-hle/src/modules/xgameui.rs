@@ -1,6 +1,6 @@
 //! System dialogs a title opens (XGameUi). A profile card has nothing to
 //! show and closes at once. Text entry opens a small host dialog (title,
-//! description, default text, the length limit) on a thread of its own and
+//! description, default text, the console's length limit) on a thread of its own and
 //! completes the call with what the user typed, or as cancelled (`E_ABORT`)
 //! when the dialog is dismissed or cannot open.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -41,12 +41,10 @@ extern "system" fn profile_card_async(
     _user: *const c_void,
     xuid: u64,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgameui::profile_card_async").enter(format_args!(""));
     tracing::info!(xuid, "profile card: nothing to show");
     xasync::finished(block, (&raw const PROFILE).cast(), S_OK)
 }
 extern "system" fn profile_card_result(_: This, block: *mut AsyncBlock) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgameui::profile_card_result").enter(format_args!(""));
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const PROFILE).cast(), 0, none, none.cast())
 }
@@ -59,11 +57,11 @@ extern "system" fn text_entry_async(
     title: *const c_char,
     description: *const c_char,
     default: *const c_char,
-    _scope: u32,
+    scope: u32,
     max_length: u32,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgameui::text_entry_async").enter(format_args!(""));
     let [title, description, default] = [title, description, default].map(|t| text(t).unwrap_or_default());
+    let max_length = max_length_for(scope, max_length);
     tracing::info!(title, description, max_length, "text entry");
     xasync::pending_with(block, (&raw const TEXT).cast(), move || {
         match ask(&title, &description, &default, max_length) {
@@ -82,7 +80,6 @@ extern "system" fn text_entry_async(
 }
 /// Bytes of the result, its NUL included.
 extern "system" fn text_entry_size(_: This, block: *mut AsyncBlock, out: *mut u32) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgameui::text_entry_size").enter(format_args!(""));
     let mut size = 0;
     let hr = xasync::XAsyncGetResultSize(block, &mut size);
     if hr < 0 {
@@ -97,7 +94,6 @@ extern "system" fn text_entry_result(
     buffer: *mut c_char,
     used: *mut u32,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgameui::text_entry_result").enter(format_args!(""));
     let mut written = 0;
     let identity = (&raw const TEXT).cast();
     let hr = xasync::XAsyncGetResult(block, identity, size as usize, buffer.cast(), &mut written);
@@ -107,24 +103,30 @@ extern "system" fn text_entry_result(
     put(used, written as u32)
 }
 
-/// At most `max` characters (0: no limit).
-fn limit(typed: &str, max: u32) -> String {
-    match max {
-        0 => typed.to_owned(),
-        max => typed.chars().take(max as usize).collect(),
+/// The console's most characters for a text entry.
+const MAX_LENGTH: u32 = 1024;
+/// `XGameUiTextEntryInputScope::Password`.
+const PASSWORD: u32 = 31;
+
+/// The limit the console applies, as documented: the title's, at most
+/// 1024; 1024 for 0 and for a password, whatever the title asks.
+fn max_length_for(scope: u32, max: u32) -> u32 {
+    if max == 0 || scope == PASSWORD {
+        MAX_LENGTH
+    } else {
+        max.min(MAX_LENGTH)
     }
 }
 
-/// Asks the user in a modal host dialog; `None` if dismissed.
-#[cfg(all(windows, not(test)))]
-fn ask(title: &str, description: &str, default: &str, max: u32) -> Option<String> {
-    dialog::ask(title, description, default, max)
+/// At most `max` characters.
+fn limit(typed: &str, max: u32) -> String {
+    typed.chars().take(max as usize).collect()
 }
 
-/// Off Windows there is no host dialog: the user dismisses it.
-#[cfg(all(not(windows), not(test)))]
-fn ask(_: &str, _: &str, _: &str, _: u32) -> Option<String> {
-    None
+/// Asks the user in a modal host dialog; `None` if dismissed.
+#[cfg(not(test))]
+fn ask(title: &str, description: &str, default: &str, max: u32) -> Option<String> {
+    dialog::ask(title, description, default, max)
 }
 
 /// Tests answer for the user: "typed" for a title starting with "Type",
@@ -134,7 +136,6 @@ fn ask(title: &str, _: &str, default: &str, _: u32) -> Option<String> {
     title.starts_with("Type").then(|| format!("{default}typed"))
 }
 
-#[cfg(windows)]
 mod dialog {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -212,7 +213,6 @@ mod dialog {
     }
 
     extern "system" fn procedure(dialog: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> isize {
-        let _stall = victory_gpu::stall_site!("xgameui::procedure").enter(format_args!(""));
         // SAFETY: our dialog; its user data is the `Entry` from `ask`,
         // stored at WM_INITDIALOG.
         unsafe {
@@ -227,7 +227,11 @@ mod dialog {
                     0 // focus set here
                 }
                 wm::WM_COMMAND => {
-                    let entry = &mut *(wm::GetWindowLongPtrW(dialog, wm::GWLP_USERDATA) as *mut Entry);
+                    let user_data = wm::GetWindowLongPtrW(dialog, wm::GWLP_USERDATA);
+                    if user_data == 0 {
+                        return 0;
+                    }
+                    let entry = &mut *(user_data as *mut Entry);
                     match (wparam & 0xffff) as i32 {
                         wm::IDOK => {
                             let mut buffer = vec![0u16; wm::GetWindowTextLengthW(edit) as usize + 1];
@@ -244,6 +248,19 @@ mod dialog {
                 }
                 _ => 0,
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn command_before_init_is_ignored() {
+            assert_eq!(
+                procedure(std::ptr::null_mut(), wm::WM_COMMAND, wm::IDOK as WPARAM, 0,),
+                0
+            );
         }
     }
 }
@@ -330,5 +347,47 @@ mod tests {
         assert_eq!(result(this, &mut b, 7, out.as_mut_ptr(), &mut used), S_OK);
         assert_eq!((text(out.as_ptr()).as_deref(), used), (Some("abctyp"), 7));
         assert_eq!(limit("\u{e9}t\u{e9}s", 3), "\u{e9}t\u{e9}");
+    }
+
+    /// 0 and limits over 1024 mean 1024; a password ignores the title's.
+    #[test]
+    fn text_entry_limits_follow_the_console() {
+        assert_eq!(max_length_for(0, 0), 1024);
+        assert_eq!(max_length_for(0, 5000), 1024);
+        assert_eq!(max_length_for(0, 16), 16);
+        assert_eq!(max_length_for(PASSWORD, 8), 1024);
+
+        type Entry = extern "system" fn(
+            This,
+            *mut AsyncBlock,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            u32,
+            u32,
+        ) -> HRESULT;
+        type Size = extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
+        type Result_ =
+            extern "system" fn(This, *mut AsyncBlock, u32, *mut c_char, *mut u32) -> HRESULT;
+        let this: This = &OBJECT;
+        let entry = method::<Entry>(&OBJECT, 0x88);
+        let null = std::ptr::null();
+        let long = std::ffi::CString::new("a".repeat(2000)).unwrap();
+        for (scope, max, default, expect) in [
+            (0, 0, long.as_ptr(), 1025),
+            (PASSWORD, 8, c"abc".as_ptr(), 9),
+        ] {
+            let mut b = block();
+            let title = c"Type".as_ptr();
+            assert_eq!(entry(this, &mut b, title, null, default, scope, max), S_OK);
+            assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+            let mut size = 0;
+            assert_eq!(method::<Size>(&OBJECT, 0x90)(this, &mut b, &mut size), S_OK);
+            assert_eq!(size, expect, "scope {scope}, max {max}");
+            let mut out = vec![0 as c_char; size as usize];
+            let result = method::<Result_>(&OBJECT, 0x98);
+            let used = std::ptr::null_mut();
+            assert_eq!(result(this, &mut b, size, out.as_mut_ptr(), used), S_OK);
+        }
     }
 }

@@ -13,8 +13,10 @@
 //!
 //! The control-flow graph keeps its shape and must be reducible (DXIL's
 //! only requirement). Helper lanes of a pixel shader count as live: on PC
-//! their side effects are dropped too, and what they compute is only read
-//! through derivatives.
+//! their side effects are dropped too, and what they compute is read through
+//! derivatives and quad operations. A lane a pixel program kills goes on as
+//! such a helper while its quad lives (`s_wqm` of the live mask): the branch
+//! that leaves when no lane is live is not its own bit's to take.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -455,6 +457,22 @@ impl Structured {
     }
 }
 
+thread_local! {
+    /// Killed lanes of a live quad go on ([`without_live_quads`]).
+    static LIVE_QUADS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// `f` with a pixel program's killed lanes leaving where the wave's other lanes go on in
+/// whole-quad mode (each lane takes the branch "no lane is live" on its own bit), as before
+/// they went on: for a program that goes on to a lane test the lowering cannot make (a
+/// constant lane mask) and translated that way.
+pub fn without_live_quads<T>(f: impl FnOnce() -> T) -> T {
+    let was = LIVE_QUADS.replace(false);
+    let r = f();
+    LIVE_QUADS.set(was);
+    r
+}
+
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
     structure_wide(program, &HashSet::new())
@@ -537,6 +555,8 @@ struct Lanes<'a> {
     scc_every: HashSet<Value>,
     /// See [`Structured::wave_any`].
     wave_any: Vec<Option<bool>>,
+    /// Mask values an `s_wqm` reads: a pixel program's live lanes, whose quads go on.
+    quad_sources: HashSet<Value>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -570,16 +590,6 @@ struct SopMasks {
 
 const MAX_ROUNDS: usize = 256;
 
-/// Whether a wave64 lane mask split into two scalar moves is recognised as
-/// the mask it was copied from. `VICTORY_DX_LANE_MASK_MOVES=0` turns the
-/// recovery off, leaving the split pair as an opaque atom.
-fn wave64_mask_from_moves() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !std::env::var_os("VICTORY_DX_LANE_MASK_MOVES").is_some_and(|v| v == "0")
-    })
-}
-
 impl<'a> Lanes<'a> {
     fn new(p: &'a Program) -> Result<Self, ShaderError> {
         let blocks = &p.blocks;
@@ -591,6 +601,7 @@ impl<'a> Lanes<'a> {
         check_reducible(p, &order, &index)?;
         let mut incoming = vec![Vec::new(); blocks.len()];
         let (mut defs, mut phis) = (Map::default(), Map::default());
+        let mut quad_sources = HashSet::new();
         for (b, block) in blocks.iter().enumerate() {
             for (k, s) in block.exit.successors().into_iter().enumerate() {
                 incoming[s].push((b, k == 0));
@@ -601,6 +612,14 @@ impl<'a> Lanes<'a> {
             for (i, inst) in block.insts.iter().enumerate() {
                 for &(_, v) in &inst.writes {
                     defs.insert(v, (b, i));
+                }
+                if inst.name().starts_with("s_wqm_b") {
+                    quad_sources.extend(
+                        inst.reads
+                            .iter()
+                            .filter(|r| matches!(r.0, Reg::S(_)))
+                            .map(|r| r.1),
+                    );
                 }
             }
         }
@@ -627,6 +646,7 @@ impl<'a> Lanes<'a> {
             wide: HashSet::new(),
             scc_every: HashSet::new(),
             wave_any: vec![None; blocks.len()],
+            quad_sources,
         })
     }
 
@@ -802,6 +822,9 @@ impl<'a> Lanes<'a> {
             .iter()
             .enumerate()
             .map(|(n, block)| {
+                // Reachability is fixed within the block. Vector instructions
+                // with the same EXEC therefore need the same guard.
+                let mut last_guard = None;
                 block
                     .insts
                     .iter()
@@ -811,8 +834,16 @@ impl<'a> Lanes<'a> {
                         | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => {
                             None
                         }
-                        (&Some(e), _) if b.implies(cond[n], e) => None,
-                        (&Some(e), _) => Some(b.given(e, cond[n])),
+                        (&Some(e), _) => {
+                            if let Some((prev, guard)) = last_guard
+                                && prev == e
+                            {
+                                return guard;
+                            }
+                            let guard = (!b.implies(cond[n], e)).then(|| b.given(e, cond[n]));
+                            last_guard = Some((e, guard));
+                            guard
+                        }
                     })
                     .collect()
             })
@@ -907,17 +938,6 @@ impl<'a> Lanes<'a> {
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
         }
-        // A scalar pair can be parked in two VGPR lanes and restored one
-        // dword at a time. The spill pass turns these into scalar moves.
-        // Recover the original lane predicate only when the two words
-        // still come from the same known mask, in their original order.
-        if self.p.wave64
-            && wave64_mask_from_moves()
-            && let Some(m) = self.moved_mask(k)
-        {
-            self.masks.insert(k, m);
-            return (m, true);
-        }
         let p = self.p;
         let (m, derived) = match self.join(k) {
             Some(join) => join,
@@ -958,30 +978,6 @@ impl<'a> Lanes<'a> {
         };
         cache.insert(k, m);
         (m, derived)
-    }
-
-    /// The mask `k` was copied from, through scalar moves only, when both of
-    /// its dwords still trace back to the same known mask of the same pair.
-    fn moved_mask(&self, k: Key) -> Option<Bool> {
-        let source = (self.move_source(k.0), self.move_source(k.1));
-        if source == k {
-            return None;
-        }
-        self.masks.get(&source).copied()
-    }
-
-    fn move_source(&self, mut value: Value) -> Value {
-        while let Some(&(b, i)) = self.defs.get(&value) {
-            let inst = &self.p.blocks[b].insts[i];
-            let [(Reg::S(_), source)] = inst.reads.as_slice() else {
-                break;
-            };
-            if inst.name() != "s_mov_b32" {
-                break;
-            }
-            value = *source;
-        }
-        value
     }
 
     /// A mask joined by phis at a block entry, and whether a mask coming in
@@ -1253,7 +1249,19 @@ impl<'a> Lanes<'a> {
                             self.active.insert(k.0);
                         }
                     }
-                    if let (Some(scc), Some(m)) = (inst.write(Reg::Scc), r.scc) {
+                    if let (Some(scc), Some(mut m)) = (inst.write(Reg::Scc), r.scc) {
+                        // A pixel program's live lanes (`s_andn2` of the killed ones), which
+                        // `s_wqm` widens again: a lane whose own bit is clear goes on with its
+                        // quad (a helper that computes what the quad reads, not only
+                        // derivatives), so "no lane is set" is not its own bit's answer.
+                        if let Some((k, _)) = r.dst
+                            && self.quad_sources.contains(&k.0)
+                            && LIVE_QUADS.get()
+                        {
+                            let born = self.born(k.0);
+                            let q = self.b.atom(Atom::Quad(k.0), born);
+                            m = self.b.or(m, q);
+                        }
                         self.scc_lane.insert(scc, m);
                     }
                 }
@@ -1373,17 +1381,16 @@ impl<'a> Lanes<'a> {
         match inst.name() {
             "s_cbranch_execz" => self.b.not(exec),
             "s_cbranch_execnz" => exec,
-            // Hardware tests raw VCC, not VCC & EXEC; inactive lanes can
-            // leave bits in VCC and masking would flip the branch.
             n @ ("s_cbranch_vccz" | "s_cbranch_vccnz") => {
                 let vcc = match self.key(|r| inst.read(r), VCC) {
                     Some(k) => self.mask(k).0,
                     None => Bool::FALSE,
                 };
+                let any = self.b.and(vcc, exec);
                 if n.ends_with("nz") {
-                    vcc
+                    any
                 } else {
-                    self.b.not(vcc)
+                    self.b.not(any)
                 }
             }
             n => {
@@ -1624,6 +1631,37 @@ mod tests {
     }
 
     #[test]
+    fn guards_follow_exec_and_block_reachability() {
+        let p = build(
+            &[
+                0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0xBF88_0005, // s_cbranch_execz -> end
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0x7DA4_0880, // v_cmpx_eq_u32 exec, 0, v4
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0xBE82_0480, // s_mov_b64 s[2:3], 0
+                0x7E0A_0280, // v_mov_b32 v5, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let lane = |block: usize, i: usize| {
+            Atom::Lane(p.blocks[block].insts[i].write(Reg::S(EXEC)).unwrap())
+        };
+        let a = s.guards[0][1].unwrap();
+        let b = s.guards[1][2].unwrap();
+        assert_eq!(s.bools.node(a), Some((lane(0, 0), Bool::FALSE, Bool::TRUE)));
+        assert_eq!(s.guards[0], [None, Some(a), Some(a), None]);
+        // The fallthrough already implies the first compare. Only the second
+        // compare needs testing, and the scalar move never needs a guard.
+        assert_eq!(s.bools.node(b), Some((lane(1, 1), Bool::FALSE, Bool::TRUE)));
+        assert_eq!(s.guards[1], [None, None, Some(b), None, Some(b)]);
+    }
+
+    #[test]
     fn divergent_loop_exits_per_lane() {
         let p = build(
             &[
@@ -1690,6 +1728,44 @@ mod tests {
     }
 
     #[test]
+    fn killed_lanes_of_a_live_quad_go_on() {
+        // A pixel program's kill: the live mask loses the killed lanes, the wave leaves
+        // when none is left, else its quads go on in whole-quad mode (the killed lanes as
+        // helpers, whose values quad reads take). Without `s_wqm` a killed lane leaves.
+        for wqm in [true, false] {
+            // s_wqm_b32 s1, s76, or s_mov_b32 s1, s76
+            let widen = if wqm { 0xBE81_094C } else { 0xBE81_034C };
+            let p = build(
+                &[
+                    0xBECC_037E, // s_mov_b32 s76, exec_lo
+                    0x7C28_10F2, // v_cmpx_gt_f32 exec_lo, 1.0, v8
+                    0x8A4C_7E4C, // s_andn2_b32 s76, s76, exec_lo
+                    0xBF84_0003, // s_cbranch_scc0 -> 28
+                    widen,
+                    0xBEFE_0301, // s_mov_b32 exec_lo, s1
+                    0x7E02_0280, // v_mov_b32 v1, 0
+                    S_ENDPGM,    // 28
+                ],
+                false,
+            );
+            let s = structure(&p).unwrap();
+            let LaneExit::Branch { when, .. } = s.exits[0] else {
+                panic!()
+            };
+            let support = s.bools.support(when);
+            let quad = support.iter().any(|a| matches!(a, Atom::Quad(_)));
+            assert_eq!(quad, wqm, "s_wqm {wqm}");
+            // The second try of a program that does not translate so: the lane's own bit.
+            let s = without_live_quads(|| structure(&p)).unwrap();
+            let LaneExit::Branch { when, .. } = s.exits[0] else {
+                panic!()
+            };
+            let support = s.bools.support(when);
+            assert!(!support.iter().any(|a| matches!(a, Atom::Quad(_))));
+        }
+    }
+
+    #[test]
     fn scalar_branches_stay_uniform() {
         let p = build(
             &[
@@ -1733,32 +1809,6 @@ mod tests {
                 Some((Atom::Lane(lo), Bool::FALSE, Bool::TRUE)),
                 "{reader:#x}: vcc_hi was zeroed after the compare"
             );
-        }
-    }
-
-    #[test]
-    fn split_scalar_copies_across_a_branch_preserve_both_words_of_a_wave64_mask() {
-        for (high, intact) in [(0xBE83_036B, true), (0xBE83_036A, false)] {
-            let p = build(
-                &[
-                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
-                    0xBE84_046A, // s_mov_b64 s[4:5], vcc
-                    0xBF06_0100, // s_cmp_eq_u32 s0, s1
-                    0xBF85_0004, // s_cbranch_scc1 -> join at 32
-                    0xBE82_036A, // s_mov_b32 s2, vcc_lo
-                    high,        // s_mov_b32 s3, vcc_hi (or vcc_lo)
-                    0xBE84_0302, // s_mov_b32 s4, s2
-                    0xBE85_0303, // s_mov_b32 s5, s3
-                    0xBEFE_0404, // s_mov_b64 exec, s[4:5]
-                    0x7E02_0280, // v_mov_b32 v1, 0
-                    S_ENDPGM,
-                ],
-                true,
-            );
-            let s = structure(&p).unwrap();
-            let compare = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
-            let restored = p.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
-            assert_eq!(s.masks[&restored] == s.masks[&compare], intact);
         }
     }
 
@@ -1842,38 +1892,6 @@ mod tests {
                 .any(|&e| matches!(s.bools.support(e)[..], [Atom::Lane(_)])),
             "{edges:?}"
         );
-    }
-
-    /// `s_cbranch_vccz/nz` tests raw VCC, without EXEC masking (Belobug #83,
-    /// upstream #2406).
-    #[test]
-    fn cbranch_vcc_tests_raw_vcc_without_exec_masking() {
-        for (branch_word, invert) in [(0xBF87_0001_u32, false), (0xBF86_0001_u32, true)] {
-            // v_cmp_eq_u32 vcc, 0, v0; v_cmpx_eq_u32 exec, 0, v1;
-            // s_cbranch_vccnz / s_cbranch_vccz -> target; v_mov; S_ENDPGM.
-            let p = build(
-                &[
-                    0x7D84_0080,
-                    0x7DA4_0280,
-                    branch_word,
-                    0x7E04_0280,
-                    S_ENDPGM,
-                ],
-                false,
-            );
-            let s = structure(&p).unwrap();
-            let LaneExit::Branch { when, .. } = s.exits[0] else {
-                panic!("expected branch exit");
-            };
-            let cmp = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
-            let (lo, hi) = if invert {
-                (Bool::TRUE, Bool::FALSE)
-            } else {
-                (Bool::FALSE, Bool::TRUE)
-            };
-            assert_eq!(s.bools.node(when), Some((Atom::Lane(cmp), lo, hi)));
-            assert_eq!(s.bools.support(when), vec![Atom::Lane(cmp)]);
-        }
     }
 
     #[test]

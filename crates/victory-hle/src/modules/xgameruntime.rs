@@ -114,14 +114,12 @@ const AREAS: &[&[Interface]] = &[
 
 /// `AddRef` and `Release`.
 pub extern "system" fn add_ref(_: *const Object) -> u32 {
-    let _stall = victory_gpu::stall_site!("xgameruntime::add_ref").enter(format_args!(""));
     1
 }
 
 /// A slot nobody has needed yet; logged with its area. Wrong for a slot
 /// that returns `bool` or a value.
 pub extern "system" fn missing<const SLOT: usize>(this: *const Object) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgameruntime::missing").enter(format_args!(""));
     // SAFETY: title code calls methods on objects we handed out.
     let area = unsafe { (*this).area };
     tracing::warn!(
@@ -183,25 +181,21 @@ pub(crate) fn method<F: Copy>(object: &Object, slot: usize) -> F {
 }
 
 pub extern "system" fn XGameRuntimeInitialize() -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgameruntime::XGameRuntimeInitialize").enter(format_args!(""));
     tracing::info!("XGameRuntimeInitialize");
     S_OK
 }
 
 pub extern "system" fn XGameRuntimeUninitialize() {
-    let _stall = victory_gpu::stall_site!("xgameruntime::XGameRuntimeUninitialize").enter(format_args!(""));
     tracing::info!("XGameRuntimeUninitialize");
 }
 
 /// The arguments identify the title's build of the stub; not checked.
 pub extern "system" fn InitializeApiImpl(version: u64, build: u64) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgameruntime::InitializeApiImpl").enter(format_args!(""));
     tracing::info!(version, build, "InitializeApiImpl");
     S_OK
 }
 
 pub extern "system" fn InitializeApiImplEx(version: u64, build: u64, flags: u64) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgameruntime::InitializeApiImplEx").enter(format_args!(""));
     tracing::info!(version, build, flags, "InitializeApiImplEx");
     S_OK
 }
@@ -215,13 +209,11 @@ pub extern "system" fn InitializeApiImplEx2(
     flags: u64,
     options: *const c_void,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgameruntime::InitializeApiImplEx2").enter(format_args!(""));
     tracing::info!(version, build, flags, ?options, "InitializeApiImplEx2");
     S_OK
 }
 
 pub extern "system" fn UninitializeApiImpl() {
-    let _stall = victory_gpu::stall_site!("xgameruntime::UninitializeApiImpl").enter(format_args!(""));
     tracing::info!("UninitializeApiImpl");
 }
 
@@ -232,7 +224,6 @@ pub extern "system" fn QueryApiImpl(
     iid: *const Guid,
     out: *mut *mut c_void,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgameruntime::QueryApiImpl").enter(format_args!(""));
     static QUERIED: Mutex<Vec<(Guid, Guid)>> = Mutex::new(Vec::new());
     // SAFETY: the title passes pointers to GUIDs (null is tolerated).
     let (Some(&provider), Some(&iid)) = (unsafe { provider.as_ref() }, unsafe { iid.as_ref() })
@@ -270,7 +261,6 @@ pub extern "system" fn QueryApiImpl(
 }
 
 pub extern "system" fn XErrorReport(hr: HRESULT, message: *const c_char) {
-    let _stall = victory_gpu::stall_site!("xgameruntime::XErrorReport").enter(format_args!(""));
     let message = if message.is_null() {
         "".into()
     } else {

@@ -26,10 +26,10 @@
 //! index from the wave index (s3 bits 24-27) and the lane (`v_mbcnt`), and
 //! its group id from v5 of the first lane (`v_readfirstlane`: the group
 //! times the group size). Lane n exports vertex n (`exp pos`, `exp param`)
-//! and primitive n (`exp prim`: 10-bit vertex indices at bits 0, 10, 20,
-//! bit 31 culls); `param` entries with bit 7 are per-primitive outputs. One
-//! lane sends the output counts (`s_sendmsg` GS_ALLOC_REQ, m0 = vertices |
-//! primitives << 12).
+//! and primitive n (`exp prim`: 9-bit vertex indices at bits 0, 10, 20,
+//! each with an edge flag above it, bit 31 culls); `param` entries with
+//! bit 7 are per-primitive outputs. One lane sends the output counts
+//! (`s_sendmsg` GS_ALLOC_REQ, m0 = vertices | primitives << 12).
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
@@ -369,7 +369,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         defs: &defs,
         phis: &phis,
     };
-    let mut first_halves: Vec<(Site, Attribute, Option<Value>)> = Vec::new();
+    let mut first_halves = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -383,13 +383,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
-                        ("v_interp_p1_f32", _) => {
-                            let val = match *dst {
-                                Operand::Vector { reg, .. } => inst.write(Reg::V(reg)),
-                                _ => None,
-                            };
-                            first_halves.push((site, attribute, val));
-                        }
+                        ("v_interp_p1_f32", _) => first_halves.push((site, attribute)),
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
                                 return Err(unsupported(at, "an interpolation operand"));
@@ -410,12 +404,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 }
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
                     "v_interp_p1ll_f16" => {
-                        let attribute = attribute(inst, &v.src[0])?;
-                        let val = match v.dst {
-                            Some(Operand::Vector { reg, .. }) => inst.write(Reg::V(reg)),
-                            _ => None,
-                        };
-                        first_halves.push((site, attribute, val));
+                        first_halves.push((site, attribute(inst, &v.src[0])?));
                     }
                     "v_interp_p2_f16" => {
                         let attribute = attribute(inst, &v.src[0])?;
@@ -474,47 +463,50 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             }
         }
     }
-    // Any `v_interp_p1*` half whose result is read by something other than a
-    // paired `Interp::Interpolated` second half (or that is unpaired) must
-    // evaluate on its own as `Interp::Weighted` so downstream reads succeed.
-    if !first_halves.is_empty() {
-        let interp_p2: std::collections::HashSet<Site> = io
-            .interps
-            .iter()
-            .filter_map(|&(s, ref k)| matches!(k, Interp::Interpolated { .. }).then_some(s))
-            .collect();
-        let mut outside_reads: std::collections::HashSet<Value> = std::collections::HashSet::new();
-        for (b, block) in p.blocks.iter().enumerate() {
-            for (i, inst) in block.insts.iter().enumerate() {
-                if !interp_p2.contains(&(b, i)) {
-                    for &(_, v) in &inst.reads {
-                        outside_reads.insert(v);
-                    }
-                }
+    if first_halves.is_empty() {
+        return Ok(io);
+    }
+    // A loaded i/j pair normally becomes one host interpolation: its first
+    // half need not be evaluated. A first half also read as data (or used
+    // without a second half) must keep P0 + i * P10. Follow phi uses too,
+    // without forcing ordinary pairs to read per-vertex attributes.
+    let folded: std::collections::HashSet<_> = io
+        .interps
+        .iter()
+        .filter_map(|(s, i)| matches!(i, Interp::Interpolated { .. }).then_some(*s))
+        .collect();
+    let mut used: std::collections::HashSet<_> = p
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(b, blk)| {
+            blk.insts
+                .iter()
+                .enumerate()
+                .map(move |(i, inst)| ((b, i), inst))
+        })
+        .filter(|(s, _)| !folded.contains(s))
+        .flat_map(|(_, inst)| inst.reads.iter().map(|r| r.1))
+        .collect();
+    loop {
+        let before = used.len();
+        for phi in p.blocks.iter().flat_map(|b| &b.phis) {
+            if used.contains(&phi.value) {
+                used.extend(&phi.args);
             }
         }
-        // Also propagate through phis that are read outside `interp_p2`.
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for block in &p.blocks {
-                for phi in &block.phis {
-                    if outside_reads.contains(&phi.value) {
-                        for &v in &phi.args {
-                            if outside_reads.insert(v) {
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-            }
+        if used.len() == before {
+            break;
         }
-        for (site, attribute, val) in first_halves {
-            if val.is_some_and(|v| outside_reads.contains(&v))
-                && !io.interps.iter().any(|(s, _)| *s == site)
-            {
-                io.interps.push((site, Interp::Weighted { attribute }));
-            }
+    }
+    for (site, attribute) in first_halves {
+        if !io.interps.iter().any(|(s, _)| *s == site)
+            && p.blocks[site.0].insts[site.1]
+                .writes
+                .iter()
+                .any(|w| used.contains(&w.1))
+        {
+            io.interps.push((site, Interp::Weighted { attribute }));
         }
     }
     Ok(io)

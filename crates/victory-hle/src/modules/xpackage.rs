@@ -71,12 +71,10 @@ fn package_bytes() -> u64 {
 type This = *const Object;
 
 extern "system" fn current_identifier(_: This, size: usize, buffer: *mut u8) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xpackage::current_identifier").enter(format_args!(""));
     put_string(&identifier(), size, buffer, std::ptr::null_mut())
 }
 
 extern "system" fn is_packaged(_: This) -> bool {
-    let _stall = victory_gpu::stall_site!("xpackage::is_packaged").enter(format_args!(""));
     true
 }
 
@@ -96,13 +94,12 @@ extern "system" fn create_monitor(
     _queue: *const c_void,
     out: *mut *const c_void,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xpackage::create_monitor").enter(format_args!(""));
     if !is_ours(id) {
         return NO_PACKAGE;
     }
     put(out, monitor())
 }
-extern "system" fn close_monitor(_: This, _: *const c_void) { let _stall = victory_gpu::stall_site!("xpackage::close_monitor").enter(format_args!("")); }
+extern "system" fn close_monitor(_: This, _: *const c_void) {}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +112,6 @@ pub struct Progress {
 }
 
 extern "system" fn progress(_: This, _: *const c_void, out: *mut Progress) {
-    let _stall = victory_gpu::stall_site!("xpackage::progress").enter(format_args!(""));
     let bytes = package_bytes();
     put(
         out,
@@ -137,8 +133,17 @@ extern "system" fn register_progress(
     _callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xpackage::register_progress").enter(format_args!(""));
     put(out, token())
+}
+
+/// The completed installation has no pending progress callbacks to wait for.
+extern "system" fn unregister_progress(
+    _: This,
+    _monitor: *const c_void,
+    _token: u64,
+    _wait: bool,
+) -> bool {
+    true
 }
 
 /// 0: ready.
@@ -153,7 +158,6 @@ extern "system" fn find_availability(
     _selectors: *const c_void,
     out: *mut u32,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xpackage::find_availability").enter(format_args!(""));
     if !is_ours(id) {
         return NO_PACKAGE;
     }
@@ -166,7 +170,6 @@ extern "system" fn change_order(
     _count: u32,
     _selectors: *const c_void,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xpackage::change_order").enter(format_args!(""));
     if is_ours(id) { S_OK } else { NO_PACKAGE }
 }
 
@@ -182,7 +185,6 @@ extern "system" fn install_chunks_async(
     _suppress_confirmation: bool,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xpackage::install_chunks_async").enter(format_args!(""));
     let result = if is_ours(id) {
         Ok(xasync::bytes(monitor()))
     } else {
@@ -195,7 +197,6 @@ extern "system" fn install_chunks_result(
     block: *mut AsyncBlock,
     out: *mut *const c_void,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xpackage::install_chunks_result").enter(format_args!(""));
     xasync::result(block, (&raw const INSTALL).cast(), out)
 }
 
@@ -208,7 +209,6 @@ extern "system" fn estimate_download(
     bytes: *mut u64,
     confirm: *mut bool,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xpackage::estimate_download").enter(format_args!(""));
     if !is_ours(id) {
         return NO_PACKAGE;
     }
@@ -228,21 +228,18 @@ extern "system" fn uninstall_chunks(
     _count: u32,
     _selectors: *const c_void,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xpackage::uninstall_chunks").enter(format_args!(""));
     if is_ours(id) { S_OK } else { NO_PACKAGE }
 }
 
 /// Mount handles only come from mounting another package, and there is
 /// none.
 extern "system" fn mount_path(_: This, _: *const c_void, _: usize, _: *mut u8) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xpackage::mount_path").enter(format_args!(""));
     xasync::E_INVALIDARG
 }
-extern "system" fn close_mount(_: This, _: *const c_void) { let _stall = victory_gpu::stall_site!("xpackage::close_mount").enter(format_args!("")); }
+extern "system" fn close_mount(_: This, _: *const c_void) {}
 
 /// Only other packages are uninstalled this way, and none is installed.
 extern "system" fn uninstall_package(_: This, id: *const c_char) -> bool {
-    let _stall = victory_gpu::stall_site!("xpackage::uninstall_package").enter(format_args!(""));
     tracing::info!(
         id = text(id).unwrap_or_default(),
         "package uninstall refused"
@@ -253,7 +250,6 @@ extern "system" fn uninstall_package(_: This, id: *const c_char) -> bool {
 static MOUNT: u8 = 0;
 
 extern "system" fn mount_async(_: This, id: *const c_char, block: *mut AsyncBlock) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xpackage::mount_async").enter(format_args!(""));
     tracing::info!(
         id = text(id).unwrap_or_default(),
         "package mount: not installed"
@@ -265,7 +261,6 @@ extern "system" fn mount_result(
     block: *mut AsyncBlock,
     out: *mut *const c_void,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xpackage::mount_result").enter(format_args!(""));
     xasync::result(block, (&raw const MOUNT).cast(), out)
 }
 
@@ -279,7 +274,6 @@ extern "system" fn enumerate(
     _context: *mut c_void,
     _callback: *const c_void,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xpackage::enumerate").enter(format_args!(""));
     tracing::debug!(kind, "packages enumerated: none");
     S_OK
 }
@@ -295,7 +289,7 @@ static VTABLE: Methods<40> = Methods([
     progress as *const (),              // 0x38
     missing::<8> as *const (),          // 0x40 update a monitor
     register_progress as *const (),     // 0x48
-    missing::<10> as *const (),         // 0x50 unregister it
+    unregister_progress as *const (),   // 0x50
     missing::<11> as *const (),         // 0x58 user locale
     find_availability as *const (),     // 0x60
     missing::<13> as *const (),         // 0x68 enumerate chunk availability
@@ -331,6 +325,34 @@ static VTABLE: Methods<40> = Methods([
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn completed_installation_unregisters_progress_immediately() {
+        type Register =
+            extern "system" fn(This, *const c_void, *mut c_void, *const c_void, *mut u64) -> HRESULT;
+        type Unregister = extern "system" fn(This, *const c_void, u64, bool) -> bool;
+        extern "system" fn callback(_: *mut c_void, _: *const c_void) {}
+
+        let this: This = &OBJECT;
+        let register = method::<Register>(&OBJECT, 0x48);
+        assert_eq!(VTABLE.0[0x50 / 8], unregister_progress as *const ());
+        let unregister = method::<Unregister>(&OBJECT, 0x50);
+        for wait in [false, true] {
+            let mut token = 0;
+            assert_eq!(
+                register(
+                    this,
+                    monitor(),
+                    std::ptr::null_mut(),
+                    callback as *const c_void,
+                    &mut token
+                ),
+                S_OK
+            );
+            assert_ne!(token, 0);
+            assert!(unregister(this, monitor(), token, wait));
+        }
+    }
 
     #[test]
     fn the_installation_is_complete_and_alone() {

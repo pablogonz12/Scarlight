@@ -109,13 +109,6 @@ impl Source {
             s => vec![s],
         }
     }
-
-    /// Whether every path to this descriptor reads the resource heap itself
-    /// (an index the title made, not a table), when `heap` says so of a leaf.
-    pub fn heap_only(&self, heap: impl Fn(&Self) -> bool) -> bool {
-        let l = self.leaves();
-        !l.is_empty() && l.iter().all(|s| heap(s))
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,10 +142,6 @@ pub struct Resources {
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
     pub descriptors: Vec<Descriptor>,
-    /// The effective bytes of fixed loads through a built [`CODE`]
-    /// descriptor ([`Tracer::track`]'s `s_buffer_*` arm): the descriptor's
-    /// base plus the load's own byte offset, which can lie below the base.
-    pub code_reads: Vec<Address>,
     /// Direct descriptor sources with a draw-evaluable index.
     pub root_indexed_views: Vec<RootIndexedView>,
     /// User SGPRs holding root parameters: value on entry, layout index,
@@ -235,17 +224,17 @@ pub fn track(
     let mut offset_at =
         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
     for (b, block) in p.blocks.iter().enumerate() {
+        t.at.set(Some(b));
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
-            t.at.set(Some(site));
             let fail = |what| ShaderError::Unsupported {
                 offset: inst.machine.offset,
                 what,
             };
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
-            let mut descriptor = |op: &Operand, role| -> Result<Source, ShaderError> {
-                let source = t.descriptor(inst, op, site).map_err(fail)?;
+            let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
+                let source = t.descriptor(inst, op, b).map_err(fail)?;
                 // A descriptor the code keeps per lane ([`Tracer::lane_copies`])
                 // is the same in every lane: its loop is lowered as it stands
                 // and needs no proof.
@@ -258,12 +247,8 @@ pub fn track(
                 {
                     offset.push((v, load));
                 }
-                out.descriptors.push(Descriptor {
-                    site,
-                    role,
-                    source: source.clone(),
-                });
-                Ok(source)
+                out.descriptors.push(Descriptor { site, role, source });
+                Ok(())
             };
             match &inst.fields {
                 Fields::Image { rsrc, .. } if inst.name().starts_with("image_bvh") => {
@@ -287,45 +272,25 @@ pub fn track(
                             out.bvh.push((site, BvhNodes::Memory { word1, word3 }));
                         }
                         _ => {
-                            let _ = descriptor(rsrc, Role::Resource)?;
+                            descriptor(rsrc, Role::Resource)?;
                             out.bvh.push((site, BvhNodes::Resource));
                         }
                     }
                 }
                 Fields::Image { rsrc, sampler, .. } => {
-                    let _ = descriptor(rsrc, Role::Resource)?;
+                    descriptor(rsrc, Role::Resource)?;
                     if let Some(s) = sampler {
-                        let _ = descriptor(s, Role::Sampler)?;
+                        descriptor(s, Role::Sampler)?;
                     }
                 }
                 // Cache invalidations name a buffer's address space but do
                 // not read its descriptor; the host has no cache to drop.
                 Fields::Buffer { rsrc, .. } if !inst.name().ends_with("_inv") => {
-                    let _ = descriptor(rsrc, Role::Resource)?;
+                    descriptor(rsrc, Role::Resource)?
                 }
                 Fields::Buffer { .. } => {}
-                Fields::Smem {
-                    base,
-                    offset,
-                    soffset,
-                    ..
-                } if inst.name().starts_with("s_buffer_") => {
-                    let source = descriptor(base, Role::Resource)?;
-                    // A load through a descriptor built around the code
-                    // table reads the descriptor's base plus the load's own
-                    // byte offset, which can lie before the base (`s_sub_u32`
-                    // against `s_getpc_b64`): record the byte it reads, so
-                    // [`crate::emit::lower`] starts the table low enough.
-                    if let Source::Built { address, .. } = source
-                        && address.param == CODE
-                        && matches!(soffset, Operand::Scalar { code: NULL, .. })
-                    {
-                        out.code_reads.push(Address {
-                            param: CODE,
-                            offset: address.offset.wrapping_add(*offset as u32),
-                            dynamic: address.dynamic,
-                        });
-                    }
+                Fields::Smem { base, .. } if inst.name().starts_with("s_buffer_") => {
+                    descriptor(base, Role::Resource)?;
                 }
                 Fields::Smem {
                     base,
@@ -446,8 +411,8 @@ struct Tracer<'a> {
     meets: std::cell::RefCell<Meets>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
-    /// The block and instruction index of the access being traced ([`Self::live`]).
-    at: std::cell::Cell<Option<Site>>,
+    /// The block of the access being traced ([`Self::live`]).
+    at: std::cell::Cell<Option<usize>>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -872,7 +837,6 @@ impl<'a> Tracer<'a> {
             })) != Some(v)
             || f.abs != 0
             || f.neg != 0
-            || f.clamp
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -899,7 +863,6 @@ impl<'a> Tracer<'a> {
             && let Fields::Valu(f) = &inst.fields
             && f.abs == 0
             && f.neg == 0
-            && !f.clamp
             && f.sdwa.is_none()
             && f.dpp.is_none()
             && let Some(t) = f.src.first().and_then(|s| self.vterm(inst, s))
@@ -1150,29 +1113,24 @@ impl<'a> Tracer<'a> {
         self.address(lo, hi, extra)
     }
 
-    /// The lanes that execute `site` and read its operands: block reachability
-    /// plus any per-lane EXEC guard for vector instructions.
-    fn active(&self, site: Site, lanes: &Structured) -> Known {
-        let mut known = vec![(lanes.reach[site.0], true)];
-        if !matches!(self.inst(site).fields, Fields::Smem { .. })
-            && let Some(&Some(guard)) = lanes.guards.get(site.0).and_then(|g| g.get(site.1))
-        {
-            known.push((guard, true));
-        }
-        known
-    }
-
-    /// The source of the descriptor operand `op` of `inst`, at `at`.
-    fn descriptor(&self, inst: &Inst, op: &Operand, at: Site) -> Result<Source, &'static str> {
+    /// The source of the descriptor operand `op` of `inst`, in block `at`.
+    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
-        let words = (0..dwords)
+        let mut words = (0..dwords)
             .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
-        // Only the lanes that run the access read the descriptor.
-        let mut known = self.lanes.map(|l| self.active(at, l)).unwrap_or_default();
+        // A byte access through a buffer descriptor made raw reads what the
+        // descriptor's view does with a raw host view (VIctory upstream 0b35b7f).
+        if !inst.name().contains("format")
+            && let Some(raw) = self.made_raw(&words)
+        {
+            words = raw.to_vec();
+        }
+        // Only the lanes that reach the access read the descriptor.
+        let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
         self.classify(&words, &mut Vec::new(), &mut known)
     }
 
@@ -1241,9 +1199,6 @@ impl<'a> Tracer<'a> {
                 bits,
                 words: [w2, w3],
             });
-        }
-        if let Some(source) = self.raw_view(words) {
-            return Ok(source);
         }
         let loaded = |w: &Term| {
             matches!(*w, Term::Value(v)
@@ -1327,7 +1282,7 @@ impl<'a> Tracer<'a> {
         let (Some(at), Some(lanes)) = (self.at.get(), self.lanes) else {
             return t;
         };
-        let mut known = self.active(at, lanes);
+        let mut known = vec![(lanes.reach[at], true)];
         for _ in 0..MAX_JOINS {
             let Term::Value(v) = t else { break };
             let Some((block, i)) = self.phis[v.0 as usize] else {
@@ -1514,6 +1469,46 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// The words of a buffer descriptor that `words` makes raw, as the
+    /// FidelityFX upscaler's compiler does before byte accesses: the stride
+    /// (dword 1 bits 16-29) cleared, the record count times max(stride, 1),
+    /// out-of-bounds checking by bytes (dword 3 bits 28-29 set). The bounds
+    /// are then the view's size in bytes either way.
+    fn made_raw(&self, words: &[Term]) -> Option<[Term; 4]> {
+        let [w0, Term::Value(w1), Term::Value(w2), Term::Value(w3)] = *words else {
+            return None;
+        };
+        // `x op c` with `c` either side.
+        let with = |v: Value, name: &str, c: u32| match self.sop2(v, &[name])?.1 {
+            [x, Term::Const(k)] | [Term::Const(k), x] if k == c => Some(x),
+            _ => None,
+        };
+        let d1 = with(w1, "s_and_b32", 0xC000_FFFF)?;
+        let Term::Value(m3) = with(w3, "s_or_b32", 0x3000_0000)? else {
+            return None;
+        };
+        let d3 = with(m3, "s_and_b32", 0xCFFF_FFFF)?;
+        let [a, b] = self.sop2(w2, &["s_mul_i32"])?.1;
+        let max = |t: Term| match t {
+            Term::Value(s) => with(s, "s_max_u32", 1),
+            Term::Const(_) => None,
+        };
+        let (d2, field) = match (max(a), max(b)) {
+            (_, Some(f)) => (a, f),
+            (Some(f), None) => (b, f),
+            (None, None) => return None,
+        };
+        let Term::Value(field) = field else {
+            return None;
+        };
+        // s_bfe_u32: offset 16, width 14.
+        let (_, [x, Term::Const(0x000E_0010)]) = self.sop2(field, &["s_bfe_u32"])? else {
+            return None;
+        };
+        (x == d1).then_some([w0, d1, d2, d3])
+    }
+
+
     /// For a `v_readfirstlane_b32` result: the VGPR value it reads.
     fn first_lane_source(&self, v: Value) -> Option<Value> {
         let inst = self.def(v)?;
@@ -1633,7 +1628,6 @@ impl<'a> Tracer<'a> {
             && let Fields::Valu(f) = &inst.fields
             && f.abs == 0
             && f.neg == 0
-            && !f.clamp
             && f.sdwa.is_none()
             && f.dpp.is_none()
             && let Some(t) = f.src.first().and_then(|s| self.raw(inst, s))
@@ -2119,48 +2113,6 @@ impl<'a> Tracer<'a> {
         Ok(out)
     }
 
-    /// A loaded buffer descriptor the code views as a raw buffer, as the
-    /// FidelityFX upscaler's programs do before byte-addressed access: the
-    /// stride cleared (dword 1 bits 16-29), the record count multiplied (by
-    /// the stride, into bytes), the out-of-bounds mode set (dword 3 bits
-    /// 28-29). The base address and everything else stay as loaded, so it
-    /// is the loaded descriptor; the host reads it raw through its view.
-    fn raw_view(&self, words: &[Term]) -> Option<Source> {
-        const STRIDE: u32 = 0x3FFF_0000;
-        const OOB: u32 = 0x3000_0000;
-        let [w0, w1, w2, w3] = *words else {
-            return None;
-        };
-        let value = |t: Term| match t {
-            Term::Value(v) => Some(v),
-            Term::Const(_) => None,
-        };
-        let w1 = match self.sop2(value(w1)?, &["s_and_b32"]) {
-            Some((_, [x, Term::Const(m)] | [Term::Const(m), x])) if m | STRIDE == !0 => x,
-            _ => w1,
-        };
-        let w2 = match self.sop2(value(w2)?, &["s_mul_i32"]) {
-            Some((_, [x, _])) if self.loaded(&[w0, w1, x]).is_some() => x,
-            Some((_, [_, y])) => y,
-            None => w2,
-        };
-        let mut w3 = w3;
-        if let Some((_, [x, Term::Const(o)] | [Term::Const(o), x])) =
-            self.sop2(value(w3)?, &["s_or_b32"])
-            && o & !OOB == 0
-        {
-            w3 = x;
-        }
-        if let Some((_, [x, Term::Const(m)] | [Term::Const(m), x])) =
-            self.sop2(value(w3)?, &["s_and_b32"])
-            && m | OOB == !0
-        {
-            w3 = x;
-        }
-        let source = self.loaded(&[w0, w1, w2, w3])?;
-        (words != [w0, w1, w2, w3]).then_some(source)
-    }
-
     /// Consecutive dwords of one scalar load.
     fn loaded(&self, words: &[Term]) -> Option<Source> {
         let Term::Value(v0) = words[0] else {
@@ -2426,11 +2378,11 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
-    if inst.name() == "s_bfm_b32" && k == 0 {
-        // A bit field of constant width and offset (a sampler word, say).
-        let (width, at) = (lane_of(*src.first()?)?, lane_of(*src.get(1)?)?);
-        let ones = (1u32 << (width & 31)).wrapping_sub(1);
-        return Some(Moved::Const(ones << (at & 31)));
+    // A mask of S0 bits from bit S1, as the upscaler's compiler makes an
+    // immediate sampler's word.
+    if let ("s_bfm_b32", 0, [Operand::Const(w), Operand::Const(at)]) = (inst.name(), k, &src[..]) {
+        let (w, at) = (inline(*w)? & 31, inline(*at)? & 31);
+        return Some(Moved::Const(((1u32 << w) - 1) << at));
     }
     let src = src.first()?;
     match (inst.name(), *src) {
@@ -2444,11 +2396,12 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         // that has no inline form; fold more if descriptors need it.
         ("s_brev_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(x.reverse_bits())),
         ("s_not_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(!x)),
-        // 64-bit inline integers are sign-extended.
-        // Literals below 2^31: zero and sign extension agree.
-        ("s_mov_b64", Operand::Literal(x)) if (x as i32) >= 0 => {
+        // shortcut: a literal below 2^31, whose high dword is 0 whether the
+        // hardware extends it with zeros or with its sign.
+        ("s_mov_b64", Operand::Literal(x)) if x >> 31 == 0 => {
             Some(Moved::Const(if k == 0 { x } else { 0 }))
         }
+        // 64-bit inline integers are sign-extended.
         ("s_mov_b64", Operand::Const(c @ 128..=208)) => {
             let low = inline(c)?;
             Some(Moved::Const(if k == 0 {
@@ -2559,45 +2512,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_loaded_buffer_descriptor_viewed_raw_is_the_loaded_one() {
-        // As the FidelityFX upscaler's programs do (FSPX).
-        let mut words = vec![
-            0xBE8A_0304, // s_mov_b32 s10, s4
-            0xBE8B_0380, // s_mov_b32 s11, 0
-            0xF408_0305,
-            0xFA00_0160, // s_load_dwordx4 s[12:15], s[10:11], 0x160
-            0x938A_FF0D,
-            0x000E_0010, // s_bfe_u32 s10, s13, 0x000e0010 (the stride)
-            0x848A_810A, // s_max_u32 s10, s10, 1
-            0x870F_FF0F,
-            0xCFFF_FFFF, // s_and_b32 s15, s15, 0xcfffffff
-            0x930E_0A0E, // s_mul_i32 s14, s14, s10
-            0x880F_FF0F,
-            0x3000_0000, // s_or_b32 s15, s15, 0x30000000
-            0x870D_FF0D,
-            0xC000_FFFF, // s_and_b32 s13, s13, 0xc000ffff
-            0xE038_1000,
-            0x8003_0802, // buffer_load_dwordx4 v[8:11], v2, s[12:15], 0 offen
-            S_ENDPGM,
-        ];
-        let layout = [param(Table, 4, 1)];
-        let r = track_words(&words, &layout, HwStage::Cs);
-        assert_eq!(r.scalar, [((0, 2), at(0, 0x160))]);
-        assert_eq!(
-            r.descriptors[0].source,
-            Source::Loaded {
-                load: (0, 2),
-                first: 0
-            }
-        );
-        // A moved base address is another buffer.
-        words.insert(14, 0x800C_900C); // s_add_u32 s12, s12, 16
-        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let p = crate::ir::build(&code, false, 256).unwrap();
-        assert!(track(&p, &layout, HwStage::Cs, None).is_err());
-    }
-
-    #[test]
     fn root_descriptors_are_built_in_code() {
         let r = track_words(
             &[
@@ -2695,6 +2609,94 @@ pub(crate) mod tests {
             HwStage::Ps,
         );
         assert_eq!(r.scalar, [((0, 3), at(0, 0x20))]);
+    }
+
+    /// A VGPR a wave reduction used is free again after it: from the first
+    /// save on it holds parked scalars alone (an upscaler program parks a
+    /// constant buffer's descriptor that way).
+    #[test]
+    fn a_vgpr_used_before_holds_spilled_sgprs_from_its_first_save() {
+        let before = [
+            0x7E00_0281, // v_mov_b32 v0, 1
+            0x7E02_0300, // v_mov_b32 v1, v0
+        ];
+        let park = [
+            0xD761_0000,
+            0x0001_0609, // v_writelane_b32 v0, s9, 3
+            0xD760_0002,
+            0x0001_0700, // v_readlane_b32 s2, v0, 3
+            0xBE83_0380, // s_mov_b32 s3, 0
+        ];
+        let load = [
+            0xF40C_0001,
+            0xFA00_0020, // s_load_dwordx8 s[0:7], s[2:3], 0x20
+            S_ENDPGM,
+        ];
+        let words = [&before[..], &park, &load].concat();
+        let r = track_words(&words, &[param(Table, 9, 1)], HwStage::Ps);
+        assert_eq!(r.scalar, [((0, 5), at(0, 0x20))]);
+        // Still lane reads: a lane restored before it is saved, and a
+        // register with an ordinary use after the first save.
+        let restored_first = [&before[..], &park[2..4], &park[..2], &load].concat();
+        let used_after = [&before[..], &park, &before[1..], &load].concat();
+        for words in [restored_first, used_after] {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, true, 8).unwrap();
+            let insts = p.blocks.iter().flat_map(|b| &b.insts);
+            assert_eq!(insts.filter(|i| i.name() == "v_readlane_b32").count(), 1);
+        }
+    }
+
+    /// Two lanes hold a pair (a lane mask, say) and later one of them a
+    /// scalar, as in a water volume program that parks more than the lanes
+    /// of one VGPR hold: the pair still moves as one.
+    #[test]
+    fn a_lane_spilled_to_again_later_does_not_split_an_earlier_pair() {
+        let pair = [
+            0xD761_0000u32,
+            0x0001_0004, // v_writelane_b32 v0, s4, 0
+            0xD761_0000,
+            0x0001_0205, // v_writelane_b32 v0, s5, 1
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xD760_0004,
+            0x0001_0100, // v_readlane_b32 s4, v0, 0
+            0xD760_0005,
+            0x0001_0300, // v_readlane_b32 s5, v0, 1
+        ];
+        let scalar = [
+            0xD761_0000u32,
+            0x0001_0006, // v_writelane_b32 v0, s6, 0
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xD760_0006,
+            0x0001_0100, // v_readlane_b32 s6, v0, 0
+            S_ENDPGM,
+        ];
+        let moves = |words: &[u32]| {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, true, 8).unwrap();
+            let names: Vec<_> = p.blocks[0].insts.iter().map(|i| i.name()).collect();
+            assert!(!names.iter().any(|n| n.contains("lane")));
+            names.iter().filter(|n| **n == "s_mov_b64").count()
+        };
+        assert_eq!(moves(&[&pair[..], &scalar].concat()), 2);
+        // A restore both saves reach keeps the lane one scalar.
+        let joined = [
+            &pair[..4],
+            &[0xBF84_0002], // s_cbranch_scc0 past the second save
+            &scalar[..2],
+            &pair[4..],
+            &scalar[2..],
+        ]
+        .concat();
+        assert_eq!(moves_anywhere(&joined), 0);
+    }
+
+    fn moves_anywhere(words: &[u32]) -> usize {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 8).unwrap();
+        let insts = p.blocks.iter().flat_map(|b| &b.insts);
+        insts.filter(|i| i.name() == "s_mov_b64").count()
     }
 
     #[test]
@@ -2799,35 +2801,6 @@ pub(crate) mod tests {
         let a = r.scalar[0].1;
         assert_eq!((a.param, a.offset), (CODE, 4));
         assert!(a.dynamic.is_some(), "the lane's index is the computed term");
-    }
-
-    /// VOP3 integer `clamp` saturates, so a clamped add is no wrapping sum:
-    /// address analysis must not decompose one into the code's base plus an
-    /// index (`VIC-BT-010`, the resource side of project-flamingo #675).
-    #[test]
-    fn a_clamped_vector_add_is_not_wrapping_address_math() {
-        let r = track_words(
-            &[
-                0xBE82_1F00, // 0x00: s_getpc_b64 s[2:3]
-                0xD70F_8457, // v_add_co_u32 v87, s4, v74, s2, with clamp
-                0x0000_054A,
-                0xD528_0458,
-                0x0010_0680, // v_add_co_ci_u32 v88, s4, 0, s3, s4
-                0x7E0C_0557, // v_readfirstlane_b32 s6, v87
-                0x7E0E_0558, // v_readfirstlane_b32 s7, v88
-                0xF400_0203,
-                0xFA00_0000, // s_load_dword s8, s[6:7], 0x0
-                S_ENDPGM,
-            ],
-            &[],
-            HwStage::Cs,
-        );
-        assert_eq!(r.scalar.len(), 1);
-        let a = r.scalar[0].1;
-        assert_eq!(
-            a.param, MEMORY,
-            "a clamped add is not the code's base plus an index: {a:?}"
-        );
     }
 
     #[test]
@@ -2935,6 +2908,76 @@ pub(crate) mod tests {
         );
         assert_eq!(r.scalar, [((0, 2), at(0, 0)), ((0, 3), at(0, 0x10))]);
     }
+
+    /// The FidelityFX upscaler's byte accesses make a loaded buffer
+    /// descriptor raw first (stride cleared, records times stride, bounds
+    /// in bytes): the access reads the loaded descriptor. Any other change
+    /// still fails.
+    #[test]
+    fn a_descriptor_made_raw_is_the_loaded_one() {
+        let words = |mask: u32| -> Vec<u8> {
+            [
+                0xBE88_0304, // s_mov_b32 s8, s4
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xF408_0204,
+                0xFA00_0160, // s_load_dwordx4 s[8:11], s[8:9], 0x160
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x938C_FF09,
+                0x000E_0010, // s_bfe_u32 s12, s9, 0x000e0010
+                0x848C_810C, // s_max_u32 s12, s12, 1
+                0x8709_FF09,
+                mask, // s_and_b32 s9, s9, mask
+                0x870B_FF0B,
+                0xCFFF_FFFF, // s_and_b32 s11, s11, 0xcfffffff
+                0x930A_0C0A, // s_mul_i32 s10, s10, s12
+                0x880B_FF0B,
+                0x3000_0000, // s_or_b32 s11, s11, 0x30000000
+                0xE078_1000,
+                0x8002_0007, // buffer_store_dwordx4 v[0:3], v7, s[8:11], 0 offen
+                S_ENDPGM,
+            ]
+            .iter()
+            .flat_map(|w: &u32| w.to_le_bytes())
+            .collect()
+        };
+        let run = |mask| {
+            let p = crate::ir::build(&words(mask), false, 256).unwrap();
+            track(&p, &[param(Table, 4, 1)], HwStage::Cs, lanes(&p).as_ref())
+        };
+        assert!(run(0xC000_FFFF).is_ok());
+        assert_eq!(
+            run(0xC000_FFFE).unwrap_err(),
+            ShaderError::Unsupported {
+                offset: 0x3c,
+                what: "a descriptor changed after loading"
+            }
+        );
+    }
+
+    /// Immediate sampler words the upscaler's compiler makes with a bit
+    /// mask and a 64-bit move of a literal.
+    #[test]
+    fn sampler_words_from_bit_masks_and_wide_literals_are_constants() {
+        let code: Vec<u8> = [
+            0xB010_3092, // s_movk_i32 s16, 0x3092
+            0x9211_8C8C, // s_bfm_b32 s17, 12, 12
+            0xBE92_04FF,
+            0x1850_0000, // s_mov_b64 s[18:19], 0x18500000
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let layout = [param(Table, 4, 1)];
+        let t = Tracer::new(&p, &layout, HwStage::Cs, None).unwrap();
+        let block = &p.blocks[0];
+        let value = |n: usize, k: usize| t.origin(block.insts[n].writes[k].1);
+        assert_eq!(value(1, 0), Term::Const(0x00FF_F000));
+        assert_eq!(value(2, 0), Term::Const(0x1850_0000));
+        assert_eq!(value(2, 1), Term::Const(0));
+    }
+
 
     #[test]
     fn a_selection_that_mixes_two_descriptors_fails() {
@@ -4017,42 +4060,5 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
-    }
-
-    #[test]
-    fn guarded_image_sample_after_early_out_strip_tracks_only_active_edge() {
-        // Entry sets in_bounds = (s2 > v0) via v_cmpx and has an early-out `s_cbranch_execz`
-        // to S_ENDPGM. After `without_early_outs` strips that branch, `b_join` has `reach = TRUE`
-        // including the `!in_bounds` edge skipping `s_load_dwordx8 s[12:19]`; `Tracer::active`
-        // uses `image_sample_lz`'s `guard = in_bounds` to eliminate that edge cleanly.
-        let words: [u32; 19] = [
-            0xBE84_0300, // 0: s_mov_b32 s4, s0
-            0xBE85_0380, // 1: s_mov_b32 s5, 0
-            0xBE86_0301, // 2: s_mov_b32 s6, s1
-            0xBE87_0380, // 3: s_mov_b32 s7, 0
-            0xF408_0203, // 4..5: s_load_dwordx4 s[8:11], s[6:7], 0x0 (sampler)
-            0xFA00_0000,
-            0x7D88_0002, // 6: v_cmp_gt_u32 vcc, s2, v0 (in_bounds into vcc)
-            0xBE95_3C6A, // 7: s_and_saveexec_b32 s21, vcc (exec shares the exact `in_bounds` mask)
-            0xBF88_0009, // 8: s_cbranch_execz -> +9 words (18: S_ENDPGM)
-            0xBF86_0002, // 9: s_cbranch_vccz -> +2 words (12: skip image load when !in_bounds)
-            0xF40C_0302, // 10..11: s_load_dwordx8 s[12:19], s[4:5], 0x0 (image)
-            0xFA00_0000,
-            0xF09C_0F08, // 12..13: image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
-            0x0043_0C02,
-            0xF408_0A02, // 14..15: s_load_dwordx4 s[40:43], s[4:5], 0x40
-            0xFA00_0040,
-            0xE070_1000, // 16..17: buffer_store_dword v12, v16, s[40:43], 0 offen
-            0x800A_0C10,
-            0xBF81_0000, // 18: s_endpgm
-        ];
-        let code: Vec<u8> = words.iter().flat_map(|x| x.to_le_bytes()).collect();
-        let p = crate::ir::build(&code, false, 256).unwrap();
-        let eo = crate::ir::without_early_outs(&p).expect("early-out stripped");
-        let st = crate::structure::structure(&eo).unwrap();
-        let layout = [param(Table, 0, 1), param(Table, 1, 1)];
-        let r = track(&eo, &layout, HwStage::Cs, Some(&st))
-            .expect("guard in active() should prune the !in_bounds edge after early-out strip");
-        assert_eq!(r.descriptors.len(), 3);
     }
 }

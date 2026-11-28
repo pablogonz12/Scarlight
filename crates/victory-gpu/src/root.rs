@@ -78,6 +78,45 @@ fn host_export(cache: &OnceLock<Option<usize>>, name: &CStr) -> Option<usize> {
     })
 }
 
+/// The host's serializer refused a description the title made for the
+/// console's, whose serializer takes it (a flag the host runtime does not
+/// know: Windows 10's in-box runtime refuses the directly indexed heap
+/// flags, #168). The title then has a failure and no blob, which its code
+/// may not check, so the refusal is logged with the host's reason.
+fn note_refusal(hr: HRESULT, flags: u32, error: *mut *mut c_void) {
+    if hr >= 0 {
+        return;
+    }
+    // SAFETY: `error` is the title's out pointer, nulled before the host's
+    // call; the host put its blob there or left it null.
+    let blob = (!error.is_null())
+        .then(|| unsafe { *error })
+        .filter(|b| !b.is_null());
+    #[cfg(windows)]
+    let why = blob.and_then(|b| {
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::Interface;
+        // SAFETY: the host's blob, alive until the title releases it.
+        unsafe { ID3DBlob::from_raw_borrowed(&b) }.map(crate::pipeline::host::blob_text)
+    });
+    #[cfg(not(windows))]
+    let why = blob.map(|_| String::new());
+    tracing::warn!(
+        hr = format_args!("{hr:#x}"),
+        flags = format_args!("{flags:#x}"),
+        why = why.as_deref().unwrap_or(""),
+        "host refused the title's root signature"
+    );
+}
+
+/// Nulls the title's error out pointer, so a refusal's blob is the host's.
+fn clear(error: *mut *mut c_void) {
+    if !error.is_null() {
+        // SAFETY: the title's out pointer.
+        unsafe { *error = std::ptr::null_mut() };
+    }
+}
+
 fn without_console_flags(desc: Desc) -> Desc {
     if desc.flags & CONSOLE_FLAGS != 0 {
         tracing::debug!(
@@ -107,15 +146,13 @@ pub extern "system" fn serialize(
         tracing::warn!("no host d3d12.dll to serialize root signatures");
         return E_NOTIMPL;
     };
+    let desc = without_console_flags(desc);
+    clear(error);
     // SAFETY: the export has this signature; it takes what the title passed.
-    unsafe {
-        std::mem::transmute::<usize, Serialize>(address)(
-            &without_console_flags(desc),
-            version,
-            blob,
-            error,
-        )
-    }
+    let hr =
+        unsafe { std::mem::transmute::<usize, Serialize>(address)(&desc, version, blob, error) };
+    note_refusal(hr, desc.flags, error);
+    hr
 }
 
 /// `d3d12_xs!D3D12SerializeVersionedRootSignature`.
@@ -137,8 +174,12 @@ pub extern "system" fn serialize_versioned(
         desc: without_console_flags(desc.desc),
         ..desc
     };
+    clear(error);
     // SAFETY: the export has this signature; it takes what the title passed.
-    unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) }
+    let hr =
+        unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) };
+    note_refusal(hr, desc.desc.flags, error);
+    hr
 }
 
 type Deserialize =
@@ -154,7 +195,10 @@ pub extern "system" fn create_deserializer(
     iid: *const Iid,
     out: *mut *mut c_void,
 ) -> HRESULT {
-    if blob.is_null() || out.is_null() {
+    // The host dereferences the interface id without checking it, so a null
+    // one is answered here instead of crashing there; an empty blob is
+    // malformed and rejected the same way.
+    if blob.is_null() || size == 0 || iid.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
     static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
@@ -215,7 +259,218 @@ static FUNCTIONS: Table<24> = {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::{S_OK, slot};
+    use crate::object::{E_NOINTERFACE, E_POINTER, S_FALSE, S_OK, slot};
+
+    /// An interface we do not implement.
+    const OTHER_IID: Iid = guid(0x5a5a_5a5a, 0x5a5a, 0x5a5a, [0x5a; 8]);
+
+    /// The shim hands the blob to the host unchanged; `create` keeps it, so
+    /// any bytes serve.
+    const BLOB: [u8; 4] = [0x01, 0x02, 0x03, 0x04];
+
+    fn created(iid: &Iid) -> This {
+        let mut out = std::ptr::null();
+        let hr = create(
+            std::ptr::null(),
+            0,
+            BLOB.as_ptr(),
+            BLOB.len(),
+            iid,
+            &mut out,
+        );
+        assert_eq!(hr, S_OK);
+        assert!(!out.is_null());
+        out
+    }
+
+    /// The host's structures, field for field (64-bit layout).
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn descriptions_keep_the_pc_layout() {
+        assert_eq!(std::mem::size_of::<Desc>(), 40);
+        assert_eq!(std::mem::offset_of!(Desc, parameter_count), 0);
+        assert_eq!(std::mem::offset_of!(Desc, parameters), 8);
+        assert_eq!(std::mem::offset_of!(Desc, sampler_count), 16);
+        assert_eq!(std::mem::offset_of!(Desc, samplers), 24);
+        assert_eq!(std::mem::offset_of!(Desc, flags), 32);
+        assert_eq!(std::mem::size_of::<VersionedDesc>(), 48);
+        assert_eq!(std::mem::offset_of!(VersionedDesc, version), 0);
+        assert_eq!(std::mem::offset_of!(VersionedDesc, desc), 8);
+    }
+
+    #[test]
+    fn console_flags_are_dropped_and_the_rest_kept() {
+        assert_eq!(CONSOLE_FLAGS, 0xff00_0000);
+        let desc = Desc {
+            parameter_count: 2,
+            parameters: BLOB.as_ptr().cast(),
+            sampler_count: 1,
+            samplers: BLOB.as_ptr().cast(),
+            flags: 0xffff_ffff,
+        };
+        let plain = without_console_flags(desc);
+        assert_eq!(plain.flags, 0x00ff_ffff);
+        assert_eq!((plain.parameter_count, plain.sampler_count), (2, 1));
+        assert!(std::ptr::eq(plain.parameters, desc.parameters));
+        assert!(std::ptr::eq(plain.samplers, desc.samplers));
+
+        let low = Desc {
+            flags: 0x00ab_cdef,
+            ..desc
+        };
+        assert_eq!(without_console_flags(low).flags, 0x00ab_cdef);
+        let none = Desc { flags: 0, ..desc };
+        assert_eq!(without_console_flags(none).flags, 0);
+    }
+
+    #[test]
+    fn serializers_reject_a_null_description() {
+        let mut blob = std::ptr::null_mut();
+        let mut error = std::ptr::null_mut();
+        assert_eq!(
+            serialize(std::ptr::null(), 1, &mut blob, &mut error),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            serialize_versioned(std::ptr::null(), &mut blob, &mut error),
+            E_INVALIDARG
+        );
+        assert!(blob.is_null() && error.is_null());
+    }
+
+    /// A null `riid` used to be forwarded to the host, which dereferences it
+    /// (an access violation in `d3d12.dll`); an empty blob is malformed.
+    #[test]
+    fn deserializer_creation_rejects_missing_arguments() {
+        let iid = ROOT_SIGNATURE_IIDS[0];
+        let mut out = std::ptr::null_mut();
+        assert_eq!(
+            create_deserializer(std::ptr::null(), BLOB.len(), &iid, &mut out),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            create_deserializer(BLOB.as_ptr(), BLOB.len(), std::ptr::null(), &mut out),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            create_deserializer(BLOB.as_ptr(), 0, &iid, &mut out),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            create_deserializer(BLOB.as_ptr(), BLOB.len(), &iid, std::ptr::null_mut()),
+            E_INVALIDARG
+        );
+        assert!(out.is_null());
+    }
+
+    #[test]
+    fn creating_a_root_signature_checks_its_arguments() {
+        let iid = ROOT_SIGNATURE_IIDS[0];
+        let mut out = std::ptr::null();
+        assert_eq!(
+            create(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                BLOB.len(),
+                &iid,
+                &mut out
+            ),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            create(std::ptr::null(), 0, BLOB.as_ptr(), 0, &iid, &mut out),
+            E_INVALIDARG
+        );
+        assert!(out.is_null());
+
+        // An unknown interface is dropped, and the answer is null.
+        assert_eq!(
+            create(
+                std::ptr::null(),
+                0,
+                BLOB.as_ptr(),
+                BLOB.len(),
+                &OTHER_IID,
+                &mut out
+            ),
+            E_NOINTERFACE
+        );
+        assert!(out.is_null());
+        assert_eq!(
+            create(
+                std::ptr::null(),
+                0,
+                BLOB.as_ptr(),
+                BLOB.len(),
+                std::ptr::null(),
+                &mut out
+            ),
+            E_NOINTERFACE
+        );
+        assert!(out.is_null());
+
+        // Nowhere to write means the title only asked whether creation works.
+        assert_eq!(
+            create(
+                std::ptr::null(),
+                0,
+                BLOB.as_ptr(),
+                BLOB.len(),
+                &iid,
+                std::ptr::null_mut()
+            ),
+            S_FALSE
+        );
+    }
+
+    #[test]
+    fn every_known_interface_creates_a_working_object() {
+        let root = created(&ROOT_SIGNATURE_IIDS[0]);
+        let query = slot::<extern "system" fn(This, *const Iid, *mut This) -> HRESULT>(root, 0);
+        for iid in &ROOT_SIGNATURE_IIDS {
+            let mut out = std::ptr::null();
+            assert_eq!(query(root, iid, &mut out), S_OK);
+            assert!(std::ptr::eq(out, root));
+            assert_eq!(object::release(out), 1, "the original reference remains");
+        }
+        let mut out = std::ptr::null();
+        assert_eq!(query(root, &OTHER_IID, &mut out), E_NOINTERFACE);
+        assert!(out.is_null());
+        assert_eq!(query(root, std::ptr::null(), &mut out), E_NOINTERFACE);
+        assert_eq!(
+            query(root, &ROOT_SIGNATURE_IIDS[0], std::ptr::null_mut()),
+            E_POINTER
+        );
+        assert_eq!(object::release(root), 0);
+    }
+
+    #[test]
+    fn the_table_has_the_object_and_device_child_slots() {
+        let root = created(&ROOT_SIGNATURE_IIDS[1]);
+        // SetPrivateDataInterface is the one object method left out.
+        assert_eq!(
+            slot::<extern "system" fn() -> HRESULT>(root, 0x28)(),
+            E_NOTIMPL
+        );
+        assert_eq!(
+            slot::<extern "system" fn(This, *const u16) -> HRESULT>(root, 0x30)(
+                root,
+                std::ptr::null()
+            ),
+            S_OK
+        );
+        // GetDevice: an unknown interface is answered, not dereferenced.
+        let mut device = std::ptr::null();
+        let get_device =
+            slot::<extern "system" fn(This, *const Iid, *mut This) -> HRESULT>(root, 0x38);
+        assert_eq!(
+            get_device(root, std::ptr::null(), &mut device),
+            E_NOINTERFACE
+        );
+        assert!(device.is_null());
+        assert_eq!(object::release(root), 0);
+    }
 
     /// One 32-bit constant at b0, serialized by the host, then created.
     #[cfg(windows)]
@@ -297,6 +552,43 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
     }
 
+    /// A flag the host runtime does not know: the title gets the host's
+    /// failure, no blob and the host's reason, as from Windows 10's in-box
+    /// runtime for the directly indexed heap flags (#168).
+    #[cfg(windows)]
+    #[test]
+    fn host_refusals_reach_the_title() {
+        use crate::object::E_INVALIDARG;
+        let desc = VersionedDesc {
+            version: 2,
+            desc: Desc {
+                parameter_count: 0,
+                parameters: std::ptr::null(),
+                sampler_count: 0,
+                samplers: std::ptr::null(),
+                flags: 0x0080_0001,
+            },
+        };
+        let mut blob = std::ptr::null_mut();
+        let mut error = std::ptr::dangling_mut::<c_void>();
+        assert_eq!(
+            serialize_versioned(&desc, &mut blob, &mut error),
+            E_INVALIDARG
+        );
+        assert!(blob.is_null());
+        assert!(!error.is_null());
+        let error = error.cast_const().cast::<Object>();
+        let data = slot::<extern "system" fn(This) -> *const u8>(error, 0x18)(error);
+        let size = slot::<extern "system" fn(This) -> usize>(error, 0x20)(error);
+        // SAFETY: the host's blob, `size` bytes.
+        let text = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(data, size) });
+        assert!(
+            text.contains("Unsupported bit-flag set (root signature flags 800001)"),
+            "{text}"
+        );
+        slot::<extern "system" fn(This) -> u32>(error, 0x10)(error);
+    }
+
     /// Version 1.0 through the versioned entry point, with a console flag.
     #[cfg(windows)]
     #[test]
@@ -320,5 +612,49 @@ mod tests {
             serialize_versioned(std::ptr::null(), &mut blob.cast_mut().cast(), &mut error),
             E_INVALIDARG
         );
+    }
+
+    /// Truncated and nonsense blobs reach the host, which rejects them
+    /// without writing an object.
+    #[cfg(windows)]
+    #[test]
+    fn malformed_blobs_are_rejected_by_the_host() {
+        use windows::Win32::Graphics::Direct3D12::ID3D12RootSignatureDeserializer;
+        use windows::core::Interface;
+        let desc = VersionedDesc {
+            version: 1,
+            desc: Desc {
+                parameter_count: 0,
+                parameters: std::ptr::null(),
+                sampler_count: 0,
+                samplers: std::ptr::null(),
+                flags: 1,
+            },
+        };
+        let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
+        assert_eq!(serialize_versioned(&desc, &mut blob, &mut error), S_OK);
+        let blob = blob.cast_const().cast::<Object>();
+        let data = slot::<extern "system" fn(This) -> *const u8>(blob, 0x18)(blob);
+        let size = slot::<extern "system" fn(This) -> usize>(blob, 0x20)(blob);
+        let iid: Iid = ID3D12RootSignatureDeserializer::IID.to_u128().to_be_bytes();
+        let iid = guid(
+            u32::from_be_bytes(iid[0..4].try_into().unwrap()),
+            u16::from_be_bytes(iid[4..6].try_into().unwrap()),
+            u16::from_be_bytes(iid[6..8].try_into().unwrap()),
+            iid[8..16].try_into().unwrap(),
+        );
+        let mut out = std::ptr::null_mut();
+        assert_eq!(
+            create_deserializer(data, size - 1, &iid, &mut out),
+            E_INVALIDARG
+        );
+        assert!(out.is_null());
+        let garbage = [0xffu8; 64];
+        assert_eq!(
+            create_deserializer(garbage.as_ptr(), garbage.len(), &iid, &mut out),
+            E_INVALIDARG
+        );
+        assert!(out.is_null());
+        slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
     }
 }

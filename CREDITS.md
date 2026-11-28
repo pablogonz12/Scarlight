@@ -423,3 +423,117 @@ D
 - **loyodea**, Belobug/VIctory-Belobug-AMD `a31fa6cbf`, GPL-3.0: reject zero translation worker counts and test CLI validation.
 - **sawetco**, Belobug/VIctory-Belobug-AMD commit 4fd34fdd6, GPL-3.0: follow unchanged scalar joins when removing wave64 early-out skips.
 - **Venom**, [VIctory #3503](https://github.com/Marvisak/VIctory/pull/3503), GPL-3.0: reuse the matching shadow buffer entry during lookup.
+
+- **crashbashash**, VIctory-proton Linux branch (GPL-3.0): Proton integration, Linux launcher, memory and rendering optimizations.
+- **Belobug (beloooo)** and contributors, VIctory-Belobug-AMD (GPL-3.0): AMD-oriented renderer and compatibility core. All original commit authors are preserved in history.
+
+## Imported fork history contributors
+
+The following authors appear in the source history relative to the Scarlight base; original history remains available in the source repository.
+
+- local <local@localhost>
+- crashbashash <109347317+crashbashash@users.noreply.github.com>
+- beloooo <belobug69@gmail.com>
+- gomeaw <163130210+gomeaw@users.noreply.github.com>
+- feanorsun <59348287+feanorsun@users.noreply.github.com>
+- Vyacheslav Venglovsky <vyacheslav.venglovsky@gmail.com>
+- 给伊莉雅补魔 <98532177+geiyiliyabumo@users.noreply.github.com>
+- icecreammule277-dot <360389640+icecreammule277-dot@users.noreply.github.com>
+- Duff <19514584+Dufftwt@users.noreply.github.com>
+- quaternion <quaternion@lumina.software>
+- LF2000 Builder <builder@lf2000.local>
+- Lux-Designs <battledogegames@gmail.com>
+- Maraco91 <43787609+Maraco91@users.noreply.github.com>
+- Noname0202 <marta.indra2002@gmail.com>
+- loyodea <114196242+loyodea@users.noreply.github.com>
+- Andrea Bugeja <25248102+arogan178@users.noreply.github.com>
+- AnoHunted <360473103+AnoHunted@users.noreply.github.com>
+- BastienRdz <58186763+BastienRodz@users.noreply.github.com>
+- EatCodeSleep2 <52021568+EatCodeSleep2@users.noreply.github.com>
+- IronMan <tec.alan.andreani@gmail.com>
+- TG0000 <122870448+TG0000@users.noreply.github.com>
+- Tex <kwintjanleenders@gmail.com>
+- Yoshi-233 <76078963+Yoshi-233@users.noreply.github.com>
+- adrianmjim <11887815+adrianmjim@users.noreply.github.com>
+- fxceless <36782933+fxceless@users.noreply.github.com>
+- jaschinski97-ops <232683647+jaschinski97-ops@users.noreply.github.com>
+- marquezini <felipemarquesini10@gmail.com>
+- zhu1025960209-web <255052750+zhu1025960209-web@users.noreply.github.com>
+- BlueDragonReal <matijamesic1234@gmail.com>
+- ESAT <esatgani_41@hotmail.com>
+- Enzo Souza Duarte <enzosouzaduarte6@outlook.com>
+- Luiz Neves <luizgustavobenicio@gmail.com>
+- Manuel Pérez <manuelperezardanuy@gmail.com>
+- Marvis <marvis@noreply.invalid>
+- Serph91P <maximilianebert1991@gmail.com>
+- TinkerBell-90 <131240361+TinkerBell-90@users.noreply.github.com>
+- UwUCammie <UwUCammie@users.noreply.github.com>
+- alexdeliu <240865807+alexdeliu@users.noreply.github.com>
+- nathanbzrr <nbezerradev@gmail.com>
+- sharan104 <36886295+sharan104@users.noreply.github.com>
+- zocram4cc <79211006+zocram4cc@users.noreply.github.com>
+- Adika713 <Adika713@users.noreply.github.com>
+- AgneyaK <82705373+AgneyaK@users.noreply.github.com>
+- AlanQiang0418 <alanqiang@outlook.com>
+- Aws <aliaws123@outlook.com>
+- BE29ZZ <146044690+BE29ZZ@users.noreply.github.com>
+- BaggyALPHA <257889696+BaggyALPHA@users.noreply.github.com>
+- Bloxive <ptmshu23@gmail.com>
+- Calvix2k <calvinhebben1@gmail.com>
+- Christian Thackston <christian@thackston.dev>
+- David Palacios <97840947+dpalacios69@users.noreply.github.com>
+- Devin <devin@users.invalid>
+- Diego <diegofreire8482@hotmail.com>
+- Diogo Sousa <128872698+SousaTrashBin@users.noreply.github.com>
+- DocBlack89 <22809438+DocBlack89@users.noreply.github.com>
+- DoubleD17 <48109637+DoubleD17@users.noreply.github.com>
+- Eduardo Bertozzi <bertozzidudu@gmail.com>
+- FIocker <4461558+FIocker@users.noreply.github.com>
+- FictionHub <ktpservices029@gmail.com>
+- FrancescoGelosoEterea <francescogeloso890@gmail.com>
+- Fuzeofficial <141716957+fuzeofficlal@users.noreply.github.com>
+- Giuseppe Rainone <giusepperainone64@gmail.com>
+- HailLucifer666 <acarghyachowdhury25@gmail.com>
+- Jake <jake.radcliff@verizon.net>
+- KoLolX3 <94136289+KoLolX3@users.noreply.github.com>
+- Ludovic Tourniquet <254161373+lerapeurdu62280-debug@users.noreply.github.com>
+- Luiz Gustavo Benicio Neves <luizgustavobenicio@gmail.com>
+- Luiz Otavio Mello de Campos <luizotaviomello82@gmail.com>
+- Maledetto <20729264+Makto94@users.noreply.github.com>
+- Mekamb_ <grubyogon10@gmail.com>
+- Muhammad Salman Barkat <144205612+SalmanBarkat@users.noreply.github.com>
+- Mumogg <104529023+Mumogg@users.noreply.github.com>
+- Nixitov <125388985+Nixitov@users.noreply.github.com>
+- NuraadGit <NuraadGit@users.noreply.github.com>
+- Omeya Sawant <omeyasawant1999@gmail.com>
+- Oğuz Akın <oguzzakin@gmail.com>
+- Pedro Fortunato <pedrofortunato@MacBook-Pro-de-Pedro.local>
+- SlopComp <360476765+SlopComp@users.noreply.github.com>
+- Thomas Askharoun <151990913+askharoun@users.noreply.github.com>
+- Vax <vaximous@gmail.com>
+- WellyngtonSantos <98568556+WellyngtonSantos@users.noreply.github.com>
+- ashrafsdrop <waker17752@gmail.com>
+- avatarmanz <64326402+avatarmanz@users.noreply.github.com>
+- borntofrag <borntofrag34@yahoo.com>
+- broccolize <203913429+broccolize@users.noreply.github.com>
+- bvtterbroot <157503259+bvtterbroot@users.noreply.github.com>
+- divyeshganta <divyeshganta@gmail.com>
+- fluffyflattershy-afk <fluffy.flattershy@gmail.com>
+- fuzeofficial <bochunran@gmail.com>
+- heromike405-arch <heromike405@gmail.com>
+- hussainmussa <hussainmussa@users.noreply.github.com>
+- imjustprism <69634294+imjustprism@users.noreply.github.com>
+- justrealyme <82029927+justrealyme@users.noreply.github.com>
+- lloyd <nichlloyd@gmail.com>
+- mattkajorinc <mattkajorinc@users.noreply.github.com>
+- mgunes1311-lab <mgunes.1311@gmail.com>
+- moe-miau <noreply@users.noreply.github.com>
+- nino-exe <173394600+nino-exe@users.noreply.github.com>
+- pes7 <pes7@users.noreply.github.com>
+- pgm1207 <104554896+pgm1207@users.noreply.github.com>
+- ryotdev <360374475+ryotdev@users.noreply.github.com>
+- sawetco <44127741+sawetco@users.noreply.github.com>
+- slatefield <supermanfan7@proton.me>
+- tedin7 <tommasoderosa94@gmail.com>
+- victory-local <local@victory.invalid>
+- warmooff-ops <warmo.off@gmail.com>

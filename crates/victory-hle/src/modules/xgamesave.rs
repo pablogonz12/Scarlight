@@ -135,7 +135,9 @@ fn valid_container(name: &str) -> bool {
 /// A committed version of a container.
 struct Version {
     dir: PathBuf,
-    number: u64,
+    /// The highest version number any entry in the container's folder
+    /// carries, readable or not; the next commit goes above it.
+    highest: u64,
     name: String,
     display: String,
     /// Blob names; blob `i` is the file `i`.
@@ -177,38 +179,73 @@ fn parse_manifest(bytes: &[u8]) -> Option<Vec<String>> {
     (out.len() >= 2).then_some(out)
 }
 
-/// The container's newest committed version, if any. Removes what a crash
-/// left: unfinished versions and older ones.
+/// The number of a version folder exactly as [`commit`] names it (`v1`,
+/// `v2`, ...); `None` for anything else, such as `v01`, `v+1` or `v0`.
+fn version_number(file: &str) -> Option<u64> {
+    let n = file.strip_prefix('v')?.parse::<u64>().ok()?;
+    (n > 0 && format!("v{n}") == file).then_some(n)
+}
+
+/// The names in version folder `dir`: container, display, blobs; `None` if
+/// its manifest is missing or does not parse.
+fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
+    let bytes = match std::fs::read(dir.join(MANIFEST)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let Some(mut names) = parse_manifest(&bytes) else {
+        return Ok(None);
+    };
+    let blobs = names.split_off(2);
+    let [name, display] = <[String; 2]>::try_from(names).expect("two names, checked by the parser");
+    Ok(Some((name, display, blobs)))
+}
+
+/// The container's newest readable committed version, if any. Removes what
+/// a crash left: unfinished versions, and versions older than that one.
+/// An unreadable newer folder (a stray, or a broken manifest) is neither
+/// taken nor removed, and never costs the version below it.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let mut committed = Vec::new();
+    let mut highest = 0;
     for entry in std::fs::read_dir(dir)?.flatten() {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
             std::fs::remove_dir_all(entry.path())?;
-        } else if let Some(n) = file.strip_prefix('v').and_then(|n| n.parse::<u64>().ok()) {
-            committed.push(n);
+        } else if let Some(n) = version_number(&file) {
+            highest = highest.max(n);
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                committed.push(n);
+            }
         }
     }
-    committed.sort_unstable();
-    let Some(&number) = committed.last() else {
+    committed.sort_unstable_by(|a, b| b.cmp(a));
+    if committed.is_empty() {
         return Ok(None);
-    };
-    for old in &committed[..committed.len() - 1] {
-        std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
     }
-    let version = dir.join(format!("v{number}"));
-    let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
-    let mut names = parse_manifest(&std::fs::read(version.join(MANIFEST))?).ok_or_else(bad)?;
-    let blobs = names.split_off(2);
-    let [name, display] = <[String; 2]>::try_from(names).map_err(|_| bad())?;
-    Ok(Some(Version {
-        dir: version,
-        number,
-        name,
-        display,
-        blobs,
-    }))
+    for (at, &number) in committed.iter().enumerate() {
+        let version = dir.join(format!("v{number}"));
+        let Some((name, display, blobs)) = load(&version)? else {
+            continue;
+        };
+        for old in &committed[at + 1..] {
+            std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+        }
+        return Ok(Some(Version {
+            dir: version,
+            highest,
+            name,
+            display,
+            blobs,
+        }));
+    }
+    // Versions exist but none reads: keep them all, and refuse.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "no save version has a readable manifest",
+    ))
 }
 
 /// The version of container `name` in `dir`; none for a missing container
@@ -256,8 +293,9 @@ fn commit(
         match source {
             Source::Data(data) => write(path, data)?,
             // Files are never changed in place, so sharing one is safe.
-            Source::Kept(from) => std::fs::hard_link(from, &path)
-                .or_else(|_| std::fs::copy(from, &path).map(drop))?,
+            Source::Kept(from) => {
+                std::fs::hard_link(from, &path).or_else(|_| write(path, &std::fs::read(from)?))?
+            }
         }
         step();
     }
@@ -470,7 +508,7 @@ impl Update {
         }
         let display = self.display.as_deref();
         let display = display.or(current.as_ref().map(|v| v.display.as_str()));
-        let number = current.as_ref().map_or(1, |v| v.number + 1);
+        let number = current.as_ref().map_or(1, |v| v.highest + 1);
         if let Err(e) = commit(&self.dir, number, &self.name, display.unwrap_or(""), &blobs) {
             return io_error(&self.dir, &e);
         }
@@ -624,7 +662,6 @@ extern "system" fn initialize_async(
     _sync_on_demand: bool,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgamesave::initialize_async").enter(format_args!(""));
     let saves = runtime::title().saves();
     let result = if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
         Err(NO_ACCESS)
@@ -638,11 +675,9 @@ extern "system" fn initialize_result(
     block: *mut AsyncBlock,
     out: *mut *mut Provider,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgamesave::initialize_result").enter(format_args!(""));
     xasync::result(block, (&raw const INIT).cast(), out)
 }
 extern "system" fn close_provider(_: This, provider: *mut Provider) {
-    let _stall = victory_gpu::stall_site!("xgamesave::close_provider").enter(format_args!(""));
     take(provider);
 }
 
@@ -651,14 +686,12 @@ extern "system" fn quota_async(
     provider: *const Provider,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgamesave::quota_async").enter(format_args!(""));
     let result = get(provider)
         .ok_or(E_INVALIDARG)
         .map(|p| xasync::bytes(p.remaining() as i64));
     xasync::finished_with(block, (&raw const QUOTA_CALL).cast(), result)
 }
 extern "system" fn quota_result(_: This, block: *mut AsyncBlock, out: *mut i64) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgamesave::quota_result").enter(format_args!(""));
     xasync::result(block, (&raw const QUOTA_CALL).cast(), out)
 }
 
@@ -668,7 +701,6 @@ extern "system" fn delete_async(
     name: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgamesave::delete_async").enter(format_args!(""));
     let hr = match (get(provider), text(name)) {
         (Some(p), Some(name)) if valid_container(&name) => delete(&p.root, &name),
         (Some(_), Some(_)) => INVALID_CONTAINER_NAME,
@@ -677,7 +709,6 @@ extern "system" fn delete_async(
     xasync::finished(block, (&raw const DELETE).cast(), hr)
 }
 extern "system" fn delete_result(_: This, block: *mut AsyncBlock) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgamesave::delete_result").enter(format_args!(""));
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const DELETE).cast(), 0, none, none.cast())
 }
@@ -691,7 +722,6 @@ extern "system" fn container_info(
     context: *mut c_void,
     callback: Option<ContainerCallback>,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgamesave::container_info").enter(format_args!(""));
     let (Some(p), Some(name), Some(callback)) = (get(provider), text(name), callback) else {
         return E_INVALIDARG;
     };
@@ -708,7 +738,6 @@ extern "system" fn enumerate_containers(
     context: *mut c_void,
     callback: Option<ContainerCallback>,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgamesave::enumerate_containers").enter(format_args!(""));
     let (Some(p), Some(callback)) = (get(provider), callback) else {
         return E_INVALIDARG;
     };
@@ -723,7 +752,6 @@ extern "system" fn create_container(
     name: *const c_char,
     out: *mut *mut Container,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgamesave::create_container").enter(format_args!(""));
     let (Some(p), Some(name)) = (get(provider), text(name)) else {
         return E_INVALIDARG;
     };
@@ -733,7 +761,6 @@ extern "system" fn create_container(
     put(out, give(p.container(&name)))
 }
 extern "system" fn close_container(_: This, container: *mut Container) {
-    let _stall = victory_gpu::stall_site!("xgamesave::close_container").enter(format_args!(""));
     take(container);
 }
 
@@ -744,7 +771,6 @@ extern "system" fn enumerate_blobs(
     context: *mut c_void,
     callback: Option<BlobCallback>,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgamesave::enumerate_blobs").enter(format_args!(""));
     let (Some(c), Some(callback)) = (get(container), callback) else {
         return E_INVALIDARG;
     };
@@ -775,7 +801,6 @@ extern "system" fn read_blobs(
     size: usize,
     out: *mut u8,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgamesave::read_blobs").enter(format_args!(""));
     let Some(c) = get(container) else {
         return E_INVALIDARG;
     };
@@ -803,7 +828,6 @@ extern "system" fn read_async(
     count: u32,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgamesave::read_async").enter(format_args!(""));
     let result = match get(container) {
         Some(c) => read(c, names(blob_names, count)).map(|blobs| layout(&blobs, 0)),
         None => Err(E_INVALIDARG),
@@ -817,7 +841,6 @@ extern "system" fn read_result(
     out: *mut u8,
     count: *mut u32,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgamesave::read_result").enter(format_args!(""));
     let mut used = 0;
     let hr = xasync::XAsyncGetResult(block, (&raw const READ).cast(), size, out.cast(), &mut used);
     // The documented error for a small buffer; the result stays for a
@@ -853,7 +876,6 @@ extern "system" fn create_update(
     display: *const c_char,
     out: *mut *mut Update,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgamesave::create_update").enter(format_args!(""));
     let Some(c) = get(container) else {
         return E_INVALIDARG;
     };
@@ -868,7 +890,6 @@ extern "system" fn create_update(
     )
 }
 extern "system" fn close_update(_: This, update: *mut Update) {
-    let _stall = victory_gpu::stall_site!("xgamesave::close_update").enter(format_args!(""));
     take(update);
 }
 
@@ -879,7 +900,6 @@ extern "system" fn write_blob(
     data: *const u8,
     size: usize,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgamesave::write_blob").enter(format_args!(""));
     // SAFETY: a handle we gave out; the title does not use it concurrently.
     let (Some(update), Some(name)) = (unsafe { update.as_mut() }, text(name)) else {
         return E_INVALIDARG;
@@ -901,7 +921,6 @@ extern "system" fn write_blob(
 }
 
 extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgamesave::delete_blob").enter(format_args!(""));
     // SAFETY: as in `write_blob`.
     match (unsafe { update.as_mut() }, text(name)) {
         (Some(update), Some(name)) if !name.is_empty() => {
@@ -913,12 +932,10 @@ extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char
 }
 
 extern "system" fn submit_async(_: This, update: *const Update, block: *mut AsyncBlock) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgamesave::submit_async").enter(format_args!(""));
     let hr = get(update).map_or(E_INVALIDARG, Update::submit);
     xasync::finished(block, (&raw const SUBMIT).cast(), hr)
 }
 extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgamesave::submit_result").enter(format_args!(""));
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const SUBMIT).cast(), 0, none, none.cast())
 }
@@ -1090,6 +1107,37 @@ mod tests {
         }
     }
 
+    /// A kept blob that cannot be hard-linked (NTFS allows 1024 links to a
+    /// file) is copied into the new version with its exact bytes.
+    #[cfg(windows)]
+    #[test]
+    fn a_kept_blob_past_the_link_limit_is_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+            S_OK
+        );
+        const NTFS: &str = "the temp folder must be on NTFS, which allows 1024 links to a file";
+        let old_b = container_dir(root, "Slot").join("v1").join("1");
+        for i in 0..1023 {
+            std::fs::hard_link(&old_b, links.path().join(i.to_string())).expect(NTFS);
+        }
+        let full = std::fs::hard_link(&old_b, links.path().join("full")).expect_err(NTFS);
+        assert_eq!(full.kind(), std::io::ErrorKind::TooManyLinks, "{NTFS}");
+
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK);
+
+        let new = (
+            "two".into(),
+            vec![("a".into(), "new a".into()), ("b".into(), "old b".into())],
+        );
+        assert_eq!(state(root), Some(new));
+        assert!(!old_b.exists());
+        assert_eq!(std::fs::read(links.path().join("0")).unwrap(), b"old b");
+    }
+
     #[test]
     fn names_are_exact() {
         for name in ["Save_1", "slot/2", "a.b c%", "\u{e9}t\u{e9}"] {
@@ -1161,7 +1209,7 @@ mod tests {
             ]
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
-        assert_eq!((v.number, v.display.as_str()), (1, "Chapter 1"));
+        assert_eq!((v.dir.file_name(), v.display.as_str()), (Some("v1".as_ref()), "Chapter 1"));
     }
 
     /// An empty configuration id names none. As a folder name it would be
@@ -1247,7 +1295,6 @@ mod tests {
         // A new provider sees the container and reads both blobs back.
         let provider = give(Provider::open(saves.path(), Some("scid")).unwrap());
         extern "system" fn seen(info: *const ContainerInfo, context: *mut c_void) -> bool {
-            let _stall = victory_gpu::stall_site!("xgamesave::seen").enter(format_args!(""));
             // SAFETY: valid during the callback; the context is the test's vector.
             let (info, out) = unsafe {
                 (
@@ -1373,5 +1420,73 @@ mod tests {
         assert!(found.is_empty());
         close_container(this, container);
         close_provider(this, provider);
+    }
+
+    /// Only `v<N>` as `commit` writes it is a version: `v01` and the like
+    /// are neither read, counted nor removed (#870).
+    #[test]
+    fn a_noncanonical_folder_does_not_remove_a_committed_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+        let slot = container_dir(root, "Slot");
+        for stray in ["v01", "v001", "v+1", "v0", "v02"] {
+            std::fs::create_dir(slot.join(stray)).unwrap();
+        }
+        assert_eq!(state(root), old_state());
+        assert!(slot.join("v1").is_dir());
+        for stray in ["v01", "v001", "v+1", "v0", "v02"] {
+            assert!(slot.join(stray).exists(), "{stray} was removed");
+        }
+    }
+
+    /// A newer version folder that does not read (an empty folder, a file,
+    /// a broken manifest) neither hides the committed save, nor removes it,
+    /// nor blocks the next update, which goes above it.
+    #[test]
+    fn an_unreadable_newer_version_does_not_cost_the_save() {
+        type Make = fn(&Path);
+        let strays: [(&str, Make); 3] = [
+            ("empty folder", |p| std::fs::create_dir(p).unwrap()),
+            ("file", |p| std::fs::write(p, b"not a version").unwrap()),
+            ("broken manifest", |p| {
+                std::fs::create_dir(p).unwrap();
+                std::fs::write(p.join(MANIFEST), [9, 0, 0, 0, b'x']).unwrap();
+            }),
+        ];
+        for (what, make) in strays {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+            let slot = container_dir(root, "Slot");
+            make(&slot.join("v2"));
+
+            assert_eq!(state(root), old_state(), "{what}: read");
+            assert!(slot.join("v1").is_dir(), "{what}: v1 was removed");
+
+            assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK, "{what}: update");
+            let blobs = vec![("a".into(), "new a".into()), ("b".into(), "old b".into())];
+            let after = Some(("two".into(), blobs));
+            assert_eq!(state(root), after, "{what}: after the update");
+            assert!(slot.join("v3").is_dir(), "{what}: the update did not go above v2");
+            // Read again: the new version stays the container.
+            assert_eq!(state(root), after, "{what}: second read");
+        }
+    }
+
+    /// With no readable version at all, reads and updates fail and nothing
+    /// is removed.
+    #[test]
+    fn no_readable_version_is_refused_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("old a"))]), S_OK);
+        let slot = container_dir(root, "Slot");
+        std::fs::write(slot.join("v1").join(MANIFEST), [1, 2, 3]).unwrap();
+        let c = Provider { root: root.into() }.container("Slot");
+        assert_eq!(read(&c, None).err(), Some(NO_ACCESS));
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), NO_ACCESS);
+        assert!(slot.join("v1").join("0").is_file());
+        assert!(!slot.join("v2").exists());
     }
 }

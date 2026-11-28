@@ -1,5 +1,7 @@
 //! Survey shader containers: bitcode, console additions and native code.
 
+pub(crate) mod scan;
+
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -23,16 +25,7 @@ impl Source<'_> {
     pub(crate) fn bytes(&self) -> Option<Cow<'_, [u8]>> {
         match self {
             Source::Raw { data, .. } => Some(Cow::Borrowed(data)),
-            Source::Packed(record) => {
-                let mut bytes = record.unpack()?;
-                // The unpacked record can extend past the DXBC container:
-                // key and translate the container's own bytes, as a
-                // standalone copy of it has them.
-                if let Ok(container) = Container::parse(&bytes) {
-                    bytes.truncate(container.as_bytes().len());
-                }
-                Some(Cow::Owned(bytes))
-            }
+            Source::Packed(r) => r.unpack().map(Cow::Owned),
         }
     }
 
@@ -51,13 +44,12 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     if sgd5::is_sgd5(data) {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
-    let raw = memchr::memmem::find_iter(data, b"DXBC").filter_map(|offset| {
-        let container = Container::parse(&data[offset..]).ok()?;
-        Some(Source::Raw {
+    let raw = memchr::memmem::find_iter(data, b"DXBC")
+        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
+        .map(|offset| Source::Raw {
             offset,
-            data: container.as_bytes(),
-        })
-    });
+            data: &data[offset..],
+        });
     out.extend(raw);
     out
 }
@@ -84,22 +76,9 @@ struct Totals {
 pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let mut t = Totals::default();
+    let mut scan = scan::FileScan::new(MAX_FILE, verbose);
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if entry.metadata().map(|m| m.len()).unwrap_or(0) > MAX_FILE {
-                eprintln!("skipping large file {}", path.display());
-                continue;
-            }
-            let Ok(data) = std::fs::read(path) else {
-                continue;
-            };
+        for (path, data) in scan.files(root) {
             let mut found_here = 0;
             for source in sources(&data) {
                 let Some(bytes) = source.bytes() else {
@@ -111,18 +90,23 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                 };
                 found_here += 1;
                 t.containers += 1;
-                let dxil = container.part(FourCC::DXIL);
+                let dxil = container.part(FourCC::DXIL).or(container.part(FourCC::ACCC));
                 t.with_dxil_part += usize::from(dxil.is_some());
                 let program = dxil.and_then(|p| DxilProgram::parse(p.data).ok());
                 let mut listing = Vec::new();
                 // Independent of the bitcode: titles may strip it.
-                let native = match victory_shader::program_part(&container).map(native_programs) {
+                let native = match dxil.map(|p| native_programs(p.data)) {
                     Some(Ok(programs)) if !programs.is_empty() => {
                         t.with_native += 1;
                         let mut list = Vec::new();
                         for n in &programs {
                             *t.native_stages.entry(n.stage).or_default() += 1;
                             list.push(format!("{:?} {} B", n.stage, n.code.len()));
+                            if disasm {
+                                listing.push(format!("    {:?} stage I/O: {:?}", n.stage, n.io));
+                                listing.extend(n.layout.iter().map(|p| format!("    {p:?}")));
+                                listing.extend(n.used.iter().map(|u| format!("    {u:?}")));
+                            }
                             match gfx10::decode(&n.code) {
                                 Ok(insts) => {
                                     t.decoded += 1;
@@ -132,9 +116,6 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                                         *t.unnamed.entry(key).or_default() += 1;
                                     }
                                     if disasm {
-                                        listing
-                                            .extend(n.layout.iter().map(|p| format!("    {p:?}")));
-                                        listing.extend(n.used.iter().map(|u| format!("    {u:?}")));
                                         listing.extend(
                                             insts.iter().map(|i| format_instruction(i, n.wave64)),
                                         );
@@ -179,7 +160,9 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     None => "no parsable DXIL program".to_owned(),
                 } + &native;
                 if verbose {
-                    println!("{}{}: {line}", path.display(), source.label());
+                    // As a run's log and a replay name it (`hash=`).
+                    let hash = blake3::hash(&bytes).to_hex();
+                    println!("{}{} #{}: {line}", path.display(), source.label(), &hash[..16]);
                     for l in &listing {
                         println!("{l}");
                     }
@@ -224,6 +207,7 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
     if t.containers == 0 {
         println!("(none found: shaders may sit in compressed or encrypted archives)");
     }
+    println!("{scan}");
     Ok(())
 }
 
@@ -234,56 +218,4 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A minimal container: one `SFI0` part of `n` bytes.
-    fn container(n: usize) -> Vec<u8> {
-        let total = 0x20 + 4 + 8 + n;
-        let mut out = Vec::with_capacity(total);
-        out.extend_from_slice(b"DXBC");
-        out.extend_from_slice(&[0; 16]);
-        out.extend_from_slice(&1u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&(total as u32).to_le_bytes());
-        out.extend_from_slice(&1u32.to_le_bytes());
-        out.extend_from_slice(&0x24u32.to_le_bytes());
-        out.extend_from_slice(b"SFI0");
-        out.extend_from_slice(&(n as u32).to_le_bytes());
-        out.extend(std::iter::repeat_n(0x5A, n));
-        out
-    }
-
-    /// A container packed in an `SGD5` record whose unpacked payload runs on
-    /// past the container's declared length keys on the container's bytes,
-    /// as its standalone copy does; the junk after it is not part of it.
-    #[test]
-    fn a_packed_shader_keys_on_its_declared_container_bytes() {
-        let shader = container(44);
-        let payload = [shader.as_slice(), &[0; 16]].concat();
-        // Stored DEFLATE blocks, so the payload needs no compressor.
-        let mut packed = Vec::new();
-        for (last, block) in [(0u8, &payload[..2]), (1, &payload[2..])] {
-            let len = block.len() as u16;
-            packed.push(last);
-            packed.extend_from_slice(&len.to_le_bytes());
-            packed.extend_from_slice(&(!len).to_le_bytes());
-            packed.extend_from_slice(block);
-        }
-        let record_size = packed.len() as u32 + 12;
-        let mut archive = b"prefixSGD5\x02A\x00\x32".to_vec();
-        for field in [record_size, 0x000D_DCE7, record_size, payload.len() as u32] {
-            archive.extend_from_slice(&field.to_le_bytes());
-        }
-        archive.extend_from_slice(&packed);
-
-        let sources = sources(&archive);
-        let bytes: Vec<_> = sources.iter().filter_map(|s| s.bytes()).collect();
-        assert_eq!(bytes.len(), 1, "one packed record");
-        assert_eq!(bytes[0].as_ref(), shader.as_slice(), "the container's own bytes");
-        assert_eq!(blake3::hash(&bytes[0]), blake3::hash(&shader), "the standalone hash");
-    }
 }

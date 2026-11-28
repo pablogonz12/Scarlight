@@ -3,15 +3,6 @@
 //! Resolution order for each value: environment variable, then the config
 //! file (`VICTORY_CONFIG`, else `./victory.toml`), then the default.
 //! See `victory.example.toml` at the repository root.
-//!
-//! Per-title profiles (see [`crate::profile`]) are read from the first of
-//! these that holds one for the image being run:
-//! `VICTORY_PROFILE_DIR`, `%APPDATA%\victory\titles`,
-//! `$XDG_CONFIG_HOME/victory/titles` (or `~/.config/victory/titles`), else
-//! `%LOCALAPPDATA%\victory\titles` (the cache's parent, for a system with
-//! none of those variables). A Windows build under Wine reaches the
-//! last two through the `Z:` drive; the `Z:` form of a POSIX path is tried
-//! before the path itself, so both spellings work.
 
 use std::path::{Path, PathBuf};
 
@@ -19,12 +10,13 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::policy::ensure_outside_repo;
-use crate::profile::Profile;
 
 #[derive(Debug, Default, Clone)]
 pub struct Config {
     /// The user's dump of the title.
     pub game_dir: Option<PathBuf>,
+    /// Folder containing the PC FidelityFX upscaler for the optional FSR profile.
+    pub fidelityfx_dir: Option<PathBuf>,
     /// Root for all derived data. Always outside the repository.
     pub cache_dir: PathBuf,
     /// What titles write and must keep (persistent local storage). Never
@@ -32,9 +24,6 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Other titles used to exercise platform-level code.
     pub test_titles: Vec<PathBuf>,
-    /// Where per-title profiles are read from, in priority order (never the
-    /// repository).
-    pub profile_dirs: Vec<PathBuf>,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
 }
@@ -50,6 +39,7 @@ struct FileConfig {
 #[serde(deny_unknown_fields)]
 struct FilePaths {
     game_dir: Option<PathBuf>,
+    fidelityfx_dir: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     #[serde(default)]
@@ -59,7 +49,7 @@ struct FilePaths {
 impl Config {
     /// Loads configuration from the environment and the config file.
     pub fn load() -> Result<Self> {
-        let explicit = std::env::var_os("VICTORY_CONFIG").map(PathBuf::from);
+        let explicit = explicit_config_path(|k| std::env::var_os(k));
         let path = explicit
             .clone()
             .unwrap_or_else(|| PathBuf::from("victory.toml"));
@@ -104,15 +94,12 @@ impl Config {
         let data_dir = env_path("VICTORY_DATA_DIR")
             .or(file.data_dir)
             .map_or_else(|| default_dir("data"), Ok)?;
-        // Profiles are found through the user's shell environment or inside
-        // the Wine prefix, not beside whichever victory.toml was passed.
-        let profile_dirs = profile_dirs(&env);
         Ok(Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
+            fidelityfx_dir: env_path("VICTORY_FIDELITYFX_DIR").or(file.fidelityfx_dir),
             cache_dir,
             data_dir,
             test_titles,
-            profile_dirs,
             source,
         })
     }
@@ -123,14 +110,6 @@ impl Config {
             "no game directory configured: set VICTORY_GAME_DIR or [paths].game_dir in \
              victory.toml (see victory.example.toml)",
         )
-    }
-
-    /// The profile for an image whose BLAKE3 is `blake3_hex`: the first one
-    /// found in [`Config::profile_dirs`], in priority order.
-    pub fn title_profile(&self, blake3_hex: &str) -> Option<Profile> {
-        self.profile_dirs
-            .iter()
-            .find_map(|dir| crate::profile::for_build(dir, blake3_hex))
     }
 
     /// Returns `<cache>/<sub>`, creating it, after checking the asset policy.
@@ -144,40 +123,12 @@ impl Config {
     }
 }
 
-/// The directories profiles are read from, in priority order: the
-/// environment, the roaming AppData, then the user's config directory.
-fn profile_dirs(env: &impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<PathBuf> {
-    let env_path = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(dir) = env_path(crate::profile::DIR_ENV) {
-        dirs.push(dir);
-    }
-    if let Some(appdata) = env_path("APPDATA") {
-        dirs.push(appdata.join("victory").join("titles"));
-    }
-    let config_home =
-        env_path("XDG_CONFIG_HOME").or_else(|| env_path("HOME").map(|home| home.join(".config")));
-    if let Some(config_home) = config_home {
-        dirs.extend(dir_aliases(&config_home.join("victory").join("titles")));
-    }
-    if dirs.is_empty() {
-        // Profiles are optional: a system that names no home at all runs
-        // without them rather than failing to start.
-        if let Ok(dir) = default_dir("titles") {
-            dirs.push(dir);
-        }
-    }
-    dirs
-}
-
-/// `dir`, plus how a Windows build reaches it under Wine: the same absolute
-/// POSIX path through the `Z:` drive, tried first.
-fn dir_aliases(dir: &Path) -> Vec<PathBuf> {
-    #[cfg(windows)]
-    if let Some(rest) = dir.to_string_lossy().strip_prefix('/') {
-        return vec![PathBuf::from(format!("Z:\\{}", rest.replace('/', "\\"))), dir.to_owned()];
-    }
-    vec![dir.to_owned()]
+/// The config file explicitly named by the environment, if any. An empty
+/// `VICTORY_CONFIG` means unset, like the other path variables.
+fn explicit_config_path(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    env("VICTORY_CONFIG")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
@@ -238,55 +189,6 @@ mod tests {
     }
 
     #[test]
-    fn profile_dirs_are_env_then_appdata_then_xdg_config() {
-        let env = |k: &str| match k {
-            "VICTORY_PROFILE_DIR" => Some(OsString::from("from-env")),
-            "APPDATA" => Some(OsString::from("appdata")),
-            "XDG_CONFIG_HOME" => Some(OsString::from("xdg")),
-            _ => None,
-        };
-        let cfg = Config::resolve(FilePaths::default(), None, env).unwrap();
-        assert_eq!(cfg.profile_dirs[0], PathBuf::from("from-env"));
-        let appdata = Path::new("appdata").join("victory").join("titles");
-        let xdg = Path::new("xdg").join("victory").join("titles");
-        let at = |dir: &Path| cfg.profile_dirs.iter().position(|d| d == dir);
-        assert!(at(&appdata) > Some(0));
-        assert!(at(&xdg) > at(&appdata));
-    }
-
-    #[test]
-    fn profiles_are_optional_on_a_system_that_names_no_home() {
-        let env = |_: &str| None;
-        let cfg = Config::resolve(FilePaths::default(), None, env).unwrap();
-        assert!(cfg.title_profile("0123456789abcdef").is_none());
-    }
-
-    #[test]
-    fn profile_dirs_fall_back_to_the_home_config_directory() {
-        let env = |k: &str| (k == "HOME").then(|| OsString::from("home"));
-        let cfg = Config::resolve(FilePaths::default(), None, env).unwrap();
-        let want = Path::new("home")
-            .join(".config")
-            .join("victory")
-            .join("titles");
-        assert!(cfg.profile_dirs.iter().any(|d| d == &want));
-        assert!(cfg.profile_dirs.len() <= 2);
-    }
-
-    #[test]
-    fn a_windows_build_also_tries_the_z_drive_form() {
-        // Only a Windows build can use `Z:`; elsewhere the plain path is all
-        // there is, and both spellings must not be searched twice.
-        let env = |k: &str| (k == "XDG_CONFIG_HOME").then(|| OsString::from("/home/x/.config"));
-        let cfg = Config::resolve(FilePaths::default(), None, env).unwrap();
-        let z = cfg
-            .profile_dirs
-            .iter()
-            .any(|d| d.to_string_lossy().starts_with("Z:"));
-        assert_eq!(z, cfg!(windows));
-    }
-
-    #[test]
     fn test_titles_env_splits_paths() {
         let value = std::env::join_paths(["first", "second"]).unwrap();
         let file = FilePaths::default();
@@ -295,6 +197,17 @@ mod tests {
         assert_eq!(
             cfg.test_titles,
             vec![PathBuf::from("first"), PathBuf::from("second")]
+        );
+    }
+
+    #[test]
+    fn empty_config_env_is_ignored() {
+        let empty = |k: &str| (k == "VICTORY_CONFIG").then(OsString::new);
+        assert_eq!(explicit_config_path(empty), None);
+        let set = |k: &str| (k == "VICTORY_CONFIG").then(|| OsString::from("custom.toml"));
+        assert_eq!(
+            explicit_config_path(set),
+            Some(PathBuf::from("custom.toml"))
         );
     }
 
