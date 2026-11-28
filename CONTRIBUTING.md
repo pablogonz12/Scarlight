@@ -81,7 +81,7 @@ Install your distribution's `clang` package as well (`clang` on Arch, `clang` on
 `clang` via `xcode-select` on macOS); `cargo xwin` drives it as the cross linker.
 
 The Wine/Proton/vkd3d-proton setup that runs here is in the [quick start](README.md#quick-start) and
-[docs/linux.md](docs/linux.md).
+[docs/linux-proton.md](docs/linux-proton.md).
 
 **On Windows** (MSVC):
 

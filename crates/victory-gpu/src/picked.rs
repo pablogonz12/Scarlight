@@ -1,468 +1,388 @@
-//! Of a declared range, only the 64 KiB pages the shaders wrote are
-//! compared (`VICTORY_PICKED_WRITES=1`; off by default).
+//! Buffers shaders write through views they pick from the heap by an index
+//! they compute (`VICTORY_PICKED_WRITES`; off by default, [`stage`]).
 //!
-//! A submission declares the ranges its unordered-access views cover, and
-//! every byte of them is compared with the copy's bytes from before it
-//! (`crate::shadow::find_all`): a title buffer's views are declared whole,
-//! so a shader that sets a few words of a 24 MB buffer costs a compare of
-//! 24 MB. Most of a declared range was not written. Which pages were is
-//! learned from the compares themselves: a page that differed is looked at
-//! again every time, on the ground that a page written once is written
-//! again; of the others, one page in [`slice`] is looked at each time, in
-//! turn, so that every page of a range is looked at once in 64 submissions
-//! and nothing stays missed. The turn is the pass's, not a range's
-//! (`next_turn`): every page of every span of a submission is looked at on
-//! the same rule, so a copy with two spans in one submission covers both.
-//! Ranges of at most [`slice`] pages are compared whole: the rotation would
-//! find a change there late for no saving.
+//! Which views a draw or dispatch writes through is known from its tables
+//! and root parameters, and their ranges are declared: what is written there
+//! comes back to title memory (`Shadow::gpu_writes`). A view picked by an
+//! index out of a buffer, per lane, names any of the heap's. What was
+//! written through one stayed on the card: title memory, and the title's own
+//! copies and textures made from it, never saw it, and a refresh of its 64
+//! KiB put title memory's older bytes over it. (Captures replay1 and
+//! replay2: `[compute 82a2ad6d07417d36]` writes 4.6 MB a frame of a 24 MB
+//! buffer so.) To declare all such a shader could write would be 987 MB of
+//! 573 buffers for every list that runs one.
 //!
-//! What is found late is not landed late, and nothing is lost, as long as
-//! the page's bytes and their reference stay as they are between looks:
-//! the compare reads the copy against its snapshot, and a page left out
-//! keeps both, so the difference is still there when its turn comes and is
-//! then put back into title memory as any other (`Shadow::copy_back`). That
-//! is why only pages whose snapshot piece is *kept* and current are left
-//! out (`Shadow::baseline_pages`: `VICTORY_KEEP_SNAPSHOTS=1`, a piece
-//! taken whole and not taken again since), and why unwatched memory, which
-//! a refresh copies whole, is never left out.
+//! Two things make it small. The compare on the card says what changed since
+//! the last time it looked, whoever wrote it and whenever: looking now and
+//! then misses no buffer, it only finds it later. And a buffer that was
+//! written so once is written so again. So with a submission that has a
+//! shader that stores through a picked view ([`stores_picked`])
 //!
-//! The idea, the rotation and the numbers are
-//! avatarmanz/VIctory-7900XTX's (`VICTORY_PICKED_WRITES`, 69 -> 6 ms of
-//! page compares a frame); this is the same scheme over our compares.
+//! - the buffers found written that way ([`found`]) are declared: compared
+//!   and landed with the submission, as any declared write;
+//! - of the others that the heap shows unordered views of the next [`slice`]
+//!   in turn, once a frame, is compared, and nothing else: at 32 MB all of
+//!   them in some 30 frames. Where something changed that nobody declared,
+//!   the buffer is one of the first kind from then on.
+//!
+//! What is found late is not landed late: the title may have other things in
+//! that memory by then. It goes to title memory with the next declared write
+//! to its 64 KiB. So what is written once, into a buffer not found yet, stays
+//! on the card as before.
+//!
+//! The declarations are the submission's, made when its refreshes are done
+//! (`Host::submit`): no refresh of it finds a range closed on their account.
+//!
+//! Only copies in the card's memory: for those in the PC's, a declared range
+//! is a snapshot and a compare on the CPU. (They hold 55 MB of the 987.)
+//!
+//! What it costs: the hashing of the slice and of the buffers found, and
+//! what changed of the latter coming back. What else changes: a step on the
+//! CPU that reads a buffer found waits for the flight, as it should always
+//! have done.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-/// The pages of title memory a compare cuts a range into: the 64 KiB
-/// pieces the copy-back works in (`crate::shadow`).
-pub(crate) const PAGE: usize = 64 << 10;
+use crate::host::HostList;
+use crate::shadow::Shadow;
 
-/// Of the pages not learned, one in this many is compared at each look, in
-/// turn (`VICTORY_PICKED_SLICE`).
-fn slice() -> usize {
-    static SLICE: OnceLock<usize> = OnceLock::new();
-    *SLICE.get_or_init(|| {
-        std::env::var("VICTORY_PICKED_SLICE").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&s| s > 0).unwrap_or(64)
-    })
-}
-
-/// A range of at most this many pages is compared whole.
-fn small() -> usize {
-    slice().max(1)
-}
-
-/// Whether picked writes are on. Off unless `VICTORY_PICKED_WRITES=1`.
 pub(crate) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        if !std::env::var_os("VICTORY_PICKED_WRITES").is_some_and(|v| v == "1") {
-            return false;
-        }
-        if !std::env::var_os("VICTORY_KEEP_SNAPSHOTS").is_some_and(|v| v == "1") {
-            tracing::warn!(
-                "VICTORY_PICKED_WRITES=1 needs VICTORY_KEEP_SNAPSHOTS=1 (a page left out is only found again if \
-                 its snapshot piece is kept and current); every declared range is compared whole"
-            );
-        }
-        true
+    stage() > 0
+}
+
+/// `VICTORY_PICKED_WRITES`: 0 (off), 1 (what is found is declared, so that
+/// no refresh sends title memory over it while a flight may write it, and
+/// not landed), 2 (landed too).
+fn stage() -> u8 {
+    static STAGE: OnceLock<u8> = OnceLock::new();
+    *STAGE.get_or_init(|| match std::env::var("VICTORY_PICKED_WRITES").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
     })
 }
 
-/// Since the last frame-rate line: bytes compared and bytes left out.
+/// Whether what is found is landed.
+pub(crate) fn lands() -> bool {
+    stage() > 1
+}
+
+/// Bytes looked at in turn per frame (`VICTORY_PICKED_MB`).
+fn slice() -> u64 {
+    static SLICE: OnceLock<u64> = OnceLock::new();
+    *SLICE.get_or_init(|| {
+        let mb = std::env::var("VICTORY_PICKED_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        mb.unwrap_or(32) << 20
+    })
+}
+
+/// A list's key for [`HostList::first_use`]: it runs such a shader (no title
+/// resource is there).
+const KEY: usize = usize::MAX - 0x7a;
+
+/// `list` runs a shader that stores through a picked view.
+pub(crate) fn runs_in(list: &HostList) {
+    list.first_use(KEY);
+}
+
+/// [`crate::pipeline::Translated::picks`]: not asked yet, asked, the answers.
+const UNKNOWN: u8 = 0;
+const ASKED: u8 = 1;
+const NO: u8 = 2;
+const YES: u8 = 3;
+
+/// Whether `shader`, which stores to buffers, does so through a view it
+/// picks. Tracing its descriptors takes some 50 ms, so a thread of ours does
+/// it when the shader is first bound, and it is "no" until then: what it
+/// writes is found some frames later in any case. (Of the 25,904 programs of
+/// the title 2,923 store and have the view heap among their parameters; 37
+/// compute programs store through views they pick.)
+pub(crate) fn picks(shader: &Arc<crate::pipeline::Shader>, known: &AtomicU8) -> bool {
+    match known.load(Relaxed) {
+        YES => true,
+        UNKNOWN => {
+            if known.compare_exchange(UNKNOWN, ASKED, Relaxed, Relaxed).is_ok() {
+                ask(shader.clone());
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn ask(shader: Arc<crate::pipeline::Shader>) {
+    use std::sync::mpsc::{Sender, channel};
+    static ASKS: OnceLock<Mutex<Sender<Arc<crate::pipeline::Shader>>>> = OnceLock::new();
+    let asks = ASKS.get_or_init(|| {
+        let (send, asks) = channel::<Arc<crate::pipeline::Shader>>();
+        let _ = std::thread::Builder::new().name("victory-picked".into()).spawn(move || {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+            // SAFETY: this thread's own.
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+            for shader in asks {
+                let yes = shader.programs().is_none_or(|all| all.iter().any(stores_picked));
+                if yes {
+                    tracing::info!(hash = %shader.hash, "a shader stores through views it picks from the heap (VICTORY_PICKED_WRITES=1)");
+                }
+                if let Some(t) = shader.translated() {
+                    t.picks.store(if yes { YES } else { NO }, Relaxed);
+                }
+            }
+        });
+        Mutex::new(send)
+    });
+    let _ = asks.lock().unwrap_or_else(|e| e.into_inner()).send(shader);
+}
+
+/// Whether the code of `program` stores to a buffer through a descriptor
+/// that its tables do not name: loaded from the view heap, or from a table at
+/// an offset it computes (programs with the view heap among their parameters). Yes where that cannot be told.
+fn stores_picked(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::HwStage;
+    use victory_shader::gfx10::Fields;
+    use victory_shader::native::RootType;
+    use victory_shader::resource::{Role, Source};
+    // (The programs that are translated.)
+    if !matches!(program.stage, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms) {
+        return false;
+    }
+    let heap = |param: usize| program.layout.get(param).is_some_and(|p| p.root == RootType::ResourceHeap);
+    if !(0..program.layout.len()).any(heap) {
+        return false;
+    }
+    let Ok(p) = victory_shader::spill::build(program) else {
+        return true;
+    };
+    // The structure is what takes time, and only per-lane descriptors need
+    // it.
+    let plain = victory_shader::resource::track(&p, &program.layout, program.stage, None);
+    let res = plain.or_else(|_| {
+        let st = victory_shader::structure::structure(&p);
+        victory_shader::resource::track(&p, &program.layout, program.stage, st.as_ref().ok())
+    });
+    let Ok(res) = res else {
+        return true;
+    };
+    res.descriptors.iter().filter(|d| d.role == Role::Resource).any(|d| {
+        let inst = &p.blocks[d.site.0].insts[d.site.1];
+        let stores = matches!(inst.fields, Fields::Buffer { .. }) && (inst.name().contains("store") || inst.name().contains("atomic"));
+        stores
+            && d.source.leaves().into_iter().any(|s| match s {
+                Source::Loaded { load, .. } | Source::Fetched { load, .. } => res
+                    .scalar
+                    .iter()
+                    .find(|(site, _)| site == load)
+                    .is_some_and(|(_, a)| heap(a.param) || a.dynamic.is_some()),
+                _ => false,
+            })
+    })
+}
+
+/// A buffer the heap shows unordered views of: title addresses, from the
+/// first to the last.
+struct Shown {
+    copy: Weak<Shadow>,
+    from: u64,
+    to: u64,
+}
+
+#[derive(Default)]
+struct State {
+    shown: BTreeMap<u64, Shown>,
+    /// The copies (by number) found written through picked views.
+    found: BTreeSet<u64>,
+    /// Where the next slice begins: copy, offset from its first address.
+    next: (u64, u64),
+    /// The frame of the last slice.
+    frame: u64,
+}
+
+static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+impl State {
+    /// The ranges of the next `most` bytes in turn, at most all once.
+    fn turn(&mut self, most: u64) -> Vec<(u64, u64, u64)> {
+        let mut out: Vec<(u64, u64, u64)> = Vec::new();
+        let mut left = most;
+        // (The one it begins in may come twice: its end first.)
+        for _ in 0..=self.shown.len() {
+            let (copy, offset) = self.next;
+            let Some((&id, s)) = self.shown.range(copy..).next().or_else(|| self.shown.iter().next()) else {
+                break;
+            };
+            let offset = if id == copy { offset } else { 0 };
+            let len = s.to - s.from;
+            let n = len.saturating_sub(offset).min(left);
+            if n > 0 && !self.found.contains(&id) {
+                if out.iter().any(|r| r.0 == id) {
+                    break;
+                }
+                out.push((id, s.from + offset, n));
+                left -= n;
+                if offset + n < len {
+                    self.next = (id, offset + n);
+                    break;
+                }
+            }
+            self.next = (id + 1, 0);
+            if left == 0 {
+                break;
+            }
+        }
+        out
+    }
+}
+
+/// The pass over the heap's buffer views (`crate::draw`): the unordered ones
+/// it looked at (copy, from, to); `all` if those are all there are.
+pub(crate) fn shown(views: Vec<(Arc<Shadow>, u64, u64)>, all: bool) {
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let state = state.get_or_insert_with(State::default);
+    if all {
+        state.shown.clear();
+    }
+    for (copy, from, to) in views.into_iter().filter(|v| v.0.carded() && v.1 < v.2) {
+        let e = state.shown.entry(copy.id()).or_insert_with(|| Shown {
+            copy: Arc::downgrade(&copy),
+            from,
+            to,
+        });
+        (e.from, e.to) = (e.from.min(from), e.to.max(to));
+    }
+}
+
+/// A range of a copy: title address and bytes.
+pub(crate) type Range = (Arc<Shadow>, usize, usize);
+
+/// What is done with a submission.
+#[derive(Default)]
+pub(crate) struct Ranges {
+    /// To be declared.
+    pub(crate) written: Vec<Range>,
+    /// To be compared only.
+    pub(crate) looked: Vec<Range>,
+}
+
+/// Of a submission that is about to go to the card, its refreshes done: what
+/// is to be declared and looked at, if one of its lists runs a shader that
+/// stores through a picked view.
+pub(crate) fn declare(runs: &[&HostList]) -> Ranges {
+    if !on() || !runs.iter().any(|list| list.used(KEY)) {
+        return Ranges::default();
+    }
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(state) = state.as_mut() else {
+        return Ranges::default();
+    };
+    let frame = crate::frame::current();
+    let written: Vec<(u64, u64, u64)> =
+        state.found.iter().filter_map(|id| state.shown.get(id).map(|s| (*id, s.from, s.to - s.from))).collect();
+    let mut looked = Vec::new();
+    if state.frame != frame {
+        state.frame = frame;
+        looked = state.turn(slice());
+    }
+    let of = |ranges: Vec<(u64, u64, u64)>, count: usize| -> Vec<Range> {
+        COUNTS[count].fetch_add(ranges.iter().map(|r| r.2).sum(), Relaxed);
+        ranges
+            .into_iter()
+            .filter_map(|(id, at, len)| Some((state.shown.get(&id)?.copy.upgrade()?, at as usize, len as usize)))
+            .collect()
+    };
+    Ranges { written: of(written, 0), looked: of(looked, 1) }
+}
+
+/// The compare found a piece changed (it begins at offset `at` of `copy`)
+/// where it only looked: something wrote it through a view nobody declared.
+pub(crate) fn found(copy: &Arc<Shadow>, at: usize) {
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if state.get_or_insert_with(State::default).found.insert(copy.id()) {
+        let (start, len) = copy.span();
+        tracing::info!(
+            "a buffer is written through views picked from the heap: {start:#x}+{len:#x} (first seen at +{at:#x}; VICTORY_PICKED_WRITES=1): \
+             declared with every submission that may write it from here on"
+        );
+    }
+}
+
+/// Since the last frame-rate line: bytes declared, and bytes looked at.
 static COUNTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
-/// What the picked compares did since the last line, for the frame line.
+/// For the frame-rate line.
 pub(crate) fn log(frames: f64) {
-    let c: Vec<f64> = COUNTS.iter().map(|c| c.swap(0, Relaxed) as f64 / frames / (1 << 20) as f64).collect();
-    if c.iter().all(|&v| v == 0.0) {
+    if !on() {
         return;
     }
-    tracing::info!("compared per frame with picked writes: {:.1} MB of {:.1} MB declared", c[0], c[0] + c[1]);
+    let [declared, looked] = [0, 1].map(|i| COUNTS[i].swap(0, Relaxed) as f64 / frames / (1 << 20) as f64);
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let (shown, found) = state.as_ref().map_or((0, 0), |s| (s.shown.len(), s.found.len()));
+    tracing::info!(
+        "views picked from the heap, per frame (VICTORY_PICKED_WRITES=1): {declared:.1} MB declared for them, {looked:.1} MB \
+         looked at in turn; unordered views of {shown} buffers on the card, {found} of them found written"
+    );
 }
 
-/// The copy's turn: its own count, one per compare of a submission's ranges
-/// and the same for every span of it (see [`spans`]). Per copy, so that a
-/// copy compares on every other submission of two still walks every one of
-/// its pages (`turn % slice` would otherwise only ever be the parity of its
-/// own turns, and half its pages never look).
-pub(crate) fn next_turn(id: u64) -> Option<u64> {
-    let mut turns = TURNS.lock().unwrap_or_else(|e| e.into_inner());
-    next_turn_in(&mut turns, id)
-}
-
-fn next_turn_in(turns: &mut BTreeMap<u64, u64>, id: u64) -> Option<u64> {
-    if !turns.contains_key(&id) && turns.len() >= KEPT {
-        return None;
-    }
-    let t = turns.entry(id).or_insert(0);
-    let now = *t;
-    *t = t.wrapping_add(1);
-    Some(now)
-}
-
-/// Each copy's count of compares so far, its turn ([`next_turn`]).
-static TURNS: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
-
-/// The pages a copy's compares have found written: looked at every time
-/// from then on, counted from the copy's first page.
-#[derive(Default)]
-struct Learned {
-    learned: BTreeSet<usize>,
-}
-
-/// Copies with a set.
-static SETS: Mutex<BTreeMap<u64, Learned>> = Mutex::new(BTreeMap::new());
-
-/// At most this many copies keep a set (the world has a few hundred live).
-const KEPT: usize = 4096;
-
-/// The offsets of a copy of title memory from `start` (`id` is the copy's,
-/// [`crate::shadow::Shadow::id`]) that its compare examines on `turn`: the
-/// pages the shaders wrote so far and this turn's page in [`slice`], of
-/// `[from, to)`.
-///
-/// `[from, to)` whole where `baseline` is `None` (nothing picked, a range
-/// too small for the rotation), and where a page's snapshot piece is not
-/// one the copy may leave out: `baseline` holds that per page of the range,
-/// from its first, as [`crate::shadow::Shadow::baseline_pages`] gives it.
-pub(crate) fn spans(
-    turn: u64,
-    id: u64,
-    start: usize,
-    from: usize,
-    to: usize,
-    baseline: Option<&[bool]>,
-) -> Vec<(usize, usize)> {
-    if from >= to {
-        return Vec::new();
-    }
-    let base = start / PAGE;
-    let first = (start + from) / PAGE - base;
-    let last = (start + to - 1) / PAGE - base;
-    let skip = match baseline {
-        Some(baseline) if last - first >= small() && baseline.len() == last - first + 1 => baseline,
-        _ => {
-            COUNTS[0].fetch_add((to - from) as u64, Relaxed);
-            return vec![(from, to)];
-        }
-    };
-    let exams: Vec<bool> = (first..=last)
-        .map(|page| {
-            let learned = SETS.lock().unwrap_or_else(|e| e.into_inner()).get(&id).is_some_and(|s| s.learned.contains(&page));
-            // (A page whose snapshot piece is not current is never left out.)
-            !skip[page - first] || learned || page % slice() == (turn as usize) % slice()
-        })
-        .collect();
-    let mut out: Vec<(usize, usize)> = Vec::new();
-    let mut run: Option<(usize, usize)> = None;
-    for (page, &examined) in (first..=last).zip(&exams) {
-        let lo = (((base + page) * PAGE).saturating_sub(start)).max(from);
-        let hi = ((base + page + 1) * PAGE).saturating_sub(start).min(to);
-        if hi <= lo {
-            continue;
-        }
-        if examined {
-            run = Some(match run {
-                Some((a, _)) => (a, hi),
-                None => (lo, hi),
-            });
-        } else if let Some((a, e)) = run.take() {
-            out.push((a, e));
+/// Declared writes, per copy, and those of `picked`.
+pub(crate) fn with(mut back: Vec<(Arc<Shadow>, Vec<(usize, usize)>)>, picked: &[Range]) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+    for (copy, at, len) in picked {
+        let range = (*at, *at + *len);
+        match back.iter_mut().find(|b| Arc::ptr_eq(&b.0, copy)) {
+            Some((_, ranges)) if ranges.contains(&range) => {}
+            Some((_, ranges)) => ranges.push(range),
+            None => back.push((copy.clone(), vec![range])),
         }
     }
-    if let Some((a, e)) = run {
-        out.push((a, e));
-    }
-    let examined: usize = out.iter().map(|&(a, e)| e - a).sum();
-    COUNTS[0].fetch_add(examined as u64, Relaxed);
-    COUNTS[1].fetch_add((to - from - examined) as u64, Relaxed);
-    out
-}
-
-/// Without a retained turn, comparing the whole range prevents starvation.
-pub(crate) fn spans_for_turn(
-    turn: Option<u64>, id: u64, start: usize, from: usize, to: usize, baseline: Option<&[bool]>,
-) -> Vec<(usize, usize)> {
-    match turn {
-        Some(turn) => spans(turn, id, start, from, to, baseline),
-        None if from < to => vec![(from, to)],
-        None => Vec::new(),
-    }
-}
-
-/// The pages of the copy from `start` that the pieces `[at, at + n)` of
-/// `found` hold are learned: they are compared every time from now on.
-pub(crate) fn found(id: u64, start: usize, found: &[(usize, usize)]) {
-    if found.is_empty() {
-        return;
-    }
-    let base = start / PAGE;
-    let mut sets = SETS.lock().unwrap_or_else(|e| e.into_inner());
-    if sets.len() >= KEPT && !sets.contains_key(&id) {
-        sets.clear();
-    }
-    let sweep = sets.entry(id).or_default();
-    for &(at, n) in found {
-        if n == 0 {
-            continue;
-        }
-        for page in (start + at) / PAGE..=(start + at + n - 1) / PAGE {
-            sweep.learned.insert(page - base);
-        }
-    }
-}
-
-/// Forgets a copy's set: its copy is gone, and a new one with the same
-/// number does not inherit its pages.
-pub(crate) fn forget(id: u64) {
-    SETS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-    TURNS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    back
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PAGE, found, slice, spans};
-    use std::collections::BTreeSet;
+    use super::*;
 
-    /// A deterministic stand-in for a random number generator (no crate of
-    /// its own, no clock: the same walk on every machine).
-    struct Rng(u64);
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
+    fn state(sizes: &[u64]) -> State {
+        let mut state = State::default();
+        for (i, &n) in sizes.iter().enumerate() {
+            let from = (i as u64 + 1) << 32;
+            state.shown.insert(i as u64 * 3 + 2, Shown { copy: Weak::new(), from, to: from + n });
         }
-        fn below(&mut self, n: usize) -> usize {
-            (self.next() % n as u64) as usize
-        }
+        state
     }
 
-    /// One look of a copy of title memory from `start` on `turn`: `changed`
-    /// are the numbers (`address / PAGE`) of the pages that differ from the
-    /// snapshot, `baseline` which pages may be left out. Returns the changed
-    /// pages found, and learns them as the compare does (`found` is told
-    /// the pieces that differ).
-    fn look(
-        turn: u64,
-        id: u64,
-        start: usize,
-        from: usize,
-        to: usize,
-        baseline: Option<&[bool]>,
-        changed: &BTreeSet<usize>,
-    ) -> BTreeSet<usize> {
-        let mut out = BTreeSet::new();
-        for (a, e) in spans(turn, id, start, from, to, baseline) {
-            let pieces: Vec<(usize, usize)> = changed
-                .iter()
-                .copied()
-                .filter(|&page| page * PAGE < start + e && (page + 1) * PAGE > start + a)
-                .map(|page| (page * PAGE - start, PAGE))
-                .collect();
-            out.extend(pieces.iter().map(|&(at, _)| (start + at) / PAGE));
-            found(id, start, &pieces);
-        }
-        out
-    }
-
-    /// Over the looks a sweep takes, the picked compares find the pages a
-    /// whole scan finds and nothing else, on ranges of every size: the
-    /// picked path against the path that examines the whole range.
+    /// Every byte in turn, none left out, whatever the slice.
     #[test]
-    fn the_picked_pages_found_are_the_ones_a_whole_scan_finds() {
-        let mut rng = Rng(0x5eed_1234_9abc_def1);
-        for case in 0..96 {
-            let pages = 1 + rng.below(600);
-            let start = 0x1_0000 + rng.below(4) * PAGE * 7;
-            let (from, to) = (0, pages * PAGE);
-            let mut changed = BTreeSet::new();
-            for _ in 0..rng.below(48) {
-                changed.insert(start / PAGE + rng.below(pages));
-            }
-            // The whole scan: one look, every changed page.
-            let whole = look(0, 2000 + case, start, from, to, None, &changed);
-            assert_eq!(whole, changed, "{case}: a whole scan finds every changed page");
-            // The picked path: look after look.
-            let allowed = vec![true; pages];
-            let id = 3000 + case;
-            let mut picked = BTreeSet::new();
-            for turn in 0..slice() + 1 {
-                picked.extend(look(turn as u64, id, start, from, to, Some(&allowed), &changed));
-            }
-            assert_eq!(picked, whole, "{case}: {pages} pages");
-        }
-    }
-
-    /// A page the compare leaves out is not lost: its turn comes within a
-    /// sweep, however big the range, and the change is found then.
-    #[test]
-    fn a_page_left_out_is_found_on_its_turn() {
-        let start = 0x2_0000;
-        let pages = slice() * 4;
-        let allowed = vec![true; pages];
-        let mut changed = BTreeSet::new();
-        changed.insert(start / PAGE + pages - 1);
-        let mut seen = BTreeSet::new();
-        for turn in 0..slice() {
-            let found = look(turn as u64, 7, start, 0, pages * PAGE, Some(&allowed), &changed);
-            assert!(found.is_empty() || found == changed, "{turn}: nothing but the page changed");
-            seen.extend(found);
-        }
-        assert_eq!(seen, changed, "the last page is found within a sweep");
-    }
-
-    /// Where nothing is picked, or the range is small, every byte of it is
-    /// compared, as without the switch; and a page the copy may not leave
-    /// out (its snapshot piece is not current) is looked at every time.
-    #[test]
-    fn a_page_that_may_not_be_left_out_is_looked_at_every_time() {
-        let start = 0x3_0000;
-        let pages = slice() * 8;
-        let to = pages * PAGE;
-        assert_eq!(spans(0, 11, start, 0, to, None), vec![(0, to)]);
-        let allowed = vec![true; slice()];
-        assert_eq!(spans(0, 12, start, 0, slice() * PAGE, Some(&allowed)), vec![(0, slice() * PAGE)]);
-        // One page among many may not be left out: it is compared on every
-        // turn, the others by rotation.
-        let mut baseline = vec![true; pages];
-        baseline[5] = false;
-        for turn in 0..4u64 {
-            let looked = spans(turn, 13, start, 0, to, Some(&baseline));
-            let covers = |at: usize| looked.iter().any(|&(a, e)| a <= at && at < e);
-            assert!(covers(5 * PAGE), "{turn}: page 5 is compared every time");
-        }
-    }
-
-    /// A copy's sweep goes on when the map is full: its turn is not cleared
-    /// back to 0 with everyone else's (the pages off its first then never
-    /// look).
-    #[test]
-    fn a_full_map_does_not_restart_a_copys_sweep() {
-        let id = 0x00fa_0000_0000_00d1u64;
-        let mut turns = std::collections::BTreeMap::new();
-        // A few of its own turns first, so a restart cannot hide behind 0.
-        let mut first = None;
-        for _ in 0..4 {
-            first = super::next_turn_in(&mut turns, id);
-        }
-        assert_eq!(first, Some(3));
-        // More copies than the map keeps, each asking once: a whole-range
-        // scan of a big title does this, and so does a small one that learns.
-        for i in 0..(super::KEPT as u64 * 2) {
-            let other = 0x0100_0000_0000_0000u64 | i.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-            super::next_turn_in(&mut turns, other);
-        }
-        assert_eq!(super::next_turn_in(&mut turns, id), Some(4));
-        assert_eq!(super::next_turn_in(&mut turns, u64::MAX), None);
-        assert_eq!(super::spans_for_turn(None, u64::MAX, 0, 0, 8 * PAGE, Some(&[true; 8])), vec![(0, 8 * PAGE)]);
-        assert!(super::spans_for_turn(None, u64::MAX, 0, 0, 0, None).is_empty());
-        turns.remove(&id);
-        assert_eq!(super::next_turn_in(&mut turns, u64::MAX), Some(0));
-    }
-
-    /// The spans are of the range, in order, never overlapping; over a
-    /// sweep they cover it — also when a copy has two spans in one look,
-    /// which share the pass's turn: each span covers its own pages over the
-    /// same turns, so no page is left out for good.
-    #[test]
-    fn the_spans_are_of_the_range_and_cover_it_over_a_sweep() {
-        let start = 0x10_0000;
-        let to = slice() * 3 * PAGE;
-        let mut covered = vec![false; to];
-        for turn in 0..slice() {
-            let looked = spans(turn as u64, 14, start, PAGE, to, Some(&vec![true; to / PAGE]));
-            assert!(!looked.is_empty());
-            let mut at = PAGE;
-            for (a, e) in looked {
-                assert!(a >= at && e > a && e <= to, "{a} {e}");
-                at = e;
-                for i in a..e {
-                    covered[i] = true;
-                }
-            }
-        }
-        assert!(covered[PAGE..].iter().all(|&c| c), "every byte gets its turn");
-        assert_eq!(spans(0, 15, start, PAGE, PAGE, Some(&[true])), Vec::new(), "an empty range");
-
-        // Two spans of one copy in one submission (a `hand_back_now` work
-        // item each), the same turn: every page of both is looked at over
-        // the sweep.
-        let pages = slice() * 4;
-        let all = vec![true; pages * 2];
-        let mut seen = vec![false; pages * 2];
-        for turn in 0..slice() as u64 {
-            for (from, to) in [(0usize, pages * PAGE), (pages * PAGE, pages * 2 * PAGE)] {
-                for (a, e) in spans(turn, 16, start, from, to, Some(&all[from / PAGE..to / PAGE])) {
-                    let first = a / PAGE;
-                    let last = (e - 1) / PAGE;
-                    for page in first..=last {
-                        seen[page] = true;
+    fn all_buffers_are_looked_at_in_turn() {
+        let sizes = [100u64, 7, 1000, 1, 350];
+        let total: u64 = sizes.iter().sum();
+        for most in [1u64, 10, 99, 350, 1000, 5000] {
+            let mut s = state(&sizes);
+            let mut seen = std::collections::BTreeMap::<u64, u64>::new();
+            // (A turn ends with the list: it may take one more.)
+            let turns = total.div_ceil(most) + sizes.len() as u64 + 1;
+            for _ in 0..turns {
+                let turn = s.turn(most);
+                assert!(turn.iter().map(|r| r.2).sum::<u64>() <= most);
+                for (id, at, n) in turn {
+                    let from = s.shown[&id].from;
+                    for b in at - from..at - from + n.min(2000) {
+                        *seen.entry(id << 32 | b).or_default() += 1;
                     }
                 }
             }
+            assert_eq!(seen.len() as u64, total, "slices of {most}");
         }
-        assert!(seen.iter().all(|&s| s), "both spans are covered over a sweep");
     }
 
-    /// What the compare of 4,096 pages (256 MB) costs whole and picked,
-    /// with one page in 64 of them changed (the frame the switch is for).
-    ///
-    /// `cargo test --release -p victory-gpu --lib compare_of_4k_pages -- --nocapture`
     #[test]
-    fn compare_of_4k_pages_whole_and_picked() {
-        use std::time::Instant;
-        let pages = 4096;
-        let len = pages * PAGE;
-        let start = 0x1_0000_0000usize;
-        let mut data = vec![0xa5u8; len];
-        let before = vec![0xa5u8; len];
-        // 1 page in 64 changed, as the shaders of a frame leave it.
-        let changed: Vec<usize> = (0..pages).filter(|page| page % 64 == 37).collect();
-        for &page in &changed {
-            for byte in &mut data[page * PAGE..(page + 1) * PAGE] {
-                *byte ^= 0x01;
-            }
-        }
-        let whole = |data: &[u8], before: &[u8]| -> Vec<(usize, usize)> {
-            let mut pieces = Vec::new();
-            for page in 0..pages {
-                let (at, n) = (page * PAGE, PAGE);
-                if data[at..at + n] != before[at..at + n] {
-                    pieces.push((at, n));
-                }
-            }
-            pieces
-        };
-        let picked = |turn: u64, data: &[u8], before: &[u8], baseline: &[bool]| -> Vec<(usize, usize)> {
-            let mut pieces = Vec::new();
-            for (a, e) in spans(turn, 1, start, 0, len, Some(baseline)) {
-                let mut at = a;
-                while at < e {
-                    let n = (PAGE - (start + at) % PAGE).min(e - at);
-                    if data[at..at + n] != before[at..at + n] {
-                        pieces.push((at, n));
-                    }
-                    at += n;
-                }
-            }
-            pieces
-        };
-        let time = |f: &mut dyn FnMut()| {
-            let started = Instant::now();
-            f();
-            started.elapsed()
-        };
-        let baseline = vec![true; pages];
-        let mut whole_found = Vec::new();
-        let whole_us = time(&mut || whole_found = whole(&data, &before));
-        let mut picked_found = Vec::new();
-        // The look whose turn's pages are the changed ones (page 37 in 64).
-        let picked_us = time(&mut || picked_found = picked(37, &data, &before, &baseline));
-        assert_eq!(whole_found.len(), changed.len(), "a whole scan finds them all");
-        assert_eq!(picked_found.len(), changed.len(), "the look of their turn finds them all");
-        eprintln!("4,096 pages, {} changed: whole {whole_us:?}, picked {picked_us:?}", changed.len());
+    fn what_was_found_has_no_turn() {
+        let mut s = state(&[64, 64, 64]);
+        s.found.insert(5);
+        let turn = s.turn(1000);
+        assert_eq!(turn.iter().map(|r| r.0).collect::<Vec<_>>(), [2, 8]);
+        assert!(state(&[]).turn(10).is_empty());
+        let mut all = state(&[64]);
+        all.found.insert(2);
+        assert!(all.turn(10).is_empty());
     }
 }

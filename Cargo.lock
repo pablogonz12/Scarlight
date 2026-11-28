@@ -636,6 +636,7 @@ dependencies = [
  "blake3",
  "clap",
  "memchr",
+ "tempfile",
  "tracing",
  "victory-core",
  "victory-game",
@@ -655,7 +656,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
- "tracing",
  "tracing-subscriber",
 ]
 
@@ -695,7 +695,6 @@ dependencies = [
  "opus-pure",
  "tempfile",
  "tracing",
- "victory-core",
  "victory-formats",
  "victory-gpu",
  "victory-loader",

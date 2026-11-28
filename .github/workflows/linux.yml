@@ -53,10 +53,14 @@ jobs:
       # The launcher and the tooling are shell we ship; lint them where they run.
       - name: Shellcheck the shell under tools/
         run: |
-          mapfile -t scripts < <(git ls-files 'tools/*.sh' 'tools/**/*.sh' 'tools/scarlight-launcher/scarlight' 'tools/steam-compat/scarlight')
+          mapfile -t scripts < <(git ls-files 'tools/*.sh' 'tools/**/*.sh' 'tools/scarlight-launcher/scarlight' 'tools/steam-compat/scarlight' 'tests/steam-compat-pick.sh')
           printf 'shellcheck %s\n' "${scripts[*]}"
           shellcheck --version | head -2
           shellcheck -x -S warning "${scripts[@]}"
+      # Which Proton the Steam tool picks, and whether the fast-only settings go
+      # on, against fake compatibilitytools.d folders (no Wine runs).
+      - name: Steam tool Proton choice
+        run: bash tests/steam-compat-pick.sh
       - uses: actions/upload-artifact@v7
         with:
           name: victory-windows-x86_64

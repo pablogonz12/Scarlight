@@ -10,7 +10,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-const MAX_FILE_SIZE: usize = 512 * 1024;
+// (The translator's one file is 570 KiB of source.)
+const MAX_FILE_SIZE: usize = 640 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
@@ -26,12 +27,12 @@ const ALLOWED_NAME_SUFFIXES: &[&str] = &[".desktop.in"];
 const SCRIPT_DIR_PREFIX: &str = "tools/";
 const SCRIPT_SHEBANG: &[u8] = b"#!";
 /// The one extensionless data file under `tools/`: the GE-Proton release a
-/// Scarlight release is cut from, one `GE-Proton<major>-<release>` line. The
-/// packager reads it for the version, the entry script for the Proton to use.
+/// Scarlight release is cut from, one `GE-Proton<major>-<release>` line.
 const BASE_FILE: &str = "tools/steam-compat/BASE";
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
     ".gitattributes",
+    ".gitmodules",
     ".editorconfig",
     ".victory-root",
     "pre-commit",
@@ -71,15 +72,14 @@ const EXTENSION_EXCEPTIONS: &[(&str, &str)] = &[
     ),
     (
         "docs/progress/index.html",
-        "the GitHub Pages page: generated text-only HTML from tools/progress/shader_scan.py, rebuilt by the Pages workflow"
+        "the GitHub Pages page: generated text-only HTML from tools/progress/shader_scan.py, rebuilt by the Pages workflow",
     ),
 ];
 
 /// Path prefixes holding our own terminal recordings: screencast GIFs of our
 /// tools, made on our machines with a throwaway profile. A GIF is binary by
 /// construction, so files here skip the type allowlist and the text/NUL check;
-/// the size limit and the forbidden signatures still apply, and so does every
-/// other file in the tree. See docs/asset-policy.md.
+/// the size limit and the forbidden signatures still apply. See docs/asset-policy.md.
 const RECORDING_PREFIXES: &[&str] = &["docs/img/"];
 
 /// Signatures of formats that must never be committed.
@@ -119,7 +119,7 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
                 Err(_) => continue,
             }
         };
-        for problem in check_with(path, &content, policy_flags(path)) {
+        for problem in check(path, &content) {
             violations.push(format!("{path}: {problem}"));
         }
     }
@@ -137,7 +137,7 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
     )
 }
 
-fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
+pub(crate) fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
     let git = |args: &[&str]| -> Result<Option<Vec<String>>> {
         let out = Command::new("git")
             .args(args)
@@ -192,7 +192,6 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
 }
 
 /// All problems with one file. Pure, for testing.
-#[cfg(test)]
 pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     check_with(path, content, policy_flags(path))
 }
@@ -234,13 +233,21 @@ fn check_with(path: &str, content: &[u8], flags: (bool, bool)) -> Vec<String> {
             problems.push(format!("looks like a {what}"));
         }
     }
-    if content.contains(&0) && !binary_ok {
+    if binary_ok {
+        // Our own recordings: size and signatures above are the checks.
+    } else if content.contains(&0) {
         problems.push("binary content (NUL bytes)".to_owned());
-    } else if !binary_ok
-        && let Some(run) = longest_encoded_run(content)
+    } else if let Some(run) = longest_encoded_run(content)
         && run > MAX_ENCODED_RUN
     {
         problems.push(format!("{run}-character hex/base64 run (embedded data?)"));
+    } else {
+        let digits = longest_hex_literal_run(content);
+        if digits > MAX_ENCODED_RUN {
+            problems.push(format!(
+                "{digits} hex digits in one run of \\x/0x literals (embedded data?)"
+            ));
+        }
     }
     problems
 }
@@ -274,6 +281,38 @@ fn is_tool_base_file(path: &str, content: &[u8]) -> bool {
 fn longest_encoded_run(content: &[u8]) -> Option<usize> {
     let is_payload = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=');
     content.split(|b| !is_payload(b)).map(<[u8]>::len).max()
+}
+
+/// Most hex digits in `\xNN` escapes or `0x` literals with only commas,
+/// whitespace or backslashes between them: a byte string or `xxd -i` array,
+/// which `longest_encoded_run` sees as many 3- or 4-character runs.
+/// shortcut: decimal arrays (`[77, 90, ...]`) still pass, add a literal count if one shows up.
+fn longest_hex_literal_run(content: &[u8]) -> usize {
+    let (mut i, mut run, mut longest) = (0, 0, 0);
+    while i < content.len() {
+        match &content[i..] {
+            [b'\\' | b'0', b'x' | b'X', rest @ ..] => {
+                let len = rest
+                    .iter()
+                    .take_while(|b| b.is_ascii_hexdigit() || **b == b'_')
+                    .count();
+                run += rest[..len].iter().filter(|b| b.is_ascii_hexdigit()).count();
+                longest = longest.max(run);
+                // Skip a type suffix such as `u8` or `u32`.
+                let suffix = rest[len..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_alphanumeric())
+                    .count();
+                i += 2 + len + suffix;
+            }
+            [b, ..] if matches!(b, b',' | b'\\') || b.is_ascii_whitespace() => i += 1,
+            _ => {
+                run = 0;
+                i += 1;
+            }
+        }
+    }
+    longest
 }
 
 #[cfg(test)]
@@ -311,6 +350,49 @@ mod tests {
     }
 
     #[test]
+    fn rejects_data_smuggled_into_text() {
+        let blob = format!("const DATA: &str = \"{}\";", "A1".repeat(400));
+        assert!(!check("src/blob.rs", blob.as_bytes()).is_empty());
+    }
+
+    /// Synthetic bytes, never game data.
+    fn synthetic(n: u32) -> impl Iterator<Item = u32> {
+        (0..n).map(|i| (i * 37 + 11) % 256)
+    }
+
+    #[test]
+    fn rejects_data_smuggled_as_an_escaped_byte_string() {
+        // 4096 bytes as one unbroken `\xNN` hex run, the shape a byte-string
+        // literal of copied data takes.
+        let esc: String = synthetic(4096).map(|b| format!("\\x{b:02x}")).collect();
+        let src = format!("pub const DATA: &[u8] = b\"{esc}\";\n");
+        assert!(
+            !check("src/data.rs", src.as_bytes()).is_empty(),
+            "{} bytes of \\x-escaped hex passed",
+            src.len()
+        );
+    }
+
+    #[test]
+    fn rejects_data_smuggled_as_a_hex_byte_array() {
+        // `xxd -i` style: 4096 bytes as hex literals.
+        let lits: Vec<String> = synthetic(4096).map(|b| format!("0x{b:02x}")).collect();
+        let src = format!("pub const DATA: [u8; 4096] = [{}];\n", lits.join(", "));
+        assert!(
+            !check("src/data.rs", src.as_bytes()).is_empty(),
+            "{} bytes of hex array passed",
+            src.len()
+        );
+        // A short constant table, like the 16-entry ones in the tree, stays legal.
+        let table: Vec<String> = synthetic(16).map(|w| format!("0x{w:08x}_u32")).collect();
+        let src = format!(
+            "const T: [u32; 16] = [\n    {},\n];\n",
+            table.join(",\n    ")
+        );
+        assert!(check("src/table.rs", src.as_bytes()).is_empty());
+    }
+
+    #[test]
     fn accepts_our_recordings() {
         // A minimal GIF: header, logical screen, one pixel, trailer.
         let gif = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
@@ -324,15 +406,9 @@ mod tests {
             "magic still wins over the recording exemption"
         );
         assert!(
-            !check("docs/img/launcher.gif", &vec![b'a'; 600 * 1024]).is_empty(),
+            !check("docs/img/launcher.gif", &vec![b'a'; super::MAX_FILE_SIZE + 1]).is_empty(),
             "recordings are still size-limited"
         );
-    }
-
-    #[test]
-    fn rejects_data_smuggled_into_text() {
-        let blob = format!("const DATA: &str = \"{}\";", "A1".repeat(400));
-        assert!(!check("src/blob.rs", blob.as_bytes()).is_empty());
     }
 
     #[test]
@@ -387,7 +463,7 @@ mod tests {
         assert!(
             !check_with(
                 "docs/brand/logo.svg",
-                &vec![b'a'; 600 * 1024],
+                &vec![b'a'; super::MAX_FILE_SIZE + 1],
                 (true, false)
             )
             .is_empty()

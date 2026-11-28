@@ -1,478 +1,233 @@
-//! Host-memory admission: what speculation and reusable upload storage may
-//! take, and how long to wait once the driver has refused an allocation.
+//! Host-memory admission for speculative texture work and reusable upload storage.
 //!
-//! Idea from codec-d/CGBJ's coolfox branch (ab75ac3e0 "Back off refused GPU
-//! pool growth and defer uploads under low commit", 8cc31ab37 "32GB RAM
-//! residency budgets"): that code samples a Windows host's free physical RAM
-//! and commit, keeps a pressure state with hysteresis, and gates its bindless
-//! prefetch and upload pool growth on it. Our target is a 16 GiB PC and a
-//! 16 GiB RADV card behind vkd3d-proton, where a refused import falls back
-//! silently (HansKristian-Work/vkd3d-proton#3522) and our canary
-//! ([`crate::inplace`]) and the mip retry carry that failure: so this keeps
-//! the floors, the hysteresis and the refusal backoff, in our units, behind
-//! `VICTORY_RESIDENCY=0`.
-//!
-//! Nothing here makes an allocation succeed. It keeps us from asking again
-//! right away, and from taking the PC's last gigabyte for something a later
-//! frame would rather have.
+//! From codec-d/cool_fox (641835a4, fabb872a, c64fc9b4, 08e4574d, e94d277a; the
+//! values of the last). Only with `VICTORY_RESIDENCY=1` ([`on`]): the memory
+//! of the system is then asked once a second; below 3 GiB of free RAM or 4 GiB
+//! of commit (out again above 5 / 6) texture prefetch is limited to 64 MiB a
+//! frame and idle scratch and staging blocks are let go; below 1.5 GiB of
+//! commit to 16 MiB; the texture pass stops below 512 MiB of commit, new
+//! staging blocks for textures picked by index below 1 GiB. With 32 GiB of RAM
+//! or less (or `VICTORY_RESIDENCY_LIMITED=1`) the budgets of a smaller PC.
+//! Off, nothing here changes anything, except that for 500 ms after the card
+//! refused memory (E_OUTOFMEMORY) the texture pass stops ([`upload_refused`]).
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 const MIB: u64 = 1 << 20;
-const GIB: u64 = 1 << 30;
 
-/// How long a refused allocation keeps further ones from being tried. The
-/// driver has just told us the PC or the card has nothing; every texture of
-/// the frame asking again costs a failed driver call each.
-const REFUSAL_MS: u64 = 500;
-
-/// How long a staging buffer or a kept chunk no list holds is kept while the
-/// PC is under pressure: one second, against the RAM-scaled idle of
-/// [`crate::host::ram_idle_ms`].
-pub(crate) const PRESSURE_IDLE_MS: u64 = 1_000;
-
-/// Whether the guard is on: `VICTORY_RESIDENCY=0` turns it off, at once
-/// (`crate::switches`) or from the environment. Off, nothing here ever limits
-/// an upload, a growth or a retry, as before.
-pub(crate) fn enabled() -> bool {
+/// `VICTORY_RESIDENCY=1`: the memory budgets of this module (off by default).
+pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    let base = *ON.get_or_init(|| std::env::var_os("VICTORY_RESIDENCY").is_none_or(|v| v != "0"));
-    crate::switches::b("VICTORY_RESIDENCY", base)
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESIDENCY").is_some_and(|v| v == "1"))
 }
-
+const GIB: u64 = 1 << 30;
 static PRESSURED: AtomicBool = AtomicBool::new(false);
-/// The commit sample the admission gates read, at most one per sample window.
-static COMMIT: AtomicU64 = AtomicU64::new(u64::MAX);
-static NEXT_SAMPLE: AtomicU64 = AtomicU64::new(0);
-/// When a refused allocation may be tried again.
-static RETRY_AT: AtomicU64 = AtomicU64::new(0);
-/// Whether a growth was deferred since the last frame line.
-static DEFERRED: AtomicU64 = AtomicU64::new(0);
+static HEADROOM: AtomicU64 = AtomicU64::new(u64::MAX);
 
-/// Free physical RAM and available commit (physical RAM plus page file).
-fn memory_status() -> Option<(u64, u64)> {
-    // SAFETY: the call fills a correctly sized structure of plain data, and a
-    // failed call leaves it unused.
+fn memory_status() -> Option<MEMORYSTATUSEX> {
+    // SAFETY: the API initializes the fields of a correctly sized structure.
     let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    (unsafe { GlobalMemoryStatusEx(&mut status) } != 0)
-        .then_some((status.ullAvailPhys, status.ullAvailPageFile))
+    (unsafe { GlobalMemoryStatusEx(&mut status) } != 0).then_some(status)
 }
 
-/// One sixteenth of the PC's RAM, between 256 MiB and 1 GiB: what an upload
-/// leaves free once it has taken its bytes, so that Rust and the title are not
-/// aborted for the last megabyte. A 16 GiB PC (16 GiB card, our target) keeps
-/// 1 GiB; an 8 GiB one keeps 512 MiB.
-fn upload_floor(total: u64) -> u64 {
-    (total / 16).clamp(256 * MIB, GIB)
-}
+// The texture sweep may run for seconds inside a single submitted frame.
+static NEXT_COMMIT_SAMPLE: AtomicU64 = AtomicU64::new(0);
+static AVAILABLE_COMMIT: AtomicU64 = AtomicU64::new(u64::MAX);
+static RETRY_UPLOAD_AT: AtomicU64 = AtomicU64::new(0);
 
-/// Twice [`upload_floor`]: what a brand-new OS block of upload storage (a
-/// staging buffer, a scratch chunk) leaves free. Growing a fresh block costs
-/// the title a page-file reservation the size of the block; reusing bytes
-/// inside a block that is already committed costs nothing.
-fn growth_floor(total: u64) -> u64 {
-    upload_floor(total).saturating_mul(2)
-}
-
-/// Pressure enters when free physical RAM or available commit falls to a
-/// fraction of the PC's RAM, and leaves only when both are comfortably above
-/// it: a title's own allocations dip and recover many times a second, and a
-/// guard that followed each dip would throttle a frame and unthrottle the next.
-/// One failed sample keeps the last good state.
-fn next_pressure(was: bool, total: u64, physical: u64, commit: u64) -> bool {
-    if was {
-        physical < total / 6 || commit < total / 5
-    } else {
-        physical <= total / 10 || commit <= total / 8
+pub(crate) fn allocation_error(error: &windows::core::Error) {
+    if error.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
+        RETRY_UPLOAD_AT.fetch_max(crate::host::coarse_ms().saturating_add(500), Ordering::Relaxed);
     }
 }
 
-/// Whether `bytes` more may be taken with `commit` available, leaving the
-/// floor (`growth`: the larger one) free afterwards.
-fn admitted(total: u64, commit: u64, bytes: u64, growth: bool) -> bool {
-    let budget = budgets(Some(total));
-    let floor = if growth { budget.growth_floor } else { budget.upload_floor };
-    commit >= floor.saturating_add(bytes)
+thread_local! {
+    static STAGING_DEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// A soft per-frame limit on speculative upload, as his bindless prefetch
-/// queue had: a single texture can cross it, and whatever is not admitted
-/// waits for a later frame. Under pressure only 16 MiB, on a PC with little
-/// RAM once staged bytes pass 1 GiB (his 32 GiB budget, ours by staged bytes)
-/// 64 MiB; otherwise no limit of ours.
-pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, limited: bool, staging: u64) -> u64 {
-    if pressure {
-        bytes.min(16 * MIB)
-    } else if limited && staging >= GIB {
-        bytes.min(64 * MIB)
+pub(crate) fn note_staging_deferred() {
+    STAGING_DEFERRED.set(true);
+}
+
+pub(crate) fn take_staging_deferred() -> bool {
+    STAGING_DEFERRED.replace(false)
+}
+
+pub(crate) fn upload_refused() -> bool {
+    crate::host::coarse_ms() < RETRY_UPLOAD_AT.load(Ordering::Relaxed)
+}
+
+fn sample_commit(now: u64) -> u64 {
+    let next = NEXT_COMMIT_SAMPLE.load(Ordering::Relaxed);
+    if now >= next
+        && NEXT_COMMIT_SAMPLE
+            .compare_exchange(next, now.saturating_add(32), Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        && let Some(status) = memory_status()
+    {
+        AVAILABLE_COMMIT.store(status.ullAvailPageFile, Ordering::Relaxed);
+    }
+    AVAILABLE_COMMIT.load(Ordering::Relaxed)
+}
+
+fn has_upload_reserve(commit: u64, bake: bool) -> bool {
+    // Keep a protective floor against Rust/game OOM aborts without starving
+    // bindless world textures or one-shot ped decoration bakes when steady-state
+    // commit headroom sits in the 1-4 GiB range on 32 GiB hosts.
+    commit >= if bake { 256 * MIB } else { 512 * MIB }
+}
+
+fn has_growth_reserve(commit: u64, bake: bool) -> bool {
+    // Growing a fresh 64 MiB upload block for speculative bindless prefetch
+    // requires more headroom than reusing slices already committed inside the
+    // staging pool.
+    commit >= if bake { 256 * MIB } else { 1024 * MIB }
+}
+
+/// Leave commit for game allocations and submissions already in flight while
+/// still letting bindless textures and one-shot material bakes upload.
+pub(crate) fn admit_texture_pass(bake: bool) -> bool {
+    let now = crate::host::coarse_ms();
+    if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
+        return false;
+    }
+    if !on() {
+        return true;
+    }
+    has_upload_reserve(sample_commit(now), bake)
+}
+
+/// Whether the staging allocator may commit a brand-new OS upload buffer
+/// (reusing existing free ranges in already-committed pool blocks stays open
+/// whenever `admit_texture_pass` is true).
+pub(crate) fn allow_staging_growth(bake: bool) -> bool {
+    if !on() {
+        return true;
+    }
+    let now = crate::host::coarse_ms();
+    if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
+        return false;
+    }
+    has_growth_reserve(sample_commit(now), bake)
+}
+
+pub(crate) fn limited_host_ram() -> bool {
+    static LIMITED: OnceLock<bool> = OnceLock::new();
+    *LIMITED.get_or_init(|| {
+        on() && (std::env::var_os("VICTORY_RESIDENCY_LIMITED").is_some_and(|v| v == "1")
+            || memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
+    })
+}
+
+fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
+    if was {
+        physical < 5 * GIB || commit < 6 * GIB
+    } else {
+        physical <= 3 * GIB || commit <= 4 * GIB
+    }
+}
+
+/// Called by the once-per-second submission sweep. A failed sample keeps the last good state.
+pub(crate) fn refresh() {
+    if !on() {
+        return;
+    }
+    let Some(status) = memory_status() else { return };
+    let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
+    HEADROOM.store(physical.min(commit), Ordering::Relaxed);
+    let was = pressured();
+    let pressure = next_pressure(was, physical, commit);
+    if pressure != was {
+        PRESSURED.store(pressure, Ordering::Relaxed);
+        if pressure {
+            tracing::warn!(
+                pid = std::process::id(),
+                frame = crate::frame::current(),
+                physical_free_mib = physical >> 20,
+                available_commit_mib = commit >> 20,
+                buffer_mirror_span_mib = crate::shadow::live_span_bytes() >> 20,
+                texture_staging_mib = crate::texture::live_staging_bytes() >> 20,
+                spare_scratch_mib = crate::host::ALIVE[4].load(Ordering::Relaxed) >> 20,
+                game_filled_gpu_texture_mib = crate::resource::KINDS[1].load(Ordering::Relaxed) >> 20,
+                "host memory pressure: limiting texture prefetch and idle upload storage"
+            );
+        } else {
+            tracing::info!(physical_free_mib = physical >> 20, available_commit_mib = commit >> 20, "host memory pressure cleared");
+        }
+    }
+}
+
+pub(crate) fn headroom() -> Option<u64> {
+    let bytes = HEADROOM.load(Ordering::Relaxed);
+    (bytes != u64::MAX).then_some(bytes)
+}
+
+pub(crate) fn pressured() -> bool {
+    PRESSURED.load(Ordering::Relaxed)
+}
+
+/// True when OS commit headroom is critically low (< 1.5 GiB) or an allocation
+/// just failed with `E_OUTOFMEMORY`, requiring emergency throttling.
+pub(crate) fn critical_commit() -> bool {
+    if !on() {
+        return false;
+    }
+    let now = crate::host::coarse_ms();
+    now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || sample_commit(now) < 1536 * MIB
+}
+
+/// A soft per-frame admission limit. A single texture can cross it. The
+/// queue retains unserved slots so they can be retried on later frames.
+pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited: bool, staging: u64) -> u64 {
+    if critical {
+        bytes.min(16 << 20)
+    } else if pressure || (limited && staging >= GIB) {
+        bytes.min(64 << 20)
     } else {
         bytes
     }
-}
-
-/// What this PC may keep for uploads, and for how long: one table by total
-/// RAM instead of a constant at each site (his "32GB RAM residency budgets",
-/// ours by tier). Unknown RAM gets the middle row's numbers.
-pub(crate) struct Budgets {
-    /// Scratch chunks no list holds that are kept for the next list.
-    pub(crate) spare_upload: u64,
-    /// How long idle upload storage is kept before it is freed.
-    pub(crate) idle_ms: u64,
-    /// Free commit left after an upload has taken its bytes.
-    pub(crate) upload_floor: u64,
-    /// Free commit left after a brand-new block of upload storage.
-    pub(crate) growth_floor: u64,
-}
-
-pub(crate) fn budgets(total_ram: Option<u64>) -> Budgets {
-    let spare_upload = match total_ram {
-        Some(ram) if ram <= 16 * GIB => 64 * MIB,
-        Some(ram) if ram >= 30 * GIB => 256 * MIB,
-        _ => 128 * MIB,
-    };
-    // A small PC gives idle upload storage back sooner: it has less to spare
-    // and the title's own allocations are what it is competing with.
-    let idle_ms = match total_ram {
-        Some(ram) if ram <= 12 * GIB => 5_000,
-        _ => 10_000,
-    };
-    let total = total_ram.unwrap_or(0);
-    Budgets {
-        spare_upload,
-        idle_ms,
-        upload_floor: upload_floor(total),
-        growth_floor: growth_floor(total),
-    }
-}
-
-/// A refused allocation: `E_OUTOFMEMORY` from the driver means wait, not ask
-/// the next texture's turn as well. Other errors (a bad descriptor, a dropped
-/// device) are not about memory and do not back off.
-pub(crate) fn allocation_error(error: &windows::core::Error) {
-    if !enabled() {
-        return;
-    }
-    if error.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
-        deadline(crate::host::now_ms().saturating_add(REFUSAL_MS));
-    }
-}
-
-fn deadline(at: u64) {
-    RETRY_AT.fetch_max(at, Ordering::Relaxed);
-}
-
-/// Whether an allocation was refused less than [`REFUSAL_MS`] ago.
-pub(crate) fn refused() -> bool {
-    enabled() && crate::host::now_ms() < RETRY_AT.load(Ordering::Relaxed)
-}
-
-/// Uploads deferred in a row: past this, one is admitted whatever the
-/// commit says, so a picture the title needs cannot be starved by a PC that
-/// stays low (a floor that never clears would otherwise mean never uploaded).
-const MAX_UPLOAD_DEFERRALS: u64 = 16;
-static UPLOAD_DEFERRALS: AtomicU64 = AtomicU64::new(0);
-static GROWTH_DEFERRALS: AtomicU64 = AtomicU64::new(0);
-
-/// Whether the starvation valve is open after `deferrals` refusals in a row.
-fn starved(deferrals: u64) -> bool {
-    deferrals >= MAX_UPLOAD_DEFERRALS
-}
-
-/// Counts a growth this guard held back, so a frame line can say so.
-pub(crate) fn note_deferred() {
-    DEFERRED.fetch_add(1, Ordering::Relaxed);
-}
-
-/// The growths deferred since the last call (0 when the guard is off).
-pub(crate) fn take_deferred() -> u64 {
-    DEFERRED.swap(0, Ordering::Relaxed)
-}
-
-/// Whether a staging buffer of `bytes` may be made now. A texture the title
-/// keeps sampling is not speculative, so the first one of a frame is always
-/// admitted: a guard that can starve the only upload of a frame is worse than
-/// the OOM it avoids.
-pub(crate) fn admit_upload(bytes: u64) -> bool {
-    if !enabled() {
-        UPLOAD_DEFERRALS.store(0, Ordering::Relaxed);
-        return true;
-    }
-    let total = crate::total_system_ram_bytes().unwrap_or(0);
-    let deferred = UPLOAD_DEFERRALS.load(Ordering::Relaxed);
-    let admit = total == 0 || starved(deferred) || (!refused() && admitted(total, sampled_commit(), bytes, false));
-    if admit {
-        UPLOAD_DEFERRALS.store(0, Ordering::Relaxed);
-    } else {
-        UPLOAD_DEFERRALS.fetch_add(1, Ordering::Relaxed);
-        note_deferred();
-    }
-    admit
-}
-
-/// Whether a new OS block of upload storage of `bytes` may be committed. Free
-/// ranges inside blocks already committed are not this: they cost nothing.
-pub(crate) fn admit_growth(bytes: u64) -> bool {
-    if !enabled() {
-        GROWTH_DEFERRALS.store(0, Ordering::Relaxed);
-        return true;
-    }
-    let total = crate::total_system_ram_bytes().unwrap_or(0);
-    let deferred = GROWTH_DEFERRALS.load(Ordering::Relaxed);
-    let admit = total == 0 || starved(deferred) || (!refused() && admitted(total, sampled_commit(), bytes, true));
-    if admit {
-        GROWTH_DEFERRALS.store(0, Ordering::Relaxed);
-    } else {
-        GROWTH_DEFERRALS.fetch_add(1, Ordering::Relaxed);
-        note_deferred();
-    }
-    admit
-}
-
-/// The commit sample, refreshed at most every 32 ms: a texture sweep runs for
-/// seconds inside one submitted frame, and each texture asking the OS would
-/// cost more than the decision.
-fn sampled_commit() -> u64 {
-    let now = crate::host::now_ms();
-    let next = NEXT_SAMPLE.load(Ordering::Relaxed);
-    if now >= next
-        && NEXT_SAMPLE
-            .compare_exchange(next, now.saturating_add(32), Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        && let Some((_, commit)) = memory_status()
-    {
-        COMMIT.store(commit, Ordering::Relaxed);
-    }
-    COMMIT.load(Ordering::Relaxed)
-}
-
-/// Once a second, from the sweep ([`crate::host::sweep`]): samples the PC's
-/// memory, moves the pressure state, and says when it changes. A failed sample
-/// keeps the last good state.
-pub(crate) fn tick() {
-    let Some((physical, commit)) = memory_status() else {
-        return;
-    };
-    COMMIT.store(commit, Ordering::Relaxed);
-    if !enabled() {
-        PRESSURED.store(false, Ordering::Relaxed);
-        return;
-    }
-    let total = crate::total_system_ram_bytes().unwrap_or(0);
-    if total == 0 {
-        return;
-    }
-    let was = pressured();
-    let pressure = next_pressure(was, total, physical, commit);
-    if pressure == was {
-        return;
-    }
-    PRESSURED.store(pressure, Ordering::Relaxed);
-    // Staging figures only with the diagnostics build (the memory line's own).
-    #[cfg(feature = "diagnostics")]
-    let (staging_buffers, texture_staging_mib) = {
-        let staged = crate::texture::memory();
-        (staged[0], staged[1] >> 20)
-    };
-    #[cfg(not(feature = "diagnostics"))]
-    let (staging_buffers, texture_staging_mib) = (0u64, 0u64);
-    if pressure {
-        tracing::warn!(
-            pid = std::process::id(),
-            frame = crate::frame::current(),
-            total_ram_mib = total >> 20,
-            physical_free_mib = physical >> 20,
-            available_commit_mib = commit >> 20,
-            staging_buffers,
-            texture_staging_mib,
-            upload_floor_mib = budgets(Some(total)).upload_floor >> 20,
-            growth_floor_mib = budgets(Some(total)).growth_floor >> 20,
-            "host memory pressure: deferring new upload storage and speculative uploads (VICTORY_RESIDENCY=0 turns this off)"
-        );
-    } else {
-        tracing::info!(
-            physical_free_mib = physical >> 20,
-            available_commit_mib = commit >> 20,
-            "host memory pressure cleared"
-        );
-    }
-}
-
-/// Whether the PC is short of memory right now (see [`next_pressure`]).
-pub(crate) fn pressured() -> bool {
-    enabled() && PRESSURED.load(Ordering::Relaxed)
-}
-
-/// Whether the PC has 32 GiB or less: its RAM budgets scale down, as the
-/// caller's did.
-pub(crate) fn limited_host_ram() -> bool {
-    crate::total_system_ram_bytes().is_some_and(|ram| ram <= 32 * GIB)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const SMALL: u64 = 8 * GIB;
-    const OURS: u64 = 16 * GIB;
-    const BIG: u64 = 32 * GIB;
-
-    /// The floor is one sixteenth of the PC, and a small or a huge PC stays
-    /// inside the bounds: 256 MiB (no PC we run on keeps less) and 1 GiB.
     #[test]
-    fn floors_scale_with_the_pc_between_their_bounds() {
-        assert_eq!(upload_floor(SMALL), 512 * MIB);
-        assert_eq!(upload_floor(OURS), GIB);
-        assert_eq!(upload_floor(BIG), GIB);
-        assert_eq!(upload_floor(2 * GIB), 256 * MIB);
-        assert_eq!(growth_floor(SMALL), GIB);
-        assert_eq!(growth_floor(OURS), 2 * GIB);
-        for total in [GIB, SMALL, 12 * GIB, OURS, 30 * GIB, BIG, 64 * GIB] {
-            assert!(upload_floor(total) >= 256 * MIB && upload_floor(total) <= GIB);
-            assert!(growth_floor(total) > upload_floor(total));
+    fn bake_and_lookahead_leave_room_for_live_game_allocations() {
+        for (commit, bake, lookahead, growth) in [
+            (128 * MIB, false, false, false),
+            (256 * MIB, true, false, false),
+            (512 * MIB, true, true, false),
+            (768 * MIB, true, true, false),
+            (1024 * MIB, true, true, true),
+        ] {
+            assert_eq!(has_upload_reserve(commit, true), bake);
+            assert_eq!(has_upload_reserve(commit, false), lookahead);
+            assert_eq!(has_growth_reserve(commit, false), growth);
         }
     }
 
-    /// A growth needs twice the room an upload does, and both count the bytes
-    /// about to be taken on top of the floor.
-    #[test]
-    fn an_upload_costs_its_bytes_on_top_of_the_floor() {
-        let total = OURS;
-        let floor = upload_floor(total);
-        assert!(admitted(total, floor, 0, false));
-        assert!(!admitted(total, floor - 1, 0, false));
-        assert!(!admitted(total, floor + MIB, 2 * MIB, false));
-        assert!(admitted(total, floor + 2 * MIB, 2 * MIB, false));
-        let growth = growth_floor(total);
-        assert!(admitted(total, growth + 64 * MIB, 64 * MIB, true));
-        assert!(!admitted(total, growth + 64 * MIB - 1, 64 * MIB, true));
-        assert!(!admitted(total, growth, 64 * MIB, true));
-        // Room for a small upload is not room for a block.
-        assert!(!admitted(total, floor + 64 * MIB, 64 * MIB, true));
-    }
-
-    /// Either constraint enters pressure, and both have to recover: a frame
-    /// that dips once does not unthrottle the next one.
     #[test]
     fn either_constraint_enters_pressure_and_both_must_recover() {
-        let total = OURS;
-        // Entering: free physical RAM or commit at a tenth/eighth of the PC.
-        assert!(next_pressure(false, total, total / 10, total));
-        assert!(next_pressure(false, total, total, total / 8));
-        assert!(!next_pressure(false, total, total / 9, total / 7));
-        // Leaving: both above a sixth/fifth, so one at the line is not enough.
-        assert!(next_pressure(true, total, total / 6 - 1, total));
-        assert!(!next_pressure(true, total, total / 6, total));
-        assert!(next_pressure(true, total, total, total / 5 - 1));
-        assert!(!next_pressure(true, total, total, total / 5));
-        assert!(!next_pressure(true, total, total / 5, total / 4));
-        // The state is sticky in one direction only.
-        for total in [SMALL, OURS, BIG] {
-            assert!(!next_pressure(true, total, total / 4, total / 4));
-            assert!(next_pressure(false, total, total / 20, total / 20));
-        }
+        assert!(next_pressure(false, 12 * GIB, 4 * GIB));
+        assert!(next_pressure(false, 3 * GIB, 16 * GIB));
+        assert!(next_pressure(true, 4 * GIB, 7 * GIB));
+        assert!(next_pressure(true, 6 * GIB, 5 * GIB));
+        assert!(!next_pressure(true, 5 * GIB, 6 * GIB));
+        assert!(!next_pressure(false, 4 * GIB, 5 * GIB));
     }
 
-    /// The refusal deadline is a max, so two refusals in one frame do not
-    /// shorten it, and the guard reads the clock, not a count.
     #[test]
-    fn a_refused_allocation_sets_one_deadline_ahead() {
-        let start = crate::host::now_ms();
-        deadline(start.saturating_add(REFUSAL_MS));
-        deadline(start);
-        assert!(crate::host::now_ms() < RETRY_AT.load(Ordering::Relaxed));
-    }
-
-    /// A speculative upload is capped under pressure, and by staged bytes on a
-    /// small PC; a single texture may still cross either.
-    #[test]
-    fn speculative_upload_is_capped_and_recovers() {
-        assert_eq!(prefetch_limit(512 * MIB, true, false, 0), 16 * MIB);
-        assert_eq!(prefetch_limit(8 * MIB, true, false, 0), 8 * MIB);
-        assert_eq!(prefetch_limit(512 * MIB, false, true, GIB), 64 * MIB);
-        assert_eq!(prefetch_limit(512 * MIB, false, true, GIB - 1), 512 * MIB);
-        assert_eq!(prefetch_limit(512 * MIB, false, false, 2 * GIB), 512 * MIB);
-        assert_eq!(prefetch_limit(0, false, false, 0), 0);
-        assert_eq!(prefetch_limit(192 * MIB, false, false, 0), 192 * MIB);
-    }
-
-    /// The budget table: the target PC (16 GiB) keeps 64 MiB of idle upload
-    /// storage, the 30 GiB desktop 256 MiB, a 12 GiB one gives it back in 5 s,
-    /// and the floors follow the RAM.
-    #[test]
-    fn the_budget_table_follows_the_pc() {
-        let small = budgets(Some(12 * GIB));
-        assert_eq!(small.spare_upload, 64 * MIB);
-        assert_eq!(small.idle_ms, 5_000);
-        let ours = budgets(Some(OURS));
-        assert_eq!(ours.spare_upload, 64 * MIB);
-        assert_eq!(ours.idle_ms, 10_000);
-        assert_eq!(ours.upload_floor, GIB);
-        assert_eq!(ours.growth_floor, 2 * GIB);
-        let desktop = budgets(Some(30 * GIB));
-        assert_eq!(desktop.spare_upload, 256 * MIB);
-        assert_eq!(desktop.idle_ms, 10_000);
-        let unknown = budgets(None);
-        assert_eq!(unknown.spare_upload, 128 * MIB);
-        assert_eq!(unknown.idle_ms, 10_000);
-    }
-
-    /// Microbench: the whole admission decision is arithmetic, so it has to be
-    /// far cheaper than the driver call it stands in front of (a failed
-    /// `CreateCommittedResource` is tens of microseconds; a `GlobalMemoryStatus`
-    /// sample is a syscall). 1e6 decisions against 1e6 samples' worth of time.
-    #[test]
-    fn deciding_is_nothing_next_to_asking_the_driver() {
-        let total = OURS;
-        let commit = 3 * GIB;
-        let started = std::time::Instant::now();
-        let mut admitted_count = 0u64;
-        for i in 0..1_000_000u64 {
-            let bytes = (i % 4096) << 10;
-            if admitted(total, commit, bytes, i % 2 == 0) {
-                admitted_count += 1;
-            }
-        }
-        let elapsed = started.elapsed();
-        assert!(admitted_count > 0);
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "1e6 admission decisions took {elapsed:?}"
-        );
-    }
-
-    /// The valve opens after sixteen refusals in a row, so a PC that stays
-    /// under its floor cannot starve an upload the title needs.
-    #[test]
-    fn a_long_low_commit_still_admits_one_upload() {
-        assert!(!starved(0));
-        assert!(!starved(MAX_UPLOAD_DEFERRALS - 1));
-        assert!(starved(MAX_UPLOAD_DEFERRALS));
-        assert!(starved(MAX_UPLOAD_DEFERRALS * 10));
-        // Off nothing is ever deferred, so nothing can starve.
-        if !enabled() {
-            UPLOAD_DEFERRALS.store(MAX_UPLOAD_DEFERRALS * 3, Ordering::Relaxed);
-            assert!(admit_upload(u64::MAX));
-        }
-        UPLOAD_DEFERRALS.store(0, Ordering::Relaxed);
-    }
-
-    /// Off, the guard admits everything and reads nothing.
-    #[test]
-    fn the_switch_has_a_default_and_turns_every_gate_off() {
-        if std::env::var_os("VICTORY_RESIDENCY").is_none() {
-            assert!(enabled());
-        }
-        // A refused deadline set while on does not hold a guard that is off:
-        // `refused` asks `enabled` first.
-        deadline(u64::MAX);
-        if !enabled() {
-            assert!(admit_upload(u64::MAX));
-            assert!(admit_growth(u64::MAX));
-            assert!(!refused());
-            assert!(!pressured());
-        }
-        RETRY_AT.store(0, Ordering::Relaxed);
+    fn prefetch_respects_existing_budgets_and_resumes_after_recovery() {
+        assert_eq!(prefetch_limit(512 << 20, false, false, true, GIB), 64 << 20);
+        assert_eq!(prefetch_limit(512 << 20, false, false, true, GIB - 1), 512 << 20);
+        assert_eq!(prefetch_limit(512 << 20, false, false, false, 2 * GIB), 512 << 20);
+        assert_eq!(prefetch_limit(0, true, true, false, 0), 0);
+        assert_eq!(prefetch_limit(8 << 20, true, true, false, 0), 8 << 20);
+        assert_eq!(prefetch_limit(512 << 20, true, false, false, 0), 64 << 20);
+        assert_eq!(prefetch_limit(512 << 20, true, true, false, 0), 16 << 20);
+        assert_eq!(prefetch_limit(192 << 20, false, false, false, 0), 192 << 20);
     }
 }

@@ -18,6 +18,9 @@ use crate::object::{
 use crate::queue::Written;
 use crate::resource::PAGEABLE_IIDS;
 
+#[cfg(windows)]
+pub(crate) mod thin;
+
 const ALLOCATOR_IIDS: [Iid; 4] = [
     guid(
         0x6102dee4,
@@ -114,7 +117,7 @@ struct List {
     /// Ours, after the console layout: memory handed out by
     /// [`allocate_upload`], kept until the list is reset; the host list the
     /// calls record into (decision 0007), and the draw state the title set.
-    uploads: std::sync::Mutex<Vec<Vec<u8>>>,
+    uploads: std::sync::Mutex<Vec<Upload>>,
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
     #[cfg(windows)]
@@ -127,6 +130,10 @@ struct List {
     /// at them before it runs `host`.
     #[cfg(windows)]
     gate: Vec<ValueWait>,
+    /// With `VICTORY_THIN=1`, of a list the title has: what it wrote down
+    /// ([`thin`]; then there is no `host`).
+    #[cfg(windows)]
+    thin: thin::Front,
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -142,7 +149,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -151,21 +158,6 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
-}
-
-/// As [`with_state`], for a call that reads title memory when its list is
-/// prepared (a draw's vertices, a dispatch's views): a list with pending
-/// texture read-backs is cut first, so this call's reads are prepared with
-/// the read-backs' bytes in title memory.
-#[cfg(windows)]
-fn with_state_after_read_back(
-    this: This,
-    f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State),
-) {
-    if host_list_after_read_back(this, None).is_none() {
-        return;
-    }
-    with_state(this, f);
 }
 
 /// The submission of `lists` has run: each gives its descriptor tables'
@@ -202,7 +194,7 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
 #[cfg(windows)]
 pub(crate) struct Detached {
     host: crate::host::HostList,
-    _uploads: Vec<Vec<u8>>,
+    _uploads: Vec<Upload>,
     _state: crate::draw::State,
 }
 
@@ -210,6 +202,13 @@ pub(crate) struct Detached {
 impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
+    }
+
+    /// Releases this list's dynamic descriptor slots once its GPU submission
+    /// has completed, without waiting for the full `bury_lag` (64 submissions)
+    /// allocator delay: preventing dynamic slot exhaustion at ~10k draws/frame.
+    pub(crate) fn release_tables(&mut self) {
+        self._state.tables_done();
     }
 }
 
@@ -233,32 +232,14 @@ unsafe impl Send for Idle {}
 #[cfg(windows)]
 static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
 
-/// The most host lists kept idle, and the most upload memory they may keep
+/// The most host lists kept idle (128 were too few: flights land several at
+/// a time, so lists were thrown away and others made in the same frame, with
+/// their preludes and buffers, 12 % of the submitting thread in the opening,
+/// profile cpu-1), and the most upload memory they may keep
 /// between them (a list keeps scratch chunks over a reset only while lists
-/// do not share them, `VICTORY_SCRATCH_POOL=0`), scaled from CPU cores and
-/// total system RAM.
+/// do not share them, `VICTORY_SCRATCH_POOL=0`).
 #[cfg(windows)]
-fn idle_most(total_ram_bytes: Option<u64>, cores: usize) -> (usize, u64) {
-    const GIB: u64 = 1 << 30;
-    let lists = cores.saturating_mul(16).clamp(64, 256);
-    let bytes = match total_ram_bytes {
-        Some(ram) if ram <= 16 * GIB => 128 << 20,
-        // 32 GB Windows systems typically report ~31.7–31.9 GiB in
-        // `ullTotalPhys` after firmware/hardware reservations.
-        Some(ram) if ram >= 30 * GIB => 512 << 20,
-        _ => 256 << 20,
-    };
-    (lists, bytes)
-}
-
-#[cfg(windows)]
-fn idle_limits() -> (usize, u64) {
-    static LIMITS: std::sync::OnceLock<(usize, u64)> = std::sync::OnceLock::new();
-    *LIMITS.get_or_init(|| {
-        let cores = std::thread::available_parallelism().map_or(8, usize::from);
-        idle_most(crate::total_system_ram_bytes(), cores)
-    })
-}
+const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -295,54 +276,23 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
-    let (max_lists, max_bytes) = idle_limits();
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= max_lists {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay.
-        reset_before_reuse(host, |host| host.reset(), |host| {
-            let bytes = host.scratch_kept();
-            let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-            if idle.0.len() < max_lists && idle.1 + bytes <= max_bytes {
-                idle.0.push(Idle(host, bytes));
-                idle.1 += bytes;
-            }
-        });
+        host.reset();
+        let bytes = host.scratch_kept();
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+            idle.0.push(Idle(host, bytes));
+            idle.1 += bytes;
+        }
     }
-}
-
-/// A list cannot enter the reusable pool until its reset has returned.
-#[cfg(windows)]
-fn reset_before_reuse<T>(item: T, reset: impl FnOnce(&T), publish: impl FnOnce(T)) {
-    reset(&item);
-    publish(item);
-}
-
-#[cfg(all(test, windows))]
-#[test]
-fn a_list_is_not_reused_until_its_background_reset_finishes() {
-    use std::sync::{Arc, Mutex, mpsc};
-    use std::time::Duration;
-    let idle = Arc::new(Mutex::new(Vec::new()));
-    let (started, waiting) = mpsc::channel();
-    let (release, proceed) = mpsc::channel();
-    let pool = idle.clone();
-    let worker = std::thread::spawn(move || {
-        reset_before_reuse(42, |_| {
-            started.send(()).unwrap();
-            proceed.recv_timeout(Duration::from_secs(5)).unwrap();
-        }, |list| pool.lock().unwrap().push(list));
-    });
-    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert!(idle.lock().unwrap().pop().is_none(), "resetting list became reusable");
-    release.send(()).unwrap();
-    worker.join().unwrap();
-    assert_eq!(idle.lock().unwrap().pop(), Some(42));
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut
@@ -416,156 +366,6 @@ pub(crate) fn cut_list(this: This) -> bool {
     !list.earlier.is_empty() || !list.gate.is_empty()
 }
 
-/// Whether a list is cut at its texture read-backs ([`read_back`]), so the
-/// part after one runs in a submission of its own.
-///
-/// A read-back's texels reach title memory once the list that copied them
-/// to a host buffer of ours has run ([`crate::host::HostList::defer_read_back`]).
-/// A copy recorded after one in the same submission prepares its reads
-/// before that, so it reads the title bytes from before the read-back: a
-/// buffer the title fills from a texture and then copies within one list
-/// (`CopyTextureRegion` then `CopyBufferRegion`), or across the lists of one
-/// `ExecuteCommandLists`, came out stale. Cutting the recording there (and
-/// running the parts one after the other) makes the later part prepare its
-/// reads with the read-back's bytes in title memory.
-///
-/// On by default; `VICTORY_SPLIT_READBACKS=0` records without the cut, as
-/// before.
-#[cfg(windows)]
-fn read_back_cuts() -> bool {
-    // Only the variable is read once: the queue's own switches can be turned
-    // during a run, and a cut recorded while the queue runs no parts would be
-    // submitted as `host` alone, so those commands would never run.
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_SPLIT_READBACKS").is_none_or(|v| v != "0"));
-    // A part of its own needs the queue to run parts ([`crate::queue::cuts`]),
-    // and a submission sent ahead of the wait ([`crate::host::late`]) writes
-    // its read-backs when it is settled, after the next submission's copies
-    // were prepared.
-    on && crate::queue::cuts() && !crate::host::late()
-}
-
-/// Closes the host list `this` records into and records into a fresh one
-/// from here on, keeping the closed one as a part that runs in a submission
-/// of its own ([`read_back_cuts`]). Whether it cut.
-#[cfg(windows)]
-fn cut_read_back(this: This) -> bool {
-    let Some(fresh) = fresh_list() else {
-        // shortcut: recorded on, the copy that reads the read-back's bytes
-        // may find the title's older ones.
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            tracing::warn!("no host list to cut a list at its read back: a copy after it may read stale bytes")
-        });
-        return false;
-    };
-    // SAFETY: the title passes one of our lists; a list is recorded by one
-    // thread at a time and is not submitted while it records.
-    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-    let Some(current) = list.host.as_ref() else {
-        return false;
-    };
-    current.close();
-    static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
-        tracing::info!(parts = list.earlier.len() + 2, "a list is cut at a texture read back");
-    }
-    let Some(done) = list.host.replace(fresh) else {
-        return false;
-    };
-    // The waits before any work so far stand before the part that is done.
-    let waits = std::mem::take(&mut list.gate);
-    list.earlier.push(Part { waits, host: done });
-    // What the title set so far, on the new host list.
-    if let Some(host) = list.host.as_ref() {
-        list.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .replay(host);
-    }
-    true
-}
-
-/// The host list `this` records into, cut onto a fresh part first when its
-/// pending read-backs write `range` (or anything, with `None`).
-#[cfg(windows)]
-fn host_list_after_read_back<'a>(
-    this: This,
-    range: Option<(usize, usize)>,
-) -> Option<&'a crate::host::HostList> {
-    let current = host_list(this)?;
-    if !read_back_cuts() {
-        return Some(current);
-    }
-    let cut = match range {
-        Some((start, len)) => current.reads_after_read_back(start, len),
-        None => current.has_read_backs(),
-    };
-    if cut && cut_read_back(this) {
-        host_list(this)
-    } else {
-        Some(current)
-    }
-}
-
-/// As [`host_list_after_read_back`] for a copy of `len` bytes at `dst` from
-/// `src` of title memory: either end in a read-back's rows cuts the list.
-#[cfg(windows)]
-fn host_list_after_buffers<'a>(
-    this: This,
-    dst: usize,
-    src: usize,
-    len: usize,
-) -> Option<&'a crate::host::HostList> {
-    let current = host_list(this)?;
-    if !read_back_cuts() {
-        return Some(current);
-    }
-    if (current.reads_after_read_back(src, len) || current.reads_after_read_back(dst, len))
-        && cut_read_back(this)
-    {
-        return host_list(this);
-    }
-    Some(current)
-}
-
-/// As [`host_list_after_read_back`] for a texture copy whose source is
-/// `src`: a buffer of title memory the list reads (an upload) or a texture
-/// the title wrote itself (an upload of title bytes) sees the read-backs.
-#[cfg(windows)]
-fn list_for_texture_copy<'a>(this: This, src: &CopyLocation) -> Option<&'a crate::host::HostList> {
-    const FOOTPRINT: u32 = 1;
-    let current = host_list(this)?;
-    if !read_back_cuts() || !current.has_read_backs() {
-        return Some(current);
-    }
-    let cut = if src.kind == FOOTPRINT {
-        src.footprint
-            .bytes()
-            .and_then(|bytes| {
-                buffer_range(src.resource, src.footprint.offset, bytes)
-                    .map(|data| (data as usize, bytes as usize))
-            })
-            .is_some_and(|(data, bytes)| current.reads_after_read_back(data, bytes))
-    } else {
-        crate::resource::host_resource(src.resource)
-            .is_some_and(crate::texture::title_written)
-    };
-    if cut && cut_read_back(this) {
-        host_list(this)
-    } else {
-        Some(current)
-    }
-}
-
-/// Whether a queue's entry (one submission) starts at a part: the part has
-/// waits of its own, or the part before it wrote title memory once it had
-/// run and so must be waited for first ([`cut_read_back`]).
-#[cfg(any(windows, test))]
-fn starts_entry(waits: bool, flush: bool) -> bool {
-    flush || waits
-}
-
 /// What a queue is given for submitted lists that were cut at their waits:
 /// the waits it stands at, the host lists it runs once they are met, and
 /// the order those run in.
@@ -588,12 +388,6 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
     // The lists taken: where its one host list is (entry, place), or none
     // for a list of several parts.
     let mut seen: Vec<(This, Option<(usize, usize)>)> = Vec::new();
-    // A part whose read-backs write title memory once it has run
-    // ([`cut_read_back`]) runs before what is prepared next: the part after
-    // it starts an entry of its own, so the queue gives it a submission of
-    // its own. Carried across the lists taken, a read-back that ends one
-    // list's last part ends its entry for the next list too.
-    let mut flush = false;
     for &this in lists {
         if this.is_null() {
             continue;
@@ -650,10 +444,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         ));
         let mut last = None;
         for (waits, detached) in pieces {
-            // The switch ([`read_back_cuts`]) turns every read-back-specific
-            // submission off; a part's waits keep their own boundary.
-            let read_backs = read_back_cuts() && detached.host().has_read_backs();
-            if starts_entry(!waits.is_empty(), flush) {
+            if !waits.is_empty() {
                 parts.push((waits, Vec::new(), Vec::new()));
             }
             let entry = parts.len() - 1;
@@ -662,7 +453,6 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             order.push(place);
             taken.push(detached);
             last = Some((entry, place));
-            flush = read_backs;
         }
         seen.push((this, if single { last } else { None }));
     }
@@ -784,11 +574,29 @@ fn new_list(
         return E_INVALIDARG;
     }
     tracing::debug!(kind, "command list");
+    #[cfg(windows)]
+    if thin::on() {
+        let mut list = boxed(kind, pipeline, true);
+        list.thin.begin(kind, pipeline);
+        return object::hand_out(LIST, list, iid, &LIST_IIDS, out);
+    }
+    object::hand_out(LIST, boxed(kind, pipeline, false), iid, &LIST_IIDS, out)
+}
+
+/// A list; with `thin` one whose calls are written down (it has no host list).
+fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
+    #[cfg(not(windows))]
+    let _ = thin;
     let list = Box::new(List {
-        object: if crate::device::newer() {
-            Object::new(&NEWER_LIST_FUNCTIONS)
-        } else {
-            Object::new(&LIST_FUNCTIONS)
+        object: match (crate::device::newer(), thin) {
+            (true, false) => Object::new(&NEWER_LIST_FUNCTIONS),
+            (false, false) => Object::new(&LIST_FUNCTIONS),
+            #[cfg(windows)]
+            (true, true) => Object::new(&NEWER_THIN_FUNCTIONS),
+            #[cfg(windows)]
+            (false, true) => Object::new(&THIN_FUNCTIONS),
+            #[cfg(not(windows))]
+            _ => Object::new(&LIST_FUNCTIONS),
         },
         kind,
         put: [0; 5],
@@ -799,7 +607,7 @@ fn new_list(
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().and_then(|h| match h.new_list() {
+        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
             Ok(list) => Some(list),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
@@ -816,10 +624,12 @@ fn new_list(
         earlier: Vec::new(),
         #[cfg(windows)]
         gate: Vec::new(),
+        #[cfg(windows)]
+        thin: Default::default(),
     });
     #[cfg(not(windows))]
     let _ = pipeline;
-    object::hand_out(LIST, list, iid, &LIST_IIDS, out)
+    list
 }
 
 extern "system" fn allocator_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -845,6 +655,7 @@ extern "system" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "system" fn close(this: This) -> HRESULT {
+    let _called = crate::timeline::span("the title's Close");
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
@@ -855,6 +666,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
+    let _called = crate::timeline::span("the title's list Reset");
     // A wait recorded and never submitted goes with the recording.
     VALUE_WAITS
         .lock()
@@ -879,8 +691,9 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         host.reset();
         state.reset(pipeline);
     });
+    crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
-    let _ = (this, pipeline);
+    let _ = this;
     S_OK
 }
 
@@ -969,6 +782,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     if let Some(list) = host_list(this)
         && !barriers.is_null()
     {
+        if count > 0 {
+            with_state(this, |_, state| state.synced());
+        }
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         let mut host: Vec<Barrier> = barriers
@@ -996,7 +812,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                 )
             };
             // SAFETY: an open list and live resources.
-            unsafe { list.list.ResourceBarrier(host) };
+            unsafe { list.list.barriers(host) };
         }
     }
     0
@@ -1009,8 +825,9 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
-        // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        // SAFETY: an open list and a live texture (the list's states hold
+        // it).
+        unsafe { list.list.barriers(&[barrier]) };
     }
 }
 
@@ -1032,22 +849,18 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
-/// Whether a title texture's host copy lacks its top mip levels (the host
-/// could not give them, [`crate::resource::dropped_mips`]). A copy or a
-/// resolve names the title's subresources and sizes, so it is skipped on
-/// such a copy.
+/// A copy of title memory that `list` records: on the card at its place in
+/// the list ([`crate::host::HostList::place_copy`]), or at submission.
 #[cfg(windows)]
-fn mip_dropped(texture: This) -> bool {
-    let dropped = crate::resource::dropped_mips(texture);
-    if dropped > 0 {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            tracing::warn!(
-                "a copy or resolve skipped: a host texture lost mips to memory pressure"
-            );
-        });
+fn buffer_copy(this: This, list: &crate::host::HostList, to: *mut u8, from: *const u8, len: usize) {
+    if len == 0 {
+        return;
     }
-    dropped > 0
+    if list.place_copy(to as usize, from as usize, len) {
+        with_state(this, |_, state| state.copied());
+    } else {
+        list.defer_copy(to, from, len);
+    }
 }
 
 /// Buffer to buffer: both are host memory, copied at submission.
@@ -1060,11 +873,11 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
-    if let Some(to) = buffer_range(dst, dst_offset, len)
+    if let Some(list) = host_list(this)
+        && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
-        && let Some(list) = host_list_after_buffers(this, to as usize, from as usize, len as usize)
     {
-        list.defer_copy(to, from, len as usize);
+        buffer_copy(this, list, to, from, len as usize);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
@@ -1085,37 +898,61 @@ fn unlike(dst: This, src: This) -> bool {
     unlike
 }
 
+/// Copies left out because both sides were one host texture
+/// ([`copy_resource`], [`copy_texture_region`]), since the start.
+#[cfg(windows)]
+pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
+        let Some(list) = host_list(this) else {
+            return;
+        };
         if let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            if unlike(dst, src) || mip_dropped(dst) || mip_dropped(src) {
+            if unlike(dst, src) {
                 return;
             }
+            // Two title textures over the same memory have one host
+            // texture between them: the copy would be of that texture onto
+            // itself, which the host does not allow, and it would change
+            // nothing. It was recorded all the same, with the texture left
+            // in the source state as the copy's destination (run 205's
+            // debug layer: "CopyResource with its destination in the
+            // COPY_SOURCE state", 37 times, a 2560x1440 depth texture).
+            // Only the two state changes and the copy are left out: what
+            // is noted of the textures stays as it was. After
+            // triippywhale 6e502b3b.
+            let same = windows::core::Interface::as_raw(to) == windows::core::Interface::as_raw(from);
             // A source the title fills itself is uploaded first (upstream
-            // PR #671): a copy read whatever the host texture held, and an
-            // upload reads title bytes a read-back may have written
-            // (`cut_read_back`).
-            let title_src = crate::texture::title_written(from);
-            let Some(list) = (if title_src {
-                host_list_after_read_back(this, None)
-            } else {
-                host_list(this)
-            }) else {
-                return;
-            };
-            if title_src {
+            // PR #671): a copy read whatever the host texture held.
+            if crate::texture::title_written(from) {
                 crate::texture::upload(list, src, from);
             }
             // Depth textures shaders also write: what they wrote, first.
             list.twin_use(dst, false, true);
             list.twin_use(src, false, false);
+            // A destination made level by level gets its levels' memory
+            // ahead of this list (`crate::tiles`).
+            crate::texture::card_writes(list, dst, to, None);
+            crate::texture::host_written(dst);
+            if same {
+                SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::info!(
+                        ?dst,
+                        ?src,
+                        "a copy between two title textures that share one host texture is left out: the first one"
+                    );
+                });
+                return;
+            }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -1124,10 +961,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            let bytes = a.min(b) as usize;
-            if let Some(list) = host_list_after_buffers(this, to as usize, from as usize, bytes) {
-                list.defer_copy(to, from, bytes);
-            }
+            buffer_copy(this, list, to, from, a.min(b) as usize);
         }
     }
     #[cfg(not(windows))]
@@ -1166,10 +1000,11 @@ extern "system" fn copy_texture_region(
         use windows::core::Interface;
         const FOOTPRINT: u32 = 1;
         // SAFETY: the title passes both locations (null is tolerated).
-        let (Some(&dst), Some(&src)) = (unsafe { dst.as_ref() }, unsafe { src.as_ref() }) else {
-            return;
-        };
-        let Some(list) = list_for_texture_copy(this, &src) else {
+        let (Some(list), Some(&dst), Some(&src)) =
+            (host_list(this), unsafe { dst.as_ref() }, unsafe {
+                src.as_ref()
+            })
+        else {
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
@@ -1180,9 +1015,6 @@ extern "system" fn copy_texture_region(
             // and 1x1 RGBA32F, 80 and 16 bytes: run 90), and read a buffer
             // nobody wrote. `VICTORY_READ_BACK=0` leaves them unmade, as
             // before.
-            if src.kind != FOOTPRINT && mip_dropped(src.resource) {
-                return;
-            }
             static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             let made = read_back(list, dst, x, y, z, src, source_box);
@@ -1209,13 +1041,12 @@ extern "system" fn copy_texture_region(
             }
             return;
         };
-        if unlike(dst.resource, src.resource)
-            || mip_dropped(dst.resource)
-            || (src.kind != FOOTPRINT && mip_dropped(src.resource))
-        {
+        if unlike(dst.resource, src.resource) {
             return;
         }
         let mut from = src;
+        // Both sides are the same subresource of one host texture (set below).
+        let mut same = false;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
@@ -1226,12 +1057,20 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
-                return;
+            let buffer = match list.place_source(data as usize, bytes as usize) {
+                // What shaders wrote to it, at this place of the list.
+                Some(buffer) => buffer,
+                None => {
+                    let Some((buffer, staging)) = list.upload(host, bytes) else {
+                        return;
+                    };
+                    // The list owns this mapped D3D12 upload buffer. Wine can
+                    // report its address as MEM_FREE, so use the host-upload
+                    // path.
+                    list.defer_fill_buffer(&buffer, staging, data, bytes as usize);
+                    buffer
+                }
             };
-            // The list owns this mapped D3D12 upload buffer. Wine can report
-            // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
             from.footprint.offset = 0;
             #[cfg(feature = "diagnostics")]
@@ -1244,18 +1083,70 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            // The same subresource of one host texture on both sides (two
+            // title textures over one memory): not a copy the host allows.
+            // The states and the copy are left out below; the rest is
+            // noted as before.
+            same = texture.as_raw() == to.as_raw()
+                && src.kind != FOOTPRINT
+                && dst.kind != FOOTPRINT
+                && src.footprint.offset as u32 == dst.footprint.offset as u32;
             list.twin_use(src.resource, false, false);
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
             }
-            ensure_state(list, src.resource, COPY_SOURCE);
+            if !same {
+                ensure_state(list, src.resource, COPY_SOURCE);
+            }
             from.resource = texture.as_raw().cast_const().cast();
         }
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
         list.twin_use(dst.resource, false, true);
-        ensure_state(list, dst.resource, COPY_DEST);
+        // The first copy into a texture of the title's: what it does not
+        // write is zeros, as in a texture that was an allocation of its own
+        // (`VICTORY_COPY_OVER_TITLE=title`: what title memory holds, which
+        // may be another texture's: specks on the waitress's forehead were
+        // left in run n04). (The host
+        // copy is cut from a block and held whatever lay there, and no
+        // upload is made once a copy wrote it: the atlas the title copies
+        // its baked decorations into, a 2048x2048 BC3 texture of which a
+        // bake writes 256x256 at most, was drawn over a character's face
+        // with other textures' bytes wherever nothing was baked, runs n01 and
+        // textures-1.)
+        static OVER: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let over = *OVER.get_or_init(|| match std::env::var("VICTORY_COPY_OVER_TITLE").as_deref() {
+            Ok("0") => 0,
+            Ok("title") => 1,
+            _ => 2,
+        });
+        if over != 0 && crate::texture::title_written(to) && !crate::texture::host_wrote(dst.resource as usize) {
+            // One a list uploaded, or a draw sampled, holds the title's.
+            if over == 2 && !list.used(dst.resource as usize) && !crate::texture::is_staged(dst.resource) {
+                if let Some(host) = crate::host::host() {
+                    ensure_state(list, dst.resource, COPY_DEST);
+                    let _ = list.first_use(dst.resource as usize);
+                    crate::texture::zeros(list, host, to);
+                }
+            } else {
+                crate::texture::upload(list, dst.resource, to);
+            }
+            // (Done before the title's copy writes over it.)
+            if list.used(dst.resource as usize) {
+                ensure_state(list, dst.resource, COPY_SOURCE);
+            }
+        }
+        // A destination made level by level gets the level's memory ahead
+        // of this list (`crate::tiles`): the title's bake copies each level
+        // of its result into a block-compressed texture of that kind, and
+        // a copy into a level without memory is dropped.
+        crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
         crate::texture::host_written(dst.resource);
+        if same {
+            SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        ensure_state(list, dst.resource, COPY_DEST);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
@@ -1361,9 +1252,6 @@ fn read_back(
             .CopyTextureRegion((&raw const to).cast(), 0, 0, 0, (&raw const from).cast(), host_box)
     };
     list.defer_read_back(buffer, data, [row as usize, rows as usize, pitch as usize]);
-    // The title's buffer holds these rows once the list has run: what a
-    // later command copies from here would read before then is stale.
-    list.note_read_back(data as usize, bytes as usize);
     Ok(())
 }
 
@@ -1404,12 +1292,14 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
-        if unlike(dst, src) || mip_dropped(dst) || mip_dropped(src) {
+        if unlike(dst, src) {
             return;
         }
         // Depth textures shaders also write: what they wrote, first.
         list.twin_use(dst, false, true);
         list.twin_use(src, false, false);
+        // As for a copy (`crate::tiles`).
+        crate::texture::card_writes(list, dst, to, Some(dst_sub));
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
@@ -1484,13 +1374,6 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
-        // The host does not take the render target use of this texture's
-        // format: its host copy was made without that use
-        // (`resource::taken_flags`), and a view of it would be refused
-        // (`resource::host_use_allowed`): neither is made, nor the clear.
-        if !crate::resource::host_use_allowed(texture, false) {
-            return;
-        }
         let rtv = host.rtv(Some(texture), record.desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
@@ -1560,11 +1443,15 @@ extern "system" fn clear_dsv(
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
-    if dst != 0
+    if let Some(list) = host_list(this)
+        && dst != 0
         && src != 0
-        && let Some(list) = host_list_after_buffers(this, dst as usize, src as usize, len as usize)
     {
         let len = len as usize;
+        if list.place_copy(dst as usize, src as usize, len) {
+            with_state(this, |_, state| state.copied());
+            return;
+        }
         list.defer(move || {
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
@@ -1583,16 +1470,15 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, of which the
+/// host follows one: the counts are threads, not groups (`draw.rs`
+/// `THREAD_DIMENSIONS`; the ray-tracing structure builder dispatches this way).
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+    count_dispatch();
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    with_state(this, |list, s| s.dispatch(list, x, y, z, flags));
     #[cfg(not(windows))]
-    {
-        let _ = (this, x, y, z);
-        count_dispatch();
-    }
+    let _ = (this, x, y, z, flags);
 }
 
 /// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
@@ -1629,7 +1515,10 @@ extern "system" fn resolve_queries(
         PIPELINE_STATISTICS => (Written::Value(0), 88),
         _ => (Written::Value(0), 16),
     };
-    if offset + u64::from(count) * bytes > size {
+    let Some(end) = offset.checked_add(u64::from(count) * bytes) else {
+        return;
+    };
+    if end > size {
         return;
     }
     for i in 0..u64::from(count) {
@@ -1663,15 +1552,66 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 }
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
-/// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// bottom of the pipe `(flags, control, address, size)`. The host orders
+/// nothing between dispatches by itself: what shaders wrote is waited for
+/// here as at the title's barriers (the ray-tracing structure builder has
+/// no other wait between its stages).
+/// (Arguments may be what earlier shaders wrote from here on:
+/// `State::synced`.)
+extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size: u64) {
+    #[cfg(windows)]
+    {
+        with_state(this, |_, state| state.synced());
+        if let Some(list) = host_list(this) {
+            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+            #[cfg(feature = "diagnostics")]
+            {
+                // The shapes of the title's calls, each once.
+                static SEEN: std::sync::Mutex<Vec<(u32, u32, bool)>> = std::sync::Mutex::new(Vec::new());
+                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                let shape = (flags, control, address == 0);
+                if seen.len() < 64 && !seen.contains(&shape) {
+                    seen.push(shape);
+                    tracing::info!(
+                        flags = format_args!("{flags:#x}"),
+                        control = format_args!("{control:#x}"),
+                        address = format_args!("{address:#x}"),
+                        size = format_args!("{size:#x}"),
+                        "a pipeline sync"
+                    );
+                }
+                crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
+            }
+            // SAFETY: the same layout; no resource named.
+            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            // SAFETY: an open list.
+            unsafe { list.list.barriers(&[barrier]) };
+        }
+    }
+    let _ = (this, flags, control, address, size);
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
 extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: u32) -> HRESULT {
     reset(this, allocator, pipeline)
+}
+
+#[cfg(windows)]
+use crate::upload::Upload;
+
+/// The memory of [`allocate_upload`] where no host GPU reads it by address.
+#[cfg(not(windows))]
+struct Upload(Vec<u8>);
+
+#[cfg(not(windows))]
+impl Upload {
+    fn new(len: usize) -> Option<Upload> {
+        Some(Upload(vec![0; len]))
+    }
+    fn start(&mut self) -> *mut u8 {
+        self.0.as_mut_ptr()
+    }
 }
 
 /// Newer lists' 0x4a0 `(size, alignment) -> pointer`: memory the list
@@ -1687,13 +1627,14 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     if this.is_null() || !align.is_power_of_two() {
         return std::ptr::null_mut();
     }
-    let mut block = vec![0u8; len];
-    let start = block.as_mut_ptr();
+    let Some(mut block) = Upload::new(len) else {
+        return std::ptr::null_mut();
+    };
+    let start = block.start();
     // SAFETY: the offset is below `align`, so `size` bytes fit after it.
     let at = unsafe { start.add(start.align_offset(align)) };
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    // Moving the vector keeps its heap block where it is.
     uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
     at
 }
@@ -1707,7 +1648,7 @@ extern "system" fn ignored_state(_: This) {}
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, with_state, with_state_after_read_back};
+    use super::{This, with_state};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -1843,22 +1784,23 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state_after_read_back(this, |list, s| {
+        with_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state_after_read_back(this, |list, s| s.dispatch(list, x, y, z));
+        with_state(this, |list, s| s.dispatch(list, x, y, z, 0));
     }
-    /// `DispatchMesh(x, y, z)` (the PC method of List6).
+    /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
+    /// programs take `x` groups only.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
         if y * z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
-        with_state_after_read_back(this, |list, s| s.dispatch_mesh(list, x, y, z));
+        with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
     /// shortcut: dispatches whose group count is in GPU memory (indirect)
@@ -1876,7 +1818,7 @@ mod state {
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
         }
-        with_state_after_read_back(this, |list, s| s.dispatch_mesh(list, x, 1, 1));
+        with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     pub(super) extern "system" fn draw_indexed(
         this: This,
@@ -1887,7 +1829,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state_after_read_back(this, |list, s| {
+        with_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
     }
@@ -1965,7 +1907,7 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        with_state_after_read_back(this, |list, s| {
+        with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
@@ -2027,63 +1969,11 @@ pub(crate) struct ValueWait {
     wide: bool,
 }
 
-/// The comparison code that asks nothing of the value: a wait with it is met
-/// whatever the memory holds, mapped or not.
-const ALWAYS: u32 = 8;
-
-/// Whether a wait on memory that cannot be read yet holds its queue until it
-/// reads, rather than running on at once (`VICTORY_WAIT_UNREAD=0`, as before).
-/// Memory that is not mapped is taken as not holding what is waited for
-/// unless the comparison does not look at the value (1..=7 do,
-/// `ValueWait::holds_for`), and it is taken as met after the bound
-/// (`VICTORY_WAIT_UNREAD_MS`) with a warning, so memory that never reads
-/// cannot hold a queue forever.
-fn unread_holds() -> bool {
-    static HOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *HOLD.get_or_init(|| std::env::var("VICTORY_WAIT_UNREAD").as_deref() != Ok("0"))
-}
-
-/// How long a wait may stand on memory that cannot be read before it is taken
-/// as met (`VICTORY_WAIT_UNREAD_MS`, 2000 ms; `0` waits forever).
-fn unread_bound() -> std::time::Duration {
-    static BOUND: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
-    *BOUND.get_or_init(|| {
-        let ms = std::env::var("VICTORY_WAIT_UNREAD_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2000);
-        std::time::Duration::from_millis(ms)
-    })
-}
-
-/// The unread waits seen: address, the bytes waited for there, when a look
-/// first found it unreadable, and whether the bound's warning has been
-/// logged. The bytes are part of the key: a 32-bit wait at an address reads
-/// while a 64-bit wait there does not, and one must not restart the other's
-/// bound.
-fn unread_seen() -> &'static std::sync::Mutex<Vec<(u64, usize, std::time::Instant, bool)>> {
-    static SEEN: std::sync::OnceLock<std::sync::Mutex<Vec<(u64, usize, std::time::Instant, bool)>>> =
-        std::sync::OnceLock::new();
-    SEEN.get_or_init(|| std::sync::Mutex::new(Vec::new()))
-}
-
-/// How many unread waits are tracked at once: far above the five queues the
-/// title submits (one wait per queue at most), so churn is a diagnostic, not
-/// a policy.
-const UNREAD_SEEN_MAX: usize = 64;
-
 impl ValueWait {
     /// Whether the memory holds what is waited for now.
     /// shortcut: the comparison codes are taken to be the comparison
     /// functions' (1 never .. 8 always, value against reference); one not
-    /// known counts as met.
-    ///
-    /// Memory that cannot be read yet (a page not mapped, say) is taken as
-    /// not holding, and the queue waits until it reads: running on at once
-    /// sent the work after the wait to the card before the work that writes
-    /// the value, and the wait was reported as an unknown comparison in the
-    /// frame's summary. `ALWAYS` asks nothing of the value, so it is met.
-    /// `VICTORY_WAIT_UNREAD=0` reads unreadable memory as met, as before.
+    /// known counts as met, and so does memory that is not mapped.
     ///
     /// The value is read through the kernel, which reports memory that is
     /// not there instead of faulting (as the copies of title memory are
@@ -2100,7 +1990,7 @@ impl ValueWait {
     pub(crate) fn met(&self) -> bool {
         #[cfg(all(windows, feature = "diagnostics"))]
         let started = std::time::Instant::now();
-        let met = self.holds(true);
+        let met = self.holds();
         #[cfg(all(windows, feature = "diagnostics"))]
         {
             use crate::copystat::{C, add};
@@ -2110,130 +2000,35 @@ impl ValueWait {
         met
     }
 
-    /// [`Self::met`] for a line that only reports the wait (the first waits of
-    /// a list, a capture): it does not start the unread-wait bound, so a look
-    /// taken for the log cannot age a wait the queue has not checked.
-    pub(crate) fn met_peek(&self) -> bool {
-        self.holds(false)
-    }
-
-    /// Off Windows there is no title memory to read (this crate is built
-    /// there for the unit tests and rustdoc only): the wait counts as met.
-    #[cfg(not(windows))]
-    fn holds(&self, _track: bool) -> bool {
-        true
-    }
-
-    #[cfg(windows)]
-    fn holds(&self, track: bool) -> bool {
+    fn holds(&self) -> bool {
         let bytes = if self.wide { 8 } else { 4 };
         if self.address == 0 {
             return true;
         }
+        #[cfg(windows)]
         static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        // Asking first is the same question the read answers: memory that is
-        // not committed is not readable, and is held as below.
+        #[cfg(windows)]
         if *ASK.get_or_init(|| std::env::var_os("VICTORY_WAIT_ASK").is_some_and(|v| v == "1"))
             && !crate::texture::committed(self.address as *const u8, bytes)
         {
-            return self.unread_met_tracked(track);
+            return true;
         }
         // The low `bytes` bytes; the rest stays zero.
         let mut raw = [0u8; 8];
+        #[cfg(windows)]
         if !crate::host::read_into(self.address as *const u8, &mut raw[..bytes]) {
-            return self.unread_met_tracked(track);
-        }
-        if unread_holds() && (1..ALWAYS).contains(&self.comparison) {
-            self.unread_read();
-        }
-        self.holds_for(u64::from_le_bytes(raw))
-    }
-
-    /// Whether a wait is met while its memory cannot be read: only a
-    /// comparison that does not look at the value is (`holds_for` says what
-    /// the 1..=7 codes compare), or, with `VICTORY_WAIT_UNREAD=0`, every one,
-    /// as before.
-    ///
-    /// Otherwise it is not met until it has stood on that address longer than
-    /// the bound (`VICTORY_WAIT_UNREAD_MS`, 2 s), then it is taken as met with
-    /// one warning: memory that never reads would hold its queue forever
-    /// (nothing releases a held queue on a timer, only a submission, a signal
-    /// or a present).
-    /// [`Self::unread_met`]; a look that only reports the wait (`track`
-    /// false) finds the entry it has but never starts one, so a diagnostic
-    /// look cannot start the bound of the queue's own check
-    /// ([`Self::met_peek`]).
-    fn unread_met_tracked(&self, track: bool) -> bool {
-        self.unread_met_at(std::time::Instant::now(), unread_bound(), track)
-    }
-
-    /// `unread_met` with the time, bound and whether to start tracking given.
-    fn unread_met_at(
-        &self,
-        now: std::time::Instant,
-        bound: std::time::Duration,
-        track: bool,
-    ) -> bool {
-        if !unread_holds() || !(1..ALWAYS).contains(&self.comparison) {
             return true;
         }
-        if bound.is_zero() {
-            return false;
-        }
-        let bytes = if self.wide { 8 } else { 4 };
-        let mut seen = unread_seen().lock().unwrap_or_else(|e| e.into_inner());
-        let i = match seen
-            .iter()
-            .position(|&(at, n, ..)| at == self.address && n == bytes)
+        #[cfg(not(windows))]
         {
-            Some(i) => i,
-            None => {
-                if !track {
-                    return false;
-                }
-                if seen.len() >= UNREAD_SEEN_MAX {
-                    // Room for one more: the newest entry goes, so the oldest
-                    // waits keep the time they have already stood on. (Taking
-                    // out every expired entry would restart a wait that is
-                    // close to its bound each time another address arrives.)
-                    let newest = seen
-                        .iter()
-                        .enumerate()
-                        .max_by_key(|(_, entry)| entry.2)
-                        .map(|(i, _)| i);
-                    if let Some(i) = newest {
-                        seen.swap_remove(i);
-                    }
-                }
-                seen.push((self.address, bytes, now, false));
-                return false;
+            use std::os::unix::fs::FileExt;
+            let read = std::fs::File::open("/proc/self/mem")
+                .and_then(|file| file.read_exact_at(&mut raw[..bytes], self.address));
+            if read.is_err() {
+                return true;
             }
-        };
-        let (_, _, first, warned) = seen[i];
-        if now.duration_since(first) < bound {
-            return false;
         }
-        if !warned {
-            seen[i].3 = true;
-            tracing::warn!(
-                address = format_args!("{:#x}", self.address),
-                comparison = self.comparison,
-                reference = format_args!("{:#x}", self.reference),
-                ms = bound.as_millis() as u64,
-                "a wait on memory that cannot be read was taken as met at the bound (VICTORY_WAIT_UNREAD_MS)"
-            );
-        }
-        true
-    }
-
-    /// The wait reads after standing on unreadable memory: the bound starts
-    /// over if it is unreadable again.
-    fn unread_read(&self) {
-        let bytes = if self.wide { 8 } else { 4 };
-        unread_seen()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|&(at, n, ..)| !(at == self.address && n == bytes));
+        self.holds_for(u64::from_le_bytes(raw))
     }
 
     /// Where the value waited for is: address and bytes.
@@ -2321,7 +2116,7 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
             comparison,
             reference,
             wide,
-            met = wait.met_peek(),
+            met = wait.met(),
             "a list waits for a memory value"
         );
     }
@@ -2330,7 +2125,7 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
         crate::capture::op(std::ptr::from_ref(host) as usize, || {
             format!(
                 "WAIT VALUE at {address:#x} comparison {comparison} reference {reference:#x} wide {wide} met {}",
-                wait.met_peek()
+                wait.met()
             )
         });
     }
@@ -2371,10 +2166,11 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        with_state(this, |_, state| state.synced());
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        unsafe { list.list.barriers(&[barrier]) };
     }
     #[cfg(not(windows))]
     let _ = (this, count);
@@ -2590,20 +2386,11 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 /// titles add.
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
-
-/// Resolve an original slot against the table chosen when a test list was made.
-#[cfg(all(test, windows))]
-pub(crate) fn slot_offset_for_test(list: This, offset: usize) -> usize {
-    let slot = offset / 8;
-    let expected = LIST_FUNCTIONS.0[slot];
-    if object::slot::<*const ()>(list, offset) == expected {
-        offset
-    } else {
-        let offset = newer_slot(slot) * 8;
-        assert_eq!(object::slot::<*const ()>(list, offset), expected);
-        offset
-    }
-}
+/// Of lists whose calls are written down.
+#[cfg(windows)]
+static THIN_FUNCTIONS: Table<160> = Table(thin::table(false));
+#[cfg(windows)]
+static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 
 #[cfg(test)]
 mod tests {
@@ -2652,261 +2439,27 @@ mod tests {
         assert_eq!(release(allocator), 0);
     }
 
-    /// A wait on memory that cannot be read yet is not met: its queue waits
-    /// for the value instead of sending the work after it to the card first
-    /// (#2604). On the old code the wait was met at once. Bounded, so a look
-    /// that never returns fails the test instead of hanging the run.
-    #[cfg(windows)]
+    /// An offset near `u64::MAX` must not overflow and write outside the
+    /// query destination buffer.
     #[test]
-    fn a_wait_on_memory_not_mapped_yet_is_not_met() {
-        use windows_sys::Win32::System::Memory::*;
-        // EQUAL 5 holds once the page reads.
-        let wait = |address: u64, comparison: u32| ValueWait {
-            address,
-            comparison,
-            reference: 5,
-            wide: false,
-        };
-        // SAFETY: a private page, committed, protected and freed here only.
-        let page = unsafe {
-            let at = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
-                .cast::<u32>();
-            assert!(!at.is_null());
-            at.write(5);
-            at
-        };
-        let mut old = 0;
-        // SAFETY: the page is ours and is read through the kernel, which
-        // reports an unreadable page instead of faulting.
-        assert_ne!(
-            unsafe { VirtualProtect(page.cast(), 4096, PAGE_NOACCESS, &mut old) },
-            0
-        );
-        // The look is a kernel call that does not block; the deadline only
-        // bounds a look that would not return at all.
-        let look = |w: ValueWait| {
-            let (send, got) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let _ = send.send(w.met());
-            });
-            got.recv_timeout(std::time::Duration::from_secs(5))
-                .expect("a wait's look returns")
-        };
-        let equal = wait(page as u64, 3);
-        assert!(
-            !look(equal),
-            "memory that cannot be read yet does not hold: the queue waits"
-        );
-        assert!(
-            look(wait(page as u64, ALWAYS)),
-            "ALWAYS asks nothing of the value"
-        );
-        assert!(
-            look(wait(page as u64, 0)),
-            "a comparison we do not know counts as met, readable or not"
-        );
-        // SAFETY: readable again, and ours.
-        assert_ne!(
-            unsafe { VirtualProtect(page.cast(), 4096, PAGE_READWRITE, &mut old) },
-            0
-        );
-        assert!(look(equal), "met once the value reads");
-        // SAFETY: ours, freed once.
-        assert_eq!(unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) }, 1);
-    }
-
-    /// A wait on memory that never reads is taken as met at the bound, with
-    /// one warning: nothing else releases a held queue (only a submission, a
-    /// signal or a present does), so without it the queue would stand there.
-    #[cfg(windows)]
-    #[test]
-    fn an_unreadable_wait_is_met_at_the_bound() {
-        let wait = ValueWait {
-            address: 0x7FF0_0000_0000,
-            comparison: 3,
-            reference: 5,
-            wide: false,
-        };
-        let bound = std::time::Duration::from_millis(2000);
-        let first = std::time::Instant::now();
-        assert!(!wait.unread_met_at(first, bound, true), "held at the first look");
-        assert!(
-            !wait.unread_met_at(first + std::time::Duration::from_millis(1999), bound, true),
-            "still held below the bound"
-        );
-        assert!(
-            wait.unread_met_at(first + bound, bound, true),
-            "met at the bound, so the queue runs"
-        );
-        let warned = unread_seen()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(at, .., warned)| at == wait.address && warned)
-            .count();
-        assert_eq!(warned, 1, "one warning for the address");
-        assert!(
-            wait.unread_met_at(first + bound, bound, true),
-            "still met after the bound"
-        );
-        wait.unread_read();
-        assert!(
-            !wait.unread_met_at(first + bound, bound, true),
-            "the bound starts over once it reads"
-        );
-        assert!(
-            !wait.unread_met_at(first, std::time::Duration::ZERO, true),
-            "VICTORY_WAIT_UNREAD_MS=0 waits forever"
-        );
-    }
-
-    /// A look taken for a log line (`met_peek`) does not start the bound: the
-    /// queue's own first check still has the whole bound to stand on.
-    #[cfg(windows)]
-    #[test]
-    fn a_peek_does_not_start_the_unread_bound() {
-        let wait = ValueWait {
-            address: 0x7FF0_0000_2000,
-            comparison: 3,
-            reference: 5,
-            wide: false,
-        };
-        let bound = std::time::Duration::from_millis(2000);
-        let first = std::time::Instant::now();
-        assert!(!wait.met_peek(), "a peek reports the wait as held");
-        assert!(
-            !wait.unread_met_at(first + bound, bound, true),
-            "the queue's first check starts the bound, the peek did not"
-        );
-        assert!(
-            wait.unread_met_at(first + bound + bound, bound, true),
-            "met a bound after the queue's first check"
-        );
-        wait.unread_read();
-    }
-
-    /// The bound is tracked per address and width: a 32-bit wait reads where
-    /// a 64-bit wait there does not, and its read does not restart the wider
-    /// wait's bound.
-    #[cfg(windows)]
-    #[test]
-    fn a_narrower_wait_does_not_restart_a_wider_bound() {
-        let wide = ValueWait {
-            address: 0x7FF0_0000_3000,
-            comparison: 3,
-            reference: 5,
-            wide: true,
-        };
-        let narrow = ValueWait { wide: false, ..wide };
-        let bound = std::time::Duration::from_millis(2000);
-        let first = std::time::Instant::now();
-        assert!(!wide.unread_met_at(first, bound, true));
-        narrow.unread_read();
-        let entries = unread_seen()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(at, ..)| at == wide.address)
-            .count();
-        assert_eq!(entries, 1, "one entry for the address, the wide wait's");
-        assert!(
-            wide.unread_met_at(first + bound, bound, true),
-            "met at the bound it started before the narrow wait read"
-        );
-        wide.unread_read();
-    }
-
-    /// At the cap the newest entry makes room, so an old wait keeps the time
-    /// it has stood on and still reaches its bound.
-    #[cfg(windows)]
-    #[test]
-    fn a_full_table_keeps_the_oldest_waits() {
-        let bound = std::time::Duration::from_millis(2000);
-        let first = std::time::Instant::now();
-        // This test owns the table while it runs (the suite runs one test at
-        // a time, `--test-threads=1`): what it finds goes back afterwards.
-        let reused = std::mem::take(&mut *unread_seen().lock().unwrap_or_else(|e| e.into_inner()));
-        let waits: Vec<ValueWait> = (0..UNREAD_SEEN_MAX)
-            .map(|i| ValueWait {
-                address: 0x7FF0_0001_0000 + i as u64 * 8,
-                comparison: 3,
-                reference: 5,
-                wide: false,
-            })
-            .collect();
-        for w in &waits {
-            assert!(!w.unread_met_at(first, bound, true));
-        }
-        let newcomer = ValueWait {
-            address: 0x7FF0_0002_0000,
-            ..waits[0]
-        };
-        assert!(
-            !newcomer.unread_met_at(first + bound, bound, true),
-            "a new address at the cap starts its own bound"
-        );
-        assert!(
-            waits[0].unread_met_at(first + bound, bound, true),
-            "the first wait is still tracked and reaches its bound"
-        );
+    fn resolve_queries_rejects_overflowing_offset() {
+        let null = std::ptr::null();
+        let mut allocator = null;
         assert_eq!(
-            unread_seen().lock().unwrap_or_else(|e| e.into_inner()).len(),
-            UNREAD_SEEN_MAX,
-            "the table stays at its cap"
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
         );
-        *unread_seen().lock().unwrap_or_else(|e| e.into_inner()) = reused;
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn idle_most_scales_with_ram_and_cores() {        const GIB: u64 = 1 << 30;
-        const MIB: u64 = 1 << 20;
-        assert_eq!(idle_most(None, 8), (128, 256 * MIB));
-        assert_eq!(idle_most(Some(8 * GIB), 4), (64, 128 * MIB));
-        assert_eq!(idle_most(Some(16 * GIB), 8), (128, 128 * MIB));
-        assert_eq!(idle_most(Some(24 * GIB), 12), (192, 256 * MIB));
-        assert_eq!(idle_most(Some(31 * GIB), 16), (256, 512 * MIB));
-        assert_eq!(idle_most(Some(32 * GIB), 16), (256, 512 * MIB));
-        assert_eq!(idle_most(Some(64 * GIB), 32), (256, 512 * MIB));
-    }
-}
-
-/// The parts a submission of several lists is run in
-/// ([`detach_parts`], [`starts_entry`]): which part lands in which entry, as
-/// the queues run them one entry at a time.
-#[cfg(test)]
-mod part_entry_tests {
-    use super::starts_entry;
-
-    /// The entries the parts (`(waits, read-backs)`, lists one after
-    /// another) are given, as how many parts each holds.
-    fn entries(parts: &[(bool, bool)]) -> Vec<usize> {
-        let mut entries = vec![0];
-        let mut flush = false;
-        for &(waits, read_back) in parts {
-            if starts_entry(waits, flush) {
-                entries.push(0);
-            }
-            *entries.last_mut().expect("an entry") += 1;
-            flush = read_back;
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let buffer = crate::resource::test_buffer(64);
+        // Used to overflow `offset + count * 8` (panic in debug, wrap in release).
+        resolve_queries(list, null, 0, 0, 2, buffer, u64::MAX - 8);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for object in [buffer, list, allocator] {
+            assert_eq!(release(object), 0);
         }
-        entries.retain(|&held| held > 0);
-        entries
-    }
-
-    #[test]
-    fn a_read_back_that_ends_one_list_ends_its_entry_for_the_next() {
-        // List A ends with a read-back, list B (the same submission) copies
-        // what it wrote: B's copy must be prepared after A's read-back has
-        // run, so it starts an entry of its own.
-        let two = [(false, false), (false, true), (false, false)];
-        assert_eq!(entries(&two), [2, 1], "B's part waits for A's read-back");
-        // Without the read-back the lists share the entry, as before.
-        let one = [(false, false), (false, false), (false, false)];
-        assert_eq!(entries(&one), [3], "nothing to wait for: one submission");
-        // Waits still start an entry of their own, and a read-back before a
-        // wait does not add a second one.
-        assert_eq!(entries(&[(true, false)]), [1]);
-        assert_eq!(entries(&[(false, true), (true, false)]), [1, 1]);
     }
 }

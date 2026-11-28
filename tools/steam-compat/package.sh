@@ -210,9 +210,15 @@ BUILD=__BUILD__
 
 # The Proton whose Wine Scarlight runs on: a folder name in this
 # compatibilitytools.d, or a full path to a Proton folder. Empty means the
-# GE-Proton this release is built for ($BASE, in the BASE file next to this
-# one); failing that, the newest GE-Proton11-* installed, with a warning.
+# newest paired build ($BASE-victory<N>) when its fast path can run (its own
+# vkd3d-proton and a readable, writable /dev/udmabuf); else the GE-Proton this
+# release is built for ($BASE, in the BASE file next to this one), failing
+# that the newest GE-Proton11-* installed, on the safe settings. Each launch
+# logs which one it uses and why.
 PROTON=
+
+# auto: use the fast path when the checks above pass; 0: always the safe path.
+FAST=auto
 
 # Microsoft's d3dcompiler_47.dll is optional and not shipped. If you have one
 # you are licensed to use, put its path here; empty means use Wine's built-in.

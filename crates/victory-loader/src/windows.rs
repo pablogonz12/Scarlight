@@ -84,20 +84,11 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
     }
-    if crate::hooks::enabled() {
+    let size = loaded.info.size_of_image as usize;
+    // The title hooks are made for its executable, not the DLLs beside it.
+    if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
-        let applied = unsafe {
-            crate::hooks::apply_profile(
-                loaded.base(),
-                loaded.info.size_of_image as usize,
-                &prepared.original_hash,
-            )
-        };
-        if applied > 0 {
-            tracing::info!("title profile: {applied} hooks applied");
-        } else {
-            tracing::debug!("title profile: no hooks for this image");
-        }
+        unsafe { crate::hooks::apply_asked(loaded.base(), size, &prepared.original_hash) };
     }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
@@ -198,13 +189,8 @@ impl ImportResolver for WithTitleDlls<'_> {
 }
 
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
-    if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
-        return Ok(());
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))?;
-    Ok(())
+    crate::publish::write_if_changed(path, bytes)
+        .with_context(|| format!("publishing {}", path.display()))
 }
 
 impl LoadedImage {

@@ -59,7 +59,6 @@ pub const INTERFACES: &[Interface] = &[
 type This = *const Object;
 
 extern "system" fn title_id(_: This, out: *mut u32) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgame::title_id").enter(format_args!(""));
     put(out, runtime::title().id)
 }
 
@@ -69,21 +68,12 @@ extern "system" fn title_id(_: This, out: *mut u32) -> HRESULT {
 /// arguments from its configuration. The new `victory run` gets the same
 /// options, the new executable, and the title's arguments after `--`
 /// (the title reads the whole command line).
-#[cfg(not(windows))]
-extern "system" fn launch_new_game(_: This, _: *const c_char, _: *const c_char, _: *const c_void) {
-    let _stall = victory_gpu::stall_site!("xgame::launch_new_game").enter(format_args!(""));
-    // Off Windows there is no lifecycle module (it ends the run and starts a
-    // new process through the loader): there is nothing to relaunch into.
-}
-
-#[cfg(windows)]
 extern "system" fn launch_new_game(
     _: This,
     exe: *const c_char,
     args: *const c_char,
     _user: *const c_void,
 ) {
-    let _stall = victory_gpu::stall_site!("xgame::launch_new_game").enter(format_args!(""));
     let (exe, args) = (text(exe).unwrap_or_default(), text(args).unwrap_or_default());
     tracing::info!(exe, args, "XLaunchNewGame");
     let current = runtime::main_image()
@@ -91,13 +81,18 @@ extern "system" fn launch_new_game(
         .unwrap_or_default();
     let ours: Vec<_> = std::env::args_os().skip(1).collect();
     let command = relaunch_args(ours, current.as_os_str(), &exe, &args);
-    super::lifecycle::end_title(
-        "XLaunchNewGame",
-        Box::new(move || super::lifecycle::relaunch(command)),
-    );
-    loop {
-        std::thread::park();
+    #[cfg(windows)]
+    {
+        super::lifecycle::end_title(
+            "XLaunchNewGame",
+            Box::new(move || super::lifecycle::relaunch(command)),
+        );
+        loop {
+            std::thread::park();
+        }
     }
+    #[cfg(not(windows))]
+    let _ = command;
 }
 
 /// Our own arguments for the relaunch: the title's executable replaced by
@@ -109,14 +104,52 @@ fn relaunch_args(
     args: &str,
 ) -> Vec<std::ffi::OsString> {
     let mut out: Vec<_> = ours.into_iter().take_while(|a| a != "--").collect();
+    // `runtime` makes the image path absolute when it maps the title, so a
+    // relative launch argument is not textually equal to it. Normalise the
+    // same way before matching, or a relaunch would run the old executable.
     if !exe.is_empty()
-        && let Some(slot) = out.iter_mut().find(|a| a.as_os_str() == current)
+        && let Some(slot) = out.iter_mut().find(|a| {
+            a.as_os_str() == current
+                || std::path::absolute(a).is_ok_and(|p| p.as_os_str() == current)
+        })
     {
         *slot = exe.into();
     }
     if !args.trim().is_empty() {
         out.push("--".into());
-        out.extend(args.split_whitespace().map(Into::into));
+        out.extend(split_args(args).into_iter().map(Into::into));
+    }
+    out
+}
+
+/// Splits the title's command-line tail into arguments, keeping double-quoted
+/// strings together (including empty ones). Windows command lines quote only
+/// with `"`: an apostrophe is ordinary text, as in `O'Brien`.
+fn split_args(args: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    for c in args.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            c if !quoted && c.is_whitespace() => {
+                if started {
+                    out.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            c => {
+                current.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        out.push(current);
     }
     out
 }
@@ -133,7 +166,6 @@ const AVAILABLE: [u32; 20] = [
 ];
 
 extern "system" fn is_feature_available(_: This, feature: u32) -> bool {
-    let _stall = victory_gpu::stall_site!("xgame::is_feature_available").enter(format_args!(""));
     AVAILABLE.contains(&feature)
 }
 
@@ -145,11 +177,9 @@ extern "system" fn register(
     _callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgame::register").enter(format_args!(""));
     put(out, token())
 }
 extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
-    let _stall = victory_gpu::stall_site!("xgame::unregister").enter(format_args!(""));
     true
 }
 
@@ -163,7 +193,6 @@ extern "system" fn write_event(
     _dimensions: *const c_char,
     _measurements: *const c_char,
 ) -> HRESULT {
-    let _stall = victory_gpu::stall_site!("xgame::write_event").enter(format_args!(""));
     if !name.is_null() {
         // SAFETY: a non-null name is a NUL-terminated string.
         let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
@@ -221,6 +250,37 @@ mod tests {
         let other = relaunch_args(ours, current, "G:/other.exe", "");
         assert_eq!(other.len(), 5);
         assert_eq!(other[1], "G:/other.exe");
+    }
+
+    #[test]
+    fn a_relaunch_replaces_a_relative_startup_executable() {
+        // `runtime::set_image_path` makes this absolute before the launch.
+        let current = std::path::absolute("game.exe").unwrap();
+        let ours: Vec<std::ffi::OsString> =
+            ["run", "game.exe", "--execute", "--console", "series-s", "--", "-old"]
+                .map(Into::into)
+                .into();
+        let again = relaunch_args(
+            ours,
+            current.as_os_str(),
+            "other.exe",
+            r#"--config="C:\Program Files\game" "" -name=O'Brien -y"#,
+        );
+        let expected: Vec<std::ffi::OsString> = [
+            "run",
+            "other.exe",
+            "--execute",
+            "--console",
+            "series-s",
+            "--",
+            r"--config=C:\Program Files\game",
+            "",
+            "-name=O'Brien",
+            "-y",
+        ]
+        .map(Into::into)
+        .into();
+        assert_eq!(again, expected, "the requested exe and quoted args survive");
     }
 
     #[test]

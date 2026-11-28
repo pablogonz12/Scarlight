@@ -29,7 +29,7 @@ the `Exec=` line to the full path. Nothing else is installed.
 | DLL folder | where `dxgi`, `d3d12`, `d3d12core`, `dxil`, `dxcompiler` live (a folder other than the build's own is added to `WINEDLLPATH`, so Wine really searches it) | next to the Scarlight build |
 | Prefix | `WINEPREFIX` | `${XDG_DATA_HOME:-~/.local/share}/scarlight/prefix` |
 
-`docs/linux.md` in the repository explains where those DLLs come from.
+`docs/steam.md` in the repository explains where those DLLs come from.
 
 ## The screens
 
@@ -40,7 +40,7 @@ the `Exec=` line to the full path. Nothing else is installed.
    profile is a `warn`, not a failure: profiles are optional, the layer runs without one
    and applies no title patches ("No title profile for this build"). The check asks the
    build itself (`victory.exe title-id <exe>`) and reads the same folders the loader
-   reads, so the line matches what Play will do; see `docs/title-profiles.md`.
+   reads, so the line matches what Play will do.
 2. **Main menu** - `Play` (the last setup), `Quick setup` (the three questions above),
    `Presets`, `Advanced`, `Logs`, `Help`.
 3. **Presets** - `Play`, `Performance`, `Picture debug`, `Developer` (skips the intros,

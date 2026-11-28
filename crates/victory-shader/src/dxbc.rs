@@ -17,6 +17,8 @@ pub struct FourCC(pub [u8; 4]);
 
 impl FourCC {
     pub const DXIL: FourCC = FourCC(*b"DXIL");
+    /// Native code another compiler made, in place of `DXIL` (VIctory upstream 0b35b7f).
+    pub const ACCC: FourCC = FourCC(*b"ACCC");
     pub const STAT: FourCC = FourCC(*b"STAT");
     pub const RTS0: FourCC = FourCC(*b"RTS0");
     pub const PSV0: FourCC = FourCC(*b"PSV0");
@@ -28,8 +30,6 @@ impl FourCC {
     pub const HASH: FourCC = FourCC(*b"HASH");
     pub const ILDB: FourCC = FourCC(*b"ILDB");
     pub const ILDN: FourCC = FourCC(*b"ILDN");
-    /// A precompiled program image ([`crate::fspx`]).
-    pub const ACCC: FourCC = FourCC(*b"ACCC");
 }
 
 impl std::fmt::Debug for FourCC {
@@ -61,9 +61,6 @@ pub struct Container<'a> {
     pub digest: [u8; 16],
     pub version: (u16, u16),
     pub parts: Vec<Part<'a>>,
-    /// The bytes within this container's declared length (the header's
-    /// `total`), whatever followed them in the file they came from.
-    bytes: &'a [u8],
 }
 
 const HEADER_SIZE: usize = 0x20;
@@ -108,15 +105,7 @@ impl<'a> Container<'a> {
             digest,
             version,
             parts,
-            bytes: data,
         })
-    }
-
-    /// This container's own bytes: the declared length, not the rest of the
-    /// file it was found in. A hash of these is the hash a standalone copy of
-    /// the container has.
-    pub fn as_bytes(&self) -> &'a [u8] {
-        self.bytes
     }
 
     pub fn part(&self, fourcc: FourCC) -> Option<&Part<'a>> {
@@ -179,18 +168,6 @@ mod tests {
         assert_eq!(c.part(FourCC::SFI0).unwrap().data, &[1, 2, 3, 4]);
         assert_eq!(c.part(FourCC::HASH).unwrap().data.len(), 20);
         assert!(c.part(FourCC::DXIL).is_none());
-    }
-
-    /// A container found inside a larger file is its declared bytes, so the
-    /// hash of it is the hash a standalone copy has.
-    #[test]
-    fn container_bytes_stop_at_the_declared_length() {
-        let bytes = build(&[(FourCC::SFI0, &[1, 2, 3, 4]), (FourCC::HASH, &[9; 20])]);
-        let mut block = bytes.clone();
-        block.extend_from_slice(&[0xAB; 32]);
-        let c = Container::parse(&block).unwrap();
-        assert_eq!(c.as_bytes().len(), bytes.len());
-        assert_eq!(c.as_bytes(), &bytes[..]);
     }
 
     #[test]

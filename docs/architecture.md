@@ -1,7 +1,7 @@
 # Architecture
 
 ```
- user's files (outside repo)             Scarlight
+ user's files (outside repo)             VIctory
  ───────────────────────────             ─────────────────────────────────────────
  game assets ──────────────────────────► victory-pipeline + victory-game
                                          (victory-formats, victory-shader)
@@ -35,9 +35,9 @@ Converting them ahead of time from files is only a warm-up.
 | `victory-hle` | console API implementations, host pass-through policy |
 | `victory-gpu` | D3D12.X objects, command lists and GPU memory → host D3D12 |
 | `victory-shader` | Xbox shader containers → host shaders |
-| `victory-formats` | the GPU's texture layouts (sizes, tiling, detiling), audio codecs; planned: BCPack |
+| `victory-formats` | the GPU's texture layouts (sizes, tiling, detiling), BCPack, audio codecs |
 | `victory-pipeline` | converter trait, content-addressed cache |
-| `victory-game` | Reading a title's formats: shader containers, build layouts |
+| `victory-game` | the title-specific formats, build identities, hooks |
 | `apps/victory` | command-line front end |
 | `xtask` | asset-policy check, git hooks |
 | `tests/fixtures/hle-probe` | a stand-in "title" (our own code) for loader tests |
@@ -71,9 +71,6 @@ Title storage is a drive on the console, and titles build paths on that.
 (kernel32 and the C/C++ runtime) and rewrites paths on a virtual drive to
 the host folder behind it; persistent local storage is one such drive over
 a folder under `VICTORY_DATA_DIR`. Other paths reach the host unchanged.
-An open through `CreateFileW` with access exactly `GENERIC_READ` that is
-not overlapped loses `FILE_FLAG_NO_BUFFERING`, so pack reads go through
-the host file cache: a second launch can read them from memory.
 
 An exe's code reaches its static TLS as slot 0; mapped as a DLL it gets
 another slot, so the loader redirects those loads (`victory-loader::tls`).

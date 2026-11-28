@@ -9,11 +9,6 @@
 //! wide wrapper, which would rewrite the host path a second time when its
 //! drive letter is mounted too. Letters are chosen among those the host
 //! does not use, so no host drive is hidden.
-//!
-//! Beyond paths, one flag changes on the way to the host: an open through
-//! `CreateFileW` with access exactly `GENERIC_READ` that is not overlapped
-//! loses `FILE_FLAG_NO_BUFFERING` (`dropped_flags`), so a title's pack reads
-//! go through the host file cache.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
@@ -23,11 +18,8 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-use windows_sys::Win32::Foundation::GENERIC_READ;
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
-use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, GetLogicalDrives,
-};
+use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
 use crate::{HleExport, HleModule, hle_export};
 
@@ -91,8 +83,15 @@ pub fn mount_at(letter: char, root: &Path) {
 }
 
 /// `root` as UTF-16, absolute, without trailing separators (a drive root
-/// keeps its own).
+/// keeps its own). An empty root is the current directory, as it is to a
+/// path joined to it: it is the title's folder when the title is run by its
+/// file name alone (`victory run title.exe`).
 fn root_wide(root: &Path) -> Vec<u16> {
+    let root = if root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        root
+    };
     let root = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
     let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
     while wide.len() > 3 && wide.last().is_some_and(|c| SEPARATORS.contains(c)) {
@@ -270,7 +269,6 @@ pub extern "system" fn CreateFileW(
     flags: u32,
     template: Handle,
 ) -> Handle {
-    let _stall = victory_gpu::stall_site!("files::CreateFileW").enter(format_args!("access={access:#x} disposition={disposition} flags={flags:#x}"));
     let p = wide(path);
     host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
@@ -278,36 +276,9 @@ pub extern "system" fn CreateFileW(
         share,
         security,
         disposition,
-        flags & !dropped_flags(access, flags),
+        flags,
         template,
     )
-}
-
-/// The flags the host's open does not get: an open with `GENERIC_READ` and
-/// no other access loses `FILE_FLAG_NO_BUFFERING`. On the host the flag
-/// keeps every read out of the system file cache, so a title that opens its
-/// packs with it reads the same bytes from the drive on every launch. A
-/// buffered handle returns the same bytes for the same aligned reads; a
-/// read that is not aligned, which an unbuffered handle refuses, succeeds
-/// on it. An overlapped open keeps the flag: the host's `ReadFileScatter`
-/// takes only a handle with both, and a buffered handle may finish an
-/// overlapped read inside the call. Only opens through `CreateFileW`
-/// change: `CreateFile2` keeps its flags (they sit in a structure of the
-/// caller's), and `CreateFileA` passes its flags on as given.
-fn dropped_flags(access: u32, flags: u32) -> u32 {
-    if file_cache() && access == GENERIC_READ && flags & FILE_FLAG_OVERLAPPED == 0 {
-        FILE_FLAG_NO_BUFFERING
-    } else {
-        0
-    }
-}
-
-/// Whether a read-only open loses `FILE_FLAG_NO_BUFFERING`, so that the host
-/// file cache keeps the title's packs in memory for a second launch:
-/// `VICTORY_FILE_CACHE=0` keeps what the title asked for (a start-up switch).
-fn file_cache() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_FILE_CACHE").map_or(true, |v| v != "0"))
 }
 
 pub extern "system" fn CreateFileA(
@@ -319,7 +290,6 @@ pub extern "system" fn CreateFileA(
     flags: u32,
     template: Handle,
 ) -> Handle {
-    let _stall = victory_gpu::stall_site!("files::CreateFileA").enter(format_args!(""));
     match narrow(path) {
         Some(p) => {
             host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
@@ -354,7 +324,6 @@ pub extern "system" fn CreateFile2(
     disposition: u32,
     params: *const c_void,
 ) -> Handle {
-    let _stall = victory_gpu::stall_site!("files::CreateFile2").enter(format_args!(""));
     let p = wide(path);
     host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
         p.ptr(),
@@ -366,7 +335,6 @@ pub extern "system" fn CreateFile2(
 }
 
 pub extern "system" fn DeleteFileA(path: *const c_char) -> i32 {
-    let _stall = victory_gpu::stall_site!("files::DeleteFileA").enter(format_args!(""));
     match narrow(path) {
         Some(p) => {
             host!("kernel32.dll", "DeleteFileW": extern "system" fn(*const u16) -> i32)(p.as_ptr())
@@ -378,19 +346,16 @@ pub extern "system" fn DeleteFileA(path: *const c_char) -> i32 {
 }
 
 pub extern "system" fn DeleteFileW(path: *const u16) -> i32 {
-    let _stall = victory_gpu::stall_site!("files::DeleteFileW").enter(format_args!(""));
     let p = wide(path);
     host!("kernel32.dll", "DeleteFileW": extern "system" fn(*const u16) -> i32)(p.ptr())
 }
 
 pub extern "system" fn RemoveDirectoryW(path: *const u16) -> i32 {
-    let _stall = victory_gpu::stall_site!("files::RemoveDirectoryW").enter(format_args!(""));
     let p = wide(path);
     host!("kernel32.dll", "RemoveDirectoryW": extern "system" fn(*const u16) -> i32)(p.ptr())
 }
 
 pub extern "system" fn SetFileAttributesW(path: *const u16, attributes: u32) -> i32 {
-    let _stall = victory_gpu::stall_site!("files::SetFileAttributesW").enter(format_args!(""));
     let p = wide(path);
     host!("kernel32.dll", "SetFileAttributesW": extern "system" fn(*const u16, u32) -> i32)(
         p.ptr(),
@@ -399,7 +364,6 @@ pub extern "system" fn SetFileAttributesW(path: *const u16, attributes: u32) -> 
 }
 
 pub extern "system" fn GetFileAttributesA(path: *const c_char) -> u32 {
-    let _stall = victory_gpu::stall_site!("files::GetFileAttributesA").enter(format_args!(""));
     match narrow(path) {
         Some(p) => {
             host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(
@@ -415,7 +379,6 @@ pub extern "system" fn GetFileAttributesA(path: *const c_char) -> u32 {
 }
 
 pub extern "system" fn CreateDirectoryW(path: *const u16, security: *const c_void) -> i32 {
-    let _stall = victory_gpu::stall_site!("files::CreateDirectoryW").enter(format_args!(""));
     let p = wide(path);
     host!("kernel32.dll", "CreateDirectoryW": extern "system" fn(*const u16, *const c_void) -> i32)(
         p.ptr(),
@@ -428,7 +391,6 @@ pub extern "system" fn GetFileAttributesExW(
     level: i32,
     info: *mut c_void,
 ) -> i32 {
-    let _stall = victory_gpu::stall_site!("files::GetFileAttributesExW").enter(format_args!(""));
     let p = wide(path);
     host!("kernel32.dll", "GetFileAttributesExW": extern "system" fn(*const u16, i32, *mut c_void) -> i32)(
         p.ptr(),
@@ -438,7 +400,6 @@ pub extern "system" fn GetFileAttributesExW(
 }
 
 pub extern "system" fn GetFileAttributesW(path: *const u16) -> u32 {
-    let _stall = victory_gpu::stall_site!("files::GetFileAttributesW").enter(format_args!(""));
     let p = wide(path);
     host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(p.ptr())
 }
@@ -449,7 +410,6 @@ pub extern "system" fn GetDiskFreeSpaceExW(
     total: *mut u64,
     free: *mut u64,
 ) -> i32 {
-    let _stall = victory_gpu::stall_site!("files::GetDiskFreeSpaceExW").enter(format_args!(""));
     let p = wide(path);
     host!("kernel32.dll", "GetDiskFreeSpaceExW": extern "system" fn(*const u16, *mut u64, *mut u64, *mut u64) -> i32)(
         p.ptr(),
@@ -468,7 +428,6 @@ pub extern "system" fn GetDiskFreeSpaceW(
     free_clusters: *mut u32,
     clusters: *mut u32,
 ) -> i32 {
-    let _stall = victory_gpu::stall_site!("files::GetDiskFreeSpaceW").enter(format_args!(""));
     let mut p = wide(root);
     if let Some(host) = &mut p.1
         && let [letter, colon, sep, ..] = host[..]
@@ -487,7 +446,6 @@ pub extern "system" fn GetDiskFreeSpaceW(
 }
 
 pub extern "system" fn FindFirstFileW(path: *const u16, data: *mut c_void) -> Handle {
-    let _stall = victory_gpu::stall_site!("files::FindFirstFileW").enter(format_args!(""));
     let p = wide(path);
     host!("kernel32.dll", "FindFirstFileW": extern "system" fn(*const u16, *mut c_void) -> Handle)(
         p.ptr(),
@@ -503,7 +461,6 @@ pub extern "system" fn FindFirstFileExW(
     filter: *mut c_void,
     flags: u32,
 ) -> Handle {
-    let _stall = victory_gpu::stall_site!("files::FindFirstFileExW").enter(format_args!(""));
     let p = wide(path);
     host!("kernel32.dll", "FindFirstFileExW": extern "system" fn(*const u16, i32, *mut c_void, i32, *mut c_void, u32) -> Handle)(
         p.ptr(),
@@ -516,7 +473,6 @@ pub extern "system" fn FindFirstFileExW(
 }
 
 pub extern "system" fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32 {
-    let _stall = victory_gpu::stall_site!("files::MoveFileExW").enter(format_args!(""));
     let (from, to) = (wide(from), wide(to));
     host!("kernel32.dll", "MoveFileExW": extern "system" fn(*const u16, *const u16, u32) -> i32)(
         from.ptr(),
@@ -526,7 +482,6 @@ pub extern "system" fn MoveFileExW(from: *const u16, to: *const u16, flags: u32)
 }
 
 pub extern "system" fn SetCurrentDirectoryA(path: *const c_char) -> i32 {
-    let _stall = victory_gpu::stall_site!("files::SetCurrentDirectoryA").enter(format_args!(""));
     match narrow(path) {
         Some(p) => {
             host!("kernel32.dll", "SetCurrentDirectoryW": extern "system" fn(*const u16) -> i32)(
@@ -571,7 +526,7 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
 // fail there instead of faulting into its handler; the title's
 // synchronous reads (title+0x313fc0) read straight into 4 KiB-aligned
 // destinations and retry a failed `ReadFile` forever. So the destination
-// is opened first.
+// is opened first, and not guarded again before the call is done.
 
 pub extern "system" fn ReadFile(
     file: *mut c_void,
@@ -580,16 +535,42 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    let _stall = victory_gpu::stall_site!("files::ReadFile").enter(format_args!("file={file:p} len={len}"));
-    victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+    let writing = victory_gpu::kernel_writing(buffer as usize, len as usize);
+    let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
-    )
+    );
+    // The call's error is the title's to ask for.
+    // SAFETY: plain calls.
+    let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    // shortcut: a read that goes on after the call (overlapped) is written
+    // into pages the kernel has locked by now: it lands all the same, but a
+    // refresh that guards its blocks before it does will not see it.
+    if done == 0 && error == windows_sys::Win32::Foundation::ERROR_IO_PENDING {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::info!(len, "ReadFile: a read of the title's goes on after the call"));
+    }
+    if done == 0 && error == windows_sys::Win32::Foundation::ERROR_NOACCESS {
+        static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::warn!(n, buffer = format_args!("{buffer:p}"), len, "ReadFile: the title's buffer could not be written");
+        }
+    }
+    drop(writing);
+    // SAFETY: as above.
+    unsafe { windows_sys::Win32::Foundation::SetLastError(error) };
+    done
 }
 
-/// The host CRT reads large requests straight into the caller's buffer.
+/// The host CRT reads large requests straight into the caller's buffer
+/// through the kernel, whose write fails on a guarded block instead of
+/// faulting into the guard. So the bytes are read beside, a chunk at a time
+/// (a caller may ask for far more than the file holds), and copied in from
+/// user mode, where a guarded block faults into the guard like the title's
+/// own writes. Returns the items read, as the CRT does; the bytes of a
+/// partial last item are copied too, as the CRT leaves them.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
+    let _writing = victory_gpu::kernel_writing(buffer as usize, size.saturating_mul(count));
     host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
         buffer, size, count, stream,
     )
@@ -804,131 +785,38 @@ mod tests {
         assert_eq!((&out, n), (b"0123456789", 10));
     }
 
-    /// A file of ten bytes.
-    fn ten_bytes() -> (tempfile::TempDir, std::path::PathBuf) {
+    #[test]
+    fn fread_reads_beside_in_chunks() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data.bin");
-        std::fs::write(&path, b"0123456789").unwrap();
-        (dir, path)
-    }
-
-    /// Opens the file of `ten_bytes` with `FILE_FLAG_NO_BUFFERING` and
-    /// reads ten bytes, a length an unbuffered handle refuses; returns the
-    /// bytes read, or `None` if the read failed.
-    fn unaligned_read_of_an_unbuffered_open(access: u32) -> Option<Vec<u8>> {
-        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, OPEN_EXISTING};
-        let (_dir, path) = ten_bytes();
-        let null = std::ptr::null_mut();
-        unaligned_read(CreateFileW(
-            w(&path.to_string_lossy()).as_ptr(),
-            access,
-            FILE_SHARE_READ,
-            null,
-            OPEN_EXISTING,
-            FILE_FLAG_NO_BUFFERING,
-            null,
-        ))
-    }
-
-    /// Reads ten bytes from `handle` and closes it.
-    fn unaligned_read(handle: Handle) -> Option<Vec<u8>> {
-        assert_ne!(handle as isize, -1);
-        let (mut out, mut n) = ([0u8; 10], 0);
-        let ok = ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut());
-        host!("kernel32.dll", "CloseHandle": extern "system" fn(Handle) -> i32)(handle);
-        (ok != 0).then(|| out[..usize::try_from(n).unwrap()].to_vec())
-    }
-
-    /// Wine does not enforce the Windows unbuffered alignment failure used
-    /// as the oracle by these tests, even when the flag reaches the host.
-    fn wine_lacks_unbuffered_alignment_oracle() -> bool {
-        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-        let wine = unsafe {
-            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
-            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        // Over two chunks, and not a whole number of 3-byte items.
+        let bytes: Vec<u8> = (0..(5 << 19) + 1).map(|i| (i * 7 + i / 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let fclose = host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32);
+        let open = || {
+            let f = _wfopen(w(&path.to_string_lossy()).as_ptr(), w("rb").as_ptr());
+            assert!(!f.is_null());
+            f
         };
-        if wine {
-            eprintln!("skipped: Wine does not enforce this unbuffered alignment failure");
-        }
-        wine
-    }
 
-    #[test]
-    fn a_read_only_unbuffered_open_accepts_an_unaligned_read() {
-        if !file_cache() {
-            return; // VICTORY_FILE_CACHE=0 keeps the title's own flags
-        }
-        let read = unaligned_read_of_an_unbuffered_open(GENERIC_READ);
+        // Asked for far more than the file holds: the whole file, in items.
+        let f = open();
+        let mut out = vec![0xaau8; bytes.len() + 64];
+        let items = fread(out.as_mut_ptr(), 3, out.len() / 3, f);
+        assert_eq!(items, bytes.len() / 3);
+        assert_eq!(&out[..bytes.len()], &bytes[..], "the partial last item's bytes too");
+        assert!(out[bytes.len()..].iter().all(|&b| b == 0xaa), "nothing past what was read");
+        fclose(f);
 
-        assert_eq!(read.as_deref(), Some(&b"0123456789"[..]));
-    }
-
-    #[test]
-    fn an_unbuffered_open_by_a_narrow_path_stays_unbuffered() {
-        if wine_lacks_unbuffered_alignment_oracle() { return; }
-        if !file_cache() {
-            return; // VICTORY_FILE_CACHE=0 keeps the title's own flags
-        }
-        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, OPEN_EXISTING};
-        let (_dir, path) = ten_bytes();
-        let narrow_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
-        let null = std::ptr::null_mut();
-
-        let read = unaligned_read(CreateFileA(
-            narrow_path.as_ptr(),
-            GENERIC_READ,
-            FILE_SHARE_READ,
-            null,
-            OPEN_EXISTING,
-            FILE_FLAG_NO_BUFFERING,
-            null,
-        ));
-
-        assert_eq!(read, None);
-    }
-
-    #[test]
-    fn an_overlapped_unbuffered_open_stays_unbuffered() {
-        if wine_lacks_unbuffered_alignment_oracle() { return; }
-        use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_IO_PENDING};
-        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, OPEN_EXISTING};
-        use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
-        let (_dir, path) = ten_bytes();
-        let null = std::ptr::null_mut();
-        let handle = CreateFileW(
-            w(&path.to_string_lossy()).as_ptr(),
-            GENERIC_READ,
-            FILE_SHARE_READ,
-            null,
-            OPEN_EXISTING,
-            FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED,
-            null,
-        );
-        assert_ne!(handle as isize, -1);
-        let (mut out, mut overlapped, mut n) = ([0u8; 10], OVERLAPPED::default(), 0);
-        let overlapped = &raw mut overlapped;
-
-        // Ten bytes: a length an unbuffered handle refuses.
-        let done = ReadFile(handle, out.as_mut_ptr(), 10, null.cast(), overlapped.cast());
-        let error = std::io::Error::last_os_error().raw_os_error();
-
-        if done != 0 || error == Some(ERROR_IO_PENDING as i32) {
-            // SAFETY: a live handle and the read that started on `overlapped`
-            // (a buffered handle): waited for, so it ends before its buffers go.
-            unsafe { GetOverlappedResult(handle, overlapped, &mut n, 1) };
-        }
-        host!("kernel32.dll", "CloseHandle": extern "system" fn(Handle) -> i32)(handle);
-        assert_eq!((done, error), (0, Some(ERROR_INVALID_PARAMETER as i32)));
-    }
-
-    #[test]
-    fn an_unbuffered_open_for_writing_stays_unbuffered() {
-        if wine_lacks_unbuffered_alignment_oracle() { return; }
-        use windows_sys::Win32::Foundation::GENERIC_WRITE;
-
-        let read = unaligned_read_of_an_unbuffered_open(GENERIC_READ | GENERIC_WRITE);
-
-        assert_eq!(read, None);
+        // Exact reads continue where the last one stopped.
+        let f = open();
+        let mut a = vec![0u8; 1000];
+        let mut b = vec![0u8; (1 << 20) + 5];
+        assert_eq!(fread(a.as_mut_ptr(), 1000, 1, f), 1);
+        assert_eq!(fread(b.as_mut_ptr(), 1, b.len(), f), b.len());
+        assert_eq!(a, bytes[..1000]);
+        assert_eq!(b, bytes[1000..1000 + b.len()]);
+        fclose(f);
     }
 
     fn text(v: &[u16]) -> String {
@@ -982,6 +870,17 @@ mod tests {
             verbatim(&w(r"\\server\share\")[..15], &w("/x/../../y")[..10]),
             w(r"\\?\UNC\server\share\y")[..22].to_vec()
         );
+    }
+
+    /// A title run by its file name alone has an empty folder: the drive
+    /// over it is the current directory, not the current drive's root.
+    #[test]
+    fn an_empty_root_is_the_current_directory() {
+        let letter = mount(Path::new("")).unwrap();
+        let path = format!(r"{letter}:\a.rpf");
+        let host = translate(&w(&path)[..path.len()]).map(|v| text(&v));
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(host, Some(cwd.join("a.rpf").display().to_string()));
     }
 
     #[test]

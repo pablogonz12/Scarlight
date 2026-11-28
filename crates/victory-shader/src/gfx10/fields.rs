@@ -313,12 +313,7 @@ impl Instruction {
                             | "ds_gws_sema_release_all"
                     ) {
                     0
-                } else if pair
-                    || name.contains("cmpst")
-                    || name.contains("mskor")
-                    || name == "ds_wrap_rtn_b32"
-                {
-                    // ds_wrap_rtn_b32: DATA0 is subtracted, DATA1 added.
+                } else if pair || name.contains("cmpst") || name.contains("mskor") {
                     2
                 } else {
                     1
@@ -423,6 +418,8 @@ impl Instruction {
                     saddr: (self.encoding != Encoding::Flat)
                         .then(|| scalar(saddr, 1 + u8::from(self.encoding == Encoding::Global))),
                     offset: match self.encoding {
+                        // GFX10 FLAT offsets are 11-bit and unsigned: the
+                        // hardware ignores bit 11.
                         Encoding::Flat => (w0 & 0x7FF) as i16,
                         _ => ((w0 << 4) as i16) >> 4,
                     },
@@ -607,10 +604,7 @@ impl Instruction {
                     }
                 }
                 let vdst = w0 & 0xFF;
-                v.dst = Some(if name.starts_with("v_cmpx") {
-                    // CMPX ignores VDST and writes EXEC only.
-                    scalar(EXEC, lanes)
-                } else if compare {
+                v.dst = Some(if compare {
                     scalar(vdst as u8, lanes)
                 } else {
                     valu_dst(name, vdst, dst_n)
