@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Scarlight
+Comment=Start Scarlight on Linux + Mesa (checks the machine, keeps your setup)
+Exec=scarlight
+Icon=applications-games
+Terminal=true
+Categories=Game;
+Keywords=scarlight;vulkan;mesa;proton;wine;
+StartupNotify=false

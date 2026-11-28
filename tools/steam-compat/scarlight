@@ -6,17 +6,23 @@
 # Proton's Wine, inside the prefix Steam created for this game. Settings live in
 # scarlight.conf next to this script; the log is $STEAM_COMPAT_DATA_PATH/scarlight.log.
 # Set SCARLIGHT_DRY_RUN=1 to bind imports without running (no GPU work).
+# `scarlight --print` (or SCARLIGHT_PRINT=1) only prints which Proton and which
+# path (fast or safe) a launch would use, and why, then exits: no Wine is run.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 verb="${1:-}"
 shift || true
+PRINT="${SCARLIGHT_PRINT:-}"
+if [ "$verb" = --print ]; then PRINT=1; fi
 
 # ---- settings (scarlight.conf overrides these defaults) --------------------
 BUILD=default
 # Empty: find the GE-Proton this release is built for (BASE, next to this
 # script), or else the newest GE-Proton11-* installed. See below.
 PROTON=
+# auto: the fast path when its Proton and /dev/udmabuf are usable; 0: always safe.
+FAST=auto
 D3DCOMPILER=
 PROFILE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/victory/titles"
 MESA_CACHE_MAX_SIZE=16G
@@ -33,6 +39,7 @@ if [ -f "$HERE/scarlight.conf" ]; then . "$HERE/scarlight.conf"; fi
 [ -n "${PROFILE_DIR:-}" ] || PROFILE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/victory/titles"
 [ -n "${MESA_CACHE_MAX_SIZE:-}" ] || MESA_CACHE_MAX_SIZE=16G
 [ -n "${VKD3D_CONFIG:-}" ] || VKD3D_CONFIG=ignore_shared_fence
+[ -n "${FAST:-}" ] || FAST=auto
 
 # The GE-Proton this build targets: one line, GE-Proton<major>-<release>, in the
 # BASE file next to this script (a release ships it; a source checkout has it).
@@ -71,40 +78,122 @@ find_proton() {
   return 1
 }
 
+# The paired Proton (the fork's own build, installed as $BASE-victory<N>) is
+# what the fast path needs: its Wine imports section memory through
+# /dev/udmabuf and its vkd3d-proton takes a larger view heap. Prints the newest
+# one that has a Wine, compared by name (victory10 beats victory9).
+find_paired() {
+  local base d
+  for base in "${CT_DIRS[@]}"; do
+    for d in "$base/$BASE"-victory*; do
+      case "$(basename "$d")" in
+        "$BASE"-victory[0-9]*) ;;
+        *) continue ;;
+      esac
+      if [ -x "$d/files/bin/wine" ]; then printf '%s\t%s\n' "$(basename "$d")" "$d"; fi
+    done
+  done | sort -V | tail -1 | cut -f2
+}
+
+# Prints the stock GE-Proton to fall back to: BASE as GE names its tarball
+# (GE-Proton11-14-x86_64) or as ProtonUp-Qt extracts it (GE-Proton11-14), else
+# the newest GE-Proton11-* that is not a paired build.
+find_stock() {
+  local name base d found
+  for name in "$BASE-x86_64" "$BASE"; do
+    if find_proton "$name"; then return 0; fi
+  done
+  # Only an install that has a Wine counts (a leftover folder or a half
+  # extracted tarball must not win), and they are compared by name: the newest
+  # GE-Proton11-20 beats GE-Proton11-9, whatever directory each sits in.
+  found="$(for base in "${CT_DIRS[@]}"; do
+    for d in "$base"/GE-Proton11-*; do
+      case "$(basename "$d")" in *-victory*) continue ;; esac
+      if [ -x "$d/files/bin/wine" ]; then printf '%s\t%s\n' "$(basename "$d")" "$d"; fi
+    done
+  done | sort -V | tail -1 | cut -f2)"
+  [ -n "$found" ] || return 1
+  printf '%s\n' "$found"
+}
+
+# What the fast path needs from a Proton folder ($1) and from the machine.
+# Prints what is missing, one item per line; nothing means it is usable.
+UDMABUF="${SCARLIGHT_UDMABUF:-/dev/udmabuf}"
+fast_missing() {
+  if ! grep -qa VKD3D_VIEW_HEAP_DESCRIPTORS "$1/files/lib/wine/vkd3d-proton/x86_64-windows/d3d12core.dll" 2>/dev/null; then
+    echo "$(basename "$1") has no paired vkd3d-proton (no view-heap setting in its d3d12core.dll)"
+  fi
+  if [ ! -e "$UDMABUF" ]; then
+    echo "$UDMABUF does not exist (load it: sudo modprobe udmabuf)"
+  elif [ ! -r "$UDMABUF" ] || [ ! -w "$UDMABUF" ]; then
+    echo "$UDMABUF is not readable and writable by $(id -un) (see docs/linux-proton.md)"
+  fi
+}
+
+PAIRED="$(find_paired)"
+MISSING=""
 if [ "${PROTON#/}" != "$PROTON" ]; then
   PDIR="$PROTON"
 elif [ -n "$PROTON" ]; then
   PDIR="$(find_proton "$PROTON")" || PDIR="$(dirname "$HERE")/$PROTON"
+elif [ "$FAST" != 0 ] && [ -n "$PAIRED" ] && [ -z "$(fast_missing "$PAIRED")" ]; then
+  PDIR="$PAIRED"
 else
-  # BASE, as GE names its GitHub tarball (GE-Proton11-14-x86_64) or as
-  # ProtonUp-Qt extracts it (GE-Proton11-14).
-  PDIR=""
-  for name in "$BASE-x86_64" "$BASE"; do
-    if PDIR="$(find_proton "$name")"; then break; fi
-    PDIR=""
-  done
-  if [ -z "$PDIR" ]; then
-    # A newer GE-Proton of the same series usually runs this build; say so once
-    # and name the one this release expects.
-    # Only an install that has a Wine counts (a leftover folder or a half
-    # extracted tarball must not win), and they are compared by name: the newest
-    # GE-Proton11-20 beats GE-Proton11-9, whatever directory each sits in.
-    FOUND="$(for base in "${CT_DIRS[@]}"; do
-      for d in "$base"/GE-Proton11-*; do
-        if [ -x "$d/files/bin/wine" ]; then printf '%s\t%s\n' "$(basename "$d")" "$d"; fi
-      done
-    done | sort -V | tail -1 | cut -f2)"
-    if [ -z "$FOUND" ]; then
+  # Why the paired build is not used, for the one line below.
+  if [ "$FAST" = 0 ]; then
+    MISSING="FAST=0 in scarlight.conf"
+  elif [ -z "$PAIRED" ]; then
+    MISSING="no $BASE-victory<N> in compatibilitytools.d"
+  else
+    MISSING="$(fast_missing "$PAIRED" | paste -sd ';' - | sed 's/;/; /g')"
+  fi
+  if ! PDIR="$(find_stock)"; then
+    if [ -n "$PAIRED" ]; then
+      # No stock Proton to fall back to: run the paired one on the safe settings.
+      PDIR="$PAIRED"
+    else
       log "no GE-Proton in compatibilitytools.d; $BASE is required ($GE_URL)"
       echo "scarlight: no GE-Proton found in compatibilitytools.d; $BASE is required." >&2
       echo "  Install it from $GE_URL (or set PROTON in this tool's scarlight.conf)." >&2
       exit 1
     fi
-    PDIR="$FOUND"
-    WARN="no $BASE in compatibilitytools.d; using $(basename "$PDIR") (this release expects $BASE)"
-    log "$WARN"
-    echo "scarlight: $WARN" >&2
   fi
+  case "$(basename "$PDIR")" in
+    "$BASE" | "$BASE-x86_64" | "$BASE"-victory*) ;;
+    *)
+      # A newer GE-Proton of the same series usually runs this build; say so once.
+      WARN="no $BASE in compatibilitytools.d; using $(basename "$PDIR") (this release expects $BASE)"
+      log "$WARN"
+      echo "scarlight: $WARN" >&2
+      ;;
+  esac
+fi
+# An explicit PROTON still has to pass the same checks before the fast settings go on.
+FAST_PROTON=0
+if [ -z "$MISSING" ]; then
+  if [ "$FAST" = 0 ]; then
+    MISSING="FAST=0 in scarlight.conf"
+  else
+    MISSING="$(fast_missing "$PDIR" | paste -sd ';' - | sed 's/;/; /g')"
+  fi
+fi
+if [ -z "$MISSING" ]; then
+  FAST_PROTON=1
+  PATH_LINE="fast path on $(basename "$PDIR") (paired vkd3d-proton, $UDMABUF read/write)"
+else
+  PATH_LINE="safe path on $(basename "$PDIR"): $MISSING; the fast-only settings stay off"
+fi
+log "$PATH_LINE"
+echo "scarlight: $PATH_LINE" >&2
+if [ -n "$PRINT" ]; then
+  echo "proton=$PDIR"
+  echo "fast=$FAST_PROTON"
+  if [ "$FAST_PROTON" = 1 ]; then
+    echo "env=VICTORY_PORT_CONSTANTS=1 WINE_VICTORY_LOCAL_VIEWS=1 VKD3D_DISABLE_EXTENSIONS=VK_EXT_descriptor_heap VKD3D_VIEW_HEAP_DESCRIPTORS=4194304"
+  else
+    echo "env=unset VICTORY_PORT_CONSTANTS WINE_VICTORY_LOCAL_VIEWS VKD3D_DISABLE_EXTENSIONS VKD3D_VIEW_HEAP_DESCRIPTORS"
+  fi
+  exit 0
 fi
 WINE="$PDIR/files/bin/wine"
 WSRV="$PDIR/files/bin/wineserver"
@@ -164,10 +253,6 @@ stage() { # stage SRC DEST
 }
 stage "$EXE" "$RUN/victory.exe"
 CUSTOM_VKD3D="$PDIR/files/lib/wine/vkd3d-proton/x86_64-windows"
-FAST_PROTON=0
-if grep -qa VKD3D_VIEW_HEAP_DESCRIPTORS "$CUSTOM_VKD3D/d3d12core.dll" 2>/dev/null; then
-  FAST_PROTON=1
-fi
 for f in "$HERE"/files/*.dll; do
   [ -e "$f" ] || continue
   base="$(basename "$f")"
@@ -250,7 +335,10 @@ if [ "$FAST_PROTON" = 1 ]; then
   export VICTORY_PORT_CONSTANTS=1 WINE_VICTORY_LOCAL_VIEWS=1
   export VKD3D_DISABLE_EXTENSIONS=VK_EXT_descriptor_heap VKD3D_VIEW_HEAP_DESCRIPTORS=4194304
 else
+  # The constants path on a Proton without the paired Wine and vkd3d-proton
+  # draws a black picture: clear it even when the conf or the caller set it.
   unset VICTORY_PORT_CONSTANTS WINE_VICTORY_LOCAL_VIEWS VKD3D_VIEW_HEAP_DESCRIPTORS
+  if [ "${VKD3D_DISABLE_EXTENSIONS:-}" = VK_EXT_descriptor_heap ]; then unset VKD3D_DISABLE_EXTENSIONS; fi
 fi
 
 # victory's own options come first; the title's arguments come after `--`, as

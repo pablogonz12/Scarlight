@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 160" width="720" height="160" role="img" aria-label="Scarlight">
+<title>Scarlight</title>
+<g transform="translate(8 8) scale(0.28125)">
+<circle cx="256" cy="256" r="240" fill="#ff2400"/>
+<path d="M314.9 142A68 68 0 1 0 256 244A68 68 0 1 1 197.1 346" fill="none" stroke="#ffffff" stroke-width="44" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="176" y="108" fill="#ff2400" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="84" font-weight="800" letter-spacing="4">SCARLIGHT</text>
+</svg>

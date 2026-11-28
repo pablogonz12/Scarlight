@@ -1,0 +1,20 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and general talk
+    url: https://github.com/pablogonz12/Scarlight/discussions
+    about: Ask how something works, share a setup, or suggest an idea. Bugs and test runs belong in the forms.
+  - name: How to contribute
+    url: https://github.com/pablogonz12/Scarlight/blob/main/CONTRIBUTING.md
+    about: Build, test, naming and asset rules before you open a pull request.
+  - name: Code of conduct
+    url: https://github.com/pablogonz12/Scarlight/blob/main/CODE_OF_CONDUCT.md
+    about: How we treat each other here, and where to report a problem.
+  - name: Credits
+    url: https://github.com/pablogonz12/Scarlight/blob/main/CREDITS.md
+    about: The project this is built on, and every author whose code is in the tree.
+  - name: Linux quick start
+    url: https://github.com/pablogonz12/Scarlight/blob/main/README.md#quick-start
+    about: The tested Mesa/Wine/vkd3d-proton setup, and what is known to be slow or black.
+  - name: Asset policy
+    url: https://github.com/pablogonz12/Scarlight/blob/main/docs/asset-policy.md
+    about: What may never be committed or attached.

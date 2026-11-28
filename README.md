@@ -80,9 +80,8 @@ on, name yours in `compatibilitytools.d/Scarlight-<version>/scarlight.conf` (`PR
 DXC's `dxil.dll` and `dxcompiler.dll` in `Scarlight-<version>/files/` (Microsoft's binaries are not redistributed
 by a Linux release). [docs/steam.md](docs/steam.md) has both.
 
-Running the game from a script instead of Steam, and the Mesa shader cache that cuts pipeline creation
-from 37,672 ms to 148 ms for the 751 programs of the test set, are in
-**[docs/linux.md](docs/linux.md#mesa-shader-cache)**.
+The paired Proton the fast path needs, and the checks the Steam tool makes before it uses it, are in
+**[docs/linux-proton.md](docs/linux-proton.md)**.
 
 ## Releases
 

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 28" width="1200" height="28" role="presentation" aria-hidden="true">
+<defs>
+<linearGradient id="l" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="600" y2="0"><stop offset="0" stop-color="#ff2e63" stop-opacity="0"/><stop offset=".6" stop-color="#ff2e63" stop-opacity=".85"/><stop offset="1" stop-color="#ffb347"/></linearGradient>
+<linearGradient id="r" gradientUnits="userSpaceOnUse" x1="1200" y1="0" x2="600" y2="0"><stop offset="0" stop-color="#19d8ff" stop-opacity="0"/><stop offset=".6" stop-color="#19d8ff" stop-opacity=".85"/><stop offset="1" stop-color="#7ff4ff"/></linearGradient>
+<filter id="g" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="3"/></filter>
+</defs>
+<path d="M60 14H570" stroke="url(#l)" stroke-width="2" stroke-linecap="round"/>
+<path d="M1140 14H630" stroke="url(#r)" stroke-width="2" stroke-linecap="round"/>
+<path d="M600 4L610 14L600 24L590 14Z" fill="#ffb347" opacity=".6" filter="url(#g)"/>
+<path d="M600 5L609 14L600 23L591 14Z" fill="#ff7a3d"/>
+<path d="M600 9L604.5 14L600 19L595.5 14Z" fill="#fff4e6"/>
+</svg>
