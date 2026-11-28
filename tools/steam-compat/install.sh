@@ -76,6 +76,11 @@ if [ "$UNINSTALL" = 1 ]; then
 fi
 
 mkdir -p "$DEST"
+# Only a Proton named with --proton is written into scarlight.conf; otherwise the
+# tool picks on every launch (the paired build when the fast path can run, else
+# the stock GE-Proton on the safe settings), and the one found here only
+# supplies the DXVK DLLs.
+CONF_PROTON="$PROTON"
 if [ -n "$PROTON" ] && [ "${PROTON#/}" != "$PROTON" ]; then
   [ -x "$PROTON/files/bin/wine" ] || { echo "no Wine at $PROTON/files/bin/wine" >&2; exit 1; }
 else
@@ -188,8 +193,9 @@ BUILD=default
 
 # The Proton whose Wine Scarlight runs on: a folder name in this
 # compatibilitytools.d, or a full path to a Proton folder (shell-quoted here,
-# because it is sourced as shell).
-PROTON=$(printf '%q' "$PROTON")
+# because it is sourced as shell). Empty: the newest paired GE-Proton<base>-victory<N> when
+# /dev/udmabuf is usable (the fast path), else the stock GE-Proton (safe path).
+PROTON=$(if [ -n "$CONF_PROTON" ]; then printf '%q' "$CONF_PROTON"; fi)
 
 # Microsoft's d3dcompiler_47.dll is optional and not shipped. If you have one
 # you are licensed to use, put its path here; empty means use Wine's built-in.

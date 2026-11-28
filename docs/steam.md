@@ -125,7 +125,8 @@ then press Play again; changes apply on the next launch. An empty value means "t
 | Key | Default | What it does |
 |---|---|---|
 | `BUILD` | `default` | which build to run: `files/victory-<BUILD>.exe` |
-| `PROTON` | empty: the GE-Proton the release is built for (`GE-Proton11-14`, from the `BASE` file), else the newest `GE-Proton11-*` found | the Proton whose Wine to run on: a folder name in the same `compatibilitytools.d`, or a full path to a Proton folder |
+| `PROTON` | empty: the newest paired `GE-Proton11-14-victory<N>` when the fast path can run (see docs/linux-proton.md), else the GE-Proton the release is built for (`GE-Proton11-14`, from the `BASE` file), else the newest `GE-Proton11-*` found | the Proton whose Wine to run on: a folder name in the same `compatibilitytools.d`, or a full path to a Proton folder |
+| `FAST` | `auto` | `0` always runs the safe path, even on the paired Proton |
 | `D3DCOMPILER` | empty | path to Microsoft's `d3dcompiler_47.dll` you are licensed to use; empty uses Wine's built-in compiler |
 | `PROFILE_DIR` | `~/.config/victory/titles` | where the title profiles are read from (`~` is expanded) |
 | `MESA_CACHE_MAX_SIZE` | `16G` | cap for the per-game Mesa shader cache |
