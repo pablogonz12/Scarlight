@@ -588,6 +588,139 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Which caller asked for a copy of title memory, for the read line
+/// ([`RPM_CALLS`]): the submission's copy into title memory, its fill of the
+/// list's own memory, a buffer's refresh (`shadow`), a texture's staging
+/// bytes, and everything else.
+pub(crate) const SITE_TITLE_COPY: usize = 0;
+pub(crate) const SITE_FILL: usize = 1;
+pub(crate) const SITE_REFRESH: usize = 2;
+pub(crate) const SITE_TEXTURE: usize = 3;
+pub(crate) const SITE_OTHER: usize = 4;
+const SITES: usize = 5;
+const SIZE_CLASSES: usize = 4;
+
+/// Kernel reads of title memory since the last frame line, per site and size
+/// class (1-16 B, 17-256 B, 257-4 KiB, more), and the total: `[site *
+/// SIZE_CLASSES + class]`, the last entry the total. Counted always (the frame
+/// line and the tests read it): one relaxed add per kernel read, against a call
+/// of about 2.5 us.
+static RPM_CALLS: [std::sync::atomic::AtomicU64; SITES * SIZE_CLASSES + 1] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; SITES * SIZE_CLASSES + 1];
+
+/// Coalesced reads since the last frame line: runs (unions read in one go),
+/// pieces a run served, and pieces that fell back to their own read because a
+/// page of the union is not there.
+static COALESCE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The size class of a read of `len` bytes.
+fn size_class(len: usize) -> usize {
+    match len {
+        0..=16 => 0,
+        17..=256 => 1,
+        257..=4096 => 2,
+        _ => 3,
+    }
+}
+
+thread_local! {
+    /// The site of the copy this thread is making (the caller set it around
+    /// [`copy_mapped_at`]): a thread of its own for each wide refresh.
+    static SITE: std::cell::Cell<usize> = const { std::cell::Cell::new(SITE_OTHER) };
+}
+
+/// Sets this thread's copy site for as long as it is alive.
+struct SiteHere(usize);
+
+impl SiteHere {
+    fn of(site: usize) -> SiteHere {
+        let was = SITE.with(|s| s.replace(site));
+        SiteHere(was)
+    }
+}
+
+impl Drop for SiteHere {
+    fn drop(&mut self) {
+        SITE.with(|s| s.set(self.0));
+    }
+}
+
+thread_local! {
+    /// Kernel reads this thread has made (the tests compare a run's count; the
+    /// process-wide counters above can be moved by another test's).
+    static READS_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Kernel reads of title memory made by this thread so far.
+#[cfg(test)]
+pub(crate) fn reads_here() -> u64 {
+    READS_HERE.with(|r| r.get())
+}
+
+/// Notes one kernel read of `len` bytes for the frame line.
+fn rpm_counted(len: usize) {
+    let site = SITE.with(|s| s.get());
+    RPM_CALLS[site * SIZE_CLASSES + size_class(len)].fetch_add(1, Ordering::Relaxed);
+    RPM_CALLS[SITES * SIZE_CLASSES].fetch_add(1, Ordering::Relaxed);
+    READS_HERE.with(|r| r.set(r.get() + 1));
+}
+
+#[cfg(feature = "diagnostics")]
+/// Kernel reads of title memory since the last call, by site and size class,
+/// and their total: `[site][class]`, `total`.
+pub(crate) fn rpm_take() -> ([[u64; SIZE_CLASSES]; SITES], u64) {
+    let mut by_site = [[0u64; SIZE_CLASSES]; SITES];
+    for (site, row) in by_site.iter_mut().enumerate() {
+        for (class, n) in row.iter_mut().enumerate() {
+            *n = RPM_CALLS[site * SIZE_CLASSES + class].swap(0, Ordering::Relaxed);
+        }
+    }
+    let total = RPM_CALLS[SITES * SIZE_CLASSES].swap(0, Ordering::Relaxed);
+    (by_site, total)
+}
+
+#[cfg(feature = "diagnostics")]
+/// Coalesced read runs, pieces served and pieces fallen back since the last
+/// call.
+pub(crate) fn coalesce_take() -> [u64; 3] {
+    let mut out = [0u64; 3];
+    for (o, c) in out.iter_mut().zip(COALESCE.iter()) {
+        *o = c.swap(0, Ordering::Relaxed);
+    }
+    out
+}
+
+#[cfg(feature = "diagnostics")]
+/// Logs the read line: the kernel reads of a frame by size and by caller, and
+/// what coalescing did ([`read_pieces_together`], `VICTORY_RPM_COALESCE`).
+pub(crate) fn log_reads(frames: f64) {
+    let (by_site, total) = rpm_take();
+    let [runs, pieces, fell] = coalesce_take();
+    let per = |v: u64| v as f64 / frames;
+    let sizes: [u64; SIZE_CLASSES] = std::array::from_fn(|c| by_site.iter().map(|row| row[c]).sum());
+    let site = |s: usize| by_site[s].iter().sum::<u64>();
+    tracing::info!(
+        "reads per frame: {:.0} kernel reads of title memory: {:.0} of 1-16 B, {:.0} of 17-256 B, \
+         {:.0} of 257 B-4 KiB, {:.0} bigger; by caller: {:.0} title copies, {:.0} fills, {:.0} \
+         refreshes, {:.0} textures, {:.0} other; coalesced reads: {:.1} runs over {:.0} pieces \
+         ({:.2} a run), {:.0} pieces fell back",
+        per(total),
+        per(sizes[0]),
+        per(sizes[1]),
+        per(sizes[2]),
+        per(sizes[3]),
+        per(site(SITE_TITLE_COPY)),
+        per(site(SITE_FILL)),
+        per(site(SITE_REFRESH)),
+        per(site(SITE_TEXTURE)),
+        per(site(SITE_OTHER)),
+        per(runs),
+        per(pieces),
+        per(pieces) / per(runs).max(1.0),
+        per(fell),
+    );
+}
+
 /// Host buffers made since the start, as (count, bytes): in the upload heap
 /// (staging, list scratch), shared with the processor (host copies of title
 /// memory) and the graphics card's own (indirect arguments, twins' copies).
@@ -1074,6 +1207,167 @@ mod tests {
             crate::watch::title_memory_remapped(dst as usize, N);
             assert_ne!(VirtualFree(dst.cast(), 0, MEM_RELEASE), 0);
             crate::watch::title_memory_remapped(base as usize, N);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn disabled_coalescing_executes_copy_and_fill_and_tracks_title_write() {
+        let source = [11u8, 22, 33, 44];
+        let mut title = [0u8; 4];
+        let mut fill = [0u8; 4];
+        let steps = [
+            super::Step::Copy(title.as_mut_ptr() as usize, source.as_ptr() as usize, source.len()),
+            super::Step::Fill(fill.as_mut_ptr() as usize, title.as_ptr() as usize, title.len()),
+        ];
+        let mut batch = super::Batch::default();
+        let texture = std::sync::Arc::new(());
+        assert!(batch.texture_due(&texture));
+        assert!(!batch.texture_due(&texture));
+        super::run_deferred_steps(&steps, &mut batch, false, |_, _| panic!("copy treated as other step"));
+        assert_eq!(title, source);
+        assert_eq!(fill, source);
+        assert!(batch.texture_due(&texture), "title write invalidates texture tracking");
+    }
+
+    #[test]
+    fn mapped_aliases_split_but_one_private_allocation_coalesces() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::*;
+        // SAFETY: the section, views and private allocation belong to this test.
+        unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, 65536, std::ptr::null());
+            assert!(!section.is_null());
+            let a = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 65536);
+            let b = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 65536);
+            assert!(!a.Value.is_null() && !b.Value.is_null());
+            let av = a.Value as usize;
+            let bv = b.Value as usize;
+            (av as *mut u8).add(8).write(73);
+            let pieces = [
+                super::Piece { src: av + 8, dst: bv, len: 1, title_dst: true, site: super::SITE_TITLE_COPY },
+                super::Piece { src: av, dst: bv + 16, len: 1, title_dst: true, site: super::SITE_TITLE_COPY },
+            ];
+            assert_eq!(super::coalesced_end(&pieces, 0), 1);
+            let mut batch = super::Batch::default();
+            // Even if the caller classified this as one run before a remap,
+            // execution must recheck and preserve sequential aliasing.
+            super::run_copies(&pieces, &mut batch);
+            assert_eq!((av as *const u8).add(16).read(), 73);
+            assert_ne!(UnmapViewOfFile(a), 0);
+            assert_ne!(UnmapViewOfFile(b), 0);
+            assert_ne!(CloseHandle(section), 0);
+
+            let private = VirtualAlloc(std::ptr::null(), 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(private, 0);
+            let plain = [
+                super::Piece { src: private, dst: private + 32, len: 4, title_dst: true, site: super::SITE_TITLE_COPY },
+                super::Piece { src: private + 8, dst: private + 40, len: 4, title_dst: true, site: super::SITE_TITLE_COPY },
+            ];
+            assert_eq!(super::coalesced_end(&plain, 0), 2);
+            assert_ne!(VirtualFree(private as *mut _, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// The submission's pieces close together in title memory go in one kernel
+    /// read (`VICTORY_RPM_COALESCE`), and every piece still gets the bytes its
+    /// own read would have given it. A piece whose union covers a page the
+    /// title does not have falls back to its own read, bytes unchanged.
+    #[test]
+    fn a_coalesced_read_hands_every_piece_the_same_bytes_in_fewer_calls() {
+        use windows_sys::Win32::System::Memory::*;
+        // Four pages committed whole, then one reserved and never committed.
+        const N: usize = 4 << 16;
+        let piece = |dst: usize, src: usize, len: usize| super::Piece {
+            dst,
+            src,
+            len,
+            title_dst: false,
+            site: super::SITE_FILL,
+        };
+        // SAFETY: a private region, committed and written directly, then read
+        // and freed.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), N + (64 << 10), MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base.cast(), N, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            for i in 0..N {
+                base.add(i).write((i * 37 % 251) as u8);
+            }
+            let title: Vec<u8> = (0..N).map(|i| (i * 37 % 251) as u8).collect();
+
+            // 24 pieces of 40..112 B, spread over the committed pages: one read
+            // of their union does for all of them.
+            let mut sources = Vec::new();
+            let mut at = 96;
+            for i in 0..24 {
+                let len = 40 + i * 3;
+                sources.push((at, len));
+                at += len + 40;
+            }
+            assert!(at < N, "the pieces stay inside the committed pages");
+            assert!(at - 96 <= super::COALESCE_SPAN);
+
+            // One by one, as before: every piece its own read.
+            let mut apart: Vec<Vec<u8>> = Vec::new();
+            let before = super::reads_here();
+            for &(src, len) in &sources {
+                let mut dst = vec![0xa5u8; len];
+                super::copy_piece(piece(dst.as_mut_ptr() as usize, base as usize + src, len));
+                apart.push(dst);
+            }
+            let one_by_one = super::reads_here() - before;
+            assert!(
+                one_by_one >= sources.len() as u64,
+                "a read a piece on its own: {one_by_one} for {} pieces",
+                sources.len()
+            );
+
+            // Their union in one read, cut up in host memory.
+            let mut dsts: Vec<Vec<u8>> = sources.iter().map(|&(_, len)| vec![0x5au8; len]).collect();
+            let together: Vec<super::Piece> = sources
+                .iter()
+                .zip(&mut dsts)
+                .map(|(&(src, len), dst)| piece(dst.as_mut_ptr() as usize, base as usize + src, len))
+                .collect();
+            let before = super::reads_here();
+            super::read_pieces_together(&together);
+            let together_reads = super::reads_here() - before;
+            assert!(together_reads <= 2, "one read for the run, {together_reads} were made");
+            assert!(together_reads < one_by_one);
+            for (i, (a, b)) in apart.iter().zip(&dsts).enumerate() {
+                assert_eq!(a, b, "piece {i} got other bytes coalesced");
+            }
+            for (i, (&(src, len), got)) in sources.iter().zip(&dsts).enumerate() {
+                assert_eq!(got[..], title[src..src + len], "piece {i} is not the title's");
+            }
+
+            // A run whose union reaches the reserved page: every piece back to a
+            // read of its own, and every byte the byte its own read gives.
+            let near = [piece(0, base as usize + N - 64, 64), piece(0, base as usize + N - 16, 96)];
+            let mut apart: Vec<Vec<u8>> = Vec::new();
+            for &one in &near {
+                let mut dst = vec![0xa5u8; one.len];
+                super::copy_piece(piece(dst.as_mut_ptr() as usize, one.src, one.len));
+                apart.push(dst);
+            }
+            let mut holes = near;
+            let mut dsts: Vec<Vec<u8>> = holes.iter().map(|p| vec![0x5au8; p.len]).collect();
+            for (i, dst) in dsts.iter_mut().enumerate() {
+                holes[i].dst = dst.as_mut_ptr() as usize;
+            }
+            let before = super::reads_here();
+            super::read_pieces_together(&holes);
+            let fell = super::reads_here() - before;
+            assert!(
+                fell > holes.len() as u64,
+                "the union of a hole costs a read a piece and one of its own: {fell}"
+            );
+            for (i, (a, b)) in apart.iter().zip(&dsts).enumerate() {
+                assert_eq!(a, b, "piece {i} of the fallback got other bytes");
+            }
+
+            // SAFETY: the region allocated above.
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
     }
@@ -6473,88 +6767,146 @@ impl HostList {
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
     fn run_deferred(&self, batch: &mut Batch) {
+        let deferred = self.deferred();
+        run_deferred_steps(&deferred.copies, batch, coalesce_reads(), |step, batch| {
+            self.run_step(step, batch)
+        });
+    }
+
+    /// Runs one step of the submission that is not one of its copies.
+    fn run_step(&self, step: &Step, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         let _trace = crate::trace::span("list recording");
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
-            let copied = match step {
-                &Step::Copy(dst, src, len) => {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
-                    }
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        match step {
+            // A copy is a `Piece` of the run ([`run_copies`]).
+            Step::Copy(..) | Step::Fill(..) => {}
+            Step::Refresh(shadow, address, len) => {
+                #[cfg(feature = "diagnostics")]
+                {
+                    add(C::Refreshes, 1);
+                    add(C::RefreshBytes, *len as u64);
+                }
+                batch.add(shadow, *address, *len);
+            }
+            Step::Run(work) | Step::Host(work) => {
+                if matches!(step, Step::Run(_)) {
                     batch.title_written();
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
-                    // With the submission's one asking: the journal learns it.
-                    crate::watch::wrote(dst, len);
-                    len
                 }
-                &Step::Fill(dst, src, len) => {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
-                    }
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                    len
+                work();
+                // It wrote title memory, where is not known here: the
+                // submission's one asking ends, later refreshes ask anew.
+                if matches!(step, Step::Run(_)) {
+                    crate::watch::ask_once_end();
                 }
-                Step::Refresh(shadow, address, len) => {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::Refreshes, 1);
-                        add(C::RefreshBytes, *len as u64);
-                    }
-                    batch.add(shadow, *address, *len);
-                    continue;
+                #[cfg(feature = "diagnostics")]
+                {
+                    add(C::Runs, 1);
+                    add(C::RunUs, started.elapsed().as_micros() as u64);
                 }
-                Step::Run(work) | Step::Host(work) => {
-                    if matches!(step, Step::Run(_)) {
-                        batch.title_written();
-                    }
-                    work();
-                    // It wrote title memory, where is not known here: the
-                    // submission's one asking ends, later refreshes ask anew.
-                    if matches!(step, Step::Run(_)) {
-                        crate::watch::ask_once_end();
-                    }
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::Runs, 1);
-                        add(C::RunUs, started.elapsed().as_micros() as u64);
-                    }
-                    continue;
+            }
+            Step::GpuWrite(shadow, address, len) => {
+                // The shaders start from the title's data: this copy's pending
+                // refresh first. The other copies' wait for the next flush of
+                // all (flushing all of them at every range a dispatch writes
+                // made thousands of write-watch askings a frame).
+                batch.flush_one(shadow);
+                #[cfg(feature = "diagnostics")]
+                let snapshot = std::time::Instant::now();
+                shadow.writing(*address, *len);
+                #[cfg(feature = "diagnostics")]
+                {
+                    add(C::GpuWrites, 1);
+                    add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
                 }
-                Step::GpuWrite(shadow, address, len) => {
-                    // The shaders start from the title's data: this copy's
-                    // pending refresh first. The other copies' wait for
-                    // the next flush of all (flushing all of them at every
-                    // range a dispatch writes made thousands of write-watch
-                    // askings a frame).
-                    batch.flush_one(shadow);
-                    #[cfg(feature = "diagnostics")]
-                    let snapshot = std::time::Instant::now();
-                    shadow.writing(*address, *len);
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::GpuWrites, 1);
-                        add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
-                    }
-                    continue;
+            }
+            Step::Texture(staging) => {
+                if batch.texture_due(staging) {
+                    staging.refresh();
                 }
-                Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
-                        staging.refresh();
-                    }
-                    continue;
-                }
-            };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            }
         }
     }
+}
+
+fn run_deferred_steps(steps: &[Step], batch: &mut Batch, coalesce: bool, mut other: impl FnMut(&Step, &mut Batch)) {
+    let mut i = 0;
+    while i < steps.len() {
+        let mut run = Vec::new();
+        while let Some(piece) = copy_step(&steps[i + run.len()..]) {
+            run.push(piece);
+            if !coalesce {
+                break;
+            }
+        }
+        if run.is_empty() {
+            other(&steps[i], batch);
+            i += 1;
+            continue;
+        }
+        let mut at = 0;
+        while at < run.len() {
+            let end = coalesced_end(&run, at);
+            run_copies(&run[at..end], batch);
+            at = end;
+        }
+        i += run.len();
+    }
+}
+
+/// The copy `steps.first()` is, if it is one of the submission's copies: a copy
+/// into title memory or a fill of the list's own.
+fn copy_step(steps: &[Step]) -> Option<Piece> {
+    match *steps.first()? {
+        Step::Copy(dst, src, len) => Some(Piece { dst, src, len, title_dst: true, site: SITE_TITLE_COPY }),
+        Step::Fill(dst, src, len) => Some(Piece { dst, src, len, title_dst: false, site: SITE_FILL }),
+        _ => None,
+    }
+}
+
+/// Runs a run of the submission's copies: one read of their union when they lie
+/// close together ([`read_pieces_together`]), each on its own otherwise, with
+/// the counters, the write-watch journal and the flush of pending refreshes a
+/// copy has always had.
+fn run_copies(pieces: &[Piece], batch: &mut Batch) {
+    #[cfg(feature = "diagnostics")]
+    use crate::copystat::{C, add};
+    let started = std::time::Instant::now();
+    let mut bytes = 0u64;
+    for piece in pieces {
+        bytes += piece.len as u64;
+    }
+    // A copy into title memory: the submission's pending refreshes are done
+    // first, and textures are checked again after it. No refresh, run or
+    // texture lies inside a run of copies, so once is once per copy.
+    if pieces.iter().any(|p| p.title_dst) {
+        batch.title_written();
+    }
+    #[cfg(feature = "diagnostics")]
+    for piece in pieces {
+        add(C::Copies, 1);
+        add(C::CopyBytes, piece.len as u64);
+    }
+    // The earlier grouping is only a hint: mappings may have changed since
+    // then. Recheck while holding the remapping guard through the last write.
+    let reading = (pieces.len() > 1).then(crate::watch::title_memory_reading_now).flatten();
+    if reading.is_some() && coalesced_end(pieces, 0) == pieces.len() {
+        read_pieces_together(pieces);
+    } else {
+        drop(reading);
+        for piece in pieces {
+            copy_piece(*piece);
+        }
+    }
+    // The journal learns the writes (with the submission's one asking).
+    for piece in pieces.iter().filter(|p| p.title_dst) {
+        crate::watch::wrote(piece.dst, piece.len);
+    }
+    PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    PREPARING[1].fetch_add(bytes, Ordering::Relaxed);
 }
 
 /// Whether a submission's refreshes of host copies run on several threads,
@@ -6758,6 +7110,179 @@ impl Batch {
     }
 }
 
+/// Whether `VICTORY_COPY_ASK=1` asks Windows about a title destination before
+/// each copy (see [`copy_mapped`]).
+fn copy_ask() -> bool {
+    std::env::var_os("VICTORY_COPY_ASK").is_some_and(|v| v == "1")
+}
+
+/// Whether the pieces of a submission's copies that lie close together in title
+/// memory are read in one go (`VICTORY_RPM_COALESCE=0` restores one read per
+/// piece). Off with `VICTORY_COPY_ASK=1`, which drops a copy whose destination
+/// is not all mapped where coalescing writes the mapped part, and with
+/// `VICTORY_COPY_MODE` set, which changes what a copy does.
+fn coalesce_reads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        if std::env::var_os("VICTORY_RPM_COALESCE").is_some_and(|v| v == "0") || copy_ask() {
+            return false;
+        }
+        #[cfg(feature = "diagnostics")]
+        if crate::copystat::mode() != 0 {
+            return false;
+        }
+        true
+    })
+}
+
+/// The widest span one coalesced read covers: pieces further apart than a page
+/// keep their own reads (a union over a mostly empty span reads pages nobody
+/// asked for), and so does a piece with more than a page of its own.
+const COALESCE_SPAN: usize = 64 << 10;
+
+/// The most pieces one coalesced read serves.
+const COALESCE_PIECES: usize = 64;
+
+/// One piece of a submission's copies: destination, source, bytes, whether the
+/// destination is title memory, and which caller asked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Piece {
+    dst: usize,
+    src: usize,
+    len: usize,
+    title_dst: bool,
+    /// Which caller asked (a run keeps to one site, [`log_reads`]).
+    site: usize,
+}
+
+/// The pieces `pieces[i..]` one read serves: those whose union is at most
+/// [`COALESCE_SPAN`] wide, at most [`COALESCE_PIECES`] of them, all of one
+/// caller, and none of them reading what an earlier one writes. A piece that
+/// would read an earlier piece's destination ends the run: the title's bytes
+/// there are the ones the earlier copy left, not the ones the read would find
+/// before it.
+fn coalesced_end(pieces: &[Piece], i: usize) -> usize {
+    let mut end = i + 1;
+    let Some(allocation) = plain_allocation(pieces[i].src, pieces[i].len)
+        .filter(|&allocation| plain_allocation(pieces[i].dst, pieces[i].len) == Some(allocation))
+    else {
+        return end;
+    };
+    let (mut lo, mut hi) = (pieces[i].src, pieces[i].src + pieces[i].len);
+    while end < pieces.len() && end - i < COALESCE_PIECES {
+        let p = pieces[end];
+        if p.len == 0 || p.len > COALESCE_SPAN || p.site != pieces[i].site {
+            break;
+        }
+        if plain_allocation(p.src, p.len) != Some(allocation)
+            || plain_allocation(p.dst, p.len) != Some(allocation)
+        {
+            break;
+        }
+        let (to, from) = (p.src, p.src + p.len);
+        let (nlo, nhi) = (lo.min(to), hi.max(from));
+        if nhi - nlo > COALESCE_SPAN {
+            break;
+        }
+        if pieces[i..end].iter().any(|q| q.dst < from && to < q.dst + q.len) {
+            break;
+        }
+        (lo, hi) = (nlo, nhi);
+        end += 1;
+    }
+    end
+}
+
+/// Only private, committed bytes wholly within a single queried region can be
+/// proven not to alias another view. Unknown or mapped backing stays separate.
+fn plain_allocation(at: usize, len: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let end = at.checked_add(len)?;
+    if len == 0 {
+        return None;
+    }
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: VirtualQuery writes only to the supplied information structure.
+    let queried = unsafe { VirtualQuery(at as *const _, &mut info, std::mem::size_of_val(&info)) };
+    if queried == 0 || info.State != MEM_COMMIT || info.Type != MEM_PRIVATE
+        || end > (info.BaseAddress as usize).checked_add(info.RegionSize)?
+    {
+        return None;
+    }
+    Some(info.AllocationBase as usize)
+}
+
+thread_local! {
+    /// The union a coalesced read lands in, kept for the next one (threads
+    /// differ: a wide refresh reads on several).
+    static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Reads `pieces` (a run of at least two) with one kernel read of their union
+/// and cuts it up in host memory: the pieces are adjacent or close, so one
+/// call does for all of them. Falls back to a read of its own for every piece
+/// when a page of the union is not there (counted): a union may cover pages
+/// none of the pieces asked for. Gap bytes go to the scratch buffer only, so
+/// no caller sees a byte it did not ask for.
+fn read_pieces_together(pieces: &[Piece]) {
+    let lo = pieces.iter().map(|p| p.src).min().unwrap_or(0);
+    let hi = pieces.iter().map(|p| p.src + p.len).max().unwrap_or(0);
+    let span = hi - lo;
+    SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        if scratch.len() < span {
+            scratch.resize(span, 0);
+        }
+        let base = scratch.as_mut_ptr();
+        let _here = SiteHere::of(pieces[0].site);
+        // The union is only read whole if every page of it is there; a failure
+        // leaves the pieces to reads of their own.
+        if span > 0 && read(lo as *const u8, base, span, false) {
+            for p in pieces {
+                // SAFETY: the union was read into `scratch`, which holds `span`
+                // bytes, and every piece lies inside it.
+                let from = unsafe { base.add(p.src - lo) };
+                write_piece(*p, from);
+            }
+            COALESCE[0].fetch_add(1, Ordering::Relaxed);
+            COALESCE[1].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+            return;
+        }
+        for p in pieces {
+            COALESCE[2].fetch_add(1, Ordering::Relaxed);
+            copy_piece(*p);
+        }
+    });
+}
+
+/// One piece of a coalesced run, from bytes already read into host memory
+/// (`from`), into its destination: host memory at the bytes, title memory
+/// through the kernel as [`copy_mapped`] writes it (which leaves the pages the
+/// title took away alone, as it always has).
+fn write_piece(piece: Piece, from: *const u8) {
+    let Piece { dst, len, title_dst, .. } = piece;
+    if !title_dst {
+        // SAFETY: the caller's destination is host memory of `len` bytes and
+        // does not overlap the read (a run excludes pieces that would overlap
+        // an earlier destination).
+        unsafe { std::ptr::copy_nonoverlapping(from, dst as *mut u8, len) };
+        return;
+    }
+    // The kernel writes the destination: it must not be guarded.
+    crate::watch::writing(dst, len);
+    // One kernel write a piece, not a plain copy with two probe reads before
+    // it (`plain_dst`): the probes are kernel calls of their own, and a piece
+    // of a run is small (the frame's 14,700 pieces in 6.9 MB), so the write's
+    // own call is the cheaper way to be sure the page is there.
+    write_mapped(dst as *mut u8, from, len);
+}
+
+/// One piece on its own, the way it went before coalescing: the piece's own
+/// read, its own fallbacks for the pages it cannot have.
+fn copy_piece(piece: Piece) {
+    copy_mapped_at(piece.dst as *mut u8, piece.src as *const u8, piece.len, piece.title_dst, piece.site);
+}
+
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here, and a title
@@ -6769,6 +7294,12 @@ impl Batch {
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    copy_mapped_at(dst, src, len, title_dst, SITE_OTHER);
+}
+
+/// [`copy_mapped`], asked for by `site` of the read line ([`log_reads`]).
+pub(crate) fn copy_mapped_at(dst: *mut u8, src: *const u8, len: usize, title_dst: bool, site: usize) {
+    let _here = SiteHere::of(site);
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
@@ -6790,8 +7321,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // says the same when it fails, so the question is only asked then.
     // `VICTORY_COPY_ASK=1` asks first, as before.
     static ASK: OnceLock<bool> = OnceLock::new();
-    let ask_first = title_dst
-        && *ASK.get_or_init(|| std::env::var_os("VICTORY_COPY_ASK").is_some_and(|v| v == "1"));
+    let ask_first = title_dst && *ASK.get_or_init(copy_ask);
     if ask_first && !crate::texture::committed(dst, len) {
         return;
     }
@@ -6988,6 +7518,7 @@ fn read_mark(src: *const u8, dst: *mut u8, len: usize, mark: bool, title_dst: bo
     // The guard is taken only if it is free (a caller that holds it keeps
     // it), and a read without it still reads, just without marking.
     let reading = crate::watch::title_memory_reading_now();
+    rpm_counted(len);
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
     let whole = unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 };
@@ -7045,6 +7576,7 @@ fn probe(at: usize) -> bool {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut byte = 0u8;
     let mut done = 0;
+    rpm_counted(1);
     // SAFETY: one byte of this process read into a local; the kernel checks
     // the address.
     unsafe {

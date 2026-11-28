@@ -19,8 +19,12 @@
 //!   e  guarded      the same 2409 spans, watched by our own guards instead of
 //!                  the kernel: cost per frame at 240 written blocks a frame,
 //!                  with the kernel's asking every 8th frame as the verifier
+//!   f  rpm pieces  the frame's 14,700 copies, each its own ReadProcessMemory
+//!                  into the piece's own host bytes: what coalescing starts from
+//!   g  coalesced   the pieces of a run (a site, a page wide, 64 pieces) read in
+//!                  one call of their union and cut up here: the same bytes
 //!
-//! usage: copybw [all|a|b|c|d|e] [--contend]
+//! usage: copybw [all|a|b|c|d|e|f|g] [--contend]
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -57,6 +61,12 @@ fn touch(p: *mut u8, size: usize, one_in: usize) {
 fn rpm(src: *const u8, dst: *mut u8, len: usize) {
     let mut done = 0;
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) };
+}
+
+/// Whether the kernel read all of it (a page of the source may not be there).
+fn rpm_ok(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    let mut done = 0;
+    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
 
 fn write_watch(base: *const u8, len: usize, found: &mut [usize]) -> usize {
@@ -509,6 +519,111 @@ fn main() {
             wrote as f64 / frames,
             verify / 1e3,
             verify / 1e3 / 8.0
+        );
+    }
+
+    if run("f") || run("g") {
+        // The frame's 14,700 pieces of title memory, 6.9 MB: mean 470 B. The
+        // layer's copies that lie close together, in clusters of a buffer's
+        // pieces (gaps of 8..256 B: a copy that went on exactly where the last
+        // ended is one step already, `defer_copy`), which is what coalescing
+        // can join.
+        let n = 14_700;
+        let mut pieces: Vec<(usize, usize)> = Vec::with_capacity(n);
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut total = 0;
+        let mut at = 0;
+        let mut cluster_left = 0;
+        for i in 0..n {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            // Mean 461 B: 6.8 MB in 14,700 pieces, as the frame line counts.
+            let len = if i % 5 == 4 {
+                512 + (x as usize % (1600 - 511))
+            } else {
+                64 + (x as usize % (560 - 63))
+            };
+            if cluster_left == 0 {
+                // A cluster of a buffer's pieces, inside one page.
+                at += (x as usize % 4096) + 4096;
+                cluster_left = 18 + (x as usize % 12);
+            }
+            total += len;
+            pieces.push((at, len));
+            at += len + 8 + (x as usize % 248);
+            cluster_left -= 1;
+        }
+        assert!(at < title_size, "the pieces fit the title region");
+        let span: usize = pieces.last().unwrap().0 + pieces.last().unwrap().1;
+        let mb = total as f64 / 1e6;
+
+        // `f`: one `ReadProcessMemory` a piece, into the piece's own host
+        // bytes: what the layer did before coalescing.
+        let mut one = vec![0u8; span];
+        let started = Instant::now();
+        for &(src, len) in &pieces {
+            rpm(unsafe { title.add(src) }, unsafe { one.as_mut_ptr().add(src) }, len);
+        }
+        let one_ms = started.elapsed().as_secs_f64() * 1e3;
+
+        // `g`: the pieces of a run read in one call (their union), cut up in
+        // host memory here; the run rule is the layer's (a site, a page wide,
+        // 64 pieces).
+        let mut together = vec![0u8; span];
+        let mut scratch = vec![0u8; 64 << 10];
+        let started = Instant::now();
+        let (mut runs, mut calls, mut served) = (0, 0, 0);
+        let mut i = 0;
+        while i < pieces.len() {
+            let (mut lo, mut hi) = pieces[i];
+            hi += lo; // (src, len) -> lo, hi
+            let mut end = i + 1;
+            while end < pieces.len() && end - i < 64 {
+                let (src, len) = pieces[end];
+                let (nlo, nhi) = (lo.min(src), hi.max(src + len));
+                if nhi - nlo > 64 << 10 {
+                    break;
+                }
+                (lo, hi) = (nlo, nhi);
+                end += 1;
+            }
+            calls += 1;
+            runs += 1;
+            served += end - i;
+            let span = hi - lo;
+            if rpm_ok(unsafe { title.add(lo) }, scratch.as_mut_ptr(), span) {
+                for &(src, len) in &pieces[i..end] {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            scratch.as_ptr().add(src - lo),
+                            together.as_mut_ptr().add(src),
+                            len,
+                        )
+                    };
+                }
+            } else {
+                for &(src, len) in &pieces[i..end] {
+                    rpm(unsafe { title.add(src) }, unsafe { together.as_mut_ptr().add(src) }, len);
+                }
+            }
+            i = end;
+        }
+        let together_ms = started.elapsed().as_secs_f64() * 1e3;
+        assert!(
+            one.iter().zip(&together).all(|(&a, &b)| a == b),
+            "the coalesced read gave other bytes"
+        );
+        println!(
+            "f rpm pieces : {n} calls, {mb:.2} MB, {one_ms:.2} ms, {:.2} us/call",
+            one_ms * 1e3 / n as f64
+        );
+        println!(
+            "g coalesced  : {calls} calls for {served} pieces in {runs} runs ({:.1} a run), {mb:.2} MB, \
+             {together_ms:.2} ms, {:.2} us/piece -> x{:.1}",
+            served as f64 / runs as f64,
+            together_ms * 1e3 / n as f64,
+            one_ms / together_ms
         );
     }
 

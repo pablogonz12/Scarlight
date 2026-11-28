@@ -2,7 +2,8 @@
 resolver = "3"
 members = ["crates/*", "apps/*", "xtask"]
 # Fixtures are standalone crates built on demand by integration tests.
-exclude = ["tests/fixtures"]
+# `tools/copybench` is a measurement tool built by hand, not a member.
+exclude = ["tests/fixtures", "tools/copybench"]
 
 [workspace.package]
 version = "0.1.0"
