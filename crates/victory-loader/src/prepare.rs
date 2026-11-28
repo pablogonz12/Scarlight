@@ -177,6 +177,8 @@ fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
 mod tests {
     use super::*;
 
+    // These tests parse the test executable itself, which is PE only on Windows.
+    #[cfg(windows)]
     #[test]
     fn patches_own_test_binary() {
         let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
@@ -204,6 +206,7 @@ mod tests {
         assert_eq!(prepared.bytes.len(), original.len());
     }
 
+    #[cfg(windows)]
     #[test]
     fn keeps_iat_slots_when_import_size_excludes_the_terminator() {
         let mut original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
@@ -273,6 +276,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn file_name_is_stable_per_build() {
         let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
