@@ -1,6 +1,6 @@
 # Security
 
-Scarlight runs code from files you supply, so a crash is often not a bug you can fix by design.
+ScarLight runs code from files you supply, so a crash is often not a bug you can fix by design.
 If you find something that is a real security problem (memory-safety issue reachable from
 untrusted input, path traversal in the loader or a parser, a way to make the build or tests run
 foreign code, a leaked token in the history), please report it **privately**:

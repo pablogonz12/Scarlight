@@ -1,8 +1,8 @@
-# Scarlight becomes a compatibility tool you pick in Steam
+# ScarLight becomes a compatibility tool you pick in Steam
 
 **25 November 2026**
 
-Scarlight is changing shape. Until today it was a binary you copied next to the title and started by
+ScarLight is changing shape. Until today it was a binary you copied next to the title and started by
 hand, around a development setup of scripts, a GPU test queue and a measurement lab. From today the
 thing we build and ship is **one Steam compatibility tool**: put it in Steam's `compatibilitytools.d`,
 restart Steam, choose **Scarlight (Xbox Series)** under the game's *Properties → Compatibility*, press
@@ -18,7 +18,7 @@ command-stream decoder and the shader translator are the same code, and the same
   is what you use — or run `tools/steam-compat/install.sh` from a checkout, which copies the tool, an
   already-built `victory.exe` and the DLLs it needs. `tools/steam-compat/package.sh` builds that
   tarball, and a GitHub Actions job attaches it on a tag.
-- **Only what may be redistributed is shipped.** The tarball carries Scarlight and vkd3d-proton, with
+- **Only what may be redistributed is shipped.** The tarball carries ScarLight and vkd3d-proton, with
   their licence texts. Microsoft's `d3dcompiler_47.dll` is never shipped and is optional: the tool
   runs on Wine's built-in compiler. A copy you are licensed to use is picked up at launch from, in
   order: the `D3DCOMPILER=` path in `scarlight.conf`, `files/d3dcompiler_47.dll` in the tool folder, or

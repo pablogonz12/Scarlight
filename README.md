@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/brand/logo.svg" alt="Scarlight" width="420">
+<img src="docs/brand/logo.svg" alt="ScarLight" width="420">
 
 <br>
 
@@ -9,11 +9,11 @@
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-ff7a3d?style=flat-square&labelColor=14072c)](LICENSE)
 [![Stars](https://img.shields.io/github/stars/pablogonz12/Scarlight?style=flat-square&labelColor=14072c&color=ffb347)](https://github.com/pablogonz12/Scarlight/stargazers)
 
-# Scarlight
+# ScarLight
 
 **Play Xbox Series games on your Linux PC, from Steam.**
 
-Scarlight is a Steam compatibility tool. Proton lets Steam run Windows games on Linux; Scarlight does
+ScarLight is a Steam compatibility tool. Proton lets Steam run Windows games on Linux; ScarLight does
 the same job for games built for Xbox Series. Install it once, choose it for the game in Steam, press
 Play.
 
@@ -23,7 +23,7 @@ Play.
 
 </div>
 
-> **25 November 2026 — Scarlight is now a Steam compatibility tool.** Until today it was a program you
+> **25 November 2026 — ScarLight is now a Steam compatibility tool.** Until today it was a program you
 > started by hand; from today it is one install, one entry in Steam's Compatibility list, and Play.
 > The code is the same code; the development setup of the previous line is preserved on branch
 > `legacy/amd-hub`. Why, and what moved where: [ANNOUNCEMENT.md](ANNOUNCEMENT.md).
@@ -31,14 +31,14 @@ Play.
 ## What it is
 
 Games made for an Xbox Series console do not run on a PC by themselves: they expect the console's
-system software, its graphics commands and its shaders. Scarlight supplies the missing console side,
+system software, its graphics commands and its shaders. ScarLight supplies the missing console side,
 so the game starts and draws on your machine instead. The Windows side it needs — files, memory,
 threads, the window — comes from Proton, the same Proton Steam already uses for Windows games; your
 graphics driver does the drawing.
 
 You do not run anything from a terminal: Steam launches the game, the way it does with Proton.
 
-Scarlight ships no game files. It runs a copy of a game you legally own, on your own PC.
+ScarLight ships no game files. It runs a copy of a game you legally own, on your own PC.
 
 ## What you need
 
@@ -46,7 +46,7 @@ Scarlight ships no game files. It runs a copy of a game you legally own, on your
 - **A graphics card with a Mesa Vulkan driver**: AMD (RADV) is the one tested; Intel (ANV) is checked
   offline; NVIDIA's open NVK is planned and untried.
   Vulkan 1.3 or newer. A proprietary driver is not a target of this project.
-- **A Proton you already have**: GE-Proton or Valve's Proton. Scarlight uses its Wine; we neither
+- **A Proton you already have**: GE-Proton or Valve's Proton. ScarLight uses its Wine; we neither
   ship nor fork Proton.
 - **The game's files**, from a copy you own.
 
@@ -69,7 +69,7 @@ To install that base too, pass `--with-proton` to bash after `-s --`.
 Restart Steam, then choose **Scarlight <version>** under the game's Properties > Compatibility.
 For more options and troubleshooting, see [docs/steam.md](docs/steam.md).
 
-Two things a release leaves to you, both one step: if Steam cannot find the Proton Scarlight should run
+Two things a release leaves to you, both one step: if Steam cannot find the Proton ScarLight should run
 on, name yours in `compatibilitytools.d/Scarlight-<version>/scarlight.conf` (`PROTON=`); and put your own copy of
 DXC's `dxil.dll` and `dxcompiler.dll` in `Scarlight-<version>/files/` (Microsoft's binaries are not redistributed
 by a Linux release). [docs/steam.md](docs/steam.md) has both.
@@ -81,7 +81,7 @@ from 37,672 ms to 148 ms for the 751 programs of the test set, are in
 ## Releases
 
 Releases are on the [Releases page](https://github.com/pablogonz12/Scarlight/releases): a versioned
-tarball named after the Proton it runs on — **Scarlight 11.14.1** runs on GE-Proton11-14.
+tarball named after the Proton it runs on — **ScarLight 11.14.1** runs on GE-Proton11-14.
 [docs/RELEASES.md](docs/RELEASES.md) says what a version number means, how to install one, and how
 often a new one comes.
 
@@ -107,17 +107,17 @@ No other card and no other game have been tried, so nothing here promises anythi
 <!-- progress:start -->
 [![Shader instruction coverage](https://pablogonz12.github.io/Scarlight/progress/shaders.svg)](https://pablogonz12.github.io/Scarlight/progress/)
 
-Counted from the source on every change: which GPU instructions Scarlight can read and translate.
+Counted from the source on every change: which GPU instructions ScarLight can read and translate.
 Live page with history: [pablogonz12.github.io/Scarlight/progress](https://pablogonz12.github.io/Scarlight/progress/).
 Progress in detail — what is measured, how, and where each number comes from: [docs/PROGRESS.md](docs/PROGRESS.md).
 <!-- progress:end -->
 
-## How Scarlight differs from other Xbox Series projects
+## How ScarLight differs from other Xbox Series projects
 
 Several projects take on Xbox Series games on a PC. They aim at different platforms, so the rows below
 are about fit, not quality.
 
-| | Scarlight | Other Xbox Series projects (Windows-first layers) |
+| | ScarLight | Other Xbox Series projects (Windows-first layers) |
 |---|---|---|
 | Target platform | Linux, through Steam | Windows 10/11 x64; no Linux target documented |
 | How a game is started | Picked in Steam's Compatibility list, then Play; Steam launches it | The project's own program on Windows; on Linux you would set up a Wine prefix by hand |
@@ -133,11 +133,11 @@ anything that has changed since.</sub>
 
 ```mermaid
 flowchart TB
-    S["Steam: you press Play"] --> T["Scarlight compatibility tool<br/>picks your Proton, sets up the prefix"]
+    S["Steam: you press Play"] --> T["ScarLight compatibility tool<br/>picks your Proton, sets up the prefix"]
     T --> P
     subgraph P["Proton (Wine): the operating-system side"]
         direction TB
-        G["The game's own x86-64 code"] <-->|"console API calls"| R["Scarlight runtime<br/>console APIs · GPU command decoder · RDNA2 shader recompiler"]
+        G["The game's own x86-64 code"] <-->|"console API calls"| R["ScarLight runtime<br/>console APIs · GPU command decoder · RDNA2 shader recompiler"]
     end
     R -->|"Direct3D 12 + DXIL"| V["vkd3d-proton"]
     V -->|"Vulkan + SPIR-V"| M["Mesa: RADV (tested) · ANV · NVK (planned)"]
@@ -148,15 +148,15 @@ flowchart TB
 [![Drivers: RADV · ANV](https://img.shields.io/badge/drivers-RADV%20%C2%B7%20ANV-ff7a3d?style=flat-square&labelColor=14072c)](docs/hardware.md)
 [![Vulkan 1.3](https://img.shields.io/badge/Vulkan-1.3%2B-19d8ff?style=flat-square&labelColor=14072c)](https://www.vulkan.org/)
 
-- **Steam starts it.** The game's `.exe` is a Non-Steam Game whose compatibility tool is Scarlight.
+- **Steam starts it.** The game's `.exe` is a Non-Steam Game whose compatibility tool is ScarLight.
   The tool finds your Proton, prepares the game's prefix and shader cache, and asks Steam for the same
   runtime container Proton gets.
 - **Proton does the operating-system side.** The game's file, thread, memory and window calls are
   Wine's job, through the Proton you installed.
-- **Scarlight does the console side.** It runs inside that Wine process next to the game: it answers
+- **ScarLight does the console side.** It runs inside that Wine process next to the game: it answers
   the console system APIs the game calls, decodes its GPU command streams, and recompiles its RDNA2
   shaders and pipelines for your card.
-- **vkd3d-proton and Mesa draw it.** Scarlight hands Direct3D 12 and DXIL to vkd3d-proton, which turns
+- **vkd3d-proton and Mesa draw it.** ScarLight hands Direct3D 12 and DXIL to vkd3d-proton, which turns
   them into Vulkan and SPIR-V for Mesa's RADV (AMD) or ANV (Intel); NVK (NVIDIA) is planned. Mesa is open source,
   so the driver is ours to read, tune and fix — that is why the project is built around it. RADV on
   RDNA4 is the only one tested in a game so far; ANV's pipelines are checked offline.
@@ -164,6 +164,9 @@ flowchart TB
 Design notes: [docs/architecture.md](docs/architecture.md).
 
 ## Roadmap
+
+To follow development as it happens, see the dated
+[development log](docs/ROADMAP.md#development-log).
 
 | Stage | Goal | Where it stands |
 |---|---|---|
@@ -199,7 +202,7 @@ card, driver and Mesa version, kernel, distribution, Proton build, and the last 
 
 ## Credits
 
-Scarlight is a port of the project named in [CREDITS.md](CREDITS.md) (GPL-3.0), whose history and
+ScarLight is a port of the project named in [CREDITS.md](CREDITS.md) (GPL-3.0), whose history and
 authorship this tree keeps; every contributor is named there, along with the third-party licences a
 release ships.
 

@@ -30,7 +30,7 @@ HansKristian-Work/dxil-spirv#376.
 The converter lives in the shipped `d3d12.dll`/`d3d12core.dll` pair. Build a vkd3d-proton with
 the newer dxil-spirv submodule, then install that pair where the Steam tool takes it from:
 `tools/steam-compat/install.sh --dlls <folder>` (or `package.sh` for a release). That installer
-stages a Scarlight build too, so it wants one at
+stages a ScarLight build too, so it wants one at
 `target/x86_64-pc-windows-msvc/release/victory.exe` or a path passed with `--exe`; with only an
 installed tool to hand, copy the two files straight into
 `compatibilitytools.d/Scarlight/files/` and press Play again. No DXIL byte changes, so

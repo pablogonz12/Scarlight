@@ -1,5 +1,5 @@
 name: Test report
-description: A run on your hardware, for one Scarlight commit. Numbers and log lines are the most useful thing you can give us.
+description: A run on your hardware, for one ScarLight commit. Numbers and log lines are the most useful thing you can give us.
 title: "test: "
 labels: []
 body:
@@ -13,7 +13,7 @@ body:
   - type: input
     id: commit
     attributes:
-      label: Scarlight commit
+      label: ScarLight commit
       description: Output of `git rev-parse --short HEAD`.
       placeholder: fcb278b
     validations:

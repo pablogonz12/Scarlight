@@ -1,6 +1,6 @@
 # scarlight launcher
 
-One menu for a Scarlight install on Linux + Mesa: it looks at your machine first,
+One menu for a ScarLight install on Linux + Mesa: it looks at your machine first,
 then starts the port under Wine/Proton. No game files are shipped, downloaded or
 read: every path in it is one you gave it.
 
@@ -26,7 +26,7 @@ the `Exec=` line to the full path. Nothing else is installed.
 |---|---|---|
 | Proton | folder of a Proton/GE build (`files/bin/wine`) | found in the Steam `compatibilitytools.d` folders |
 | Game | the `.exe` of the copy you own | none |
-| DLL folder | where `dxgi`, `d3d12`, `d3d12core`, `dxil`, `dxcompiler` live (a folder other than the build's own is added to `WINEDLLPATH`, so Wine really searches it) | next to the Scarlight build |
+| DLL folder | where `dxgi`, `d3d12`, `d3d12core`, `dxil`, `dxcompiler` live (a folder other than the build's own is added to `WINEDLLPATH`, so Wine really searches it) | next to the ScarLight build |
 | Prefix | `WINEPREFIX` | `${XDG_DATA_HOME:-~/.local/share}/scarlight/prefix` |
 
 `docs/linux.md` in the repository explains where those DLLs come from.

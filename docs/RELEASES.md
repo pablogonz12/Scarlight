@@ -1,13 +1,14 @@
 # Releases
 
-Scarlight ships as versioned releases: a tarball you extract into Steam's
+ScarLight ships as versioned releases: a tarball you extract into Steam's
 `compatibilitytools.d`, which Steam then lists under a title's **Properties > Compatibility** as
-**Scarlight `<version>`**. This page is the scheme, the install, and when a new release is cut.
+**Scarlight `<version>`**. The project is written ScarLight; Steam's list, folder names and
+file names still read `Scarlight`. This page is the scheme, the install, and when a new release is cut.
 For every option of the tool itself, [steam.md](steam.md) is the reference.
 
 ## 1. What a version means
 
-A Scarlight version is **`<GE major>.<GE release>.<revision>`**, built on one GE-Proton release:
+A ScarLight version is **`<GE major>.<GE release>.<revision>`**, built on one GE-Proton release:
 
 | Version | Tag | Runs on | Notes |
 |---|---|---|---|
@@ -102,6 +103,20 @@ vkd3d-proton pair at the pinned commits, packs the tarball, and publishes a **pr
 tarball, `SHA256SUMS.txt`, the vkd3d-proton corresponding source (LGPL-2.1) and the `CHANGELOG.md`
 section for that version as the body. `tools/release-notes.sh <from-tag>` drafts that section from the
 merged PR titles, grouped as Picture / Speed / Load time / Stability / Tools.
+
+The workflow's own title and body are a first version. The published release is then titled
+**ScarLight `<version>`** and its notes are rewritten in one shape:
+
+1. one line saying what the release is for;
+2. **What changed**: a few plain bullets grouped by what a user notices (performance, picture,
+   stability, install, diagnostics), each with its pull request number;
+3. **Measured**: only results a pull request or the changelog recorded, with the hardware and what
+   was compared; the section is left out when there are none;
+4. **Known issues** that applied to that release;
+5. **Credits** for ported work, following [CREDITS.md](../CREDITS.md);
+6. the install steps and the vkd3d-proton source notice.
+
+What changed in each version is also kept in [CHANGELOG.md](../CHANGELOG.md).
 
 The revision a tag must carry is whatever `package.sh` prints as its default (tags of the GE series,
 `+1`); a tag that disagrees with `BASE` is a mistake, not a variant.

@@ -1,8 +1,72 @@
 # Roadmap
 
-Two stages and one idea. The numbers below are measured on one machine (RX 9070 XT, Mesa 26.3.1
-RADV, GE-Proton11-14, vkd3d-proton master) and are here to say why each piece is worth doing, not to
+Two stages and one idea, plus a dated [development log](#development-log). The numbers in the stages
+below are measured on one machine (RX 9070 XT, Mesa 26.3.1 RADV, GE-Proton11-14, vkd3d-proton
+master) and are here to say why each piece is worth doing, not to
 promise a result. No dates.
+
+## Development log
+
+Dated notes on what is being worked on and what is known so far. Entries are not rewritten into
+promises: a fix stays "not tested in the game" until a run shows otherwise.
+
+### 28 November 2026
+
+Test machine for everything below: one RX 9070 XT, Mesa RADV, on Linux.
+
+**The core is moving to a faster Linux tree** (draft pull request
+[#356](https://github.com/pablogonz12/Scarlight/pull/356); its authors are credited there). In steady
+scenes at 3840x2160 output it holds about 30 fps, which is the title's own cap in the test scene,
+using that tree's own Proton build (four runs of that tree, one of 15 minutes, and one run of our
+branch). The released core manages about 2 fps on the same machine. This
+is one machine and one test scene, with nothing measured there while moving through the world. On
+stock GE-Proton the same tree measured 3.6-3.7 fps. It is not merged and not in a release. In two
+runs a character's clothing rendered darker, with speckles; that is not explained yet.
+
+**Starting a scene is still slow**: assets arrive late and the frame rate rises as they load. What
+the logs from game runs and an offline test show:
+
+- While waiting at scene changes, 13,000-28,000 texture slots were queued, and 95-99 % of them were
+  waiting for the title's own data to arrive in memory. A slot waited 13-31 s for it. Texture upload
+  work took 1-4 ms of a 40-210 ms frame, and the frame rate was back at 30 within 5 s of streaming
+  ending.
+- In two game runs, heavy stretches of streaming stayed under about 270 MB/s, with little link to
+  frame rate. Our storage scheduler, run offline under Wine, handled 10-30 times the rate seen in
+  the game, so the scheduler is not what sets that limit. What does is not established.
+- In 61 slow stretches from five test walks, the largest cost was a per-frame pass over the GPU
+  buffer views: about 4 ms in steady frames and a 94-360 ms mean in slow ones. Next came preparing
+  work for submission, then memory protection and waiting for new video memory to be mapped. One
+  2.4 s stall inside that pass is still not explained.
+
+**Built today, none of it tested in the game yet:**
+
+- earlier notice when a texture's data arrives;
+- uploading just the textures a baking pass is about to read, instead of waiting on a time budget;
+- less queueing when new GPU copies and textures wait to be mapped (how much it helps is unknown);
+- extra storage-batch timing in the log, to find where streaming time goes;
+- an update from the newer upstream tree
+  ([#357](https://github.com/pablogonz12/Scarlight/pull/357), draft), and a Proton build to match it;
+- a test build that combines these.
+
+**Native 4K is not verified.** The title renders internally at 2560x1440 today and upscales to
+3840x2160. The new tree has a switch to render at 3840x2160 that has not been tried; whether it fits
+in video memory and how fast it would be are unknown.
+
+**FSR 4.1 and frame generation are being scoped.** FSR 4.1 upscaling, including a mode with
+3840x2160 input, passes an offline GPU test and has not been tried in the game. For frame
+generation, we have only checked what the library offers; no frame has been generated.
+
+**Memory duplication is being mapped.** The console has one shared memory; on a PC the same data can
+sit in both RAM and video memory. A run currently needs about 17-19 GB of RAM, and about 6 GB of
+GPU-visible system memory is the layer's own copies of the title's memory. We are listing what is
+held twice before choosing a fix.
+
+**To follow along:** the draft pull requests [#356](https://github.com/pablogonz12/Scarlight/pull/356)
+(the new core), [#357](https://github.com/pablogonz12/Scarlight/pull/357) (its update),
+[#355](https://github.com/pablogonz12/Scarlight/pull/355) (GPU hang diagnostics) and
+[#354](https://github.com/pablogonz12/Scarlight/pull/354) (a small command-recording saving). Most
+of today's other fixes are not published as pull requests yet. All of them are on the
+[pull request list](https://github.com/pablogonz12/Scarlight/pulls) once opened.
 
 ## Stage 1 — what we are doing now
 
