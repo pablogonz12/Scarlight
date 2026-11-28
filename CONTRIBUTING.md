@@ -1,6 +1,6 @@
-# Contributing to Scarlight
+# Contributing to ScarLight
 
-Thanks for helping. Scarlight is GPL-3.0; the project it is built on is named in [CREDITS.md](CREDITS.md), and its
+Thanks for helping. ScarLight is GPL-3.0; the project it is built on is named in [CREDITS.md](CREDITS.md), and its
 history, authorship and commit dates are kept in this tree.
 Fixes arrive as merged commits that keep their authors (see [CREDITS.md](CREDITS.md)), plus our own
 work. Contributions of any size are welcome, and a test report is as useful as a patch.
@@ -34,7 +34,7 @@ Most of the repository needs nothing from the title, and none of the following r
   `compatibilitytools.d` plus a Steam restart shows whether the entry appears.
 * Documentation, the entry script, and reading Mesa or vkd3d-proton with us.
 
-Scarlight is written with AI assistance (Claude, DeepSeek); every change goes through CI and review.
+ScarLight is written with AI assistance (Claude, DeepSeek); every change goes through CI and review.
 
 A dry run (`SCARLIGHT_DRY_RUN=1` in a title's Launch Options: imports resolved and bound, no GPU;
 [docs/steam.md](docs/steam.md)) needs a title's `.exe`. A run, a frame rate and a test report need your

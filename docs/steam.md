@@ -1,11 +1,13 @@
-# Scarlight as a Steam compatibility tool
+# ScarLight as a Steam compatibility tool
 
-Scarlight ships as one thing: a custom compatibility tool for Steam on Linux. Install it once,
+ScarLight ships as one thing: a custom compatibility tool for Steam on Linux. Install it once,
 restart Steam, and pick **Scarlight <version>** under the title's *Properties → Compatibility*.
-Play then runs the title through Scarlight on top of a Proton you already have.
+Play then runs the title through ScarLight on top of a Proton you already have.
+
+The project is written ScarLight. Steam's own list, folder names and file names still read `Scarlight`.
 
 ```
-Steam  ──▶  Scarlight (compatibility tool)  ──▶  victory.exe (the title's console APIs, GPU
+Steam  ──▶  ScarLight (compatibility tool)  ──▶  victory.exe (the title's console APIs, GPU
                                                   command streams, RDNA2 shaders)
                                                  │
                                                  ├─ Wine .......... from your installed Proton
@@ -43,7 +45,7 @@ the host instead; nothing else changes.
    [ -f scarlight.conf ] || cp ../Scarlight-<older version>/scarlight.conf .   # keep your settings, if you had a release
    [ -f scarlight.conf ] || cp scarlight.conf.example scarlight.conf
    ```
-4. **If Scarlight is already installed**, each version has its own directory, so a new release starts
+4. **If ScarLight is already installed**, each version has its own directory, so a new release starts
    from the example: copy your `scarlight.conf` across as in step 3. Inside one directory nothing is
    ever replaced: a release ships `scarlight.conf.example` and never a `scarlight.conf`, and the tool
    copies the example into place only when there is no conf yet, so your `PROTON=`, `D3DCOMPILER=`
@@ -99,7 +101,7 @@ in `~/.cache/winetricks/d3dcompiler_47/` and in existing game prefixes), or poin
 
 ### DXC, which a release does not carry
 
-Scarlight loads `dxil.dll` and `dxcompiler.dll` (the shader compiler) at runtime. Microsoft's terms for
+ScarLight loads `dxil.dll` and `dxcompiler.dll` (the shader compiler) at runtime. Microsoft's terms for
 those binaries limit them to use on Windows, so a release does not pass them on. It is one step: get
 them from [DirectXShaderCompiler's releases](https://github.com/microsoft/DirectXShaderCompiler/releases)
 (the zip's `bin/x64` folder) and put both files in `compatibilitytools.d/Scarlight-<version>/files/`. Without
@@ -162,7 +164,7 @@ tools/steam-compat/install.sh --uninstall      # a source install (Scarlight/)
 rm -rf ~/.local/share/Steam/compatibilitytools.d/Scarlight-<version>   # a release
 ```
 
-Nothing else is needed: Scarlight keeps no service, no system package and no file outside the tool
+Nothing else is needed: ScarLight keeps no service, no system package and no file outside the tool
 folder and the game's `compatdata/<appid>/`.
 
 That folder is the game's Wine prefix, and **a game's saved games can live inside it**: back up
@@ -174,7 +176,7 @@ Compatibility setting falls back to its previous tool after a restart.
 
 | Symptom | What to do |
 |---|---|
-| Scarlight is not in the Compatibility list | the folder must be `compatibilitytools.d/Scarlight-<version>/` with `compatibilitytool.vdf` directly inside it, and Steam needs a restart |
+| ScarLight is not in the Compatibility list | the folder must be `compatibilitytools.d/Scarlight-<version>/` with `compatibilitytool.vdf` directly inside it, and Steam needs a restart |
 | `notify-send: Proton not found` / log says "no Wine at …" | `PROTON` names a folder your Steam does not have, or a path without `files/bin/wine` |
 | Nothing happens, no log | Steam never got as far as starting the tool: check the game is set to *Force the use of a specific Steam Play compatibility tool* |
 | The log says `game exe not found` | the title was launched with an argument the tool cannot resolve; clear Launch Options and try again |
@@ -183,5 +185,5 @@ Compatibility setting falls back to its previous tool after a restart.
 | A run left a stuck prefix | the tool stops a leftover wineserver itself at the start of `waitforexitandrun`; if the game still hangs, stop that game's server only: `WINEPREFIX=<the game's compatdata/<appid>/pfx> <your Proton>/files/bin/wineserver -k`. As a last resort delete `compatdata/<appid>/pfx` — after backing up any saved games that live in it |
 | Title builds its shaders again every launch | the Mesa cache is per game under `compatdata/<appid>/mesa_cache`; delete it if it is stale, and keep `MESA_CACHE_MAX_SIZE` large enough |
 | Flatpak Steam | all paths move to `~/.var/app/com.valvesoftware.Steam/data/Steam/`; `install.sh` detects that folder by itself |
-| The tool starts in a container and your Proton is not found | Scarlight runs inside a Steam Linux Runtime container, like Proton, so `compatibilitytools.d` is exposed there and a `PROTON` name resolves against it (and against the usual Steam folders, Flatpak included). If a distro's container still hides it, set `PROTON` to a full path in `scarlight.conf` |
+| The tool starts in a container and your Proton is not found | ScarLight runs inside a Steam Linux Runtime container, like Proton, so `compatibilitytools.d` is exposed there and a `PROTON` name resolves against it (and against the usual Steam folders, Flatpak included). If a distro's container still hides it, set `PROTON` to a full path in `scarlight.conf` |
 | The runtime container breaks the launch on your distro | the two lines that ask for it are `require_tool_appid` and `use_sessions` in `Scarlight/toolmanifest.vdf`; delete them and the tool runs on the host, on the same Wine |

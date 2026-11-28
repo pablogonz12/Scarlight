@@ -11,7 +11,7 @@
 
 - Offline shader count: <!-- e.g. 692 of 751 world shaders translate, all valid SPIR-V under vkd3d-proton master -->
 - Game run numbers: <!-- menus / loading / world fps, minutes run, crash or not, with and without this PR -->
-- Hardware: <!-- GPU, driver + version, OS, Windows or Linux + Wine/Proton version, vkd3d-proton version, Scarlight commit -->
+- Hardware: <!-- GPU, driver + version, OS, Windows or Linux + Wine/Proton version, vkd3d-proton version, ScarLight commit -->
 
 ## Checklist
 

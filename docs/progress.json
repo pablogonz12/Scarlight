@@ -33,7 +33,7 @@
           "note": "0 of 587 imports did not bind in this loader run; the census scans the image, the run binds every DLL"
         },
         {
-          "label": "… of which by Scarlight's HLE modules",
+          "label": "… of which by ScarLight's HLE modules",
           "impl": [
             88,
             587

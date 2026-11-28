@@ -1,6 +1,6 @@
 # Hardware
 
-Scarlight is built for Mesa's open Vulkan drivers, not for one card. This page records what has
+ScarLight is built for Mesa's open Vulkan drivers, not for one card. This page records what has
 actually been run, what we expect, and what nobody has looked at yet.
 
 ## Status

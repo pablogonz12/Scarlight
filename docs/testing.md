@@ -1,6 +1,6 @@
 # How we test
 
-Scarlight is a compatibility layer, so "it looks right" and "it is faster" are separate claims, and
+ScarLight is a compatibility layer, so "it looks right" and "it is faster" are separate claims, and
 both have to be shown. The rule is simple: nothing is published on the strength of one run, and the
 cheapest check that can answer a question runs first.
 

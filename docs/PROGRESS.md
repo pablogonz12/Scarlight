@@ -18,7 +18,7 @@ What the title's import table asks for and who answers it. Every import of the i
 | Set | Implemented | Verified | Progress | What is counted |
 |---|---|---|---|---|
 | Imports resolved | 587 / 587 | 587 / 587 | ████████████ 100 % | 0 of 587 imports did not bind in this loader run; the census scans the image, the run binds every DLL |
-| … of which by Scarlight's HLE modules | 88 / 587 | 88 / 587 | ██░░░░░░░░░░ 15 % | the console DLLs and the kernel calls this project implements itself |
+| … of which by ScarLight's HLE modules | 88 / 587 | 88 / 587 | ██░░░░░░░░░░ 15 % | the console DLLs and the kernel calls this project implements itself |
 | … of which by Wine (Proton) | 427 / 587 | 427 / 587 | █████████░░░ 73 % | passed through to the host's own implementations; working, but not our code |
 | … of which by the title's own libraries | 72 / 72 | 72 / 72 | ████████████ 100 % | shipped with the title and loaded as they are: satisfied, nothing for us to write |
 | Kernel and API sets (43 DLLs) | 280 / 280 | 280 / 280 | ████████████ 100 % | kernel and API-set calls; the split between ours and Wine's is in the row above |
