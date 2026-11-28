@@ -1,0 +1,598 @@
+{
+  "schema": 1,
+  "measured": "2026-11-25",
+  "build": "5fca579b",
+  "machine": "RX 9070 XT (RDNA4), Mesa 26.3.1 RADV, CachyOS, GE-Proton11-14, vkd3d-proton master",
+  "header": {
+    "meaning": "100 % in every row means every part the title uses is implemented and verified on Mesa; it is the target, not a guarantee, and correctness is checked by runs, not counts.",
+    "where": "Measured on 25 Nov 2026, build 5fca579b, RX 9070 XT (RDNA4) / Mesa 26.3.1 RADV. Diagnostics builds. No other GPU has been tried, and every number below comes from that one card.",
+    "notes": [
+      "Every percentage is a share of a **named set that was counted** on this machine: an import table, a shader archive, a frame of recorded work. None of them is a share of the title as a whole, and the sets overlap (a program in the shader archive is not a distinct piece of the port).",
+      "**Implemented** is what our code does today; **verified** is how much of that a run has shown working. They are separate columns because a decoder can claim an opcode that no run has proved. An em dash means that column was not counted for that row.",
+      "The counts are taken from files the user supplies; nothing from them is stored in this repository, and no title, program or asset name appears here.",
+      "A set can be complete without being ours: every import of the title **resolves** (0 missing), but 427 of the 587 are Wine (Proton) and 72 belong to the title's own libraries. The System APIs area shows both numbers side by side, and only the 88 HLE ones are code this project wrote."
+    ]
+  },
+  "areas": [
+    {
+      "id": "hle",
+      "title": "System APIs (HLE)",
+      "summary": "What the title's import table asks for and who answers it. Every import of the image resolves, but most of them are not our code: our HLE modules answer a small share, Wine answers the bulk, and the rest are libraries the title ships itself. That split is the honest reading of the bars below.",
+      "column": "Set",
+      "rows": [
+        {
+          "label": "Imports resolved",
+          "impl": [
+            587,
+            587
+          ],
+          "verified": [
+            587,
+            587
+          ],
+          "note": "0 of 587 imports did not bind in this loader run; the census scans the image, the run binds every DLL"
+        },
+        {
+          "label": "… of which by Scarlight's HLE modules",
+          "impl": [
+            88,
+            587
+          ],
+          "verified": [
+            88,
+            587
+          ],
+          "note": "the console DLLs and the kernel calls this project implements itself"
+        },
+        {
+          "label": "… of which by Wine (Proton)",
+          "impl": [
+            427,
+            587
+          ],
+          "verified": [
+            427,
+            587
+          ],
+          "note": "passed through to the host's own implementations; working, but not our code"
+        },
+        {
+          "label": "… of which by the title's own libraries",
+          "impl": [
+            72,
+            72
+          ],
+          "verified": [
+            72,
+            72
+          ],
+          "note": "shipped with the title and loaded as they are: satisfied, nothing for us to write"
+        },
+        {
+          "label": "Kernel and API sets (43 DLLs)",
+          "impl": [
+            280,
+            280
+          ],
+          "verified": [
+            280,
+            280
+          ],
+          "note": "kernel and API-set calls; the split between ours and Wine's is in the row above"
+        },
+        {
+          "label": "Console DLLs: memory, audio, input, GPU",
+          "impl": [
+            38,
+            38
+          ],
+          "verified": [
+            38,
+            38
+          ],
+          "note": "console memory, audio, input and GPU entry points, all in our HLE"
+        },
+        {
+          "label": "C runtime and OS (msvcp140, vcruntime, ws2_32, winhttp, bcrypt, mfplat)",
+          "impl": [
+            187,
+            187
+          ],
+          "verified": [
+            187,
+            187
+          ],
+          "note": "C runtime and OS calls, most of them passed to Wine"
+        },
+        {
+          "label": "HLE exports in the registry beyond this image's needs",
+          "impl_text": "more",
+          "ver_text": "used",
+          "status": "spare",
+          "note": "extra console API surface beyond this image's needs, so another build of the title can bind without a new module"
+        }
+      ],
+      "foot": [
+        "Resolved counts come from the import census of the title image and from the loader's bound line in a world run (`hle=88 host=427 title=72 missing=0`).",
+        "The 427 Wine-resolved imports are host pass-throughs: they work, and this project does not implement them. No row here claims them as ours.",
+        "Networking modules exist in our HLE but are switched off; console-only networking is not a target of this port."
+      ],
+      "readme_where": "[detail](docs/PROGRESS.md#system-apis-hle)",
+      "readme_when": "",
+      "readme_dual": [
+        "resolved (0 missing)",
+        "own HLE"
+      ],
+      "readme_from": {
+        "impl": 0,
+        "verified": 1,
+        "impl_column": "verified"
+      },
+      "readme_labels": [
+        "",
+        "own HLE"
+      ],
+      "readme_resolved": true
+    },
+    {
+      "id": "shaders",
+      "title": "Shaders",
+      "summary": "Two sets are counted: the world set used for offline checks, and the title's whole shader archive. The world set is the one every change is checked against, end to end; the archive is the size of the real job, and only its translation and emission are counted so far.",
+      "column": "Set",
+      "rows": [
+        {
+          "label": "World set, translated to host shader",
+          "impl": [
+            751,
+            751
+          ],
+          "verified": [
+            751,
+            751
+          ],
+          "note": "translated to host shader with nothing refused and nothing undecodable"
+        },
+        {
+          "label": "World set, translated + validated + real RADV pipeline",
+          "impl": [
+            749,
+            751
+          ],
+          "verified": [
+            749,
+            751
+          ],
+          "note": "749 of 751 reached a real pipeline in this run; the other 2 stop before one"
+        },
+        {
+          "label": "Whole archive, translated",
+          "impl": [
+            26084,
+            26084
+          ],
+          "verified": null,
+          "note": "every program reaches IR; the traced-resource count is in the translator's summary"
+        },
+        {
+          "label": "Whole archive, host shader emitted: all stages",
+          "impl": [
+            25602,
+            25694
+          ],
+          "verified": null,
+          "note": "vertex + pixel, compute and mesh: 92 of 25,694 programs of those stages are not emitted"
+        },
+        {
+          "label": "Whole archive, host shader emitted: vertex + pixel",
+          "impl": [
+            14164,
+            14247
+          ],
+          "verified": null,
+          "note": "83 programs of this stage are not emitted; no pipeline validation has been run on the archive yet"
+        },
+        {
+          "label": "Whole archive, host shader emitted: compute",
+          "impl": [
+            2676,
+            2682
+          ],
+          "verified": null,
+          "note": "6 programs of this stage are not emitted; no pipeline validation has been run on the archive yet"
+        },
+        {
+          "label": "Whole archive, host shader emitted: mesh",
+          "impl": [
+            8762,
+            8765
+          ],
+          "verified": null,
+          "note": "3 programs of this stage are not emitted; no pipeline validation has been run on the archive yet"
+        },
+        {
+          "label": "ISA: opcode-table entries the decoder names",
+          "impl": [
+            313,
+            1232
+          ],
+          "verified": null,
+          "note": "313 of the 1,232 opcode-table entries are named in the decoder; the title uses far fewer than the table holds, and a per-program opcode census is not taken yet"
+        }
+      ],
+      "foot": [
+        "Emitted per stage is 25,602 of 25,694 programs the archive classifies as vertex/pixel, compute or mesh; the further 390 are programs the console structure puts in none of those stages.",
+        "The stop reasons are our own diagnostic classes, counted in the translator's summary; the largest single class is \"a scalar memory read as data\".",
+        "The verified column covers the 751-program world set only. The archive has no validated pipeline column yet: translate alone is not a run."
+      ],
+      "readme_where": "[detail](docs/PROGRESS.md#shaders)",
+      "readme_when": "",
+      "readme_dual": [
+        "",
+        "verified"
+      ],
+      "readme_from": {
+        "impl": 3,
+        "verified": 1
+      },
+      "readme_labels": [
+        "",
+        "real RADV pipeline"
+      ]
+    },
+    {
+      "id": "command_stream",
+      "title": "GPU command stream",
+      "summary": "What the title records per frame and what reaches the card. The headline row measures one real world frame: the draws and dispatches it recorded, minus the ones dropped. The reasons listed below come from a separate reference run and are **not** an accounting of that frame — they are the reasons drops have been seen, with the count each reached in the run that showed it. Ray tracing is off on purpose, so most drops are one intended reason and not a gap in the port.",
+      "column": "Set",
+      "rows": [
+        {
+          "label": "Recorded work that reaches the card",
+          "impl": [
+            4309,
+            4688
+          ],
+          "verified": [
+            4309,
+            4688
+          ],
+          "note": "the last world frame of the newest run that has one: the backend's own per-frame lines"
+        },
+        {
+          "label": "D3D12 calls the title makes that our backend has",
+          "impl": [
+            99,
+            128
+          ],
+          "verified": [
+            99,
+            128
+          ],
+          "note": "present in the backend's sources; the rest are enum and helper surfaces, not missing entry points"
+        },
+        {
+          "label": "Drops: ray-tracing hit shading, left out",
+          "status": "off",
+          "note": "left out on purpose until the trace path is correct, and the largest single reason for drops"
+        },
+        {
+          "label": "Drops: one stage of the ray-tracing structure builder",
+          "status": "off",
+          "note": "off with the same switch as the trace path"
+        },
+        {
+          "label": "Drops: one whole-wave compute step",
+          "status": "dropped",
+          "note": "a section step our wave simulation does not follow yet"
+        },
+        {
+          "label": "Drops: compute and pixel programs while their pipeline is made",
+          "status": "late",
+          "note": "each named program appears once and then runs; that is the pipeline area's business"
+        }
+      ],
+      "foot": [
+        "The reference run records 168 world frames at 2.04 fps; drop reasons are the backend's own log lines, summed per frame in that run.",
+        "Nothing is dropped as \"no host pipeline\": every drop is a named, deliberate or known gap."
+      ],
+      "readme_where": "[detail](docs/PROGRESS.md#gpu-command-stream)",
+      "readme_when": "",
+      "readme_dual": [
+        "",
+        "verified"
+      ],
+      "readme_from": {
+        "impl": 0,
+        "verified": 0
+      },
+      "readme_labels": [
+        "",
+        "verified"
+      ]
+    },
+    {
+      "id": "pipelines",
+      "title": "Pipelines",
+      "summary": "A draw cannot run until its pipeline exists on the host. The world set can be built entirely offline, and the pre-bake list covers most of what the title asks for in a session; what is left is created while the title waits for it.",
+      "column": "Set",
+      "rows": [
+        {
+          "label": "World set: pipelines that build offline",
+          "impl": [
+            749,
+            751
+          ],
+          "verified": [
+            749,
+            751
+          ],
+          "note": "2 of 751 do not reach a pipeline in this run"
+        },
+        {
+          "label": "Pipelines the title asks for, covered by the pre-bake list",
+          "impl": [
+            1785,
+            2601
+          ],
+          "verified": null,
+          "note": "1,785 of the 2,601 keys the title's own early list names can be built from the saved library"
+        },
+        {
+          "label": "Late creates per frame in a world run",
+          "impl_text": "late",
+          "ver_text": "measured",
+          "status": "late",
+          "note": "programs dropped while their pipeline is made, summed over a whole run"
+        }
+      ],
+      "foot": [
+        "The pre-bake list is the union of the early-pipeline key list and the warm pipeline library the title saved itself; the gap is what a session creates on demand.",
+        "One program takes 3.6 s to compile alone, so the pre-bake must not schedule it last."
+      ],
+      "readme_where": "[detail](docs/PROGRESS.md#pipelines)",
+      "readme_when": "",
+      "readme_dual": [
+        "",
+        "of the keys the title asks for"
+      ],
+      "readme_from": {
+        "impl": 1,
+        "verified": 0
+      },
+      "readme_labels": [
+        "",
+        "built offline"
+      ]
+    },
+    {
+      "id": "features",
+      "title": "Features",
+      "summary": "Status words, not percentages: a feature is either shown working on this machine, partly working, or off. These are the rows that decide whether the port is playable, and none of them is finished.",
+      "column": "Feature",
+      "rows": [
+        {
+          "label": "Lit, textured world",
+          "status": "partly",
+          "note": "the fixed test scene renders lit and textured, at the speed the Performance area reports"
+        },
+        {
+          "label": "Shadows",
+          "status": "partly",
+          "note": "shadowed areas read too dark; cascade selection is not verified"
+        },
+        {
+          "label": "Characters and faces",
+          "status": "broken",
+          "note": "some characters' faces fail to render; regressed again in the last change window"
+        },
+        {
+          "label": "Ray tracing",
+          "status": "off",
+          "note": "the structure builder and trace path sit behind a switch; the fallback shading is what draws"
+        },
+        {
+          "label": "Audio",
+          "status": "works",
+          "note": "menu and world audio through the console audio DLLs"
+        },
+        {
+          "label": "Input",
+          "status": "works",
+          "note": "gamepad through the console input DLL"
+        },
+        {
+          "label": "Saves",
+          "status": "not yet verified",
+          "note": "the save module exists; no run has written and reloaded a save"
+        },
+        {
+          "label": "Streaming (DirectStorage)",
+          "status": "partly",
+          "note": "reads work through the host file path; the submitted-queue path is not used"
+        },
+        {
+          "label": "Video playback",
+          "status": "partly",
+          "note": "the title's own codec library loads; no cutscene has been played end to end"
+        },
+        {
+          "label": "Networking",
+          "status": "off",
+          "note": "not a target of this port"
+        }
+      ],
+      "foot": [
+        "\"Partly\" means the feature appears in at least one frame and is wrong or incomplete in a way the picture notes name; \"broken\" means it regressed and is being fixed."
+      ],
+      "readme_text": "status words",
+      "readme_where": "[detail](docs/PROGRESS.md#features)",
+      "readme_when": "",
+      "readme_verified_text": "2 of 10 shown"
+    },
+    {
+      "id": "mesa",
+      "title": "Mesa reach (compiled offline, not run)",
+      "summary": "Whether the world shader set compiles for a GPU family's Mesa driver, without that GPU. Mesa's noop drm-shim fakes each chip, so RADV and ANV build every pipeline with that family's ISA and limits. Every AMD generation up to ours compiles the whole set except Vega, whose mesh-shader programs abort the driver. On Intel, Arc B builds the whole set, while Arc A and Xe-LPG each miss one program on the stub's own gap. This is a compile result: only RDNA4 has actually been run.",
+      "column": "GPU families",
+      "rows": [
+        {
+          "label": "AMD families whose whole world set compiles offline",
+          "impl": [
+            4,
+            5
+          ],
+          "verified": null,
+          "note": "4 of 5 AMD families compile the whole set through the noop shim (Mesa driver, no GPU)"
+        },
+        {
+          "label": "Arc B (Xe2): world programs that build pipelines offline",
+          "impl": [
+            751,
+            751
+          ],
+          "verified": null,
+          "note": "751 of 751 build a pipeline through ANV and Mesa's Intel noop shim; none is refused; median 35 ms per program"
+        },
+        {
+          "label": "Arc A (DG2): world programs that build pipelines offline",
+          "impl": [
+            750,
+            751
+          ],
+          "verified": null,
+          "note": "750 of 751 build a pipeline; the one miss is the stub's gap (Unknown drm_i915_query_item), not a compiler error; median 78 ms per program"
+        },
+        {
+          "label": "Xe-LPG: world programs that build pipelines offline",
+          "impl": [
+            750,
+            751
+          ],
+          "verified": null,
+          "note": "750 of 751 build a pipeline; the one miss is the same stub gap; median 69 ms per program"
+        },
+        {
+          "label": "Vega (gfx900): world programs that compile offline",
+          "impl": [
+            669,
+            751
+          ],
+          "verified": null,
+          "note": "82 of 751 abort the driver: every mesh-shader program, and GFX9 has no mesh shader support in RADV"
+        },
+        {
+          "label": "Families with a run, not just a compile",
+          "impl": [
+            1,
+            8
+          ],
+          "verified": null,
+          "note": "only our card: every other family has compiled pipelines and no run"
+        }
+      ],
+      "foot": [
+        "Sources: `family-matrix-20261125-134909-2134785.tsv` (AMD, five families + the real card as control), `family-matrix-20261125-140636-2410746.tsv` (Intel: dg2, bmg, mtl) and `family-matrix-20261125-141256-2481125.tsv` (re-check of gfx1201 and acm: 751/751 and 750/751, the same result); the shim column for our own family matches the real-GPU column exactly, so the harness does not change the answer.",
+        "Compiled offline is not run. On RDNA1 all 82 mesh programs create, yet RADV does not advertise `VK_EXT_mesh_shader` there, so a program that uses mesh, barycentric or ray query at draw time needs the game's own fallback path.",
+        "Intel: ANV needs `libvulkan_intel.so` plus Mesa's Intel noop shim from the same build; both were built for this run. The one program that fails on dg2 and mtl is the same class, and it stops on the stub's `drm_i915_query_item` gap, not on a shader the compiler refused. Nothing Intel has been run on a card."
+      ],
+      "readme_where": "[detail](docs/PROGRESS.md#mesa-reach)",
+      "readme_when": "",
+      "readme_dual": [
+        "of 5 AMD families",
+        ""
+      ],
+      "readme_verified_text": "compiled only, not run",
+      "readme_from": {
+        "impl": 0,
+        "verified": null
+      }
+    },
+    {
+      "id": "performance",
+      "title": "Performance",
+      "summary": "Speed is measured at one fixed scene, the only figure compared between builds, against the console's 30 fps target. The port is far from it, and the card is idle for most of the frame because the CPU side is the cost.",
+      "column": "Measure",
+      "rows": [
+        {
+          "label": "Fixed test scene vs the 30 fps console target",
+          "impl": [
+            1.6,
+            30
+          ],
+          "verified": [
+            1.6,
+            30
+          ],
+          "note": "1.6 fps median at the window scene of the last recorded run, compared only with rows of the same scene"
+        },
+        {
+          "label": "Card busy share of the frame",
+          "impl": [
+            30,
+            100
+          ],
+          "verified": [
+            30,
+            100
+          ],
+          "note": "by our own clock count; the rest is the title's CPU work and our copies"
+        },
+        {
+          "label": "Time to the world",
+          "impl_text": "seconds",
+          "ver_text": "measured",
+          "status": "no target set",
+          "note": "from launch to the first world frame; the pre-bake should cut it"
+        }
+      ],
+      "foot": [
+        "fps is the median of samples at the `window` scene, compared only between rows with the same scene label; `world_fps` from other runs mixes cutscenes and is never published.",
+        "The frame is split as: title CPU work, our copies, then the card. Our copies are 98-111 ms of a 515-540 ms frame in the measured world run."
+      ],
+      "readme_where": "[detail](docs/PROGRESS.md#performance)",
+      "readme_when": "",
+      "readme_dual": [
+        "",
+        "of 30 fps"
+      ],
+      "readme_from": {
+        "impl": 0,
+        "verified": 0
+      },
+      "readme_labels": [
+        "",
+        "of 30 fps"
+      ]
+    }
+  ],
+  "method": [
+    {
+      "area": "System APIs (HLE)",
+      "how": "the title image's import table is scanned by our own census tool, which marks each function as answered by one of our HLE modules, passed through to Wine, exported by the title's own images, or missing; a world run prints the same split on its `bound` line, which is the verified column. Only the HLE column is code we wrote"
+    },
+    {
+      "area": "Shaders",
+      "how": "`victory translate` over the whole shader archive for the translated and emitted counts, and over the 751-program world set with dxil-spirv, `spirv-val` and a real RADV pipeline for the verified column"
+    },
+    {
+      "area": "GPU command stream",
+      "how": "the backend's per-frame log lines in a world run, summed by drop reason; the D3D12 calls are the title's call list against the presence of each name in the backend's sources"
+    },
+    {
+      "area": "Pipelines",
+      "how": "the offline world-set run (cold and warm Mesa cache), the title's own saved pipeline keys, and the `without a host pipeline` lines of a world run"
+    },
+    {
+      "area": "Features",
+      "how": "run verdicts and the picture notes; a feature is never called working without a frame that shows it"
+    },
+    {
+      "area": "Mesa reach",
+      "how": "the five-family offline matrix through Mesa's amdgpu noop shim, plus the real card as control; a family counts only when all of its pipelines compile"
+    },
+    {
+      "area": "Performance",
+      "how": "the fixed-scene runner's median fps and the launch-to-world time from the loader's own timestamps"
+    }
+  ],
+  "footer": "Generated by `tools/progress/render.py` from `docs/progress.json`, which `tools/progress/collect.sh` writes from local sources; both are plain text and hold counts only."
+}

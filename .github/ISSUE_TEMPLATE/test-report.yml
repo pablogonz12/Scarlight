@@ -1,0 +1,124 @@
+name: Test report
+description: A run on your hardware, for one Scarlight commit. Numbers and log lines are the most useful thing you can give us.
+title: "test: "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One report per commit, so results can be compared. Everything on one machine is welcome,
+        especially a Mesa GPU that is not an RX 9070 XT: RADV generations, Intel on ANV, NVIDIA on
+        NVK. Text and logs only — never game files, game content screenshots or hashes of game data
+        ([docs/asset-policy.md](https://github.com/pablogonz12/Scarlight/blob/main/docs/asset-policy.md)).
+  - type: input
+    id: commit
+    attributes:
+      label: Scarlight commit
+      description: Output of `git rev-parse --short HEAD`.
+      placeholder: fcb278b
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      placeholder: RX 7900 XTX / Arc B580 / RTX 4070
+    validations:
+      required: true
+  - type: dropdown
+    id: driver
+    attributes:
+      label: Vulkan driver
+      options:
+        - RADV (AMD)
+        - ANV (Intel)
+        - NVK (NVIDIA)
+        - other (say which in Notes)
+    validations:
+      required: true
+  - type: input
+    id: mesa
+    attributes:
+      label: Mesa version (paste driverName, driverVersion and apiVersion)
+      description: The device section of `vulkaninfo --summary`, plus where Mesa came from — distribution package, mesa-git, or a local build. driverVersion identifies the driver release; apiVersion alone does not.
+      placeholder: driverName radv, driverVersion 26.3.1, apiVersion 1.4.363, distribution package
+    validations:
+      required: true
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel version
+      description: Output of `uname -r`.
+      placeholder: 7.3.6-1-cachyos-eevdf
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution and session
+      placeholder: CachyOS (Arch family), Wayland
+    validations:
+      required: true
+  - type: input
+    id: proton
+    attributes:
+      label: Proton or Wine build
+      description: Which build, and whether you call its `wine` binary directly.
+      placeholder: GE-Proton11-14, called through files/bin/wine
+    validations:
+      required: true
+  - type: input
+    id: vkd3d
+    attributes:
+      label: vkd3d-proton version
+      description: Stock release, the DLLs GE-Proton ships, or master; and how it is selected.
+      placeholder: vkd3d-proton master, d3d12.dll next to victory.exe
+    validations:
+      required: true
+  - type: dropdown
+    id: progress
+    attributes:
+      label: How far did it get
+      options:
+        - No boot (nothing on screen)
+        - Menus
+        - Loading
+        - World
+    validations:
+      required: true
+  - type: input
+    id: load
+    attributes:
+      label: Time to the world
+      description: Seconds from launch to the world, or "did not reach".
+      placeholder: "160 s"
+  - type: input
+    id: fps
+    attributes:
+      label: Frame rate
+      description: Menu and world fps, and where you measured. If your run prints frame lines, paste a few instead of an average.
+      placeholder: Menus 30 fps, world 1.2 fps at the opening view
+  - type: textarea
+    id: picture
+    attributes:
+      label: What looked wrong
+      description: Missing walls, faces, close-up detail, black or flat-lit areas, wrong colours, out-of-order intro frames, anything that looked right too.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log tail
+      description: |
+        The last ~50 lines with `VICTORY_LOG=info`, including `does not translate`, dropped or
+        "being made" pipelines, device-removed and crash lines. Trim anything that is game content.
+      render: shell
+    validations:
+      required: true
+  - type: checkboxes
+    id: policy
+    attributes:
+      label: Asset policy
+      options:
+        - label: This report contains no game files, no screenshots of game content and no hashes of game data.
+          required: true

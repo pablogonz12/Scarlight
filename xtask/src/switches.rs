@@ -49,8 +49,9 @@ fn documented_switches_are_read() {
     let read = |path: &String| std::fs::read_to_string(root.join(path)).ok();
     let mut documented = BTreeSet::new();
     let mut doc_of = Vec::new();
-    // Credits document historical contributions, not current switches.
-    for path in files.iter().filter(|p| p.ends_with(".md") && p.as_str() != "CREDITS.md") {
+    // Credits and the changelog document history, not current switches.
+    let historical = |p: &str| matches!(p, "CREDITS.md" | "CHANGELOG.md");
+    for path in files.iter().filter(|p| p.ends_with(".md") && !historical(p)) {
         for name in names(&read(path).unwrap_or_default()) {
             doc_of.push((name.clone(), path.clone()));
             documented.insert(name);
