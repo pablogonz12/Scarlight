@@ -146,15 +146,14 @@ static RIP_COUNT: [[AtomicU64; 2]; SLOTS] = [const { [const { AtomicU64::new(0) 
 static RIPS_FULL: AtomicU64 = AtomicU64::new(0);
 
 fn count_rip(rip: usize, write: bool) {
-    let mut i = rip.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56;
-    for _ in 0..SLOTS {
+    let start = rip.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56;
+    for i in start..start + SLOTS {
         let slot = i % SLOTS;
         let at = RIPS[slot].load(Relaxed);
         if at == rip || (at == 0 && RIPS[slot].compare_exchange(0, rip, Relaxed, Relaxed).map_or_else(|now| now == rip, |_| true)) {
             RIP_COUNT[slot][write as usize].fetch_add(1, Relaxed);
             return;
         }
-        i += 1;
     }
     RIPS_FULL.fetch_add(1, Relaxed);
 }

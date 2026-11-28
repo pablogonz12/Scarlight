@@ -23,6 +23,7 @@
 
 #[cfg(windows)]
 mod console_insn;
+#[cfg(windows)]
 mod crash;
 #[cfg(windows)]
 pub mod descriptor_sites;
