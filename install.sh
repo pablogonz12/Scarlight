@@ -24,8 +24,17 @@ if [[ -n $uninstall ]] && ! valid_version "$uninstall"; then
   echo 'Invalid version.' >&2; exit 2
 fi
 steam_dirs=()
-for dir in "$HOME/.local/share/Steam" "$HOME/.var/app/com.valvesoftware.Steam/data/Steam"; do
-  [[ ! -d $dir ]] || steam_dirs+=("$dir/compatibilitytools.d")
+steam_roots=()
+for dir in "$HOME/.local/share/Steam" "$HOME/.steam/root" "$HOME/.var/app/com.valvesoftware.Steam/data/Steam"; do
+  [[ -d $dir ]] || continue
+  root=$(cd -P -- "$dir" && pwd -P)
+  duplicate=0
+  for existing in "${steam_roots[@]}"; do
+    [[ $root != "$existing" ]] || duplicate=1
+  done
+  ((duplicate)) && continue
+  steam_roots+=("$root")
+  steam_dirs+=("$dir/compatibilitytools.d")
 done
 ((${#steam_dirs[@]})) || { echo 'Steam not found.' >&2; exit 1; }
 if [[ -n $uninstall ]]; then
