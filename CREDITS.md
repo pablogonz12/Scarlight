@@ -410,6 +410,7 @@ D
 - **Belobug**, [e70e031c](https://github.com/Belobug/VIctory-Belobug-AMD/commit/e70e031cf): accept native shader code stored without its wrapper.
 - **Manuel Pérez**, [VIctory #114](https://github.com/Marvisak/VIctory/pull/114): run failed asynchronous call cleanup outside the completion lock.
 - **Senchsus**, [VIctory #682](https://github.com/Marvisak/VIctory/pull/682): legacy multiply treats denormal operands as zero.
+- **Marvis**, [typed integer buffer access](https://github.com/Marvisak/VIctory/commit/4243a96a7): preserve 16-bit data through integer buffer views.
 - **Marvis**, [shader UAV flags](https://github.com/Marvisak/VIctory/commit/a1a2077a3d9ab6bf51d457c1a3f86db166554446): declare UAV usage outside pixel and compute stages.
 - **CaravelaLabs**, [shader decoder change](https://github.com/Belobug/VIctory-Belobug-AMD/commit/3d71ad1a6547836ac1dbd19bfab2d759c965d307): decode the ATC probe immediate, resource width, and cache flags.
 

@@ -24,6 +24,11 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// root SRV also tells the host that the buffer views of the whole heap
 /// must be ready when it runs, not only those its tables name.
 pub const SLOT_STRIDES: u8 = 255;
+/// Bits of a view-table entry holding the byte stride.
+pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
+/// Typed integer buffer view; signed views also have `VIEW_SIGNED`.
+pub const VIEW_INTEGER: u32 = 1 << 31;
+pub const VIEW_SIGNED: u32 = 1 << 30;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 
