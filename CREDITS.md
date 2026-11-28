@@ -340,6 +340,13 @@ D
   frames for a block and no more so a voice that produces nothing cannot hold the lock
   (`crates/victory-hle/src/modules/audio.rs`, `VICTORY_XMA_REFILL`).
 
+- **Belobug/VIctory-Belobug-AMD [#128](https://github.com/Belobug/VIctory-Belobug-AMD/pull/128)** (God489),
+  GPL-3.0: `ds_bpermute_b32` / `ds_permute_b32` running within the lane's 32-lane half of a console wave
+  (RDNA ISA 10.4.4: a wave64 permutes as two independent wave32s on the index's bits 6:2), the forward
+  permute lowered at all, and 0 from a source lane that does not run the instruction (`crates/victory-shader/src/emit/lower.rs`,
+  `VICTORY_HALF_PERMUTE=0` off). Reimplemented on this tree's cross-lane helpers; the rest of the PR's
+  console-flow series is not taken.
+
 ## Tools
 
 Some commits were made with AI coding tools (Claude, Codex, Devin, Gemini, GPT). A contributor is
