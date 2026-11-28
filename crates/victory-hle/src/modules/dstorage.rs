@@ -1437,20 +1437,31 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
 
 /// `VICTORY_BCPACK_DUMP=<folder>` (diagnostics builds): the first 400 BCPack
 /// streams of 64 KiB or more (after zlib) as `bc<bc>-<n>-<destination
-/// bytes>.bin`, to measure and check the decoder away from the game.
+/// bytes>.bin`, to measure and check the decoder away from the game. A failed
+/// write is logged (once) and does not count towards the 400.
 #[cfg(feature = "diagnostics")]
 fn bcpack_dump(bc: u8, source: &[u8], size: usize) {
+    use std::sync::atomic::AtomicUsize;
     static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
-    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    static WRITTEN: AtomicUsize = AtomicUsize::new(0);
+    static WARNED: AtomicBool = AtomicBool::new(false);
     let Some(dir) = DIR.get_or_init(|| std::env::var_os("VICTORY_BCPACK_DUMP").map(Into::into)) else {
         return;
     };
-    if size < 64 << 10 {
+    if source.len() < 64 << 10 || WRITTEN.load(Ordering::Relaxed) >= 400 {
         return;
     }
-    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if n < 400 {
-        let _ = std::fs::write(dir.join(format!("bc{bc}-{n:04}-{size}.bin")), source);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("bc{bc}-{n:04}-{size}.bin"));
+    match std::fs::write(&path, source) {
+        Ok(()) => {
+            WRITTEN.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) if !WARNED.swap(true, Ordering::Relaxed) => {
+            tracing::warn!(path = %path.display(), "dstorage: VICTORY_BCPACK_DUMP write failed: {e}");
+        }
+        Err(_) => {}
     }
 }
 
