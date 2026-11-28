@@ -57,6 +57,7 @@ the design and the author are credited in the commit's `Co-authored-by:` and her
   counts skip the kernel too (`crates/victory-gpu/src/inplace.rs`, `guards.rs`, `VICTORY_PLACEHOLDER_FAST=0` off).
 
 - **brainbudt [VIctory #2796](https://github.com/Marvisak/VIctory/pull/2796)**, GPL-3.0: GFX10 instruction-start bitmap decoder.
+- **crashbashash/VIctory-proton**, GPL-3.0: direct alias texture copies, synchronous guards and paired Proton update, BCPack stream capture, and AVX2 BCPack decoding (commits 7b42330f7 through 254271b78).
 
 ## Design notes
 
