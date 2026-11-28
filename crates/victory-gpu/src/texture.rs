@@ -155,13 +155,11 @@ impl Present {
         self.writes.fetch_add(1, Relaxed);
         #[cfg(feature = "diagnostics")]
         {
-            let bytes = blake3::hash(tiled);
-            let mut label = [0u8; 8];
-            label.copy_from_slice(&bytes.as_bytes()[..8]);
+            let label = content_hash(tiled)[0];
             let frame = crate::frame::current();
             let written = self.contents.load(Relaxed);
             let mut history = self.history.lock().unwrap_or_else(|e| e.into_inner());
-            history.push((written, frame, u64::from_le_bytes(label)));
+            history.push((written, frame, label));
             if history.len() > Self::HISTORY {
                 history.remove(0);
             }
@@ -236,11 +234,55 @@ pub(crate) fn order_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ORDER").is_some_and(|v| v == "1"))
 }
 
+/// Fast 128-bit 4-lane non-cryptographic hash for texture dirty detection.
+/// Processes 32 bytes per iteration across 4 independent 64-bit accumulators,
+/// avoiding cryptographic BLAKE3 overhead on the submission critical path.
+type ContentHash = [u64; 2];
+
+fn content_hash(bytes: &[u8]) -> ContentHash {
+    const K0: u64 = 0x9e37_79b9_7f4a_7c15;
+    const K1: u64 = 0xbf58_476d_1ce4_e5b9;
+    const K2: u64 = 0x94d0_49bb_1331_11eb;
+    const K3: u64 = 0x517c_c1b7_2722_0a95;
+    let mut s0 = K0 ^ (bytes.len() as u64);
+    let mut s1 = K1;
+    let mut s2 = K2;
+    let mut s3 = K3;
+    let mut chunks = bytes.chunks_exact(32);
+    for chunk in chunks.by_ref() {
+        let a = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+        let b = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+        let c = u64::from_le_bytes(chunk[16..24].try_into().unwrap());
+        let d = u64::from_le_bytes(chunk[24..32].try_into().unwrap());
+        s0 = s0.wrapping_add(a).wrapping_mul(K1).rotate_left(31);
+        s1 = s1.wrapping_add(b).wrapping_mul(K2).rotate_left(29);
+        s2 = s2.wrapping_add(c).wrapping_mul(K3).rotate_left(27);
+        s3 = s3.wrapping_add(d).wrapping_mul(K0).rotate_left(33);
+    }
+    let rem = chunks.remainder();
+    let mut tail = rem.chunks_exact(8);
+    for word in tail.by_ref() {
+        let w = u64::from_le_bytes(word.try_into().unwrap());
+        s0 = (s0 ^ w).wrapping_mul(K1).rotate_left(31);
+    }
+    for &byte in tail.remainder() {
+        s1 = (s1 ^ u64::from(byte)).wrapping_mul(K2).rotate_left(13);
+    }
+    let mix = |mut x: u64| {
+        x ^= x >> 30;
+        x = x.wrapping_mul(K1);
+        x ^= x >> 27;
+        x = x.wrapping_mul(K2);
+        x ^ (x >> 31)
+    };
+    [mix(s0 ^ s2.rotate_left(17)), mix(s1 ^ s3.rotate_left(23))]
+}
+
 /// What a texture's staging buffer holds: the hash of the memory detiled
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hash: Option<ContentHash>,
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
@@ -257,7 +299,7 @@ struct Last {
 impl Last {
     /// `hash` is not the hash of the last read: what the guard let pass
     /// as unwritten was written.
-    fn changed(&mut self, hash: blake3::Hash) {
+    fn changed(&mut self, hash: ContentHash) {
         if self.checked && self.hash.is_some() && !self.missed {
             self.missed = true;
             // Told once per texture, so a run says whether the guard misses
@@ -864,16 +906,16 @@ fn in_place_max() -> usize {
 ///
 /// SAFETY: `at` must be readable for `len` bytes for the whole call (the
 /// caller holds the mapping, [`crate::watch::title_memory_reading`]).
-unsafe fn stable_hash(at: *const u8, len: usize) -> Option<blake3::Hash> {
+unsafe fn stable_hash(at: *const u8, len: usize) -> Option<ContentHash> {
     // SAFETY: the caller's contract.
     let bytes = unsafe { std::slice::from_raw_parts(at, len) };
-    settled(blake3::hash(bytes), blake3::hash(bytes))
+    settled(content_hash(bytes), content_hash(bytes))
 }
 
 /// [`stable_hash`]'s decision: two hashings of the same bytes that agree are
 /// one reading of them; two that do not are a title writing while we read,
 /// and nothing is decided on a mix.
-fn settled(first: blake3::Hash, second: blake3::Hash) -> Option<blake3::Hash> {
+fn settled(first: ContentHash, second: ContentHash) -> Option<ContentHash> {
     (first == second).then_some(first)
 }
 
@@ -1468,7 +1510,7 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
+                let hash = content_hash(read);
                 if last.hash == Some(hash) {
                     return false;
                 }
@@ -1494,7 +1536,7 @@ impl Staging {
             // A read through the kernel, which needs no lock.
             drop(_mapped);
             return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
+                let hash = content_hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
@@ -1553,7 +1595,7 @@ impl Staging {
         });
         drop(_mapped);
         let fresh = with_read(size, |tiled| {
-            let hash = blake3::hash(tiled);
+            let hash = content_hash(tiled);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             if last.hash == Some(hash) {
@@ -1582,7 +1624,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = blake3::hash(read);
+            let hash = content_hash(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);
@@ -1754,7 +1796,7 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
     let len = len as usize;
-    let mut hasher = blake3::Hasher::new();
+    let mut acc = 0x9e37_79b9_7f4a_7c15u64 ^ (len as u64);
     READ.with(|read| {
         let mut read = read.borrow_mut();
         read.resize(3 * WINDOW, 0);
@@ -1766,7 +1808,8 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
                 bytes,
                 false,
             );
-            hasher.update(&read[..bytes]);
+            let h = content_hash(&read[..bytes]);
+            acc = (acc ^ h[0]).wrapping_mul(0xbf58_476d_1ce4_e5b9).rotate_left(27) ^ h[1];
         };
         if len <= 3 * WINDOW {
             take(0, len);
@@ -1776,10 +1819,7 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
             take(len - WINDOW, WINDOW);
         }
     });
-    let hash = hasher.finalize();
-    let mut first = [0u8; 8];
-    first.copy_from_slice(&hash.as_bytes()[..8]);
-    u64::from_le_bytes(first) | 1
+    acc | 1
 }
 
 /// Whether a title texture has a staging buffer: a list recorded its
@@ -2479,14 +2519,14 @@ mod in_place_tests {
             unsafe { stable_hash(at as *const u8, 2 * 4096) }.expect("a range nobody writes");
         assert_eq!(
             live,
-            blake3::hash(bytes),
+            content_hash(bytes),
             "in place and through a copy are the same bytes"
         );
         // A title writing the bytes while they are read: the two hashings
         // disagree, and no decision is made on the mix (the next refresh
         // looks again).
         assert_eq!(super::settled(live, live), Some(live));
-        let moved = blake3::hash(b"the title wrote this in between");
+        let moved = content_hash(b"the title wrote this in between");
         assert_eq!(super::settled(live, moved), None);
         // SAFETY: the memory allocated above.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
@@ -2682,11 +2722,11 @@ mod title_memory_tests {
 
 #[cfg(test)]
 mod guard_tests {
-    use super::Last;
+    use super::{Last, content_hash};
 
     #[test]
     fn a_change_the_guard_let_pass_makes_the_texture_hashed_every_check() {
-        let (a, b) = (blake3::hash(b"a"), blake3::hash(b"b"));
+        let (a, b) = (content_hash(b"a"), content_hash(b"b"));
         let mut last = Last::default();
         last.changed(a);
         assert!(!last.missed);
@@ -2703,7 +2743,7 @@ mod guard_tests {
             checked: true,
             ..Default::default()
         };
-        last.changed(blake3::hash(b"a"));
+        last.changed(content_hash(b"a"));
         assert!(!last.missed);
     }
 }
