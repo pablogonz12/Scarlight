@@ -9,8 +9,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
-use victory_shader::emit::host::{self, Host};
-use victory_shader::emit::{self, validator::Validator};
+use victory_shader::emit;
+#[cfg(windows)]
+use victory_shader::emit::{host::{self, Host}, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
@@ -150,7 +151,9 @@ struct Checks {
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
+    #[cfg(windows)]
     validator: Option<Validator>,
+    #[cfg(windows)]
     host: Option<(Host, emit::HostShader)>,
 }
 
@@ -255,6 +258,13 @@ pub fn run(
         victory_core::ensure_outside_repo(Path::new(&dir))?;
     }
     let paths = crate::default_paths(paths)?;
+    #[cfg(not(windows))]
+    if pipelines || validate || std::env::var_os("VICTORY_PAIRS").is_some_and(|v| !v.is_empty()) {
+        anyhow::bail!("host pipeline creation and DXIL validation require Windows");
+    }
+    #[cfg(not(windows))]
+    let host_caps: Option<(u32, bool)> = None;
+    #[cfg(windows)]
     let host_caps = if pipelines {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         if let Some(name) = host.adapter_name() {
@@ -276,7 +286,9 @@ pub fn run(
         || host_caps.is_some_and(|(_, rdna)| rdna),
         |v| v == "1",
     ));
+    #[cfg(windows)]
     let dll = validate.then(Validator::default_path).flatten();
+    #[cfg(windows)]
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
         println!(
@@ -317,9 +329,11 @@ pub fn run(
                         };
                         let mut checks = Checks {
                             keep: (!pairs.is_empty()).then(|| kept.clone()),
+                            #[cfg(windows)]
                             validator: validate
                                 .then(|| Validator::load(dll.as_deref()).ok())
                                 .flatten(),
+                            #[cfg(windows)]
                             host: pipelines
                                 .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                 .flatten(),
@@ -382,6 +396,7 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    #[cfg(windows)]
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -755,6 +770,8 @@ fn check(
             &shader.dxil,
         );
     }
+    #[cfg(windows)]
+    {
     if let Some((h, stub_ps)) = &checks.host {
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
@@ -811,6 +828,11 @@ fn check(
             }
             t.fail(format!("validator: {first}"), label);
         }
+    }
+    }
+    #[cfg(not(windows))]
+    if t.list {
+        t.lines.push(format!("{}  emitted", label()));
     }
 }
 
