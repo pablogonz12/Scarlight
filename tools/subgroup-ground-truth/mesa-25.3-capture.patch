@@ -1,0 +1,18 @@
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+index ae981cf..105f7aa 100644
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -3272,6 +3272,13 @@ radv_shader_dump_debug_info(struct radv_device *device, bool dump_shader, struct
+                             struct radv_shader_info *info)
+ {
+    if (dump_shader) {
++      const char *capture = getenv("HARNESS_ISA_PATH");
++      if (capture && binary->type == RADV_BINARY_TYPE_LEGACY && shaders[0]->info.stage == MESA_SHADER_COMPUTE) {
++         struct radv_shader_binary_legacy *b = (struct radv_shader_binary_legacy *)binary;
++         FILE *f = fopen(capture, "wb");
++         if (f) { fwrite(b->data + b->stats_size, 1, b->exec_size, f); fclose(f); }
++         fprintf(stderr, "HARNESS code_size=%u exec_size=%u wave=%u\n", b->code_size, b->exec_size, info->wave_size);
++      }
+       const struct radv_physical_device *pdev = radv_device_physical(device);
+       const struct radv_instance *instance = radv_physical_device_instance(pdev);
+ 
