@@ -709,20 +709,25 @@ mod tests {
     #[test]
     fn title_images_report_their_original_path() {
         let base = 0x7000_0000_0000;
-        runtime::set_image_path(base, std::path::Path::new(r"C:\title\game.exe"));
+        #[cfg(windows)]
+        let path = std::path::PathBuf::from(r"C:\title\game.exe");
+        #[cfg(not(windows))]
+        let path = std::env::temp_dir().join("title").join("game.exe");
+        runtime::set_image_path(base, &path);
         let module = base as *mut c_void;
-        let mut buf = [0xFFFFu16; 32];
+        let mut buf = [0xFFFFu16; 512];
         let n = GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32);
         assert_eq!(
             String::from_utf16_lossy(&buf[..n as usize]),
-            r"C:\title\game.exe"
+            path.to_string_lossy()
         );
         assert_eq!(buf[n as usize], 0);
 
         // Too small: truncated, NUL-terminated, the buffer size returned.
         let mut small = [0u8; 4];
         assert_eq!(GetModuleFileNameA(module, small.as_mut_ptr(), 4), 4);
-        assert_eq!(&small, &[b'C', b':', b'\\', 0]);
+        assert_eq!(&small[..3], &path.to_string_lossy().as_bytes()[..3]);
+        assert_eq!(small[3], 0);
     }
 
     /// The title's arguments come right after the program, and the list ends
@@ -790,7 +795,11 @@ mod tests {
     #[test]
     fn title_dlls_and_pseudo_modules_are_found_by_name() {
         let base = 0x7100_0000_0000usize;
-        runtime::set_image_path(base, std::path::Path::new(r"C:\title\Mapped.dll"));
+        #[cfg(windows)]
+        let path = std::path::PathBuf::from(r"C:\title\Mapped.dll");
+        #[cfg(not(windows))]
+        let path = std::env::temp_dir().join("title").join("Mapped.dll");
+        runtime::set_image_path(base, &path);
         runtime::set_title_dll_loader(Box::new(|file| match file {
             "late.dll" => Ok(Some(0x7200_0000_0000)),
             "broken.dll" => Err("bad image".into()),

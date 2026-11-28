@@ -253,6 +253,8 @@ mod tests {
         });
 
         // The path is a drive root, never the host folder.
+        #[cfg(windows)]
+        {
         let mut size = 0;
         assert_eq!(method::<Size>(&OBJECT, 0x18)(this, &mut size), S_OK);
         assert_eq!(size, 4, "X:\\ and its NUL");
@@ -263,8 +265,6 @@ mod tests {
         let drive = std::str::from_utf8(&buffer[..3]).unwrap();
         assert!(drive.ends_with(":\\"), "{drive}");
         // Title file calls on it reach the folder.
-        #[cfg(windows)]
-        {
         let path = format!("{drive}save.dat\0");
         let mut attributes = [0u8; 36];
         let get_attributes = super::super::files::GetFileAttributesExW;
