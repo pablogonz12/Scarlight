@@ -7638,6 +7638,10 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            // `VICTORY_THIN=1`: what the title's list calls wrote down and the
+            // translating threads did with it.
+            #[cfg(windows)]
+            crate::list::thin::log(frames);
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
