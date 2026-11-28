@@ -1187,6 +1187,20 @@ pub(crate) struct HostList {
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
 }
 
+#[cfg(feature = "diagnostics")]
+fn hangdog_record(runs: &[&HostList]) {
+    let pipelines = runs.iter().flat_map(|list| {
+        list.pipelines.lock().unwrap_or_else(|e| e.into_inner()).iter().take(8).cloned().collect::<Vec<_>>()
+    }).take(8).collect();
+    crate::hangdog::record(crate::hangdog::Record {
+        frame: crate::frame::current(),
+        lists: runs.len(),
+        draws_total: crate::draw::drawn(),
+        dispatches_total: crate::draw::dispatched(),
+        pipelines,
+    });
+}
+
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 
@@ -4072,11 +4086,15 @@ impl Host {
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                #[cfg(feature = "diagnostics")]
+                hangdog_record(&[]);
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
                 self.card_sent();
                 self.queue.Signal(&fence, sent)?;
+                #[cfg(feature = "diagnostics")]
+                crate::hangdog::fence_started(&fence, sent);
                 fence.SetEventOnCompletion(sent, event)?;
                 WaitForSingleObject(event, INFINITE);
                 Ok(after)
@@ -4131,6 +4149,8 @@ impl Host {
             if !flights.is_empty() {
                 // SAFETY: a plain query.
                 if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                    #[cfg(feature = "diagnostics")]
+                    crate::hangdog::dump();
                     let runs: Vec<&HostList> = flights.iter().flat_map(|f| f.order.iter().map(|&i| f.lists[i].host())).collect();
                     fail(format_args!(
                         "host GPU device removed after {} submissions sent ahead (VICTORY_RELAY=1) of {} lists{}{}",
@@ -4291,10 +4311,14 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
+                    #[cfg(feature = "diagnostics")]
+                    hangdog_record(&[]);
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
                     self.queue.Signal(&self.fence, *submitted)?;
+                    #[cfg(feature = "diagnostics")]
+                    crate::hangdog::fence_started(&self.fence, *submitted);
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
@@ -4550,6 +4574,8 @@ impl Host {
                 });
                 // SAFETY: a plain query.
                 if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                    #[cfg(feature = "diagnostics")]
+                    crate::hangdog::dump();
                     let runs: Vec<&HostList> = items
                         .iter()
                         .filter_map(|i| match i {
@@ -4829,6 +4855,8 @@ impl Host {
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
+            #[cfg(feature = "diagnostics")]
+            hangdog_record(runs);
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
@@ -4838,6 +4866,8 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
+            #[cfg(feature = "diagnostics")]
+            crate::hangdog::fence_started(&self.fence, *submitted);
             let back = declared_writes(runs);
             let mut texture_back_ranges = Vec::new();
             for list in runs {
@@ -4875,6 +4905,8 @@ impl Host {
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            hangdog_record(runs);
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
@@ -4885,6 +4917,8 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
+                        #[cfg(feature = "diagnostics")]
+                        crate::hangdog::fence_started(&self.fence, *submitted);
                         working(false);
                         WaitForSingleObject(self.event, INFINITE);
                         stood(started);
@@ -4944,6 +4978,8 @@ impl Host {
         }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            #[cfg(feature = "diagnostics")]
+            crate::hangdog::dump();
             fail(format_args!(
                 "host GPU device removed after a submission of {} lists{}{}",
                 runs.len(),
@@ -8052,6 +8088,8 @@ impl Host {
                 }
                 Err(error) => {
                     if self.device.GetDeviceRemovedReason().is_err() {
+                        #[cfg(feature = "diagnostics")]
+                        crate::hangdog::dump();
                         fail(format_args!(
                             "host GPU device removed during Present: {error}{}{}",
                             self.removal_data(&[&p.copy]),
