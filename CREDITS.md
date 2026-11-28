@@ -358,6 +358,12 @@ Missing or wrong name? Open an issue.
   blending turned on only where it was needed (`crates/victory-gpu/src/pipeline/host.rs`,
   `VICTORY_HOST_BLEND=0`). Its host-pipeline device test used `D3DCompile`; ours checks the state itself.
 
+- **avatarmanz/VIctory-7900XTX [3a99ee610](https://github.com/avatarmanz/VIctory-7900XTX/commit/3a99ee610)**
+  (avatarmanz), GPL-3.0-or-later: list calls that only write down their arguments, translated by threads of ours
+  beside the title's recording, on a list of ours that the title never sees (`VICTORY_THIN=1`, off by default;
+  `crates/victory-gpu/src/list/thin.rs`), reimplemented on this tree's lists: the render target and depth view
+  records, arrays and structures are copied at the call, and a recording the title resets or releases without
+  submitting is not run further.
 - **avatarmanz/VIctory-7900XTX** ([ca1d519f1](https://github.com/avatarmanz/VIctory-7900XTX/commit/ca1d519f1),
   [44629de2e](https://github.com/avatarmanz/VIctory-7900XTX/commit/44629de2e), and the four commits beside them),
   GPL-3.0, after ZJOU acf478b8 and Belobug 92d353f8, 84ea9c12, dd799aad and 76387c2d (romainhedouin): per-frame CPU
@@ -381,6 +387,17 @@ Missing or wrong name? Open an issue.
   (after fxceless/victory-fork [c36971b2](https://github.com/fxceless/victory-fork/commit/c36971b2)), GPL-3.0:
   `VICTORY_CARD_BUFFERS_MIN_KB`, so that title buffers' copies under the MiB floor can go into the card's memory
   (unset: the floor of before) (`crates/victory-gpu/src/shadow.rs`).
+- **avatarmanz/VIctory-7900XTX [3a99ee610](https://github.com/avatarmanz/VIctory-7900XTX/commit/3a99ee610)**
+  (avatarmanz), GPL-3.0-or-later: list calls that only write down their arguments, translated by threads of ours
+  beside the title's recording, on a list of ours that the title never sees (`VICTORY_THIN=1`, off by default;
+  `crates/victory-gpu/src/list/thin.rs`), reimplemented on this tree's lists: the render target and depth view
+  records, arrays and structures are copied at the call, and a recording the title resets or releases without
+  submitting is not run further.
+
+  (avatarmanz), GPL-3.0-or-later: the title's `ExecuteCommandLists` and `Signal` put in a line of ours and made by
+  a thread of ours, so the recording does not wait for its own submission (`VICTORY_ASYNC_SUBMIT=1`, off by
+  default, needs `VICTORY_THIN=1`; `crates/victory-gpu/src/queue/behind.rs`), with the order the title asks for
+  kept: a wait, a present, our own submission and a fence read take the line in first.
 D
 - **fever308/victory-corgi [95641affc](https://github.com/fever308/victory-corgi/commit/95641affc)**, GPL-3.0:
   the title's "idle" and "lowest" threads (the streaming pager's among them) run "below normal", and the process

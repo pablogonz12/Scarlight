@@ -3574,6 +3574,10 @@ void main() {
         slot::<Copy>(list, 0x80)(list, &to, 0, 0, 0, &from, null.cast());
         slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        // What the submission ran is looked at here: with submissions made by
+        // a thread of ours (`VICTORY_ASYNC_SUBMIT=1`) that is a wait, as a
+        // title's own wait for the queue's fence is.
+        crate::queue::before_sync();
 
         // Read the host texture back into a readback buffer.
         let readback_heap = D3D12_HEAP_PROPERTIES {

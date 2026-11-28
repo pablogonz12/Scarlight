@@ -341,7 +341,10 @@ fn sweep() {
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
-    let started = STARTED.load(Ordering::Acquire);
+    // (Those the title made and the line has not begun get the next numbers.)
+    // Only submissions advance `FINISHED`: a signal in the line is not a
+    // number that will ever be reached.
+    let started = STARTED.load(Ordering::Acquire) + crate::queue::submissions();
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
@@ -4364,6 +4367,8 @@ impl Host {
     /// Runs closed lists and waits for them, and with [`late`] for
     /// everything sent to the card before them, which is settled first.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        // Behind what the title's queues were given before it.
+        crate::queue::before_sync();
         let _ = self.submit(runs, false);
     }
 
@@ -7638,6 +7643,12 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            // `VICTORY_THIN=1`: what the title's list calls wrote down and the
+            // translating threads did with it.
+            #[cfg(windows)]
+            crate::list::thin::log(frames);
+            #[cfg(windows)]
+            crate::queue::behind_line(frames);
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
