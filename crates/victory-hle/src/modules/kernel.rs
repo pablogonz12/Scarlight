@@ -426,6 +426,7 @@ fn title_priority(asked: i32) -> i32 {
 }
 
 /// [`title_priority`].
+#[cfg(windows)]
 pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32 {
     static AS_SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let as_set = *AS_SET.get_or_init(|| std::env::var_os("VICTORY_TITLE_PRIORITIES").is_some_and(|v| v == "0"));
@@ -468,6 +469,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            #[cfg(windows)]
             hle_export!(SetThreadPriority),
         ],
     }
@@ -689,6 +691,8 @@ mod tests {
     fn no_title_thread_waits_for_idle_processors() {
         let given: Vec<i32> = [-15, -2, -1, 0, 1, 2, 15].into_iter().map(title_priority).collect();
         assert_eq!(given, [-1, -1, -1, 0, 1, 2, 15]);
+        #[cfg(windows)]
+        {
         use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
         std::thread::spawn(|| {
             // SAFETY: plain calls on this thread.
@@ -699,6 +703,7 @@ mod tests {
         })
         .join()
         .unwrap();
+        }
     }
 
     #[test]

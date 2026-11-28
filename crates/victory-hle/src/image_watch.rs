@@ -28,6 +28,7 @@ fn words(text: &str) -> Vec<Word> {
 }
 
 /// `word` of the image at `base`; `None` if it cannot be read.
+#[cfg(windows)]
 fn read(base: usize, word: &Word) -> Option<u64> {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -44,6 +45,17 @@ fn read(base: usize, word: &Word) -> Option<u64> {
         )
     };
     (ok != 0).then(|| u64::from_le_bytes(value))
+}
+
+#[cfg(not(windows))]
+fn read(base: usize, word: &Word) -> Option<u64> {
+    use std::os::unix::fs::FileExt;
+    let mut value = [0u8; 8];
+    std::fs::File::open("/proc/self/mem").ok()?.read_exact_at(
+        &mut value[..word.bytes],
+        base.checked_add(word.offset)? as u64,
+    ).ok()?;
+    Some(u64::from_le_bytes(value))
 }
 
 /// Starts watching the image at `base`, if asked for.
