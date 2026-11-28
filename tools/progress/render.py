@@ -106,9 +106,9 @@ def page(doc):
         lines.append("- " + line)
     lines.append("")
     lines.append(
-        "Regenerate with `tools/progress/collect.sh` (local, needs your own copy of the "
-        "title) and `tools/progress/render.py`; both are idempotent and the JSON holds "
-        "counts only."
+        "`tools/progress/render.py` regenerates the page from existing counts without an "
+        "executable. Collect new runtime measurements only with test inputs authorized "
+        "for this environment."
     )
     lines.append("")
     for area in doc["areas"]:

@@ -703,11 +703,11 @@ EOF
   fi
 
   if [ -z "$GAME_EXE" ]; then
-    chk fail "Your copy of the game: not set" "Quick setup: pick the .exe of the copy you own (nothing is downloaded)"
+    chk fail "Local executable: not set" "Quick setup: select an executable authorized for this environment"
   elif [ -f "$GAME_EXE" ]; then
-    chk ok "Your copy of the game: $GAME_EXE"
+    chk ok "Local executable: $GAME_EXE"
   else
-    chk fail "Your copy of the game: $GAME_EXE does not exist" "Quick setup: pick the .exe of the copy you own"
+    chk fail "Local executable: $GAME_EXE does not exist" "Quick setup: select an executable authorized for this environment"
   fi
 
   if [ -d "$PREFIX" ]; then
@@ -966,7 +966,7 @@ EOF
   fi
   [ -x "$PROTON/files/bin/wine" ] || ui_show "Proton" "$PROTON has no files/bin/wine - Wine may not start. You can change it later in Advanced."
 
-  GAME_EXE=$(ui_input "Quick setup 2/3: your game" "full path of the .exe of the copy you own (nothing is downloaded)" "$GAME_EXE") || return 1
+  GAME_EXE=$(ui_input "Quick setup 2/3: local executable" "Full path of an executable authorized for this environment" "$GAME_EXE") || return 1
   [ -n "$GAME_EXE" ] || return 1
   GAME_DIR=${GAME_EXE%/*}
 
@@ -1082,7 +1082,7 @@ EOF
         esac ;;
       # each edit lands in a temporary first: a cancelled prompt must keep the old value
       build) v=$(ui_input "Scarlight build" "the victory.exe you built" "$PORT_EXE") && PORT_EXE=$v ;;
-      title) v=$(ui_input "Game exe" "the .exe of the copy you own" "$GAME_EXE") && {
+      title) v=$(ui_input "Local executable" "An executable authorized for this environment" "$GAME_EXE") && {
                GAME_EXE=$v; [ -n "$GAME_EXE" ] && GAME_DIR=${GAME_EXE%/*}; } ;;
       dlls) v=$(ui_input "DLL folder" "where dxgi/d3d12/d3d12core/dxil live ('-' clears: use the build's own)" "$DLLDIR") && {
               case "$v" in -|none|clear) DLLDIR="" ;; *) DLLDIR=$v ;; esac; } ;;
@@ -1132,11 +1132,11 @@ menu_help() {
   ui_show "Help" "Scarlight launcher
 
 Play starts the setup you saved last; the summary and the exact command are shown before anything runs.
-Quick setup asks three things: your Proton/GE folder, the .exe of the copy you own, and the folder with the DXVK/vkd3d/DXC DLLs.
+Quick setup asks for your Proton/GE folder, a local executable authorized for this environment, and the folder with the DXVK/vkd3d/DXC DLLs.
 Presets set everything at once; Advanced changes one thing and remembers it.
 
 Everything lives in $CONFIG_DIR (last.env plus any *.env profile). Prefix: $PREFIX. Logs: $LOG_DIR.
-Nothing here downloads the game; bring your own copy.
+The launcher does not obtain executable files for you.
 
 Flags: --check (machine report), --dry-run (print the command), --profile NAME, --list-profiles, --save-profile NAME, --ui gum|fzf|whiptail|dialog|select, --help.
 Docs: docs/linux.md in the repository."

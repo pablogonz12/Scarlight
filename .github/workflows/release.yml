@@ -208,7 +208,7 @@ jobs:
             echo "Full instructions: [docs/RELEASES.md](https://github.com/${{ github.repository }}/blob/main/docs/RELEASES.md)."
             echo "DXC's dxil.dll and dxcompiler.dll are yours to add (docs/steam.md): Microsoft's terms leave them out of a Linux release."
             echo "Ships vkd3d-proton ${VKD3D_COMMIT} with dxil-spirv ${DXIL_SPIRV_COMMIT} (LGPL-2.1); its corresponding source is attached."
-            echo "No game files, ever: Scarlight runs a copy of a game you own."
+            echo "Use ScarLight only with software you have permission to run in this environment. Do not share or link to unauthorized code, builds, or assets."
           } > notes.md
           cat notes.md
       - name: Create the pre-release
@@ -224,7 +224,7 @@ jobs:
             gh release upload "$tag" "${assets[@]}" SHA256SUMS.txt --clobber
           else
             gh release create "$tag" "${assets[@]}" SHA256SUMS.txt \
-              --prerelease --title "Scarlight $PACKAGED_VERSION" \
+              --prerelease --title "ScarLight $PACKAGED_VERSION" \
               --target "$GITHUB_SHA" --notes-file notes.md
           fi
       - uses: actions/upload-artifact@v7

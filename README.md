@@ -11,11 +11,11 @@
 
 # ScarLight
 
-**Play Xbox Series games on your Linux PC, from Steam.**
+**Experimental Xbox Series compatibility layer for Linux and Mesa.**
 
-ScarLight is a Steam compatibility tool. Proton lets Steam run Windows games on Linux; ScarLight does
-the same job for games built for Xbox Series. Install it once, choose it for the game in Steam, press
-Play.
+ScarLight is a Steam compatibility tool built on Proton and vkd3d-proton. It implements parts of
+the Xbox Series runtime on Linux. Compatibility is limited; this is not a claim of support for the
+Xbox Series catalogue.
 
 <sub>[What it is](#what-it-is) · [What you need](#what-you-need) · [Install](#install) ·
 [Status](#status) · [How it works](#how-it-works) · [Roadmap](#roadmap) · [Help wanted](#help-wanted) ·
@@ -38,7 +38,13 @@ graphics driver does the drawing.
 
 You do not run anything from a terminal: Steam launches the game, the way it does with Proton.
 
-ScarLight ships no game files. It runs a copy of a game you legally own, on your own PC.
+## Content and testing
+
+Use ScarLight only with software you have permission to run in this environment. Owning a copy
+does not by itself establish that permission. Do not upload, request, share, or link to leaked or
+otherwise unauthorized code, builds, or assets in issues, discussions, pull requests, or releases.
+No game files are needed to build ScarLight or run its source-based tests. See
+[Contributing](CONTRIBUTING.md#testing-without-game-files) to get started.
 
 ## What you need
 
@@ -48,7 +54,6 @@ ScarLight ships no game files. It runs a copy of a game you legally own, on your
   Vulkan 1.3 or newer. A proprietary driver is not a target of this project.
 - **A Proton you already have**: GE-Proton or Valve's Proton. ScarLight uses its Wine; we neither
   ship nor fork Proton.
-- **The game's files**, from a copy you own.
 
 ## Install
 

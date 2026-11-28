@@ -3,7 +3,7 @@
 
 ![ISA coverage](progress/shaders.svg)
 
-**This section needs no title, so CI regenerates it on every push; the per-title rows above need your own copy of the title and stay as they are.** It compares the decoder's opcode tables with a public reference list of every RDNA2 instruction form, then asks each backend whether it has a case for the form. Decoded, and a case in a backend, are statements about our code, not about a shader that ran: a form we name can still be translated wrongly, and nothing here is a picture.
+**CI regenerates this section from source on every push, without an executable. It does not rerun the runtime measurements above.** It compares the decoder's opcode tables with a public reference list of every RDNA2 instruction form, then asks each backend whether it has a case for the form. Decoded, and a case in a backend, are statements about our code, not about a shader that ran: a form we name can still be translated wrongly, and nothing here is a picture.
 
 **1203 of 1236 reference forms decoded; 711 with a DXIL-path case; the direct SPIR-V emitter is not on this branch, so that column is empty.**
 
