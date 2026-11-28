@@ -9,7 +9,7 @@ Measured on 25 Nov 2026, build 5fca579b, RX 9070 XT (RDNA4) / Mesa 26.3.1 RADV. 
 - The counts are taken from files the user supplies; nothing from them is stored in this repository, and no title, program or asset name appears here.
 - A set can be complete without being ours: every import of the title **resolves** (0 missing), but 427 of the 587 are Wine (Proton) and 72 belong to the title's own libraries. The System APIs area shows both numbers side by side, and only the 88 HLE ones are code this project wrote.
 
-Regenerate with `tools/progress/collect.sh` (local, needs your own copy of the title) and `tools/progress/render.py`; both are idempotent and the JSON holds counts only.
+`tools/progress/render.py` regenerates the page from existing counts without an executable. Collect new runtime measurements only with test inputs authorized for this environment.
 
 ## System APIs (HLE)
 
@@ -142,7 +142,7 @@ Speed is measured at one fixed scene, the only figure compared between builds, a
 
 ![ISA coverage](progress/shaders.svg)
 
-**This section needs no title, so CI regenerates it on every push; the per-title rows above need your own copy of the title and stay as they are.** It compares the decoder's opcode tables with a public reference list of every RDNA2 instruction form, then asks each backend whether it has a case for the form. Decoded, and a case in a backend, are statements about our code, not about a shader that ran: a form we name can still be translated wrongly, and nothing here is a picture.
+**CI regenerates this section from source on every push, without an executable. It does not rerun the runtime measurements above.** It compares the decoder's opcode tables with a public reference list of every RDNA2 instruction form, then asks each backend whether it has a case for the form. Decoded, and a case in a backend, are statements about our code, not about a shader that ran: a form we name can still be translated wrongly, and nothing here is a picture.
 
 **1200 of 1236 reference forms decoded; 680 with a DXIL-path case; the direct SPIR-V emitter is not on this branch, so that column is empty.**
 

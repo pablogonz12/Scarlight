@@ -40,7 +40,7 @@ outside the repository.
 set -eu
 PROTON="$HOME/.local/share/Steam/compatibilitytools.d/GE-Proton11-14-x86_64"   # your folder name; usually ends in -x86_64
 EXE="$HOME/src/Scarlight/target/x86_64-pc-windows-msvc/release/victory.exe"
-GAME_DIR="$HOME/victory-data/game"          # your own legally obtained files
+GAME_DIR="$HOME/victory-data/game"          # local test input authorized for this environment
 GAME_EXE="<the title's exe>"
 
 export WINEPREFIX="$HOME/.local/share/scarlight-prefix"

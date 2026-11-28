@@ -20,7 +20,7 @@ Comment on the issue before you start so two people do not build the same thing.
 contributors are not expected to know Rust's Windows bindings or Mesa: say what you are unsure of in
 the issue and somebody will narrow it down.
 
-## No game files? Here is what you can do
+## Testing without game files
 
 Most of the repository needs nothing from the title, and none of the following reads a game file:
 
@@ -36,12 +36,10 @@ Most of the repository needs nothing from the title, and none of the following r
 
 ScarLight is written with AI assistance (Claude, DeepSeek); every change goes through CI and review.
 
-A dry run (`SCARLIGHT_DRY_RUN=1` in a title's Launch Options: imports resolved and bound, no GPU;
-[docs/steam.md](docs/steam.md)) needs a title's `.exe`. A run, a frame rate and a test report need your
-own copy of a title: the
-[test report form](https://github.com/pablogonz12/Scarlight/issues/new?template=test-report.yml) says
-what to send. The [`help wanted`](https://github.com/pablogonz12/Scarlight/labels/help%20wanted)
-issues each say which part of their work can be done without one.
+A bind-only dry run (`SCARLIGHT_DRY_RUN=1`; see [docs/steam.md](docs/steam.md)) or runtime test
+needs an executable you have permission to run in this environment. Use synthetic fixtures where
+possible. In the [test report form](https://github.com/pablogonz12/Scarlight/issues/new?template=test-report.yml),
+share sanitized observations, not executable files, dumps, or assets.
 
 ## Where pull requests go
 
@@ -55,10 +53,9 @@ issues each say which part of their work can be done without one.
 
 ## Naming rule
 
-* **Docs, commit messages, issue and pull request text never name the title or its developer.**
-  Say "the title", "the game's files", "the user's copy". Not the game's name, not its studio's name,
-  not their abbreviations, not in a comment or a commit either. This is not modesty: it is what keeps
-  the repository up.
+* Keep bug reports and examples focused on the compatibility layer: use synthetic examples or
+  sanitized diagnostics without title or developer names, local paths, or proprietary material.
+  Do not upload, solicit, share, or link to leaked or unauthorized material.
 * **Internal names stay `victory*`**: crates (`victory-core`, `victory-gpu`, …), the `victory`
   binary, `victory.toml`, `VICTORY_*` environment variables. Renaming them breaks every upstream
   patch we still want to merge, so do not.
