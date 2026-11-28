@@ -21,7 +21,8 @@ fn names(text: &str) -> BTreeSet<String> {
             .take_while(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
             .count();
         let suffix = tail[..len].trim_end_matches('_');
-        if !suffix.is_empty() {
+        let embedded = at > 0 && (rest.as_bytes()[at - 1].is_ascii_alphanumeric() || rest.as_bytes()[at - 1] == b'_');
+        if !suffix.is_empty() && !embedded {
             found.insert(format!("{PREFIX}{suffix}"));
         }
         rest = &tail[len..];
@@ -48,7 +49,8 @@ fn documented_switches_are_read() {
     let read = |path: &String| std::fs::read_to_string(root.join(path)).ok();
     let mut documented = BTreeSet::new();
     let mut doc_of = Vec::new();
-    for path in files.iter().filter(|p| p.ends_with(".md")) {
+    // Credits document historical contributions, not current switches.
+    for path in files.iter().filter(|p| p.ends_with(".md") && p.as_str() != "CREDITS.md") {
         for name in names(&read(path).unwrap_or_default()) {
             doc_of.push((name.clone(), path.clone()));
             documented.insert(name);
@@ -91,6 +93,7 @@ fn finds_whole_names_only() {
         found,
         ["VICTORY_LATE_WAIT", "VICTORY_LATE_WAITS", "VICTORY_X"]
     );
+    assert!(names("WINE_VICTORY_LOCAL_VIEWS").is_empty());
 }
 
 #[test]
